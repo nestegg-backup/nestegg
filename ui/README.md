@@ -26,9 +26,12 @@ records `docs/decisions/0003-*.md` first.
 2. **Build output in `ui/dist/`** (static files: `index.html` + assets). The
    Rust binary embeds this directory at compile time; there is no Node.js at
    runtime. Keep the bundle small.
-3. **Auth:** the first page load arrives as `/?token=<token>`; the server sets
-   an HttpOnly cookie and the UI must not store the token in localStorage.
-   Relative URLs only (`api/v1/status`, not absolute hosts).
+3. **Auth:** `nestegg ui` opens `/#token=<token>`. On load, read the token
+   from `location.hash`, store it in `sessionStorage`, remove it from the
+   address bar (`history.replaceState`) and send it as
+   `Authorization: Bearer <token>` with every `api/v1/*` request. No cookies,
+   no localStorage. A 401 means the session ended: show "open the address
+   printed by `nestegg ui`". Relative URLs only (`api/v1/status`).
 4. **License:** all dependencies must be AGPL-3.0-compatible (MIT, BSD,
    Apache-2.0, ISC, MPL-2.0, GPL/AGPL are fine). Run a license check before
    adding dependencies.
@@ -49,7 +52,7 @@ Requires Node.js 22 and npm.
 ```sh
 cd ui
 npm ci
-npm run dev          # http://127.0.0.1:5173 with the mock API
+npm run dev          # mock API; open http://127.0.0.1:5173/#token=dev
 npm run check        # svelte-check / TypeScript
 npm test             # vitest
 npm run test:tz      # the same tests in Pacific/Auckland and America/Los_Angeles
@@ -62,9 +65,19 @@ npm run licenses     # licence check of all installed packages
 `npm run dev` serves `/api/v1/*` from a mock (`mock/world.ts`, a Vite
 dev-server middleware; it is not part of the build). It answers the
 endpoints of `api/openapi.yaml` plus the proposals in `API-REQUESTS.md`,
-with placeholder data only. Pick a scenario with a query parameter on the
-page URL; the choice is kept in a cookie and reloading with the parameter
-resets it:
+with placeholder data only.
+
+Like `nestegg ui`, the mock answers `/api/` only with
+`Authorization: Bearer <token>` and returns 401 otherwise. The page takes the
+token from the address, so open `http://127.0.0.1:5173/#token=dev` (the dev
+server prints this address; set `NESTEGG_MOCK_TOKEN` to use another token).
+A tab opened without `#token=` shows "the session has ended", as with the
+real daemon.
+
+Pick a scenario with a query parameter in front of the fragment, e.g.
+`http://127.0.0.1:5173/?scenario=failing#token=dev`. Loading a page with
+`?scenario=` makes it the current scenario of the dev server (for all tabs)
+and resets it:
 
 | `?scenario=` | What it shows |
 |---|---|
@@ -91,7 +104,7 @@ Add faults to any scenario with `&fault=a,b`:
 
 `down` can also be switched while the page is open:
 `curl -X POST 'http://127.0.0.1:5173/__mock/fault?down=1'` (and `down=0`); it
-applies to the scenario the browser chose last.
+applies to the current scenario.
 
 Add `&daemon=today` to get only what the daemon offers today: no
 `/machines` and `/session` (404), browse and restore answer 501.
@@ -119,8 +132,9 @@ npm run dev
 nestegg ui --dev-proxy http://127.0.0.1:5173
 ```
 
-Open the address printed by `nestegg ui`. API calls then go to the daemon
-socket, not to the mock.
+Open the address printed by `nestegg ui` (`http://127.0.0.1:<port>/#token=…`).
+The page comes from the dev server, API calls go to the daemon socket with
+`nestegg ui`'s token, not to the mock.
 
 ### Structure
 
@@ -128,7 +142,8 @@ socket, not to the mock.
 |---|---|
 | `src/App.svelte` | Layout (list and detail; two screens below 760 px) and hash routing |
 | `src/components/` | Views: this PC, other PCs, server, settings, restore flow |
-| `src/lib/api.ts` | API client (relative URLs, no token handling – the session cookie is HttpOnly) |
+| `src/lib/session.ts` | Session token: taken from `#token=`, kept in `sessionStorage`, removed from the address bar |
+| `src/lib/api.ts` | API client (relative URLs, `Authorization: Bearer` header) |
 | `src/lib/derive.ts`, `src/lib/text.ts` | State derivation and status sentences (unit-tested) |
 | `src/lib/format.ts` | Date, size and duration formatting |
 | `src/i18n/` | German and English strings |
@@ -150,6 +165,6 @@ socket, not to the mock.
   core side updates the contract and the daemon.
 - Until the daemon is ready, develop against a mock that returns the
   examples from the OpenAPI contract (e.g. a small dev-server middleware in
-  `ui/`). `nestegg ui --dev-proxy` support for a Vite-style dev server will
-  be added on the core side.
+  `ui/`). Against the real daemon: `nestegg ui --dev-proxy http://127.0.0.1:5173`
+  forwards everything except `/api/` to a Vite-style dev server.
 - Integration into `main` happens via merge of the `ui` branch after review.

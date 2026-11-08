@@ -4,9 +4,12 @@
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod identity;
 pub mod inventory;
+pub mod mounts;
 pub mod run;
 pub mod secrets;
+pub mod staging;
 pub mod state;
 pub mod status;
 pub mod ui;

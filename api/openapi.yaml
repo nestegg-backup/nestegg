@@ -12,9 +12,14 @@ info:
     - Durations are integer seconds, sizes integer bytes.
     - Unknown fields must be ignored by clients (the API may add fields).
     - Errors use the `Error` schema with a stable machine-readable `code`.
-    - When accessed through `nestegg ui`, every request must carry the session
-      token, either as `Authorization: Bearer <token>` or, for the first page
-      load only, as `?token=<token>` (the server then sets an HttpOnly cookie).
+    - When accessed through `nestegg ui`, every API request must carry the
+      session token as `Authorization: Bearer <token>`. `nestegg ui` opens
+      `http://127.0.0.1:<port>/#token=<token>`; the page reads the token from
+      the URL fragment (never sent to a server), stores it in
+      `sessionStorage`, removes it from the address bar and sends it with
+      every request. No cookies are used (cookies are shared across all ports
+      of 127.0.0.1). Static UI files are served without a token.
+    - Run IDs look like `20261108T213012Z-manual-a3f9` (random suffix).
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
@@ -200,7 +205,7 @@ components:
       name: runId
       in: path
       required: true
-      schema: { type: string, examples: ["20261108T213012Z-timer"] }
+      schema: { type: string, examples: ["20261108T213012Z-timer-a3f9"] }
   schemas:
     Error:
       type: object

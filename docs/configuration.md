@@ -67,6 +67,7 @@ keep_runs = 200                 # local run history
 include_dev = []                # extra mount points, e.g. ["/boot/efi"]
 sources = [
   { archive = "home", path = "/home" },
+  # { archive = "data", path = "/srv/data", require_mount = true },
   { archive = "etc", path = "/etc" },
   { archive = "root", path = "/root", optional = true },
   { archive = "usr-local", path = "/usr/local", optional = true },
@@ -84,6 +85,12 @@ Notes:
   a source need an own source entry or `include_dev`.
 - **Missing sources fail the run** unless marked `optional = true`. A missing
   data disk must not silently produce an incomplete "successful" backup.
+- **Unmounted disks fail the run.** If `/etc/fstab` lists a file system at or
+  below a source (without `noauto`) and it is not mounted, the run fails
+  instead of backing up the empty mount point. `require_mount = true` makes
+  the source itself mandatory as a mount point, also without an fstab entry.
+  Separate file systems mounted below a source that are not backed up (no
+  own source, not in `include_dev`) are reported as warnings.
 - **Excludes** use the `proxmox-backup-client --exclude` syntax
   (gitignore-like). Excluded directories are not read at all.
 - **Schedule:** the timer checks hourly; a backup runs when the last success
@@ -108,6 +115,17 @@ descriptors, never via command line arguments, environment values or logs.
 exists on this computer and the disk fails, the backups are lost. That is why
 backups refuse to run until `nestegg key confirm-exported` was executed.
 
+## Limitations
+
+- The daemon, the timer runs and the CLI must run in the same PID namespace
+  (normal desktop installation). Running some of them inside a container
+  that shares `/run/nestegg` and `/var/lib/nestegg` with the host is not
+  supported: "is a backup running?" is detected via `/proc/locks`, which only
+  shows locks of the own PID namespace. A second backup can still never run
+  in parallel (exclusive lock), but status display may be wrong.
+- Staged restores into user directories need temporary space for a second
+  copy (see Restore).
+
 ## Files
 
 | Path | Content |
@@ -126,7 +144,27 @@ sudo nestegg restore host/desktop/2026-11-08T21:30:12Z home.pxar /root/restore-d
      --pattern 'alice/Documents/**'
 ```
 
-Restores always go into a new directory and never overwrite files. Because
+Restores always go into a new directory and never overwrite files.
+
+- Into a root-owned location (e.g. `/root/restore-…`): runs as root and
+  restores original owners and permissions.
+- Into a directory other users can modify (e.g. your home, via `sudo`): the
+  archive is first restored as root into a private staging directory under
+  `/var/lib/nestegg/restore-staging/` (needs temporary space there; choose
+  another root-owned location with `--staging-dir`), then copied by a process
+  running as you into a temporary sibling directory, which is renamed to the
+  target only when the copy is complete. Nothing can be redirected; the files
+  are owned by you; ACLs, extended attributes, file capabilities and sockets
+  are not copied (skipped entries are listed as warnings). Sparse files stay
+  sparse.
+- The key is used only for encrypted or signed archives. For backups made
+  with an older key, pass its exported copy: `--keyfile old-key.json`.
+
+The key confirmation (`nestegg key confirm-exported`) is bound to the exact
+key that is stored. Replacing the key (`nestegg key create --force`) blocks
+backups again until the new key has been exported and confirmed.
+
+Because
 backups are normal PBS snapshots, they can also be restored with plain
 `proxmox-backup-client` (with the exported key) or through the PBS web UI
 (unencrypted backups only).

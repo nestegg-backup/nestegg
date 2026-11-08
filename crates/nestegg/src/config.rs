@@ -123,6 +123,10 @@ pub struct Source {
     /// missing source fails the run.
     #[serde(default)]
     pub optional: bool,
+    /// The path must be a mounted file system (protects against backing up
+    /// the empty mount point of a disk that failed to mount).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_mount: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,6 +244,7 @@ pub fn default_sources() -> Vec<Source> {
         archive: archive.to_string(),
         path: PathBuf::from(path),
         optional,
+        require_mount: false,
     })
     .collect()
 }
@@ -326,8 +331,16 @@ impl Config {
             if !seen.insert(&source.archive) {
                 bail!("archive name '{}' is used twice", source.archive);
             }
-            if !source.path.is_absolute() {
-                bail!("source path {} must be absolute", source.path.display());
+            if !source.path.is_absolute()
+                || source
+                    .path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "source path {} must be absolute and must not contain '..'",
+                    source.path.display()
+                );
             }
         }
         if let Some(wake) = &self.wake {

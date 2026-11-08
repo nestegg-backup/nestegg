@@ -24,6 +24,8 @@ pub const API_VERSION: &str = "1";
 #[derive(Clone)]
 struct App {
     paths: Paths,
+    /// Serialises "check for an active run, reserve, spawn".
+    start: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 pub struct ApiError {
@@ -81,7 +83,10 @@ pub fn router(paths: Paths) -> Router {
         .fallback(|| async {
             ApiError::new(StatusCode::NOT_FOUND, "not_found", "unknown endpoint")
         })
-        .with_state(App { paths })
+        .with_state(App {
+            paths,
+            start: Default::default(),
+        })
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -167,12 +172,17 @@ fn log_tail(path: &Path, lines: usize) -> Vec<String> {
 
 async fn start_run(AxState(app): AxState<App>) -> ApiResult<(StatusCode, Json<Run>)> {
     let run = blocking(move || -> Result<std::result::Result<Run, &'static str>> {
+        let _guard = app.start.lock().unwrap_or_else(|e| e.into_inner());
         if crate::run::active_run(&app.paths)?.is_some() {
             return Ok(Err("a backup run is already in progress"));
         }
         let run = Run::new(Trigger::Manual, Utc::now());
-        Store::new(&app.paths).save_current(&run)?;
-        spawn_run(&run.id)?;
+        let store = Store::new(&app.paths);
+        store.save_current(&run)?;
+        if let Err(e) = spawn_run(&run.id) {
+            let _ = store.clear_current_if(&run.id);
+            return Err(e);
+        }
         Ok(Ok(run))
     })
     .await?;

@@ -39,9 +39,9 @@ const de = {
     daemonTitle: "Keine Verbindung zum nestegg-Dienst",
     daemonText:
       "Die Oberfläche läuft, aber der Dienst im Hintergrund antwortet nicht. Ob er läuft, zeigt dieser Befehl im Terminal:",
-    authTitle: "Diese Sitzung ist nicht mehr gültig",
+    authTitle: "Die Sitzung ist beendet",
     authText:
-      "Öffne die Adresse, die nestegg ui im Terminal ausgegeben hat, oder starte nestegg ui neu.",
+      "Öffne die Adresse, die nestegg ui im Terminal ausgegeben hat. Läuft nestegg ui nicht mehr, starte es neu; es gibt dann eine neue Adresse aus.",
     genericTitle: "Etwas ist schiefgelaufen",
     genericText: "Die Antwort des nestegg-Dienstes ließ sich nicht verarbeiten.",
     detail: (msg: string) => `Meldung: ${msg}`,
@@ -51,7 +51,8 @@ const de = {
     lost: "Keine Verbindung zum nestegg-Dienst.",
     stale: (m: Moment) =>
       `Die Angaben stammen von ${at(m)} und sind vielleicht nicht mehr aktuell. Die Seite fragt weiter nach und aktualisiert sich von selbst.`,
-    authLost: "Die Sitzung ist nicht mehr gültig. Öffne die Adresse, die nestegg ui im Terminal ausgibt, oder starte nestegg ui neu.",
+    authLost:
+      "Die Sitzung ist beendet. Öffne die Adresse, die nestegg ui im Terminal ausgegeben hat, oder starte nestegg ui neu.",
     runUnknown: "Wie weit die Sicherung ist, ist gerade unbekannt.",
     restoreUnknown:
       "Ob das Wiederherstellen noch läuft, ist gerade unbekannt: Der nestegg-Dienst antwortet nicht. Die Seite fragt weiter nach.",

@@ -90,6 +90,14 @@ pub fn backup_args(spec: &BackupSpec) -> Vec<OsString> {
     args
 }
 
+/// Backup time (epoch seconds) from a snapshot path `type/id/<RFC 3339>`.
+pub fn snapshot_epoch(snapshot: &str) -> Option<i64> {
+    let time = snapshot.rsplit('/').next()?;
+    DateTime::parse_from_rfc3339(time)
+        .ok()
+        .map(|t| t.timestamp())
+}
+
 /// Snapshot path as used by the PBS: `host/<id>/<RFC 3339 UTC>`.
 pub fn snapshot_path(backup_id: &str, backup_time: i64) -> String {
     let t = Utc
@@ -225,6 +233,90 @@ pub fn parse_snapshot_list(json: &str) -> Result<Vec<SnapshotInfo>> {
     Ok(out)
 }
 
+pub enum RestoreKey {
+    /// Use the stored key if the archive is signed or encrypted.
+    Auto,
+    /// Use this key (e.g. an exported key of an older key generation).
+    File(Secret),
+    /// Never pass a key.
+    Without,
+}
+
+pub struct RestoreRequest<'a> {
+    pub snapshot: &'a str,
+    pub archive: &'a str,
+    pub target: &'a Path,
+    pub patterns: &'a [String],
+    pub key: RestoreKey,
+}
+
+fn archive_candidates(archive: &str) -> Vec<String> {
+    let base = archive
+        .strip_suffix(".pxar")
+        .or_else(|| archive.strip_suffix(".mpxar"))
+        .or_else(|| archive.strip_suffix(".ppxar"))
+        .unwrap_or(archive);
+    ["pxar", "mpxar", "ppxar", "img"]
+        .iter()
+        .flat_map(|ext| [format!("{base}.{ext}.didx"), format!("{base}.{ext}.fidx")])
+        .chain([format!("{archive}.blob"), archive.to_string()])
+        .collect()
+}
+
+/// Sum of the sizes of the files belonging to `archive` in the JSON of
+/// `snapshot files`.
+pub fn size_for_archive(json: &str, archive: &str) -> Option<u64> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let candidates = archive_candidates(archive);
+    let sizes: Vec<u64> = value
+        .as_array()?
+        .iter()
+        .filter(|f| {
+            f["filename"]
+                .as_str()
+                .is_some_and(|n| candidates.iter().any(|c| c == n))
+        })
+        .filter_map(|f| f["size"].as_u64())
+        .collect();
+    (!sizes.is_empty()).then(|| sizes.iter().sum())
+}
+
+/// Find the crypt mode of `archive` (e.g. `home.pxar`) in the JSON of
+/// `snapshot files`. Split archives (`home.mpxar`/`home.ppxar`) count too.
+pub fn crypt_mode_for_archive(json: &str, archive: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let base = archive
+        .strip_suffix(".pxar")
+        .or_else(|| archive.strip_suffix(".mpxar"))
+        .or_else(|| archive.strip_suffix(".ppxar"))
+        .unwrap_or(archive);
+    let candidates: Vec<String> = ["pxar", "mpxar", "ppxar", "img"]
+        .iter()
+        .flat_map(|ext| [format!("{base}.{ext}.didx"), format!("{base}.{ext}.fidx")])
+        .chain([format!("{archive}.blob"), archive.to_string()])
+        .collect();
+    let modes: Vec<String> = value
+        .as_array()?
+        .iter()
+        .filter(|f| {
+            f["filename"]
+                .as_str()
+                .is_some_and(|n| candidates.iter().any(|c| c == n))
+        })
+        .filter_map(|f| f["crypt-mode"].as_str().map(String::from))
+        .collect();
+    if modes.is_empty() {
+        return None;
+    }
+    // Strongest mode wins.
+    for m in ["encrypt", "sign-only", "none"] {
+        if modes.iter().any(|x| x == m) {
+            return Some(m.to_string());
+        }
+    }
+    modes.into_iter().next()
+}
+
 pub struct BackupOutcome {
     pub archives: Vec<ArchiveStats>,
 }
@@ -352,25 +444,71 @@ impl<'a> Client<'a> {
         Ok(())
     }
 
-    /// Restore an archive (or the paths matching `patterns`) into `target`.
-    pub fn restore(
-        &self,
-        snapshot: &str,
-        archive: &str,
-        target: &Path,
-        patterns: &[String],
-        log: &mut dyn Write,
-    ) -> Result<()> {
+    /// Crypt mode (`none`, `sign-only`, `encrypt`) of an archive in a
+    /// snapshot, from `snapshot files`. `None` if the archive is not found.
+    pub fn archive_crypt_mode(&self, snapshot: &str, archive: &str) -> Result<Option<String>> {
+        Ok(crypt_mode_for_archive(
+            &self.snapshot_files(snapshot)?,
+            archive,
+        ))
+    }
+
+    /// Size in bytes of an archive (sum of its index files), if listed.
+    pub fn archive_size(&self, snapshot: &str, archive: &str) -> Result<Option<u64>> {
+        Ok(size_for_archive(&self.snapshot_files(snapshot)?, archive))
+    }
+
+    /// JSON of `snapshot files`.
+    pub fn snapshot_files(&self, snapshot: &str) -> Result<String> {
         let mut fds = FdPassing::new();
         let mut cmd = self.command(&mut fds)?;
-        cmd.args(["restore", snapshot, archive]).arg(target);
-        for p in patterns {
+        cmd.args(["snapshot", "files", snapshot, "--output-format", "json"]);
+        self.add_namespace(&mut cmd);
+        fds.apply(&mut cmd);
+        let output = cmd.output().context("cannot run proxmox-backup-client")?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Restore an archive (or the paths matching `patterns`) into `target`.
+    ///
+    /// The key is only passed when the archive is signed or encrypted (or
+    /// an explicit key is given); passing a key for an unsigned archive makes
+    /// the client reject it.
+    pub fn restore(&self, request: &RestoreRequest<'_>, log: &mut dyn Write) -> Result<()> {
+        let key = match &request.key {
+            RestoreKey::Without => None,
+            RestoreKey::File(secret) => Some(Secret::new(secret.as_bytes().to_vec())),
+            RestoreKey::Auto => {
+                let mode = self.archive_crypt_mode(request.snapshot, request.archive)?;
+                match mode.as_deref() {
+                    None => bail!(
+                        "archive {} not found in snapshot {}",
+                        request.archive,
+                        request.snapshot
+                    ),
+                    Some("none") => None,
+                    Some(_) => Some(self.secrets.load(secrets::ENCRYPTION_KEY).context(
+                        "this archive is encrypted or signed; pass the exported key with --keyfile",
+                    )?),
+                }
+            }
+        };
+        let mut fds = FdPassing::new();
+        let mut cmd = self.command(&mut fds)?;
+        cmd.args(["restore", request.snapshot, request.archive])
+            .arg(request.target);
+        for p in request.patterns {
             cmd.args(["--pattern", p]);
         }
-        if self.secrets.exists(secrets::ENCRYPTION_KEY) {
-            let key = self.secrets.load(secrets::ENCRYPTION_KEY)?;
-            fds.add(&key, KEY_FD)?;
+        if let Some(key) = &key {
+            fds.add(key, KEY_FD)?;
             cmd.args(["--keyfd", &KEY_FD.to_string()]);
+        } else {
+            // Without this the client falls back to its own default key.
+            cmd.args(["--crypt-mode", "none"]);
         }
         self.add_namespace(&mut cmd);
         fds.apply(&mut cmd);
@@ -591,6 +729,15 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_epoch_roundtrip() {
+        assert_eq!(
+            snapshot_epoch(&snapshot_path("desktop", 1_794_000_000)),
+            Some(1_794_000_000)
+        );
+        assert_eq!(snapshot_epoch("garbage"), None);
+    }
+
+    #[test]
     fn snapshot_path_format() {
         assert_eq!(
             snapshot_path("desktop", 0),
@@ -648,6 +795,47 @@ mod tests {
         assert_eq!(snaps[0].comment.as_deref(), Some("nestegg ok"));
         assert_eq!(snaps[1].archives, vec!["a.pxar.didx".to_string()]);
         assert_eq!(snaps[1].encrypted, None);
+    }
+
+    #[test]
+    fn archive_size_lookup() {
+        let json = r#"[{"filename":"home.pxar.didx","crypt-mode":"encrypt","size":1000},
+                       {"filename":"data.mpxar.didx","size":10},{"filename":"data.ppxar.didx","size":90}]"#;
+        assert_eq!(size_for_archive(json, "home.pxar"), Some(1000));
+        assert_eq!(size_for_archive(json, "data.pxar"), Some(100));
+        assert_eq!(size_for_archive(json, "nope.pxar"), None);
+    }
+
+    #[test]
+    fn crypt_mode_lookup() {
+        let json = r#"[
+          {"filename":"home.pxar.didx","crypt-mode":"encrypt","size":1},
+          {"filename":"old.pxar.didx","crypt-mode":"none","size":1},
+          {"filename":"data.mpxar.didx","crypt-mode":"encrypt","size":1},
+          {"filename":"data.ppxar.didx","crypt-mode":"encrypt","size":1},
+          {"filename":"index.json.blob","crypt-mode":"sign-only","size":1}
+        ]"#;
+        assert_eq!(
+            crypt_mode_for_archive(json, "home.pxar").as_deref(),
+            Some("encrypt")
+        );
+        assert_eq!(
+            crypt_mode_for_archive(json, "old.pxar").as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            crypt_mode_for_archive(json, "data.pxar").as_deref(),
+            Some("encrypt")
+        );
+        assert_eq!(crypt_mode_for_archive(json, "missing.pxar"), None);
+        // "home" must not match "homework.pxar.didx".
+        assert_eq!(
+            crypt_mode_for_archive(
+                r#"[{"filename":"homework.pxar.didx","crypt-mode":"none"}]"#,
+                "home.pxar"
+            ),
+            None
+        );
     }
 
     #[test]

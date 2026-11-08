@@ -38,8 +38,9 @@ const en = {
     daemonTitle: "No connection to the nestegg service",
     daemonText:
       "The interface is running, but the background service does not answer. This command in a terminal shows whether it is running:",
-    authTitle: "This session is no longer valid",
-    authText: "Open the address that nestegg ui printed in the terminal, or start nestegg ui again.",
+    authTitle: "The session has ended",
+    authText:
+      "Open the address that nestegg ui printed in the terminal. If nestegg ui is no longer running, start it again; it prints a new address.",
     genericTitle: "Something went wrong",
     genericText: "The answer of the nestegg service could not be processed.",
     detail: (msg: string) => `Message: ${msg}`,
@@ -49,7 +50,7 @@ const en = {
     lost: "No connection to the nestegg service.",
     stale: (m: Moment) =>
       `The information is from ${at(m)} and may be out of date. The page keeps asking and updates by itself.`,
-    authLost: "This session is no longer valid. Open the address that nestegg ui prints in the terminal, or start nestegg ui again.",
+    authLost: "The session has ended. Open the address that nestegg ui printed in the terminal, or start nestegg ui again.",
     runUnknown: "How far the backup has got is unknown right now.",
     restoreUnknown:
       "Whether the restore is still running is unknown right now: the nestegg service does not answer. The page keeps asking.",

@@ -39,9 +39,9 @@ export default defineConfig(({ command }) => ({
     host: "127.0.0.1",
     port,
     strictPort: true,
-    // Behind `nestegg ui --dev-proxy` the page comes from nestegg's port. Its
-    // login handler treats any `?token=` query as a login attempt, which also
-    // catches Vite's websocket URL; so the HMR client talks to Vite directly.
+    // Behind `nestegg ui --dev-proxy` the page comes from nestegg's port, whose
+    // HTTP/1 forwarding does not pass websocket upgrades on; so the HMR client
+    // talks to Vite directly.
     hmr: { host: "127.0.0.1", clientPort: port },
   },
   build: {

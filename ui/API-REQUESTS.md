@@ -128,8 +128,7 @@ unless asked (`?wake=true`).
   first (Node 22: `npm ci && npm run build` in `ui/`). After the first UI
   build an existing `target/` may need `cargo clean -p nestegg` once, because
   the derive does not notice that the folder appeared.
-- **`?token=` handling in `nestegg ui`:** every request whose query contains
-  `token=` is treated as a login attempt, on any path. Vite's HMR websocket
-  uses `/?token=…` as well; the UI config therefore points the websocket
-  straight at the Vite port. Restricting the login check to `GET /` would
-  remove the collision.
+- **Websockets through `--dev-proxy`:** the forwarding in `nestegg ui` does
+  not pass websocket upgrades on, so Vite's live reload would not work
+  through it. The UI config points the HMR websocket straight at the Vite
+  port; nothing is needed on the core side unless that should change.

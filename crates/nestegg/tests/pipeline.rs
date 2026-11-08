@@ -127,7 +127,15 @@ inventory = false
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_else(|| serde_json::json!({}));
-        state["key_exported"] = serde_json::json!(exported);
+        let digest = nestegg::secrets::digest(&nestegg::secrets::Secret::new(
+            fs::read(self.root().join("cred/encryption-key")).unwrap_or_default(),
+        ));
+        state["key_digest"] = serde_json::json!(digest);
+        state["key_exported_digest"] = if exported {
+            serde_json::json!(digest)
+        } else {
+            serde_json::Value::Null
+        };
         fs::write(path, state.to_string()).unwrap();
     }
 
@@ -315,6 +323,147 @@ fn world_readable_secret_is_refused() {
     assert!(msg.contains("accessible by other users"), "{msg}");
 }
 
+#[test]
+fn replaced_key_invalidates_export_confirmation() {
+    let env = Env::new();
+    // Confirmation belongs to the old key; a new key was stored afterwards
+    // (e.g. `key create --force` whose state update failed).
+    write_secret(&env.root().join("cred/encryption-key"), "{\"new\":1}");
+    let out = env.run(&["run"]);
+    assert_eq!(code(&out), 1);
+    assert_eq!(env.state()["last_run"]["error"]["kind"], "config");
+    assert!(!env.fake_log().contains("ARGS backup"));
+}
+
+#[test]
+fn unmounted_fstab_source_fails_instead_of_empty_backup() {
+    let env = Env::new();
+    let home = env.root().join("src/home");
+    fs::write(
+        env.root().join("fstab"),
+        format!("UUID=x {} ext4 defaults 0 2\n", home.display()),
+    )
+    .unwrap();
+    fs::write(
+        env.root().join("mountinfo"),
+        "22 1 259:2 / / rw - ext4 /dev/sda1 rw\n",
+    )
+    .unwrap();
+    let out = env
+        .command(&["run"])
+        .env("NESTEGG_FSTAB", env.root().join("fstab"))
+        .env("NESTEGG_MOUNTINFO", env.root().join("mountinfo"))
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1);
+    let state = env.state();
+    assert_eq!(state["last_run"]["error"]["kind"], "source_missing");
+    assert!(state["last_success"].is_null());
+    assert!(!env.fake_log().contains("ARGS backup"));
+}
+
+#[test]
+fn status_works_with_read_only_lock_file_during_run() {
+    let env = Env::new();
+    // Simulate a running backup: hold the lock, current.json present.
+    let lock_path = env.root().join("run/run.lock");
+    let lock_file = fs::File::create(&lock_path).unwrap();
+    let _held = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive).unwrap();
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o444)).unwrap();
+    let mut run = serde_json::json!({
+        "id": "20261108T000000Z-timer-0001", "trigger": "timer", "state": "uploading",
+        "started_at": "2020-01-01T00:00:00Z"
+    });
+    run["finished_at"] = serde_json::Value::Null;
+    fs::write(env.root().join("state/current.json"), run.to_string()).unwrap();
+    let out = env.run(&["status", "--json"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["health"], "running");
+}
+
+#[test]
+fn promised_run_that_cannot_get_the_lock_is_recorded_as_cancelled() {
+    let env = Env::new();
+    let lock_file = fs::File::create(env.root().join("run/run.lock")).unwrap();
+    let _held = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive).unwrap();
+    let id = "20261108T120000Z-manual-abcd";
+    fs::write(
+        env.root().join("state/current.json"),
+        serde_json::json!({"id": id, "trigger": "manual", "state": "starting",
+                           "started_at": "2026-11-08T12:00:00Z"})
+        .to_string(),
+    )
+    .unwrap();
+    let out = env.run(&["run", "--trigger", "manual", "--run-id", id]);
+    assert_eq!(code(&out), 0);
+    let record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(env.root().join(format!("state/runs/{id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["state"], "cancelled");
+    assert_eq!(record["error"]["kind"], "already_running");
+    assert!(!env.root().join("state/current.json").exists());
+}
+
+#[test]
+fn confirmation_requires_exporting_the_current_key() {
+    let env = Env::new();
+    env.set_key_exported(false);
+    let key_cmd = |args: &[&str]| {
+        env.command(args)
+            .env("NESTEGG_ALLOW_NON_ROOT", "1")
+            .env_remove("SUDO_UID")
+            .output()
+            .unwrap()
+    };
+    let out = key_cmd(&["key", "confirm-exported"]);
+    assert_eq!(code(&out), 1, "confirm without export must fail");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not been exported"));
+    let export = env.root().join("exported-key.json");
+    assert_eq!(
+        code(&key_cmd(&["key", "export", export.to_str().unwrap()])),
+        0
+    );
+    assert_eq!(
+        fs::metadata(&export).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // Key replaced after the export: confirming must fail.
+    write_secret(&env.root().join("cred/encryption-key"), "{\"other\":2}");
+    assert_eq!(code(&key_cmd(&["key", "confirm-exported"])), 1);
+    // Export the new key, then confirm works and backups run.
+    let export2 = env.root().join("exported-key-2.json");
+    assert_eq!(
+        code(&key_cmd(&["key", "export", export2.to_str().unwrap()])),
+        0
+    );
+    assert_eq!(code(&key_cmd(&["key", "confirm-exported"])), 0);
+    assert_eq!(code(&env.run(&["run"])), 0);
+    // Export refuses to overwrite.
+    assert_eq!(
+        code(&key_cmd(&["key", "export", export2.to_str().unwrap()])),
+        1
+    );
+}
+
+#[test]
+fn restore_target_with_dotdot_is_rejected() {
+    let env = Env::new();
+    let out = env
+        .command(&[
+            "restore",
+            "host/test/2026-11-06T21:20:00Z",
+            "etc.pxar",
+            "/root/missing/../../tmp/x",
+        ])
+        .env("NESTEGG_ALLOW_NON_ROOT", "1")
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("'..'"));
+}
+
 // ---------------------------------------------------------------- daemon
 
 struct Daemon(Child);
@@ -381,7 +530,7 @@ fn daemon_serves_status_runs_and_snapshots() {
     let (code, run) = request(&socket, "POST", "/api/v1/runs");
     assert_eq!(code, 202, "{run}");
     let id = run["id"].as_str().unwrap().to_string();
-    assert!(id.ends_with("-manual"));
+    assert!(id.contains("-manual-"));
 
     // Wait for the detached run to finish.
     let start = Instant::now();
@@ -427,6 +576,33 @@ fn daemon_serves_status_runs_and_snapshots() {
     let (code, cfg) = request(&socket, "GET", "/api/v1/config");
     assert_eq!(code, 200);
     assert_eq!(cfg["sources"][0]["archive"], "home.pxar");
+
+    // Concurrent start requests: exactly one run starts, the rest get 409,
+    // no internal errors.
+    let handles: Vec<_> = (0..16)
+        .map(|_| {
+            let socket = socket.clone();
+            std::thread::spawn(move || request(&socket, "POST", "/api/v1/runs").0)
+        })
+        .collect();
+    let codes: Vec<u16> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(codes.iter().filter(|c| **c == 202).count(), 1, "{codes:?}");
+    assert!(codes.iter().all(|c| *c == 202 || *c == 409), "{codes:?}");
+    let start = Instant::now();
+    loop {
+        let (_, runs) = request(&socket, "GET", "/api/v1/runs");
+        let done = runs["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["state"] == "succeeded")
+            .count();
+        if done == 2 {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "{runs}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     let (code, err) = request(&socket, "GET", "/api/v1/runs/..%2Fetc");
     assert_eq!(code, 404, "{err}");

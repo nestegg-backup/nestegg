@@ -59,11 +59,29 @@ impl RunLock {
             .write(true)
             .open(paths.lock_file())
             .with_context(|| format!("cannot open {}", paths.lock_file().display()))?;
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => Ok(Some(RunLock { _lock: lock })),
-            Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
-            Err((_, e)) => Err(e).context("cannot lock run file"),
+        // Group members probe the lock read-only; do not depend on the umask.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("cannot set mode of {}", paths.lock_file().display()))?;
         }
+        // A short retry: a reader that briefly holds a shared lock (older
+        // versions, fallback probe) must not make a start fail.
+        let mut file = file;
+        for attempt in 0..10 {
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => return Ok(Some(RunLock { _lock: lock })),
+                Err((f, nix::errno::Errno::EWOULDBLOCK)) => {
+                    if attempt == 9 || lock_is_held(paths) == Some(true) {
+                        return Ok(None);
+                    }
+                    file = f;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err((_, e)) => return Err(e).context("cannot lock run file"),
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -74,14 +92,60 @@ pub fn active_run(paths: &Paths) -> Result<Option<Run>> {
     let Some(current) = store.load_current()? else {
         return Ok(None);
     };
-    if !paths.lock_file().exists() {
-        return Ok(None);
+    let young = Utc::now() - current.started_at <= Duration::seconds(60);
+    match lock_is_held(paths) {
+        // A run holds the lock.
+        Some(true) => Ok(Some(current)),
+        // No lock holder: a fresh reservation (run still starting) counts,
+        // an old leftover from a crashed run does not.
+        Some(false) => Ok(young.then_some(current)),
+        // Lock file missing or unreadable for this user: trust current.json
+        // while it is fresh or still being updated.
+        None => Ok(young.then_some(current)),
     }
-    let lock_free = RunLock::try_acquire(paths)?.is_some();
-    if lock_free && Utc::now() - current.started_at > Duration::seconds(60) {
-        return Ok(None);
+}
+
+/// Probe the run lock without write access, so group members can call it.
+/// `None` if the lock file cannot be opened.
+/// Primary method: look the lock up in `/proc/locks` (no lock is taken, so
+/// a status query can never disturb a starting run). Fallback: a shared
+/// non-blocking probe.
+fn lock_is_held(paths: &Paths) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(paths.lock_file()).ok()?;
+    if let Ok(locks) = fs::read_to_string("/proc/locks") {
+        return Some(proc_locks_has_write_flock(&locks, meta.dev(), meta.ino()));
     }
-    Ok(Some(current))
+    let file = File::open(paths.lock_file()).ok()?;
+    match Flock::lock(file, FlockArg::LockSharedNonblock) {
+        Ok(_shared) => Some(false),
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Some(true),
+        Err(_) => None,
+    }
+}
+
+/// `/proc/locks` lines look like
+/// `1: FLOCK  ADVISORY  WRITE 1234 00:19:5678 0 EOF` (device as hex
+/// major:minor, inode decimal). Blocked waiters are prefixed with `->`.
+pub fn proc_locks_has_write_flock(locks: &str, dev: u64, ino: u64) -> bool {
+    let major = nix::sys::stat::major(dev);
+    let minor = nix::sys::stat::minor(dev);
+    locks.lines().any(|line| {
+        if line.contains("->") {
+            return false;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 || fields[1] != "FLOCK" || fields[3] != "WRITE" {
+            return false;
+        }
+        let mut id = fields[5].split(':');
+        let (Some(ma), Some(mi), Some(i)) = (id.next(), id.next(), id.next()) else {
+            return false;
+        };
+        u64::from_str_radix(ma, 16).ok() == Some(major)
+            && u64::from_str_radix(mi, 16).ok() == Some(minor)
+            && i.parse::<u64>().ok() == Some(ino)
+    })
 }
 
 struct Reporter<'a> {
@@ -123,6 +187,25 @@ impl Reporter<'_> {
 pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     let Some(_lock) = RunLock::try_acquire(paths)? else {
         eprintln!("another backup run is in progress");
+        // A run promised by the daemon (pre-assigned ID) gets a final record
+        // so it does not stay "starting" forever. state.json belongs to the
+        // run holding the lock and is not touched.
+        if let Some(id) = options
+            .run_id
+            .as_deref()
+            .filter(|id| crate::state::is_valid_run_id(id))
+        {
+            let store = Store::new(paths);
+            let mut run = Run::new(options.trigger, Utc::now());
+            run.id = id.to_string();
+            run.error = Some(RunError {
+                kind: ErrorKind::AlreadyRunning,
+                message: "another backup run was already in progress".into(),
+            });
+            run.finish(RunState::Cancelled, Utc::now());
+            store.record_run_only(&run)?;
+            store.clear_current_if(id)?;
+        }
         return Ok(RunExit::AlreadyRunning);
     };
     let store = Store::new(paths);
@@ -194,7 +277,7 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     let final_state = rep.run.state;
     rep.line(&format!("run finished: {:?}", final_state));
     store.record_finished(&rep.run, keep)?;
-    store.clear_current()?;
+    store.clear_current_if(&rep.run.id)?;
     Ok(match final_state {
         RunState::Succeeded => RunExit::Succeeded,
         RunState::PbsUnreachable => RunExit::PbsUnreachable,
@@ -215,7 +298,8 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             );
             return Ok(());
         }
-        if !state.key_exported {
+        let key_digest = secrets::digest(&secrets.load(secrets::ENCRYPTION_KEY)?);
+        if state.key_exported_digest.as_deref() != Some(key_digest.as_str()) {
             rep.fail(
                 RunState::Failed,
                 config_error(
@@ -227,10 +311,69 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         }
     }
 
-    // 2. Sources.
+    // 2. Sources. Resolve the paths first: touching a path may trigger an
+    // automount, and the mount table must be read afterwards.
+    let resolved: Vec<Option<PathBuf>> = config
+        .backup
+        .sources
+        .iter()
+        .map(|s| fs::canonicalize(&s.path).ok())
+        .collect();
+    let mut covered: Vec<PathBuf> = config
+        .backup
+        .sources
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    covered.extend(config.backup.include_dev.iter().cloned());
+    let covered: Vec<PathBuf> = covered
+        .into_iter()
+        .map(|p| fs::canonicalize(&p).unwrap_or(p))
+        .collect();
+    let (mounts, fstab) = match crate::mounts::load() {
+        Ok(t) => t,
+        Err(e) => {
+            rep.fail(
+                RunState::Failed,
+                RunError {
+                    kind: ErrorKind::Internal,
+                    message: format!("{e:#}"),
+                },
+            );
+            return Ok(());
+        }
+    };
     let mut archives = Vec::new();
-    for source in &config.backup.sources {
-        if source.path.exists() {
+    for (source, canonical) in config.backup.sources.iter().zip(resolved) {
+        if let Some(canonical) = canonical {
+            let check = crate::mounts::check_source(
+                &canonical,
+                source.require_mount,
+                &covered,
+                &mounts,
+                &fstab,
+            );
+            for w in check.warnings {
+                rep.warn(w);
+            }
+            if !check.errors.is_empty() {
+                if source.optional {
+                    rep.warn(format!(
+                        "optional source {} skipped: {}",
+                        source.path.display(),
+                        check.errors.join("; ")
+                    ));
+                    continue;
+                }
+                rep.fail(
+                    RunState::Failed,
+                    RunError {
+                        kind: ErrorKind::SourceMissing,
+                        message: check.errors.join("; "),
+                    },
+                );
+                return Ok(());
+            }
             archives.push(ArchiveSpec {
                 name: source.archive.clone(),
                 path: source.path.clone(),
@@ -310,7 +453,21 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
 
     // 5. Backup.
     let backup_id = config.effective_backup_id();
-    let backup_time = Utc::now().timestamp();
+    // The PBS rejects a snapshot that is not newer than the previous one
+    // (second precision); wait if the last backup was in this second.
+    let previous = state
+        .last_success
+        .as_ref()
+        .and_then(|r| r.snapshot.as_deref())
+        .and_then(crate::client::snapshot_epoch);
+    let mut backup_time = Utc::now().timestamp();
+    if let Some(prev) = previous {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while backup_time <= prev && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            backup_time = Utc::now().timestamp();
+        }
+    }
     let spec = BackupSpec {
         backup_id: backup_id.clone(),
         namespace: config.pbs.namespace.clone(),
@@ -423,6 +580,34 @@ mod tests {
         let notes = snapshot_notes(&run, 42);
         assert!(notes.lines().next().unwrap().contains("ok, 42 s"));
         assert!(!notes.contains("/home"));
+    }
+
+    #[test]
+    fn proc_locks_parsing() {
+        let dev = nix::sys::stat::makedev(0, 0x19);
+        let text = "1: FLOCK  ADVISORY  WRITE 1234 00:19:5678 0 EOF\n2: POSIX  ADVISORY  WRITE 99 00:19:1 0 EOF\n";
+        assert!(proc_locks_has_write_flock(text, dev, 5678));
+        assert!(!proc_locks_has_write_flock(text, dev, 1));
+        assert!(!proc_locks_has_write_flock(
+            "1: FLOCK  ADVISORY  READ 1 00:19:5678 0 EOF\n",
+            dev,
+            5678
+        ));
+    }
+
+    #[test]
+    fn held_lock_is_visible_without_taking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: dir.path().join("c.toml"),
+            credentials_dir: dir.path().join("cred"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+        };
+        let lock = RunLock::try_acquire(&paths).unwrap().unwrap();
+        assert_eq!(lock_is_held(&paths), Some(true));
+        drop(lock);
+        assert_eq!(lock_is_held(&paths), Some(false));
     }
 
     #[test]

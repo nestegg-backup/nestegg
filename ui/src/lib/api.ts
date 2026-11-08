@@ -1,6 +1,8 @@
 // Thin client for the local API. Relative URLs only: the page is served by
-// `nestegg ui` (or the Vite dev server) and the session cookie is HttpOnly,
-// so the token never touches JavaScript.
+// `nestegg ui` (or the Vite dev server). Every request carries the session
+// token as `Authorization: Bearer …` (see session.ts).
+
+import { authHeaders } from "./session";
 
 import type {
   ConfigView,
@@ -17,7 +19,7 @@ import type {
 } from "./types";
 
 export type FailureKind =
-  | "unauthorized" // 401: session cookie missing or wrong
+  | "unauthorized" // 401: no or wrong session token; the session has ended
   | "daemon" // 502 from `nestegg ui` or network error: daemon not reachable
   | "not_implemented" // 501
   | "not_found" // 404
@@ -52,10 +54,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`api/v1/${path}`, {
-      credentials: "same-origin",
+      credentials: "omit",
       cache: "no-store",
       ...init,
-      headers: { Accept: "application/json", ...(init?.body ? { "Content-Type": "application/json" } : {}) },
+      headers: {
+        Accept: "application/json",
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...authHeaders(),
+      },
     });
   } catch (e) {
     throw new ApiFailure("daemon", 0, null, e instanceof Error ? e.message : String(e));

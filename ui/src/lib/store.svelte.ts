@@ -1,6 +1,7 @@
 // Application state and polling.
 
 import { api, ApiFailure, optional } from "./api";
+import { initBrowserSession } from "./session";
 import { isActive } from "./derive";
 import type { ConfigView, HealthInfo, MachinesResponse, Run, SessionInfo, Snapshot, Status } from "./types";
 
@@ -69,6 +70,13 @@ class AppState {
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") void this.poll();
     });
+    // The address printed by `nestegg ui` opened again in this tab: new session.
+    window.addEventListener("hashchange", () => {
+      if (initBrowserSession()) {
+        this.retry();
+        void this.loadMachines();
+      }
+    });
   }
 
   async poll() {
@@ -100,6 +108,9 @@ class AppState {
       }
     }
     if (typeof document !== "undefined" && document.visibilityState === "hidden" && !this.running) return;
+    // A 401 does not heal by waiting: the session ended. Polling resumes when a new
+    // token arrives (hashchange) or the user retries.
+    if (this.fatal?.kind === "unauthorized") return;
     const delay = this.fatal ? POLL_OFFLINE_MS : this.running ? POLL_RUNNING_MS : POLL_IDLE_MS;
     this.#timer = setTimeout(() => void this.poll(), delay);
   }

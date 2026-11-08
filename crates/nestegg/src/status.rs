@@ -119,7 +119,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
         encryption: Encryption {
             enabled: config.is_none_or(|c| c.backup.encryption),
             key_fingerprint: state.key_fingerprint.clone(),
-            key_exported: state.key_exported,
+            key_exported: state.key_exported(),
         },
     })
 }
