@@ -1,0 +1,55 @@
+[package]
+name = "nestegg"
+description = "Unattended, encrypted backups of Linux desktops to a Proxmox Backup Server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "client-legacy", "http1"] }
+mime_guess = "2.0.5"
+nix = { version = "0.31.3", features = ["fs", "user", "process", "signal", "term", "hostname"] }
+rand = "0.10.3"
+rust-embed = { version = "8.13.0", features = ["interpolate-folder-path"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "process", "fs", "io-util", "time"] }
+toml = "1.2.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["macros", "rt"] }
+tower = { version = "0.5.3", features = ["util"] }
+
+[package.metadata.deb]
+maintainer = "nestegg maintainers"
+copyright = "nestegg contributors"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+nestegg runs unattended, client-side encrypted backups of a Linux desktop to \
+a Proxmox Backup Server using the official proxmox-backup-client. It wakes a \
+sleeping backup server via Wake-on-LAN, keeps a package inventory for quick \
+rebuilds and offers a terminal interface and a local web interface."""
+section = "admin"
+priority = "optional"
+depends = "$auto, systemd"
+recommends = "proxmox-backup-client | proxmox-backup-client-static"
+maintainer-scripts = "../../packaging/debian/"
+assets = [
+    ["target/release/nestegg", "usr/bin/", "755"],
+    ["../../packaging/systemd/nestegg.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/systemd/nestegg-backup.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/systemd/nestegg-backup.timer", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/systemd/nestegg.tmpfiles", "usr/lib/tmpfiles.d/nestegg.conf", "644"],
+    ["../../packaging/systemd/nestegg.sysusers", "usr/lib/sysusers.d/nestegg.conf", "644"],
+    ["../../README.md", "usr/share/doc/nestegg/README.md", "644"],
+    ["../../docs/configuration.md", "usr/share/doc/nestegg/configuration.md", "644"],
+]

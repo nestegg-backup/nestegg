@@ -1,0 +1,14 @@
+[Unit]
+Description=nestegg backup check (runs a backup when one is due)
+Documentation=file:/usr/share/doc/nestegg/README.md
+
+[Timer]
+# Checked hourly; `nestegg run --trigger timer` only backs up when the last
+# success is older than schedule.interval_hours. Missed checks while the
+# computer was off are caught up after boot.
+OnCalendar=hourly
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

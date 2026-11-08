@@ -1,0 +1,140 @@
+//! The `Status` object of the API (and `nestegg status`).
+
+use std::process::{Command, Stdio};
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+
+use crate::config::{Config, Paths};
+use crate::state::{Health, Run, State, Store, health, next_due};
+
+pub const TIMER_UNIT: &str = "nestegg-backup.timer";
+
+#[derive(Debug, Serialize)]
+pub struct Status {
+    pub machine: Machine,
+    pub pbs: PbsStatus,
+    pub schedule: Schedule,
+    pub current_run: Option<Run>,
+    pub last_run: Option<Run>,
+    pub last_success: Option<Run>,
+    pub health: Health,
+    pub overdue_after_hours: u32,
+    pub encryption: Encryption,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Machine {
+    pub hostname: String,
+    pub backup_id: String,
+    pub os: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PbsStatus {
+    pub server: String,
+    pub datastore: String,
+    pub namespace: Option<String>,
+    pub reachable: Option<bool>,
+    #[serde(with = "crate::state::rfc3339_opt")]
+    pub checked_at: Option<DateTime<Utc>>,
+    pub wake_on_lan: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Schedule {
+    pub enabled: bool,
+    pub calendar: String,
+    #[serde(with = "crate::state::rfc3339_opt")]
+    pub next_run: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Encryption {
+    pub enabled: bool,
+    pub key_fingerprint: Option<String>,
+    pub key_exported: bool,
+}
+
+pub fn timer_enabled() -> bool {
+    Command::new("systemctl")
+        .args(["is-enabled", "--quiet", TIMER_UNIT])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn os_name() -> Option<String> {
+    let text = std::fs::read_to_string("/etc/os-release").ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("PRETTY_NAME="))
+        .map(|v| v.trim_matches('"').to_string())
+}
+
+pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Status> {
+    let store = Store::new(paths);
+    let state: State = store.load_state()?;
+    let current = crate::run::active_run(paths)?;
+    let now = Utc::now();
+    let overdue_after_hours = config.map(|c| c.overdue_after_hours).unwrap_or(36);
+    let interval = config.map(|c| c.schedule.interval_hours).unwrap_or(24);
+    Ok(Status {
+        machine: Machine {
+            hostname: crate::config::hostname(),
+            backup_id: config
+                .map(|c| c.effective_backup_id())
+                .unwrap_or_else(crate::config::hostname),
+            os: os_name(),
+        },
+        pbs: PbsStatus {
+            server: config
+                .map(|c| format!("{}:{}", c.pbs.server, c.pbs.port))
+                .unwrap_or_default(),
+            datastore: config.map(|c| c.pbs.datastore.clone()).unwrap_or_default(),
+            namespace: config.and_then(|c| c.pbs.namespace.clone()),
+            reachable: state.pbs_reachable,
+            checked_at: state.pbs_checked_at,
+            wake_on_lan: config.is_some_and(|c| c.wake.is_some()),
+        },
+        schedule: Schedule {
+            enabled: timer,
+            calendar: format!("every {interval} h (checked hourly)"),
+            next_run: (timer && current.is_none()).then(|| next_due(&state, interval, now)),
+        },
+        health: health(
+            config.is_some(),
+            &state,
+            current.as_ref(),
+            overdue_after_hours,
+            now,
+        ),
+        current_run: current,
+        last_run: state.last_run.clone(),
+        last_success: state.last_success.clone(),
+        overdue_after_hours,
+        encryption: Encryption {
+            enabled: config.is_none_or(|c| c.backup.encryption),
+            key_fingerprint: state.key_fingerprint.clone(),
+            key_exported: state.key_exported,
+        },
+    })
+}
+
+/// Configuration without secrets (the config file never contains any).
+pub fn config_view(config: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "backup_id": config.effective_backup_id(),
+        "sources": config.backup.sources.iter().map(|s| serde_json::json!({
+            "archive": format!("{}.pxar", s.archive),
+            "path": s.path,
+        })).collect::<Vec<_>>(),
+        "excludes": config.backup.excludes,
+        "schedule": format!("every {} h", config.schedule.interval_hours),
+        "encryption": config.backup.encryption,
+        "overdue_after_hours": config.overdue_after_hours,
+    })
+}

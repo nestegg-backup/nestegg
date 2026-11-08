@@ -29,3 +29,6 @@ state/
 
 # Agent tooling (local only)
 .claude/settings.local.json
+/target/
+/ui/dist/
+/ui/node_modules/

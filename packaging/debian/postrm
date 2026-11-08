@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+# Configuration, credentials and state are kept on purpose (also on purge):
+# deleting the encryption key would make existing backups unreadable.
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+exit 0
