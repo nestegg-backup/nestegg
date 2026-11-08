@@ -1,0 +1,780 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>nestegg – Entwurf A</title>
+<!--
+  Variant A of the nestegg web UI prototype. Static HTML, no build step, no server.
+  All data is invented example data (RFC 2606 / RFC 7042 values).
+  Model follows docs/decisions/0003 and api/openapi.yaml: the UI runs on one PC
+  ("this PC") and controls only that PC; other PCs are read-only, as reported to the PBS.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #131518;
+  --surface: #1b1e22;
+  --surface-2: #23272c;
+  --line: #2d3238;
+  --ink: #e9ebee;
+  --muted: #9aa2ab;
+  --faint: #6c747d;
+  --ok: #5cbf8c;
+  --late: #2f6b4d;
+  --attn: #e2aa52;
+  --fail: #f0766b;
+  --pbs: #9497ea;
+  --off: #4b525a;
+  --focus: #e9ebee;
+  --radius: 8px;
+  --font: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --mono: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; background: var(--bg); }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font-family: var(--font); font-size: 15px; line-height: 1.55;
+  font-variant-numeric: tabular-nums;
+}
+a { color: inherit; }
+button, input { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+.mono { font-family: var(--mono); font-size: 0.875em; overflow-wrap: anywhere; }
+
+.wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+
+/* Header */
+.top { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; padding: 20px 0; }
+.brand { font-weight: 600; text-decoration: none; letter-spacing: -0.01em; font-size: 1.0625rem; }
+.server { color: var(--muted); font-size: 0.875rem; display: flex; align-items: center; gap: 8px; }
+.server i { width: 8px; height: 8px; border-radius: 50%; background: var(--pbs); flex: none; }
+.server.awake i { background: var(--ok); }
+.server.waking i { background: var(--pbs); animation: pulse 1.2s ease-in-out infinite; }
+.nav { margin-left: auto; display: flex; gap: 4px; }
+.nav a { text-decoration: none; color: var(--muted); padding: 6px 10px; border-radius: 6px; }
+.nav a:hover { color: var(--ink); }
+.nav a[aria-current="page"] { color: var(--ink); background: var(--surface); }
+
+/* Buttons: primary is light on dark, no accent colour */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 9px 16px; border-radius: var(--radius); border: 0; cursor: pointer;
+  background: var(--surface-2); color: var(--ink); font-weight: 500; text-decoration: none; line-height: 1.2;
+}
+.btn:hover { background: #2c3137; }
+.btn.primary { background: var(--ink); color: var(--bg); }
+.btn.primary:hover { background: #ffffff; }
+.btn[disabled] { opacity: 0.45; cursor: default; }
+
+/* Answer */
+.answer { padding: 56px 0 8px; max-width: 44rem; }
+.answer h1 { font-size: clamp(1.875rem, 4.6vw, 2.875rem); line-height: 1.1; letter-spacing: -0.025em; font-weight: 600; margin: 0 0 14px; }
+.answer h1:focus, .dhead h1:focus { outline: none; }
+.answer p { margin: 0; color: var(--muted); font-size: 1.0625rem; }
+
+.attention { list-style: none; margin: 32px 0 0; padding: 0; max-width: 44rem; }
+.attention li { display: grid; grid-template-columns: 10px minmax(0, 1fr); gap: 4px 14px; padding: 14px 0; border-top: 1px solid var(--line); }
+.attention li:last-child { border-bottom: 1px solid var(--line); }
+.attention .sig { width: 10px; height: 10px; border-radius: 50%; margin-top: 7px; background: var(--attn); }
+.attention .sig.fail { background: var(--fail); }
+.attention strong { font-weight: 600; }
+.attention p { margin: 2px 0 0; color: var(--muted); }
+
+/* Night grid */
+.section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 24px; flex-wrap: wrap; margin: 56px 0 14px; }
+.section-head h2 { font-size: 1.125rem; font-weight: 600; margin: 0; }
+.section-head .stand { color: var(--faint); font-size: 0.8125rem; }
+
+.board { background: var(--surface); border-radius: 12px; }
+.row {
+  display: grid; grid-template-columns: minmax(0, 13rem) minmax(0, 1fr) minmax(0, 10rem);
+  align-items: center; gap: 20px; padding: 16px 20px;
+}
+.row + .row { border-top: 1px solid var(--line); }
+.row.labels { padding-top: 14px; padding-bottom: 4px; color: var(--faint); font-size: 0.75rem; }
+.mname a { text-decoration: none; font-weight: 600; display: block; }
+.mname a:hover { text-decoration: underline; text-underline-offset: 3px; }
+.mname span { color: var(--muted); font-size: 0.8125rem; }
+.mname .here { color: var(--ink); }
+.last { text-align: right; font-size: 0.875rem; }
+.last span { display: block; color: var(--muted); font-size: 0.8125rem; }
+.last.attn { color: var(--attn); }
+
+.nights { display: grid; grid-template-columns: repeat(14, minmax(0, 1fr)); gap: 4px; max-width: 30rem; }
+.nights.lbl span { text-align: center; }
+.nights.lbl span.today { color: var(--ink); }
+.mark {
+  height: 28px; border: 0; padding: 0; border-radius: 4px; cursor: pointer; position: relative;
+  background: var(--off); color: transparent; font-size: 11px; font-weight: 600; line-height: 28px; text-align: center;
+}
+.mark.ok   { background: var(--ok); }
+.mark.late { background: linear-gradient(to top, var(--ok) 0 50%, var(--late) 50% 100%); }
+.mark.off  { background: transparent; box-shadow: inset 0 0 0 1.5px var(--off); }
+.mark.unk  { background: transparent; background-image: radial-gradient(var(--off) 1.2px, transparent 1.4px); background-size: 6px 6px; background-position: center; }
+.mark.pbs  { background: var(--pbs); }
+.mark.pbs::after { content: ""; position: absolute; left: 25%; right: 25%; top: 50%; height: 2px; margin-top: -1px; background: #1b1d3a; border-radius: 1px; }
+.mark.fail { background: var(--fail); }
+.mark.fail::after { content: "×"; position: absolute; inset: 0; color: #3a1210; font-size: 15px; line-height: 28px; }
+.mark.run  { background: var(--ok); animation: pulse 1.2s ease-in-out infinite; }
+.mark.sel  { outline: 2px solid var(--ink); outline-offset: 2px; }
+@keyframes pulse { 50% { opacity: 0.4; } }
+
+.legend { list-style: none; margin: 14px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--muted); font-size: 0.8125rem; }
+.legend li { display: flex; align-items: center; gap: 7px; }
+.legend .mark { width: 14px; height: 18px; cursor: default; display: inline-block; line-height: 18px; }
+.legend .mark.fail::after { line-height: 18px; font-size: 12px; }
+
+.night-info { margin: 14px 0 0; padding: 14px 18px; border-radius: var(--radius); background: var(--surface); color: var(--muted); min-height: 3.2rem; }
+.night-info strong { color: var(--ink); font-weight: 600; }
+
+.footnote { color: var(--faint); font-size: 0.8125rem; margin: 48px 0 56px; max-width: 44rem; }
+
+/* Detail */
+.back { display: inline-block; margin-top: 28px; color: var(--muted); text-decoration: none; font-size: 0.875rem; }
+.back:hover { color: var(--ink); }
+.dhead { display: flex; justify-content: space-between; align-items: flex-end; gap: 20px; flex-wrap: wrap; padding: 18px 0 36px; }
+.dhead h1 { font-size: clamp(1.75rem, 4vw, 2.5rem); line-height: 1.1; letter-spacing: -0.02em; font-weight: 600; margin: 0 0 8px; }
+.dhead p { margin: 0; color: var(--muted); max-width: 38rem; }
+.state { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; font-weight: 500; }
+.state i { width: 10px; height: 10px; border-radius: 50%; background: var(--ok); flex: none; }
+.state i.attn { background: var(--attn); }
+.state i.fail { background: var(--fail); }
+.state i.run { animation: pulse 1.2s ease-in-out infinite; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.grid2 { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 40px; margin-bottom: 64px; }
+.block + .block { margin-top: 40px; }
+.block h2 { font-size: 1rem; font-weight: 600; margin: 0 0 12px; }
+.block .sub { color: var(--muted); margin: -6px 0 12px; font-size: 0.875rem; }
+.kv { list-style: none; margin: 0; padding: 0; }
+.kv li { display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; border-top: 1px solid var(--line); }
+.kv li:last-child { border-bottom: 1px solid var(--line); }
+.kv .k { color: var(--muted); flex: 0 1 auto; }
+.kv .v { text-align: right; min-width: 0; overflow-wrap: anywhere; }
+
+.log { list-style: none; margin: 0; padding: 0; }
+.log li { display: grid; grid-template-columns: 8.5rem minmax(0, 1fr); gap: 4px 16px; padding: 12px 0; border-top: 1px solid var(--line); }
+.log li:last-child { border-bottom: 1px solid var(--line); }
+.log time { color: var(--muted); }
+.log .t { font-weight: 600; }
+.log .t.ok { color: var(--ok); }
+.log .t.pbs { color: var(--pbs); }
+.log .t.fail { color: var(--fail); }
+.log .t.off, .log .t.unk { color: var(--muted); }
+.log p { margin: 0; color: var(--muted); }
+
+.note { background: var(--surface); border-radius: var(--radius); padding: 14px 18px; color: var(--muted); }
+.note strong { color: var(--ink); font-weight: 600; display: block; margin-bottom: 2px; }
+.note + .note { margin-top: 12px; }
+
+.run { background: var(--surface); border-radius: 12px; padding: 20px; margin: -12px 0 40px; }
+.run h2 { font-size: 1rem; margin: 0 0 14px; font-weight: 600; }
+.bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: var(--ok); transition: width .35s ease; }
+.steps { list-style: none; margin: 14px 0 16px; padding: 0; display: grid; gap: 6px; color: var(--faint); }
+.steps li { display: flex; align-items: center; gap: 10px; }
+.steps li::before { content: ""; width: 8px; height: 8px; border-radius: 50%; box-shadow: inset 0 0 0 1.5px var(--off); flex: none; }
+.steps li.done { color: var(--muted); }
+.steps li.done::before { background: var(--ok); box-shadow: none; }
+.steps li.now { color: var(--ink); }
+.steps li.now::before { background: var(--ink); box-shadow: none; }
+
+/* Restore */
+.stepper { list-style: none; display: flex; gap: 6px 20px; flex-wrap: wrap; margin: 0 0 28px; padding: 0; color: var(--faint); font-size: 0.875rem; counter-reset: s; }
+.stepper li { counter-increment: s; }
+.stepper li::before { content: counter(s) "  "; white-space: pre; }
+.stepper li.cur { color: var(--ink); }
+.stepper li.done { color: var(--muted); }
+.stepper li.done::before { content: "✓  "; color: var(--ok); }
+
+.pane { background: var(--surface); border-radius: 12px; padding: 24px; margin-bottom: 64px; }
+.pane h2 { font-size: 1.25rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 6px; }
+.pane h2:focus { outline: none; }
+.pane .sub { color: var(--muted); margin: 0 0 20px; }
+
+.snaps { display: grid; gap: 2px; }
+.snap { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: var(--radius); cursor: pointer; }
+.snap:hover { background: var(--surface-2); }
+.snap:has(input:checked) { background: var(--surface-2); box-shadow: inset 0 0 0 1.5px var(--ink); }
+.snap .meta { margin-left: auto; color: var(--muted); font-size: 0.875rem; }
+input[type=radio], input[type=checkbox] { accent-color: var(--ink); width: 16px; height: 16px; margin: 0; flex: none; }
+
+.search { width: 100%; padding: 10px 12px; border-radius: var(--radius); border: 1px solid var(--line); background: var(--bg); margin-bottom: 12px; }
+.tree, .tree ul { list-style: none; margin: 0; padding: 0; }
+.tree ul { padding-left: 26px; }
+.tree label { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 6px; cursor: pointer; min-width: 0; }
+.tree label:hover { background: var(--surface-2); }
+.tree .n { min-width: 0; overflow-wrap: anywhere; }
+.tree .dir { font-weight: 500; }
+.tree .sz { margin-left: auto; color: var(--muted); font-size: 0.8125rem; flex: none; }
+.tree .inc { margin-left: auto; color: var(--faint); font-size: 0.8125rem; flex: none; }
+.tree label.implied { color: var(--muted); cursor: default; }
+.picked { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.875rem; }
+.picked strong { color: var(--ink); font-weight: 500; }
+
+.field label { display: block; font-weight: 500; margin-bottom: 6px; }
+.field input { width: 100%; padding: 10px 12px; border-radius: var(--radius); border: 1px solid var(--line); background: var(--bg); font-family: var(--mono); font-size: 0.875rem; }
+.field .hint { color: var(--muted); font-size: 0.8125rem; margin: 6px 0 0; }
+.summary { margin-top: 24px; }
+
+.pane-actions { display: flex; justify-content: space-between; gap: 12px; margin-top: 28px; flex-wrap: wrap; }
+
+.cmd { background: var(--bg); border-radius: var(--radius); padding: 12px 14px; font-family: var(--mono); font-size: 0.8125rem; white-space: pre-wrap; overflow-wrap: anywhere; margin: 12px 0 0; }
+
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 16px); opacity: 0; visibility: hidden;
+  background: var(--ink); color: var(--bg); padding: 11px 16px; border-radius: var(--radius); font-weight: 500;
+  transition: opacity .2s, transform .2s, visibility 0s .2s; max-width: calc(100vw - 32px); z-index: 10;
+}
+.toast.show { opacity: 1; visibility: visible; transform: translate(-50%, 0); transition: opacity .2s, transform .2s; }
+
+.proto { text-align: center; color: var(--faint); font-size: 0.75rem; padding: 0 0 24px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+@media (max-width: 760px) {
+  .wrap { padding: 0 16px; }
+  .top { gap: 8px 16px; }
+  .server { order: 3; width: 100%; }
+  .answer { padding-top: 32px; }
+  .row { grid-template-columns: minmax(0, 1fr) auto; gap: 10px 12px; padding: 14px 16px; }
+  .row .nights { grid-column: 1 / -1; grid-row: 2; max-width: none; }
+  .row.labels .hide-s { display: none; }
+  .row.labels .nights { grid-row: 1; }
+  .nights { gap: 3px; }
+  .mark { height: 32px; line-height: 32px; }
+  .mark.fail::after { line-height: 32px; }
+  .grid2 { grid-template-columns: minmax(0, 1fr); gap: 40px; }
+  .log li { grid-template-columns: 6.5rem minmax(0, 1fr); gap: 2px 12px; }
+  .pane { padding: 18px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="#/">nestegg</a>
+    <div class="server" id="server" role="status"></div>
+    <nav class="nav" aria-label="Hauptnavigation">
+      <a href="#/" data-nav="home">Übersicht</a>
+      <a href="#/einstellungen" data-nav="settings">Einstellungen</a>
+    </nav>
+  </header>
+  <main id="app"></main>
+  <p class="proto">Entwurf A mit erfundenen Beispieldaten. Es wird nichts gesichert oder wiederhergestellt.</p>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+
+/* ---------- Example data (invented) ---------- */
+const DAYS = 14;
+const TODAY = new Date(2026, 10, 8); // Sun 8 Nov 2026
+const WD = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
+const MON = ["Jan.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sep.", "Okt.", "Nov.", "Dez."];
+const nightDate = i => { const d = new Date(TODAY); d.setDate(d.getDate() - (DAYS - 1 - i)); return d; };
+const fmtDay = d => `${WD[d.getDay()]}, ${d.getDate()}. ${MON[d.getMonth()]}`;
+const fmtShort = d => `${d.getDate()}. ${MON[d.getMonth()]}`;
+
+const server = { addr: "pbs.example.com:8007", datastore: "datastore", namespace: "zuhause", state: "asleep", wakeAt: "01:30", used: 61, free: "1,4 TB" };
+
+// Night codes: ok, late (caught up after switching on), off (this PC was off), pbs (server unreachable),
+// fail, unk (no snapshot and no report: other PCs only, reason unknown).
+const machines = [
+  { id: "arbeitsrechner", name: "Arbeitsrechner", here: true, host: "desktop.example.com", user: "alice", os: "Linux Mint 22.2",
+    nights: "ok ok ok ok ok ok pbs ok ok ok ok ok ok ok".split(" "),
+    lastTime: "heute, 02:14", report: "heute, 02:14", size: "412 GB", changed: "1,8 GB", keyExported: true },
+  { id: "laptop", name: "Laptop", host: "laptop.example.com", user: "bob", os: "Ubuntu 24.04 LTS",
+    nights: "ok ok ok ok ok unk unk unk unk unk unk unk unk unk".split(" "),
+    lastTime: "Fr, 30. Okt., 01:52", report: "Fr, 30. Okt., 01:52", size: "188 GB", keyExported: true },
+  { id: "wohnzimmer", name: "Wohnzimmer-PC", host: "media.example.com", user: "alice", os: "Linux Mint 22.2",
+    nights: "ok ok ok ok ok ok pbs ok ok fail ok ok ok ok".split(" "),
+    lastTime: "heute, 02:41", report: "heute, 02:41", size: "1,1 TB", keyExported: false },
+  { id: "werkstatt", name: "Werkstatt", host: "workshop.example.com", user: "bob", os: "Ubuntu 24.04 LTS",
+    nights: "ok late ok ok late ok pbs late ok ok late ok ok late".split(" "),
+    lastTime: "heute, 08:05", report: "heute, 08:05", size: "96 GB", keyExported: true },
+];
+const OVERDUE_NIGHTS = 2; // ~36 h threshold expressed in nights
+
+const SHORT = { ok: "gesichert", late: "nach dem Einschalten nachgeholt", off: "Rechner war aus", pbs: "Server nicht erreichbar", fail: "fehlgeschlagen", unk: "keine Meldung", run: "läuft" };
+
+/* ---------- Derived state (never hand-set) ---------- */
+let job = null;
+const isSuccess = c => c === "ok" || c === "late";
+function lastSuccessIndex(m) { for (let i = DAYS - 1; i >= 0; i--) if (isSuccess(m.nights[i])) return i; return -1; }
+function health(m) {
+  if (job && m.here) return "running";
+  const ls = lastSuccessIndex(m);
+  if (ls < 0) return "never";
+  if (DAYS - 1 - ls >= OVERDUE_NIGHTS) return "overdue";
+  if (m.nights[DAYS - 1] === "fail") return "failing";
+  return "ok";
+}
+const nightsSince = m => DAYS - 1 - lastSuccessIndex(m);
+
+/* ---------- Helpers ---------- */
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const byId = id => machines.find(m => m.id === id);
+const here = () => machines.find(m => m.here);
+const NUM = ["keiner", "einer", "zwei", "drei", "vier", "fünf", "sechs"];
+const cap = s => s[0].toUpperCase() + s.slice(1);
+function toast(msg) {
+  const t = $("#toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("show"), 3600);
+}
+
+/* ---------- Server line ---------- */
+function renderServer() {
+  const el = $("#server");
+  el.className = "server " + server.state;
+  el.innerHTML = server.state === "asleep"
+    ? `<i></i>Backup-Server ist aus und wird um ${server.wakeAt} geweckt`
+    : server.state === "waking" ? `<i></i>Backup-Server wird geweckt`
+    : `<i></i>Backup-Server ist erreichbar`;
+}
+function wakeServer() {
+  if (server.state !== "asleep") return;
+  server.state = "waking"; renderServer();
+  // Wake-up has its own lifecycle; cancelling a backup does not stop it.
+  setTimeout(() => { server.state = "awake"; renderServer(); }, 2600);
+}
+
+/* ---------- Overview ---------- */
+function attentionItems() {
+  const out = [];
+  for (const m of machines) {
+    const h = health(m);
+    if (h === "overdue") out.push({ cls: "", title: `${m.name}: seit ${nightsSince(m)} Nächten keine Sicherung`,
+      text: m.here ? "Dieser PC konnte sich zuletzt nicht sichern. Starte eine Sicherung oder sieh dir den Verlauf an."
+        : `Er hat sich seit dem ${fmtShort(nightDate(lastSuccessIndex(m)))} nicht mehr gemeldet. Schalte ihn ein, dann holt er die Sicherung von selbst nach.` });
+    if (h === "failing") out.push({ cls: "fail", title: `${m.name}: letzte Sicherung fehlgeschlagen`, text: "Details stehen im Verlauf des Rechners." });
+    if (!m.keyExported) out.push({ cls: "fail", title: `${m.name}: Schlüssel nur auf dem Rechner selbst`,
+      text: `Geht der Rechner kaputt, lassen sich seine Sicherungen nicht mehr öffnen. Am ${esc(m.name)} beheben mit <span class="mono">sudo nestegg key paperkey</span>.`, html: true });
+  }
+  return out;
+}
+
+function viewHome() {
+  const healthy = machines.filter(m => ["ok", "running"].includes(health(m)));
+  const all = healthy.length === machines.length;
+  const h1 = all ? "Alle Rechner sind gesichert."
+    : `${cap(NUM[healthy.length] || String(healthy.length))} von ${NUM[machines.length] || machines.length} Rechnern ${healthy.length === 1 ? "ist" : "sind"} gesichert.`;
+  const names = healthy.map(m => m.name);
+  const sub = all ? "Jeder Rechner hat sich in der letzten Nacht gesichert."
+    : `${names.length > 1 ? names.slice(0, -1).join(", ") + " und " + names.at(-1) : names[0]} ${names.length === 1 ? "hat" : "haben"} eine aktuelle Sicherung.`;
+  const items = attentionItems();
+
+  const labels = Array.from({ length: DAYS }, (_, i) => i === DAYS - 1 ? `<span class="today">heute</span>` : `<span>${nightDate(i).getDate()}.</span>`).join("");
+  const rows = machines.map((m, r) => {
+    const h = health(m);
+    const marks = m.nights.map((c, i) => {
+      const code = (job && m.here && i === DAYS - 1) ? "run" : c;
+      const label = `${m.name}, Nacht auf ${fmtDay(nightDate(i))}: ${SHORT[code]}`;
+      return `<button class="mark ${code}" data-r="${r}" data-i="${i}" tabindex="${r === 0 && i === DAYS - 1 ? 0 : -1}" aria-label="${esc(label)}" title="${esc(label)}"></button>`;
+    }).join("");
+    const last = h === "overdue"
+      ? `<div class="last attn">seit ${nightsSince(m)} Nächten nicht<span>zuletzt ${esc(fmtShort(nightDate(lastSuccessIndex(m))))}</span></div>`
+      : `<div class="last">${h === "running" ? "läuft gerade" : esc(m.lastTime)}<span>letzte Sicherung</span></div>`;
+    return `<div class="row machine">
+      <div class="mname"><a href="#/rechner/${m.id}">${esc(m.name)}</a><span>${m.here ? '<span class="here">Dieser PC</span>' : esc(m.host)}</span></div>
+      <div class="nights" role="group" aria-label="${esc(m.name)}: letzte 14 Nächte">${marks}</div>
+      ${last}
+    </div>`;
+  }).join("");
+
+  $("#app").innerHTML = `
+    <section class="answer">
+      <h1 tabindex="-1">${h1}</h1>
+      <p>${esc(sub)}</p>
+      ${items.length ? `<ul class="attention">${items.map(it => `<li><span class="sig ${it.cls}"></span><div><strong>${esc(it.title)}</strong><p>${it.html ? it.text : esc(it.text)}</p></div></li>`).join("")}</ul>` : ""}
+    </section>
+
+    <div class="section-head">
+      <h2>Die letzten 14 Nächte</h2>
+      <span class="stand">Andere Rechner: Stand der letzten Abfrage beim Backup-Server, heute 02:50</span>
+    </div>
+    <div class="board" id="board">
+      <div class="row labels" aria-hidden="true"><div class="hide-s">Rechner</div><div class="nights lbl">${labels}</div><div class="hide-s" style="text-align:right">Letzte Sicherung</div></div>
+      ${rows}
+    </div>
+    <ul class="legend">
+      <li><span class="mark ok"></span>gesichert</li>
+      <li><span class="mark late"></span>nach dem Einschalten nachgeholt</li>
+      <li><span class="mark pbs"></span>Server nicht erreichbar</li>
+      <li><span class="mark fail"></span>fehlgeschlagen</li>
+      <li><span class="mark unk"></span>keine Meldung</li>
+    </ul>
+    <p class="night-info" id="night-info" aria-live="polite">Ein Feld anklicken oder mit den Pfeiltasten wählen zeigt, was in der Nacht passiert ist. Fehlt dieselbe Nacht bei allen Rechnern, lag es am Backup-Server.</p>
+
+    <p class="footnote">Gesteuert wird nur dieser PC. Die anderen Rechner zeigen, was sie mit ihrer letzten Sicherung an den Backup-Server gemeldet haben; geändert werden sie am jeweiligen Rechner. Belegt auf dem Backup-Server: ${server.used} %, frei: ${server.free}.</p>`;
+
+  const board = $("#board");
+  board.addEventListener("click", e => { const mk = e.target.closest(".mark"); if (mk) showNight(mk); });
+  board.addEventListener("keydown", e => {
+    const mk = e.target.closest(".mark"); if (!mk) return;
+    let r = +mk.dataset.r, i = +mk.dataset.i;
+    if (e.key === "ArrowLeft") i = Math.max(0, i - 1);
+    else if (e.key === "ArrowRight") i = Math.min(DAYS - 1, i + 1);
+    else if (e.key === "ArrowUp") r = Math.max(0, r - 1);
+    else if (e.key === "ArrowDown") r = Math.min(machines.length - 1, r + 1);
+    else if (e.key === "Home") i = 0;
+    else if (e.key === "End") i = DAYS - 1;
+    else return;
+    e.preventDefault();
+    // Roving tabindex: the whole grid is one tab stop.
+    const next = board.querySelector(`.mark[data-r="${r}"][data-i="${i}"]`);
+    mk.tabIndex = -1; next.tabIndex = 0; next.focus(); showNight(next);
+  });
+}
+
+function nightSentence(m, code, i) {
+  const t = {
+    ok: "Gesichert.",
+    late: "Der Rechner war um 01:30 aus und hat sich beim Einschalten am Morgen gesichert.",
+    off: "Nicht gesichert, der Rechner war aus.",
+    pbs: "Nicht gesichert, weil der Backup-Server nicht aufgewacht ist (Weckruf um 01:30, nach 10 Minuten keine Antwort).",
+    fail: "Fehlgeschlagen: Der Ordner /mnt/fotos war nicht eingehängt. Es wurde nichts gesichert, damit keine unvollständige Sicherung entsteht.",
+    unk: "Keine Sicherung und keine Meldung. Ob der Rechner aus war oder etwas schiefging, zeigt erst seine nächste Sicherung.",
+    run: "Die Sicherung läuft gerade.",
+  }[code];
+  const extra = code === "pbs" && machines.every(x => x.nights[i] === "pbs" || x.nights[i] === "unk")
+    ? " In dieser Nacht konnte sich kein Rechner sichern." : "";
+  return t + extra;
+}
+function showNight(mk) {
+  const m = machines[+mk.dataset.r], i = +mk.dataset.i;
+  const code = mk.classList.contains("run") ? "run" : m.nights[i];
+  document.querySelectorAll(".mark.sel").forEach(x => x.classList.remove("sel"));
+  mk.classList.add("sel");
+  $("#night-info").innerHTML = `<strong>${esc(m.name)}, Nacht auf ${fmtDay(nightDate(i))}.</strong> ${esc(nightSentence(m, code, i))}`;
+}
+
+/* ---------- Machine detail ---------- */
+const LOG = {
+  ok: ["ok", "Gesichert", m => m.changed ? `Neu oder geändert: ${m.changed}. Dauer 6 Minuten.` : "Dauer 6 Minuten."],
+  late: ["ok", "Nachgeholt", () => "Um 01:30 aus, beim Einschalten am Morgen gesichert."],
+  off: ["off", "Nicht gesichert", () => "Rechner war aus. Wird beim nächsten Einschalten nachgeholt."],
+  pbs: ["pbs", "Server nicht erreichbar", () => "Weckruf gesendet, 10 Minuten gewartet, keine Antwort. Betraf alle Rechner."],
+  fail: ["fail", "Fehlgeschlagen", () => "Der Ordner /mnt/fotos war nicht eingehängt. Es wurde nichts gesichert."],
+  unk: ["unk", "Keine Meldung", () => "Weder eine Sicherung noch ein Bericht ist beim Backup-Server angekommen."],
+};
+function logHTML(m) {
+  const groups = [];
+  for (let i = DAYS - 1; i >= 0; i--) {
+    const c = m.nights[i], g = groups[groups.length - 1];
+    // Runs of the same result collapse into one line; the newest success stays on its own.
+    if (g && g.c === c && !(isSuccess(c) && g.from === DAYS - 1)) g.from = i; else groups.push({ c, from: i, to: i });
+  }
+  return groups.slice(0, 6).map(g => {
+    const [cls, tag, text0] = LOG[g.c], n = g.to - g.from + 1;
+    const text = n > 1 && isSuccess(g.c) ? () => (g.c === "late" ? "Jeweils beim Einschalten am Morgen gesichert." : "Jede Nacht vollständig gesichert.") : text0;
+    const when = n === 1 ? fmtDay(nightDate(g.to)) : `${nightDate(g.from).getDate()}. bis ${fmtShort(nightDate(g.to))}`;
+    return `<li><time>${when}</time><div><span class="t ${cls}">${tag}${n > 1 ? `, ${n} Nächte` : ""}</span><p>${esc(text(m))}</p></div></li>`;
+  }).join("");
+}
+const snapshotsOf = m => m.nights.map((c, i) => ({ c, i })).filter(x => isSuccess(x.c)).reverse()
+  .map(x => ({ i: x.i, d: nightDate(x.i), late: x.c === "late" }));
+
+function viewMachine(id) {
+  const m = byId(id); if (!m) return viewNotFound();
+  const h = health(m);
+  const stateText = { ok: "Gesichert", running: "Sicherung läuft", overdue: `Seit ${nightsSince(m)} Nächten keine Sicherung`, failing: "Letzte Sicherung fehlgeschlagen", never: "Noch nie gesichert" }[h];
+  const stateCls = { ok: "", running: "run", overdue: "attn", failing: "fail", never: "attn" }[h];
+  const snaps = snapshotsOf(m).slice(0, 5);
+
+  const actions = m.here ? `<div class="actions">
+      <button class="btn primary" id="run-now" ${job ? "disabled" : ""}>${job ? "Sichert …" : "Jetzt sichern"}</button>
+      <a class="btn" href="#/wiederherstellen">Dateien wiederherstellen</a></div>` : "";
+
+  const remote = m.here ? "" : `<section class="block">
+    <div class="note"><strong>Nur zum Ansehen</strong>Sichern, Wiederherstellen und Einstellungen gibt es am ${esc(m.name)} selbst. Angezeigt wird, was er mit seiner letzten Sicherung gemeldet hat (${esc(m.report)}).</div>
+    ${h === "overdue" ? `<div class="note"><strong>Was jetzt hilft</strong>Schalte den ${esc(m.name)} ein. Er holt die Sicherung dann von selbst nach, auch tagsüber; der Backup-Server wird dafür geweckt.</div>` : ""}
+  </section>`;
+
+  $("#app").innerHTML = `
+    <a class="back" href="#/">Übersicht</a>
+    <section class="dhead">
+      <div>
+        <p class="state"><i class="${stateCls}"></i>${stateText}</p>
+        <h1 tabindex="-1">${esc(m.name)}</h1>
+        <p>${m.here ? "Dieser PC, " : ""}${esc(m.host)}, ${esc(m.os)}</p>
+      </div>
+      ${actions}
+    </section>
+    <div id="run-box"></div>
+    <div class="grid2">
+      <div>
+        <section class="block"><h2>Verlauf</h2><ul class="log">${logHTML(m)}</ul></section>
+        <section class="block"><h2>Gespeicherte Sicherungen</h2>
+          <p class="sub">Der Backup-Server behält 7 tägliche, 4 wöchentliche und 6 monatliche.</p>
+          <ul class="kv">${snaps.map((s, k) => `<li><span>${fmtDay(s.d)}${k === 0 ? ", neueste" : ""}</span><span class="v" style="color:var(--muted)">${esc(m.size)}</span></li>`).join("")}</ul>
+        </section>
+      </div>
+      <div>
+        ${remote}
+        <section class="block"><h2>Verschlüsselung</h2>
+          ${m.keyExported
+            ? `<p style="margin:0;color:var(--muted)">Die Sicherungen sind verschlüsselt. Eine Kopie des Schlüssels liegt außerhalb des Rechners.</p>`
+            : `<div class="note"><strong>Schlüssel liegt nur auf dem Rechner</strong>Geht er kaputt, lassen sich die Sicherungen nicht mehr öffnen. Am ${esc(m.name)} beheben mit <span class="mono">sudo nestegg key paperkey</span>.</div>`}
+        </section>
+        ${m.here ? `<section class="block"><h2>Was gesichert wird</h2>
+          <ul class="kv"><li><span class="mono">/home</span><span class="k">alle Benutzer</span></li><li><span class="mono">/etc</span><span class="k">Systemeinstellungen</span></li><li><span class="mono">/root</span><span class="k">Administrator</span></li><li><span class="mono">/usr/local</span><span class="k">selbst installierte Programme</span></li><li><span>Systeminventar</span><span class="k">Pakete, Dienste, Laufwerke</span></li></ul>
+        </section>
+        <section class="block"><h2>Zeitplan</h2>
+          <ul class="kv"><li><span class="k">Wann</span><span class="v">täglich ab 01:30</span></li><li><span class="k">Rechner aus</span><span class="v">beim Einschalten nachholen</span></li><li><span class="k">Nächste</span><span class="v">heute Nacht, 01:30</span></li></ul>
+        </section>` : ""}
+      </div>
+    </div>`;
+  $("#run-now")?.addEventListener("click", startRun);
+  if (job && m.here) renderRunBox(true);
+}
+
+/* ---------- Run now (this PC only) ---------- */
+function startRun() {
+  if (job) return;
+  const steps = [...(server.state === "awake" ? [] : ["Backup-Server wecken"]), "Ordner prüfen", "Systeminventar erstellen", "Geänderte Daten übertragen", "Statusbericht hochladen"];
+  job = { pct: 0, steps, step: 0 };
+  wakeServer();
+  route();
+  $("#cancel-run")?.focus();
+  const tick = () => {
+    if (!job) return;
+    job.pct = Math.min(100, job.pct + 6);
+    job.step = Math.min(steps.length - 1, Math.floor(job.pct / (100 / steps.length)));
+    if (job.pct >= 100) {
+      job = null;
+      const m = here(); m.nights[DAYS - 1] = "ok"; m.lastTime = "gerade eben"; m.changed = "86 MB";
+      toast(`${m.name} gesichert.`);
+      refreshIfAffected();
+      return;
+    }
+    renderRunBox(false);
+    job.timer = setTimeout(tick, 420);
+  };
+  job.timer = setTimeout(tick, 420);
+}
+function renderRunBox(full) {
+  const box = $("#run-box"); if (!box || !job) return;
+  if (full || !box.firstElementChild) {
+    box.innerHTML = `<section class="run" aria-live="polite"><h2>Sicherung läuft</h2><div class="bar"><i></i></div><ol class="steps"></ol><button class="btn" id="cancel-run">Sicherung abbrechen</button></section>`;
+    $("#cancel-run").addEventListener("click", () => {
+      clearTimeout(job.timer); job = null;
+      toast("Sicherung abgebrochen. Die letzte vollständige Sicherung bleibt erhalten.");
+      refreshIfAffected();
+    });
+  }
+  // Update only the parts that change, so keyboard focus on the cancel button survives.
+  box.querySelector(".bar i").style.width = job.pct + "%";
+  box.querySelector(".steps").innerHTML = job.steps.map((s, k) => `<li class="${k < job.step ? "done" : k === job.step ? "now" : ""}">${s}</li>`).join("");
+}
+function refreshIfAffected() {
+  // Re-render only screens that show this PC's run state; never rebuild other screens.
+  const p = parts();
+  if (p.length === 0 || (p[0] === "rechner" && byId(p[1])?.here)) route();
+}
+
+/* ---------- Restore (this PC only, always into a new folder) ---------- */
+const TREE = [
+  { name: "home", children: [
+    { name: "alice", children: [
+      { name: "Dokumente", size: 2.4, children: [
+        { name: "Steuer 2025", size: 0.05, children: [{ name: "Belege.pdf", size: 0.004 }, { name: "Erklärung.pdf", size: 0.001 }] },
+        { name: "Lebenslauf.odt", size: 0.0001 } ] },
+      { name: "Bilder", size: 58, children: [{ name: "Urlaub 2026", size: 6.1, children: [] }] },
+      { name: ".config", size: 1.3, children: [{ name: "thunderbird", size: 1.2, children: [] }] } ] } ] },
+  { name: "etc", size: 0.02, children: [{ name: "fstab", size: 0.000001 }, { name: "nestegg", size: 0.00001, children: [] }] },
+  { name: "usr", children: [{ name: "local", size: 0.4, children: [] }] },
+];
+let restore = null;
+const fmtSize = gb => gb >= 1 ? `${gb.toLocaleString("de-DE", { maximumFractionDigits: 1 })} GB` : gb >= 0.001 ? `${Math.round(gb * 1000)} MB` : `${Math.max(1, Math.round(gb * 1e6))} KB`;
+function sizeOf(path) {
+  let list = TREE, node = null;
+  for (const s of path.split("/").filter(Boolean)) { node = (list || []).find(n => n.name === s); if (!node) return 0; list = node.children; }
+  return node?.size ?? 0;
+}
+function treeHTML(list, base, q, implied) {
+  const match = n => !q || n.name.toLowerCase().includes(q) || (n.children || []).some(match);
+  return list.filter(match).map(n => {
+    const p = `${base}/${n.name}`, isDir = !!n.children, own = restore.sel.has(p), imp = implied && !own;
+    // Once a folder matches the search, show all of its content.
+    const childQ = q && n.name.toLowerCase().includes(q) ? "" : q;
+    return `<li><label class="${imp ? "implied" : ""}">
+        <input type="checkbox" data-p="${esc(p)}" ${own || imp ? "checked" : ""} ${imp ? "disabled" : ""}>
+        <span class="n ${isDir ? "dir" : ""}">${esc(n.name)}${isDir ? "/" : ""}</span>
+        ${imp ? `<span class="inc">enthalten</span>` : n.size != null ? `<span class="sz">${fmtSize(n.size)}</span>` : ""}
+      </label>${isDir && n.children.length ? `<ul>${treeHTML(n.children, p, childQ, implied || own)}</ul>` : ""}</li>`;
+  }).join("");
+}
+
+function viewRestore() {
+  const m = here();
+  const snaps = snapshotsOf(m).slice(0, 8);
+  if (!restore) restore = { step: 0, snap: 0, sel: new Set(), q: "", target: "/home/alice/Wiederhergestellt/2026-11-08", state: "idle", pct: 0 };
+  const r = restore;
+  const steps = ["Stand wählen", "Dateien auswählen", "Ziel prüfen"];
+  const snapLabel = s => `${fmtDay(s.d)}${s.late ? ", nachgeholt" : ""}`;
+  const total = [...r.sel].reduce((a, p) => a + sizeOf(p), 0);
+  let body;
+
+  if (r.state === "done") {
+    body = `<h2 tabindex="-1">Wiederhergestellt.</h2>
+      <p class="sub">${r.sel.size} ${r.sel.size === 1 ? "Eintrag liegt" : "Einträge liegen"} jetzt in <span class="mono">${esc(r.target)}</span>. Vorhandene Dateien wurden nicht angefasst.</p>
+      <div class="actions"><a class="btn primary" href="#/rechner/${m.id}">Zurück zum ${esc(m.name)}</a></div>`;
+  } else if (r.step === 0) {
+    body = `<h2 tabindex="-1">Von wann sollen die Dateien sein?</h2>
+      <p class="sub">Zur Wahl stehen nur vollständige Sicherungen.</p>
+      <div class="snaps" role="radiogroup" aria-label="Sicherung">${snaps.map((s, k) => `
+        <label class="snap"><input type="radio" name="snap" value="${k}" ${r.snap === k ? "checked" : ""}><span>${snapLabel(s)}${k === 0 ? " (neueste)" : ""}</span><span class="meta">${esc(m.size)}</span></label>`).join("")}</div>`;
+  } else if (r.step === 1) {
+    body = `<h2 tabindex="-1">Was soll zurückgeholt werden?</h2>
+      <p class="sub">Stand ${snapLabel(snaps[r.snap])}. Ein Ordner enthält alles, was darin liegt.</p>
+      <input class="search" id="q" type="search" placeholder="Datei oder Ordner suchen" aria-label="Datei oder Ordner suchen" value="${esc(r.q)}">
+      <ul class="tree" id="tree">${treeHTML(TREE, "", r.q.toLowerCase(), false)}</ul>
+      <div class="picked" id="picked" aria-live="polite"></div>`;
+  } else {
+    body = `<h2 tabindex="-1">Wohin damit?</h2>
+      <p class="sub">nestegg legt einen neuen Ordner an. Vorhandene Dateien werden nie überschrieben.</p>
+      <div class="field"><label for="target">Neuer Ordner</label><input id="target" type="text" value="${esc(r.target)}" spellcheck="false" ${r.state === "running" ? "disabled" : ""}>
+        <p class="hint" id="target-hint">Den Ordner gibt es noch nicht. Er gehört danach dir (alice).</p></div>
+      <ul class="kv summary">
+        <li><span class="k">Stand</span><span class="v">${snapLabel(snaps[r.snap])}</span></li>
+        <li><span class="k">Auswahl</span><span class="v">${[...r.sel].map(p => `<span class="mono">${esc(p)}</span>`).join("<br>")}</span></li>
+        <li><span class="k">Größe</span><span class="v">etwa ${fmtSize(total)}</span></li>
+      </ul>
+      ${r.state === "running" ? `<div class="bar" style="margin-top:20px"><i style="width:${r.pct}%"></i></div>` : ""}`;
+  }
+
+  const nextLabel = r.step === 2 ? (r.state === "running" ? "Wird wiederhergestellt …" : "Wiederherstellen") : "Weiter";
+  $("#app").innerHTML = `
+    <a class="back" href="#/rechner/${m.id}">${esc(m.name)}</a>
+    <section class="dhead"><div><h1 tabindex="-1">Dateien wiederherstellen</h1><p>Aus den Sicherungen dieses PCs.</p></div></section>
+    ${r.state !== "done" ? `<ol class="stepper">${steps.map((s, k) => `<li class="${k < r.step ? "done" : k === r.step ? "cur" : ""}" ${k === r.step ? 'aria-current="step"' : ""}>${s}</li>`).join("")}</ol>` : ""}
+    <section class="pane">
+      ${body}
+      ${r.state !== "done" ? `<div class="pane-actions">
+        <button class="btn" id="back" ${r.state === "running" ? "disabled" : ""}>${r.step === 0 ? "Abbrechen" : "Zurück"}</button>
+        <button class="btn primary" id="next" ${(r.step === 1 && r.sel.size === 0) || r.state === "running" ? "disabled" : ""}>${nextLabel}</button>
+      </div>` : ""}
+    </section>`;
+
+  const focusHeading = () => $(".pane h2")?.focus();
+  $("#app").querySelectorAll('input[name="snap"]').forEach(x => x.addEventListener("change", () => { r.snap = +x.value; }));
+  const tree = $("#tree");
+  const updatePicked = () => {
+    const el = $("#picked"); if (!el) return;
+    const t = [...r.sel].reduce((a, p) => a + sizeOf(p), 0);
+    el.innerHTML = r.sel.size ? `<strong>${r.sel.size} ausgewählt</strong>, etwa ${fmtSize(t)}: ${[...r.sel].map(p => `<span class="mono">${esc(p)}</span>`).join(", ")}` : "Noch nichts ausgewählt.";
+    $("#next").disabled = r.sel.size === 0;
+  };
+  if (tree) {
+    tree.addEventListener("change", e => {
+      const p = e.target.dataset.p; if (!p) return;
+      if (e.target.checked) { [...r.sel].forEach(x => { if (x.startsWith(p + "/")) r.sel.delete(x); }); r.sel.add(p); }
+      else r.sel.delete(p);
+      tree.innerHTML = treeHTML(TREE, "", r.q.toLowerCase(), false);
+      tree.querySelector(`input[data-p="${CSS.escape(p)}"]`)?.focus();
+      updatePicked();
+    });
+    updatePicked();
+  }
+  const q = $("#q");
+  q?.addEventListener("input", () => { r.q = q.value; tree.innerHTML = treeHTML(TREE, "", r.q.toLowerCase(), false); });
+  const target = $("#target");
+  target?.addEventListener("input", () => {
+    r.target = target.value.trim();
+    const ok = /^\/.+/.test(r.target);
+    $("#target-hint").textContent = ok ? "Den Ordner gibt es noch nicht. Er gehört danach dir (alice)." : "Bitte einen vollständigen Pfad angeben, der mit / beginnt.";
+    $("#next").disabled = !ok;
+  });
+  $("#back")?.addEventListener("click", () => {
+    if (r.step === 0) { restore = null; location.hash = `#/rechner/${m.id}`; return; }
+    r.step--; viewRestore(); focusHeading();
+  });
+  $("#next")?.addEventListener("click", () => {
+    if (r.step < 2) { r.step++; viewRestore(); focusHeading(); return; }
+    r.state = "running"; r.pct = 0; viewRestore();
+    const tick = () => {
+      if (restore !== r) return;
+      r.pct += 20;
+      if (r.pct >= 100) { r.state = "done"; toast("Wiederhergestellt."); if (parts()[0] === "wiederherstellen") { viewRestore(); focusHeading(); } return; }
+      const bar = $(".pane .bar i"); if (bar) bar.style.width = r.pct + "%";
+      setTimeout(tick, 380);
+    };
+    setTimeout(tick, 380);
+  });
+}
+
+/* ---------- Settings (read-only view of the effective configuration) ---------- */
+function viewSettings() {
+  $("#app").innerHTML = `
+    <section class="dhead"><div><h1 tabindex="-1">Einstellungen</h1>
+      <p>So ist dieser PC eingerichtet. Geändert wird im Terminal mit <span class="mono">sudo nestegg init</span> oder in <span class="mono">/etc/nestegg/config.toml</span>.</p></div>
+      <div class="actions"><button class="btn primary" id="check">Verbindung prüfen</button></div>
+    </section>
+    <div class="grid2">
+      <div>
+        <section class="block"><h2>Backup-Server</h2><ul class="kv">
+          <li><span class="k">Adresse</span><span class="v mono">${server.addr}</span></li>
+          <li><span class="k">Datenspeicher</span><span class="v mono">${server.datastore}</span></li>
+          <li><span class="k">Bereich</span><span class="v mono">${server.namespace}</span></li>
+          <li><span class="k">Zuletzt erreicht</span><span class="v" id="last-check">heute, 02:20</span></li></ul></section>
+        <section class="block"><h2>Server aufwecken</h2><ul class="kv">
+          <li><span class="k">Vor jeder Sicherung wecken</span><span class="v">ja</span></li>
+          <li><span class="k">Netzwerkkarte (MAC)</span><span class="v mono">00:00:5e:00:53:01</span></li>
+          <li><span class="k">Höchstens warten</span><span class="v">10 Minuten</span></li></ul></section>
+      </div>
+      <div>
+        <section class="block"><h2>Zeitplan</h2><ul class="kv">
+          <li><span class="k">Sichern</span><span class="v">täglich ab 01:30</span></li>
+          <li><span class="k">Rechner war aus</span><span class="v">beim Einschalten nachholen, Server wird dafür geweckt</span></li>
+          <li><span class="k">Hinweis, wenn keine Sicherung seit</span><span class="v">36 Stunden</span></li></ul></section>
+        <section class="block"><h2>Verschlüsselung</h2><ul class="kv">
+          <li><span class="k">Verschlüsselt</span><span class="v">ja</span></li>
+          <li><span class="k">Schlüsselkopie außerhalb</span><span class="v">ja, bei der Einrichtung bestätigt</span></li></ul></section>
+        <section class="block"><h2>Weiteren Rechner hinzufügen</h2>
+          <p style="margin:0;color:var(--muted)">Auf dem anderen Rechner nestegg installieren und einrichten. Er erscheint hier nach seiner ersten Sicherung.</p>
+          <div class="cmd">sudo apt install ./nestegg_0.2_amd64.deb
+sudo nestegg init</div></section>
+      </div>
+    </div>`;
+  $("#check").addEventListener("click", () => {
+    const was = server.state;
+    wakeServer();
+    toast(was === "asleep" ? "Server war aus. Weckruf gesendet, nach 38 Sekunden erreichbar." : "Verbindung in Ordnung.");
+    $("#last-check").textContent = "gerade eben";
+  });
+}
+
+function viewNotFound() { $("#app").innerHTML = `<section class="answer"><h1>Diese Seite gibt es nicht.</h1><p><a href="#/">Zur Übersicht</a></p></section>`; }
+
+/* ---------- Router ---------- */
+const parts = () => (location.hash.replace(/^#/, "") || "/").split("/").filter(Boolean);
+function route() {
+  const p = parts();
+  document.querySelectorAll("[data-nav]").forEach(a => a.removeAttribute("aria-current"));
+  if (p.length === 0) { $('[data-nav="home"]').setAttribute("aria-current", "page"); viewHome(); }
+  else if (p[0] === "rechner") viewMachine(p[1]);
+  else if (p[0] === "wiederherstellen") viewRestore();
+  else if (p[0] === "einstellungen") { $('[data-nav="settings"]').setAttribute("aria-current", "page"); viewSettings(); }
+  else viewNotFound();
+  renderServer();
+}
+window.addEventListener("hashchange", () => {
+  if (parts()[0] !== "wiederherstellen" && restore && restore.state !== "running") restore = null;
+  window.scrollTo(0, 0);
+  route();
+  $("#app h1")?.focus({ preventScroll: true });
+});
+route();
+</script>
+</body>
+</html>

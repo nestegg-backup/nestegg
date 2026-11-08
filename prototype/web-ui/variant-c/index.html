@@ -1,0 +1,1011 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nestegg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* Prototype only. Invented example data, nothing talks to a real server. */
+:root {
+  color-scheme: dark;
+  /* three surface levels, separated by lightness only */
+  --bg0: #1b1c1f;   /* page / detail */
+  --bg1: #232428;   /* list pane, quiet blocks inside the detail */
+  --bg2: #2e3035;   /* selection, fields, blocks inside the list pane */
+  --text: #ebebed;
+  --muted: #a9abb1;
+  --faint: #8e9198;
+  --mark: #6d7078;  /* neutral marks: non-text, 3:1 on bg0 */
+  --accent: #7fa8f5;
+  --on-accent: #15171b;
+  --ok: #86c49b;
+  --warn: #e2b56c;
+  --bad: #ef8f84;
+  --pbs: #c7a2e6;
+
+  --fs-s: 13px;
+  --fs-m: 15px;
+  --fs-l: 19px;
+  --fs-xl: 28px;
+  --mono: ui-monospace, "SF Mono", "DejaVu Sans Mono", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg0);
+  color: var(--text);
+  font: 400 var(--fs-m)/1.55 "Instrument Sans", system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, p, ul, ol, dl, dd { margin: 0; padding: 0; }
+ul, ol { list-style: none; }
+a { color: inherit; }
+button, input { font: inherit; color: inherit; }
+code, .path {
+  font-family: var(--mono);
+  font-size: var(--fs-s);
+  font-variant-numeric: normal;
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* ---------- shell ---------- */
+.app { display: grid; grid-template-columns: 288px minmax(0, 1fr); min-height: 100vh; }
+.pane-list { background: var(--bg1); }
+.list-inner {
+  padding: 22px 12px 20px;
+  position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  display: flex; flex-direction: column;
+}
+.pane-main { padding: 52px 56px 72px; min-width: 0; }
+.main-inner { max-width: 680px; }
+body.focus .app { grid-template-columns: minmax(0, 1fr); }
+body.focus .pane-list { display: none; }
+body.focus .pane-main { padding-top: 40px; }
+body.focus .main-inner { margin: 0 auto; max-width: 640px; }
+
+.product { font-weight: 600; padding: 0 12px; margin-bottom: 26px; letter-spacing: -0.01em; }
+.group-title { font-size: var(--fs-s); color: var(--faint); padding: 0 12px; margin: 0 0 6px; font-weight: 500; }
+.group-note { font-size: var(--fs-s); color: var(--faint); padding: 0 12px; margin: 4px 0 8px; }
+.group + .group { margin-top: 26px; }
+
+.row {
+  display: grid; grid-template-columns: 1fr; gap: 1px;
+  padding: 9px 12px 10px; border-radius: 8px; text-decoration: none;
+  position: relative;
+}
+.row:hover { background: rgba(255,255,255,0.03); }
+.row[aria-current="page"] { background: var(--bg2); }
+.row[aria-current="page"]::before {
+  content: ""; position: absolute; left: 0; top: 11px; bottom: 11px; width: 3px;
+  border-radius: 2px; background: var(--accent);
+}
+.row-name { font-weight: 500; }
+.row-status { font-size: var(--fs-s); color: var(--muted); display: flex; align-items: center; gap: 8px; }
+
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--mark); }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.bad { background: var(--bad); }
+.dot.pbs { background: var(--pbs); }
+.dot.running { background: var(--text); }
+
+.list-foot { margin-top: auto; padding-top: 28px; }
+.foot-link { display: block; padding: 9px 12px; border-radius: 8px; text-decoration: none; color: var(--muted); }
+.foot-link:hover { background: rgba(255,255,255,0.03); color: var(--text); }
+.foot-link[aria-current="page"] { background: var(--bg2); color: var(--text); }
+
+.back { display: none; }
+
+/* ---------- type in the detail ---------- */
+.kicker { font-size: var(--fs-s); color: var(--muted); margin-bottom: 6px; }
+h1 { font-size: var(--fs-xl); line-height: 1.2; font-weight: 600; letter-spacing: -0.02em; }
+.lead { font-size: var(--fs-l); line-height: 1.4; margin-top: 18px; font-weight: 500; letter-spacing: -0.01em; }
+.lead-text { color: var(--muted); margin-top: 8px; max-width: 60ch; }
+h2 { font-size: var(--fs-m); font-weight: 600; margin: 0 0 14px; }
+.section { margin-top: 52px; }
+.muted { color: var(--muted); }
+.small { font-size: var(--fs-s); }
+.status-word { display: inline-flex; align-items: center; gap: 8px; }
+
+/* ---------- buttons ---------- */
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; align-items: center; }
+.btn {
+  appearance: none; border: 0; border-radius: 8px; cursor: pointer;
+  padding: 10px 18px; font-weight: 500; text-decoration: none; display: inline-block;
+  background: var(--bg2); color: var(--text); line-height: 1.4;
+}
+.btn:hover { background: #383a40; }
+.btn.primary { background: var(--accent); color: var(--on-accent); }
+.btn.primary:hover { background: #95b7f7; }
+.btn[disabled] { cursor: not-allowed; background: var(--bg2); color: var(--faint); }
+.linkbtn {
+  appearance: none; border: 0; background: none; padding: 4px 0; cursor: pointer;
+  color: var(--accent); text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px;
+}
+
+/* ---------- blocks ---------- */
+.keynote { margin-top: 40px; }
+.keynote h3 { font-size: var(--fs-m); font-weight: 600; display: flex; align-items: center; gap: 10px; }
+.keynote p { color: var(--muted); margin-top: 6px; max-width: 60ch; }
+.cmd {
+  display: flex; align-items: center; gap: 12px; margin-top: 14px;
+  background: var(--bg2); border-radius: 8px; padding: 10px 10px 10px 14px; min-width: 0;
+}
+.cmd code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; color: var(--text); padding: 2px 0; }
+.cmd .btn { padding: 6px 12px; background: var(--bg1); font-size: var(--fs-s); }
+.cmd .btn:hover { background: #1f2023; }
+
+/* ---------- night strip ---------- */
+.strip { display: grid; grid-template-columns: repeat(14, minmax(0, 1fr)); gap: 4px; max-width: 560px; }
+.night { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.mark { width: 100%; max-width: 26px; height: 30px; border-radius: 4px; display: flex; align-items: flex-end; }
+.mark i { display: block; width: 100%; border-radius: 4px; }
+.m-ok i { height: 100%; background: var(--mark); }
+.m-late i { height: 55%; background: var(--mark); }
+.m-off i { height: 100%; box-shadow: inset 0 0 0 1.5px var(--mark); }
+.m-fail i { height: 100%; background: var(--bad); }
+.m-pbs i { height: 100%; background: var(--pbs); }
+.m-run i { height: 100%; box-shadow: inset 0 0 0 1.5px var(--accent); }
+.night span { font-size: var(--fs-s); color: var(--faint); line-height: 1; }
+.night.today span { color: var(--text); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 20px; margin-top: 16px; font-size: var(--fs-s); color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 8px; }
+.legend .mark { width: 10px; height: 14px; border-radius: 2px; }
+.legend .mark i { border-radius: 2px; }
+
+/* ---------- run history ---------- */
+.runs { margin-top: 30px; }
+.run, .run > summary {
+  display: grid; grid-template-columns: 108px 56px minmax(0, 1fr) auto; gap: 4px 16px;
+  align-items: baseline;
+}
+.run { padding: 11px 0; }
+.runs li + li { box-shadow: 0 -1px 0 #2a2c30; }
+details.run { display: block; }
+details.run > summary { cursor: pointer; list-style: none; }
+details.run > summary::-webkit-details-marker { display: none; }
+.run .when { color: var(--muted); }
+.run .time { color: var(--muted); }
+.run .what { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.run .extra { color: var(--faint); font-size: var(--fs-s); text-align: right; }
+.run .more { color: var(--accent); font-size: var(--fs-s); text-decoration: underline; text-underline-offset: 3px; }
+details.run[open] .more-closed, details.run:not([open]) .more-open { display: none; }
+.more-row { padding: 14px 0 0; }
+#main:focus { outline: none; }
+.log {
+  margin: 12px 0 4px; background: var(--bg1); border-radius: 8px; padding: 14px 16px;
+  font-family: var(--mono); font-size: var(--fs-s); line-height: 1.7; color: var(--muted);
+  overflow-x: auto; white-space: pre;
+}
+.log-explain { margin-top: 10px; color: var(--muted); max-width: 60ch; }
+
+/* ---------- facts ---------- */
+.facts { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 12px 24px; }
+.facts dt { color: var(--muted); }
+.facts dd { min-width: 0; overflow-wrap: anywhere; }
+.facts dd code { color: var(--text); }
+.paths { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+
+/* ---------- progress ---------- */
+.steps { margin-top: 26px; display: grid; gap: 14px; }
+.step { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 12px; align-items: start; color: var(--faint); }
+.step .n {
+  width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center;
+  font-size: var(--fs-s); box-shadow: inset 0 0 0 1.5px var(--mark); margin-top: 1px;
+}
+.step.now { color: var(--text); }
+.step.now .n { box-shadow: inset 0 0 0 1.5px var(--text); }
+.step.done { color: var(--muted); }
+.step.done .n { background: var(--mark); box-shadow: none; color: var(--text); }
+.step .sub { font-size: var(--fs-s); color: var(--muted); margin-top: 2px; }
+.bar { height: 6px; background: var(--bg2); border-radius: 3px; overflow: hidden; margin-top: 10px; max-width: 420px; }
+.bar i { display: block; height: 100%; background: var(--text); border-radius: 3px; transition: width .4s linear; }
+
+/* ---------- forms / restore ---------- */
+.stepline { font-size: var(--fs-s); color: var(--muted); margin-top: 6px; }
+.topline { display: flex; justify-content: space-between; align-items: center; margin-bottom: 36px; gap: 16px; }
+.topline .linkbtn, .topline a { color: var(--muted); text-decoration: none; padding: 6px 0; }
+.topline a:hover { color: var(--text); }
+.topline .who { font-size: var(--fs-s); color: var(--faint); }
+
+.choices { margin-top: 10px; display: grid; gap: 2px; }
+.choice {
+  display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 14px; align-items: center;
+  padding: 12px 14px; border-radius: 8px; cursor: pointer;
+}
+.choice:hover { background: var(--bg1); }
+.choice:has(input:checked) { background: var(--bg2); }
+.choice input { margin: 0; width: 18px; height: 18px; accent-color: var(--accent); }
+.choice .side { color: var(--muted); font-size: var(--fs-s); text-align: right; }
+.choice-group + .choice-group { margin-top: 30px; }
+.choice-group h2 { margin-bottom: 4px; }
+
+.field-label { display: block; font-weight: 500; margin-bottom: 8px; }
+.input {
+  width: 100%; background: var(--bg2); border: 1px solid #686b72; border-radius: 8px;
+  padding: 10px 12px; outline: none;
+}
+.input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.input.mono { font-family: var(--mono); font-size: var(--fs-s); padding: 12px; }
+.prefix { display: flex; align-items: stretch; min-width: 0; }
+.prefix code {
+  display: flex; align-items: center; padding: 0 2px 0 12px; background: var(--bg2);
+  border: 1px solid #686b72; border-right: 0; border-radius: 8px 0 0 8px; color: var(--muted); white-space: nowrap;
+}
+.prefix .input { border-left: 0; border-radius: 0 8px 8px 0; padding-left: 2px; min-width: 0; }
+.prefix:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 8px; }
+.prefix .input:focus-visible { outline: none; }
+.hint { font-size: var(--fs-s); color: var(--muted); margin-top: 8px; }
+.hint.bad { color: var(--bad); }
+
+.tree { margin-top: 18px; }
+.node { display: grid; grid-template-columns: 28px 22px minmax(0, 1fr) auto; align-items: center; gap: 6px; padding: 5px 8px 5px 0; border-radius: 6px; }
+.node:hover { background: var(--bg1); }
+.twist {
+  appearance: none; border: 0; background: none; width: 28px; height: 28px; cursor: pointer; border-radius: 6px;
+  display: grid; place-items: center; color: var(--muted);
+}
+.twist svg { width: 10px; height: 10px; transition: transform .15s; }
+.twist[aria-expanded="true"] svg { transform: rotate(90deg); }
+.node input { margin: 0; width: 17px; height: 17px; accent-color: var(--accent); }
+.node label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.node .size { font-size: var(--fs-s); color: var(--faint); }
+.node.dir label { font-weight: 500; }
+.hit-path { display: block; font-family: var(--mono); font-size: var(--fs-s); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; }
+.empty { color: var(--muted); padding: 14px 0; }
+
+.selbar {
+  margin-top: 28px; padding: 16px 0 0;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+}
+.summary { margin-top: 30px; }
+.summary .facts { grid-template-columns: 140px minmax(0, 1fr); }
+.summary ul { display: grid; gap: 2px; }
+
+.meter { height: 8px; background: var(--bg2); border-radius: 4px; overflow: hidden; max-width: 420px; margin-top: 10px; }
+.meter i { display: block; height: 100%; background: var(--muted); }
+
+.notice { color: var(--muted); margin-top: 10px; max-width: 60ch; }
+
+/* ---------- phone ---------- */
+@media (max-width: 760px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .pane-list { min-height: 100vh; }
+  .list-inner { position: static; height: auto; min-height: 100vh; padding: 20px 8px 28px; }
+  .pane-main { padding: 18px 16px 56px; }
+  body.r-list .pane-main { display: none; }
+  body:not(.r-list) .pane-list { display: none; }
+  body.focus .pane-main { padding-top: 18px; }
+  .back { display: inline-block; color: var(--muted); text-decoration: none; padding: 8px 0; margin-bottom: 18px; }
+  .row { padding: 12px 12px 13px; }
+  .row[aria-current="page"] { background: transparent; }
+  .row[aria-current="page"]::before { display: none; }
+  .section { margin-top: 44px; }
+  .run, .run > summary { grid-template-columns: minmax(0, 1fr) auto; }
+  .run .when { grid-column: 1; }
+  .run .time { grid-column: 2; text-align: right; }
+  .run .what { grid-column: 1 / -1; }
+  .run .extra { grid-column: 1 / -1; text-align: left; }
+  .facts, .summary .facts { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .facts dd { margin-bottom: 12px; }
+  .strip { gap: 3px; }
+  .list-foot { margin-top: 0; }
+  .cmd { flex-wrap: wrap; }
+  .cmd code { white-space: normal; overflow-wrap: anywhere; flex-basis: 100%; }
+  .topline { margin-bottom: 26px; }
+  .selbar .btn { width: 100%; text-align: center; }
+  .actions .btn { flex: 1 1 auto; text-align: center; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="pane-list" id="list" aria-label="PCs im Haushalt"></nav>
+  <main class="pane-main" id="main" tabindex="-1"></main>
+</div>
+<script>
+/* ======================================================================
+   Example data (invented). Today is Sunday 8 Nov 2026, it is 19:24.
+   ====================================================================== */
+const WD = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+const WDL = ['Sonntag', 'Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag'];
+const MON = ['Jan.', 'Feb.', 'März', 'Apr.', 'Mai', 'Juni', 'Juli', 'Aug.', 'Sep.', 'Okt.', 'Nov.', 'Dez.'];
+const MONL = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
+const NIGHTS = Array.from({ length: 14 }, (_, i) => new Date(2026, 9, 26 + i)); // 26 Oct .. 8 Nov
+const short = d => `${WD[d.getDay()]} ${d.getDate()}. ${MON[d.getMonth()]}`;
+const long = d => `${WDL[d.getDay()]}, ${d.getDate()}. ${MONL[d.getMonth()]}`;
+const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+/* o = gesichert, l = nachgeholt, x = fehlgeschlagen, s = Server nicht erreichbar, - = PC war aus */
+const PCS = {
+  arbeitsrechner: {
+    name: 'Arbeitsrechner', self: true, host: 'desktop.example.com', user: 'alice', os: 'Linux Mint 22.2',
+    size: '412 GB', key: true, keyDate: '12. September 2026', backupId: 'desktop',
+    nights: 'oooooo' + 's' + 'ooooooo',
+    times: ['01:44', '01:39', '01:47', '01:41', '01:43', '01:40', '01:35', '01:46', '01:42', '01:45', '01:41', '01:39', '01:44', '01:42'],
+    up: ['0,8 GB', '1,3 GB', '0,6 GB', '2,1 GB', '0,9 GB', '1,4 GB', '', '0,7 GB', '1,1 GB', '0,5 GB', '3,2 GB', '0,9 GB', '1,6 GB', '1,2 GB'],
+    dur: ['14 Min.', '9 Min.', '17 Min.', '11 Min.', '13 Min.', '10 Min.', '', '16 Min.', '12 Min.', '15 Min.', '11 Min.', '9 Min.', '14 Min.', '12 Min.'],
+    sources: ['/home', '/etc', '/root', '/usr/local'],
+  },
+  wohnzimmer: {
+    name: 'Wohnzimmer-PC', host: 'media.example.com', user: 'alice', os: 'Linux Mint 22.2',
+    size: '1,1 TB', key: false, backupId: 'media',
+    nights: 'oooooo' + 's' + 'oo' + 'x' + 'oooo',
+    times: ['01:55', '01:49', '01:52', '01:58', '01:51', '01:54', '01:35', '01:56', '01:52', '01:31', '01:57', '01:53', '01:50', '02:41'],
+    up: ['4,2 GB', '1,1 GB', '0,9 GB', '1,8 GB', '0,4 GB', '2,6 GB', '', '6,1 GB', '0,7 GB', '', '9,4 GB', '1,2 GB', '0,8 GB', '1,5 GB'],
+    dur: [], sources: ['/home', '/etc', '/root', '/usr/local', '/mnt/fotos'],
+  },
+  laptop: {
+    name: 'Laptop', host: 'laptop.example.com', user: 'bob', os: 'Ubuntu 24.04 LTS',
+    size: '188 GB', key: true, backupId: 'laptop',
+    nights: 'olool' + '---------',
+    times: ['01:49', '08:17', '01:46', '01:52', '01:44', '', '', '', '', '', '', '', '', ''],
+    up: ['0,6 GB', '1,9 GB', '0,4 GB', '0,8 GB', '1,1 GB', '', '', '', '', '', '', '', '', ''],
+    dur: [], sources: ['/home', '/etc', '/root', '/usr/local'],
+  },
+  werkstatt: {
+    name: 'Werkstatt', host: 'workshop.example.com', user: 'bob', os: 'Ubuntu 24.04 LTS',
+    size: '96 GB', key: true, backupId: 'workshop',
+    nights: 'lollol' + 's' + 'ollolol',
+    times: ['07:31', '01:38', '06:58', '07:44', '01:41', '07:05', '01:35', '01:39', '07:22', '07:49', '01:40', '06:51', '01:37', '07:12'],
+    up: ['0,3 GB', '0,2 GB', '0,5 GB', '0,2 GB', '0,1 GB', '0,4 GB', '', '0,6 GB', '0,2 GB', '0,3 GB', '0,1 GB', '0,2 GB', '0,2 GB', '0,4 GB'],
+    dur: [], sources: ['/home', '/etc', '/root', '/usr/local'],
+  },
+};
+const ORDER_OTHERS = ['wohnzimmer', 'laptop', 'werkstatt']; // problems first
+const SERVER = { addr: 'pbs.example.com:8007', datastore: 'datastore', ns: 'zuhause', used: 61, free: '1,4 TB', mac: '00:00:5e:00:53:01' };
+const REPORTED_AT = 'heute um 07:20';
+
+/* live state of this PC (changes during the simulations) */
+const state = {
+  run: null,          // { phase, pct, t, timer }
+  extraRuns: [],      // manual runs added today
+  restore: { snap: null, sel: new Set(), open: new Set(['/home', '/home/alice']), q: '', folder: '', done: null },
+  check: null,        // connection check result
+  showAll: new Set(),  // PCs whose full history is expanded
+};
+
+/* ---------------------------------------------------------------- helpers */
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function lastIndex(pc, codes) {
+  for (let i = 13; i >= 0; i--) if (codes.includes(pc.nights[i])) return i;
+  return -1;
+}
+function health(id) {
+  const pc = PCS[id];
+  if (pc.self && state.run) return 'running';
+  const last = lastIndex(pc, 'olxs');
+  const lastSuccess = lastIndex(pc, 'ol');
+  if (pc.nights[last] === 'x') return 'failing';
+  if (13 - lastSuccess >= 3) return 'overdue'; // overdue after 72 h
+  return 'ok';
+}
+function listLine(id) {
+  const pc = PCS[id], h = health(id);
+  if (h === 'running') return { dot: 'running', text: 'Sichert gerade' };
+  if (pc.self && state.extraRuns.length) return { dot: 'ok', text: `Heute ${state.extraRuns[0].time} gesichert` };
+  const i = lastIndex(pc, 'olxs'), d = NIGHTS[i];
+  const when = i === 13 ? 'Heute' : `${d.getDate()}. ${MON[d.getMonth()]}`;
+  if (h === 'failing') return { dot: 'bad', text: `Fehlgeschlagen am ${d.getDate()}. ${MON[d.getMonth()]}` };
+  if (h === 'overdue') { const s = NIGHTS[lastIndex(pc, 'ol')]; return { dot: 'warn', text: `Überfällig, zuletzt ${s.getDate()}. ${MON[s.getMonth()]}` }; }
+  if (!pc.key) return { dot: 'warn', text: 'Schlüsselkopie fehlt' };
+  const c = pc.nights[lastIndex(pc, 'ol')];
+  return { dot: 'ok', text: `${when} ${pc.times[lastIndex(pc, 'ol')]} ${c === 'l' ? 'nachgeholt' : 'gesichert'}` };
+}
+
+const LABEL = { o: 'Gesichert', l: 'Nachgeholt', x: 'Fehlgeschlagen', s: 'Server nicht erreichbar', '-': 'PC war aus' };
+const MCLS = { o: 'm-ok', l: 'm-late', x: 'm-fail', s: 'm-pbs', '-': 'm-off' };
+
+function strip(pc) {
+  const cells = NIGHTS.map((d, i) => {
+    const c = pc.nights[i];
+    return `<li class="night${i === 13 ? ' today' : ''}" title="${short(d)}: ${LABEL[c]}">
+      <span class="mark ${MCLS[c]}"><i></i></span><span aria-hidden="true">${d.getDate()}</span>
+      <span class="sr">${long(d)}: ${LABEL[c]}</span></li>`;
+  }).join('');
+  const used = [...new Set(pc.nights.split(''))];
+  const legend = ['o', 'l', '-', 'x', 's'].filter(c => used.includes(c))
+    .map(c => `<span><span class="mark ${MCLS[c]}"><i></i></span>${LABEL[c]}</span>`).join('');
+  return `<ol class="strip" aria-label="Letzte 14 Nächte">${cells}</ol><div class="legend" aria-hidden="true">${legend}</div>`;
+}
+
+const LOGS = {
+  s: (pc, t) => ({
+    lines: [
+      `01:30:02  start: trigger=timer backup-id=${pc.backupId}`,
+      `01:30:02  ${SERVER.addr} did not answer ping`,
+      `01:30:02  sent Wake-on-LAN packet to ${SERVER.mac}`,
+      `01:35:02  no answer after 300 s, giving up`,
+      `01:35:02  result: pbs_unreachable`,
+    ],
+    explain: 'Der Backup-Server ist in dieser Nacht nicht aufgewacht. Nicht dieser PC hat einen Fehler gemacht: Keiner der PCs im Haushalt wurde gesichert. Die nächste Nacht lief wieder normal.',
+  }),
+  x: (pc) => ({
+    lines: [
+      `01:30:04  start: trigger=timer backup-id=${pc.backupId}`,
+      `01:30:04  ${SERVER.addr} reachable`,
+      `01:31:10  source /mnt/fotos: not a mount point (disk not mounted)`,
+      `01:31:10  result: failed (source_missing)`,
+    ],
+    explain: 'Der Ordner /mnt/fotos war nicht eingehängt, wahrscheinlich war die Fotoplatte nicht angeschlossen. nestegg bricht dann ab, statt eine unvollständige Sicherung als erfolgreich zu melden.',
+  }),
+};
+
+function runRows(id) {
+  const pc = PCS[id];
+  const rows = [];
+  if (pc.self) state.extraRuns.forEach(r => rows.push(`<li class="run">
+      <span class="when">${short(NIGHTS[13])}</span><span class="time">${r.time}</span>
+      <span class="what"><span class="dot"></span>Gesichert, von Hand gestartet</span>
+      <span class="extra">${r.dur}, ${r.up} hochgeladen</span></li>`));
+  for (let i = 13; i >= 0; i--) {
+    const c = pc.nights[i], d = NIGHTS[i];
+    const t = pc.times[i] || '';
+    let what, extra = '';
+    if (c === 'o') { what = '<span class="dot"></span>Gesichert'; extra = pc.up[i] ? `${pc.dur[i] ? pc.dur[i] + ', ' : ''}${pc.up[i]} hochgeladen` : ''; }
+    if (c === 'l') { what = '<span class="dot"></span>Nachgeholt'; extra = `PC war um 01:30 aus${pc.up[i] ? ', ' + pc.up[i] + ' hochgeladen' : ''}`; }
+    if (c === '-') {
+      let j = i; while (j > 0 && pc.nights[j - 1] === '-') j--;
+      const n = i - j + 1;
+      what = `<span class="dot"></span><span class="muted">${n > 1 ? `PC war ${n} Nächte lang aus, seit ${short(NIGHTS[j])}` : 'PC war aus, keine Sicherung'}</span>`;
+      if (n > 1) { rows.push(`<li class="run"><span class="when">${short(d)}</span><span class="time"></span><span class="what">${what}</span><span class="extra"></span></li>`); i = j; continue; }
+    }
+    if (c === 'x') what = '<span class="dot bad"></span><span>Fehlgeschlagen: Ordner <code>/mnt/fotos</code> fehlte</span>';
+    if (c === 's') what = '<span class="dot pbs"></span>Server nicht erreichbar';
+    const inner = `<span class="when">${short(d)}</span><span class="time">${c === '-' ? '' : t}</span><span class="what">${what}</span>`;
+    if (LOGS[c] && (pc.self || c === 'x')) {
+      const lg = LOGS[c](pc, t);
+      rows.push(`<li><details class="run"><summary>${inner}<span class="extra"><span class="more more-closed">Protokoll zeigen</span><span class="more more-open">Protokoll ausblenden</span></span></summary>
+        <div class="log">${lg.lines.map(esc).join('\n')}</div><p class="log-explain">${lg.explain}</p></details></li>`);
+    } else {
+      rows.push(`<li class="run">${inner}<span class="extra">${extra}</span></li>`);
+    }
+  }
+  const all = state.showAll.has(id);
+  const shown = all ? rows : rows.slice(0, 7);
+  const more = rows.length > 7
+    ? `<li class="more-row"><button class="linkbtn" data-more="${id}" aria-expanded="${all}">${all ? 'Nur die letzten 7 Nächte zeigen' : `Alle ${rows.length} Einträge zeigen`}</button></li>` : '';
+  return `<ul class="runs">${shown.join('')}${more}</ul>`;
+}
+
+/* ---------------------------------------------------------------- list pane */
+function renderList(route) {
+  const sel = route.view === 'pc' ? route.id : (route.view === 'home' ? 'arbeitsrechner' : null);
+  const row = id => {
+    const pc = PCS[id], l = listLine(id);
+    return `<li><a class="row" href="#/pc/${id}"${sel === id ? ' aria-current="page"' : ''}>
+      <span class="row-name">${pc.name}</span>
+      <span class="row-status"><span class="dot ${l.dot}"></span>${l.text}</span></a></li>`;
+  };
+  $('#list').innerHTML = `<div class="list-inner">
+    <div class="product">nestegg</div>
+    <div class="group">
+      <h2 class="group-title">Dieser PC</h2>
+      <ul>${row('arbeitsrechner')}</ul>
+    </div>
+    <div class="group">
+      <h2 class="group-title">Andere PCs im Haushalt</h2>
+      <ul>${ORDER_OTHERS.map(row).join('')}</ul>
+      <p class="group-note">Nur zur Ansicht. Diese PCs werden jeweils am PC selbst verwaltet.</p>
+    </div>
+    <div class="list-foot">
+      <a class="row" href="#/server"${route.view === 'server' ? ' aria-current="page"' : ''}>
+        <span class="row-name">Backup-Server</span>
+        <span class="row-status"><span class="dot"></span>Schläft, wird um 01:30 geweckt</span></a>
+      <a class="foot-link" href="#/settings">Einstellungen</a>
+    </div></div>`;
+}
+
+/* ---------------------------------------------------------------- this PC */
+function viewSelf() {
+  const pc = PCS.arbeitsrechner;
+  const back = '<a class="back" href="#/">Alle PCs</a>';
+  let top;
+  if (state.run) {
+    top = runProgress();
+  } else {
+    const last = state.extraRuns[0];
+    top = `
+      <p class="lead">${last ? `Heute um ${last.time} gesichert.` : 'Heute um 01:42 gesichert.'}</p>
+      <p class="lead-text">Alles in Ordnung. Die nächste Sicherung startet in der Nacht zu Montag um 01:30. Ist der PC dann aus, wird sie beim nächsten Einschalten nachgeholt.</p>
+      <div class="actions">
+        <button class="btn primary" id="runNow">Jetzt sichern</button>
+        <a class="btn" href="#/restore/1">Dateien wiederherstellen</a>
+      </div>`;
+  }
+  return `${back}
+    <p class="kicker">Dieser PC</p>
+    <h1>${pc.name}</h1>
+    <div id="runArea" aria-live="polite">${top}</div>
+    <section class="section" aria-labelledby="h-hist">
+      <h2 id="h-hist">Letzte 14 Nächte</h2>
+      ${strip(pc)}
+      ${runRows('arbeitsrechner')}
+    </section>
+    <section class="section" aria-labelledby="h-facts">
+      <h2 id="h-facts">Über diesen PC</h2>
+      <dl class="facts">
+        <dt>Adresse</dt><dd>${pc.host}</dd>
+        <dt>Benutzer</dt><dd>${pc.user}</dd>
+        <dt>System</dt><dd>${pc.os}</dd>
+        <dt>Gesichert werden</dt><dd><span class="paths">${pc.sources.map(p => `<code>${p}</code>`).join('')}</span><span class="small muted">und eine Liste der installierten Programme, Dienste und Laufwerke</span></dd>
+        <dt>Auf dem Server</dt><dd>${pc.size}</dd>
+        <dt>Verschlüsselung</dt><dd>Eingeschaltet. Eine Kopie des Schlüssels hast du am ${pc.keyDate} gespeichert.</dd>
+      </dl>
+    </section>`;
+}
+
+const PHASES = [
+  { key: 'waking_pbs', title: 'Server wecken', sub: t => t < 100 ? `Server wird geweckt. Warte auf Antwort, ${fmtSec(Math.round(t * 0.4))}` : 'Server ist wach' },
+  { key: 'inventory', title: 'Liste der Programme und Laufwerke erstellen', sub: () => 'Paketlisten, Dienste, Laufwerke' },
+  { key: 'uploading', title: 'Geänderte Dateien hochladen', sub: (t, pct) => `${(pct * 0.021).toFixed(1).replace('.', ',')} GB von etwa 2,1 GB` },
+  { key: 'finishing', title: 'Abschließen', sub: () => 'Bericht an den Server senden' },
+];
+function fmtSec(s) { return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; }
+function runProgress() {
+  const r = state.run;
+  const steps = PHASES.map((p, i) => {
+    const cls = i < r.phase ? 'done' : i === r.phase ? 'now' : '';
+    let sub = '';
+    if (i === r.phase) sub = p.sub(r.t, r.pct);
+    if (i < r.phase && i === 0) sub = 'Server ist wach, nach 0:41';
+    const bar = i === 2 && i === r.phase ? `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${r.pct}" aria-label="Hochladen"><i style="width:${r.pct}%"></i></div>` : '';
+    return `<li class="step ${cls}"><span class="n" aria-hidden="true">${i + 1}</span><div>${p.title}${sub ? `<div class="sub">${sub}</div>` : ''}${bar}</div></li>`;
+  }).join('');
+  return `<p class="lead">Sicherung läuft.</p>
+    <p class="lead-text">Du kannst diese Seite schließen, die Sicherung läuft im Hintergrund weiter.</p>
+    <ol class="steps">${steps}</ol>
+    <div class="actions"><button class="btn" id="cancelRun">Sicherung abbrechen</button></div>`;
+}
+function startRun() {
+  state.run = { phase: 0, t: 0, pct: 0 };
+  const tick = () => {
+    const r = state.run; if (!r) return;
+    r.t += 10;
+    if (r.phase === 0 && r.t > 100) { r.phase = 1; r.t = 0; }
+    else if (r.phase === 1 && r.t > 30) { r.phase = 2; r.t = 0; }
+    else if (r.phase === 2) { r.pct = Math.min(100, r.pct + 7); if (r.pct >= 100) { r.phase = 3; r.t = 0; } }
+    else if (r.phase === 3 && r.t > 20) {
+      clearInterval(r.timer); state.run = null;
+      state.extraRuns.unshift({ time: '19:31', dur: '6 Min.', up: '2,1 GB' });
+    }
+    refresh();
+  };
+  state.run.timer = setInterval(tick, 450);
+  refresh();
+}
+
+/* ---------------------------------------------------------------- other PCs (read only) */
+function viewOther(id) {
+  const pc = PCS[id], h = health(id);
+  const iLast = lastIndex(pc, 'olxs'), iOk = lastIndex(pc, 'ol');
+  const dOk = NIGHTS[iOk];
+  let lead, text;
+  if (h === 'failing') {
+    lead = `Die Sicherung am ${long(NIGHTS[iLast])}, ist fehlgeschlagen.`;
+    text = `Der Ordner <code>/mnt/fotos</code> war nicht eingehängt. Seitdem war der PC zur Sicherungszeit aus. Zuletzt erfolgreich gesichert: ${long(dOk)}, ${pc.times[iOk]}.`;
+  } else if (h === 'overdue') {
+    const nightsOff = 13 - iOk;
+    lead = `Seit ${nightsOff} Nächten nicht gesichert.`;
+    text = `Der ${pc.name} ist seit ${long(dOk)}, nicht mehr eingeschaltet worden. Sobald er wieder läuft, holt er die Sicherung von selbst nach.`;
+  } else {
+    const late = pc.nights.split('').filter(c => c === 'l').length;
+    lead = iOk === 13 ? `Heute um ${pc.times[13]} ${pc.nights[13] === 'l' ? 'nachgeholt' : 'gesichert'}.` : `Zuletzt gesichert am ${long(dOk)}.`;
+    const iFail = lastIndex(pc, 'x');
+    text = late > 0
+      ? `Um 01:30 ist dieser PC oft noch aus. Er holt die Sicherung dann am Morgen nach, so wie in ${late} der letzten 14 Nächte. Das ist in Ordnung.`
+      : iFail >= 0
+        ? `Am ${long(NIGHTS[iFail])}, ist eine Sicherung fehlgeschlagen. Seitdem läuft sie wieder jede Nacht.`
+        : 'Jede Nacht gesichert, in der der Backup-Server erreichbar war.';
+  }
+  const keyBlock = pc.key ? '' : `
+    <div class="keynote">
+      <h3><span class="dot warn"></span>Vom Schlüssel gibt es keine Kopie</h3>
+      <p>Die Sicherungen dieses PCs sind verschlüsselt, und der Schlüssel liegt nur auf dem PC selbst. Geht der ${pc.name} kaputt, lassen sich seine Sicherungen nicht mehr öffnen.</p>
+      <p>Das lässt sich nur am ${pc.name} selbst beheben, zum Beispiel mit diesem Befehl im Terminal:</p>
+      <div class="cmd"><code>sudo nestegg key paperkey</code><button class="btn" data-copy="sudo nestegg key paperkey">Befehl kopieren</button></div>
+    </div>`;
+  return `<a class="back" href="#/">Alle PCs</a>
+    <p class="kicker">Nur zur Ansicht, wird am PC selbst verwaltet</p>
+    <h1>${pc.name}</h1>
+    <p class="lead">${lead}</p>
+    <p class="lead-text">${text}</p>
+    ${keyBlock}
+    <section class="section" aria-labelledby="h-hist">
+      <h2 id="h-hist">Letzte 14 Nächte</h2>
+      ${strip(pc)}
+      ${runRows(id)}
+    </section>
+    <section class="section" aria-labelledby="h-facts">
+      <h2 id="h-facts">Was der Server über diesen PC weiß</h2>
+      <dl class="facts">
+        <dt>Adresse</dt><dd>${pc.host}</dd>
+        <dt>Benutzer</dt><dd>${pc.user}</dd>
+        <dt>System</dt><dd>${pc.os}</dd>
+        <dt>Gesichert werden</dt><dd><span class="paths">${pc.sources.map(p => `<code>${p}</code>`).join('')}</span></dd>
+        <dt>Auf dem Server</dt><dd>${pc.size}</dd>
+        <dt>Kopie des Schlüssels</dt><dd>${pc.key ? 'Ja' : '<span class="status-word"><span class="dot warn"></span>Nein</span>'}</dd>
+        <dt>Stand</dt><dd>Vom Server gelesen ${REPORTED_AT}</dd>
+      </dl>
+    </section>`;
+}
+
+/* ---------------------------------------------------------------- server */
+function viewServer() {
+  const wake = NIGHTS.map((d, i) => ({ d, i })).reverse().slice(0, 8).map(({ d, i }) => {
+    const bad = i === 6;
+    return `<li class="run"><span class="when">${short(d)}</span><span class="time">01:30</span>
+      <span class="what"><span class="dot ${bad ? 'pbs' : ''}"></span>${bad ? 'Nicht aufgewacht, kein PC wurde gesichert' : 'Aufgewacht'}</span>
+      <span class="extra">${bad ? '5 Minuten gewartet' : `nach 0:${String(38 + (i * 5) % 14)}`}</span></li>`;
+  }).join('');
+  return `<a class="back" href="#/">Alle PCs</a>
+    <p class="kicker">${SERVER.addr}</p>
+    <h1>Backup-Server</h1>
+    <p class="lead">Schläft. Wird in der Nacht zu Montag um 01:30 geweckt.</p>
+    <p class="lead-text">Der Server ist nur nachts und beim Nachholen wach. Dass er jetzt nicht antwortet, ist normal.</p>
+    <section class="section" aria-labelledby="h-space">
+      <h2 id="h-space">Speicherplatz</h2>
+      <p>${SERVER.used} % belegt, ${SERVER.free} frei</p>
+      <div class="meter" role="img" aria-label="${SERVER.used} Prozent belegt"><i style="width:${SERVER.used}%"></i></div>
+    </section>
+    <section class="section" aria-labelledby="h-wake">
+      <h2 id="h-wake">Aufwecken in den letzten Nächten</h2>
+      <p class="muted">So hat der Server auf das Wecken durch diesen PC reagiert.</p>
+      <ul class="runs">${wake}</ul>
+    </section>
+    <section class="section" aria-labelledby="h-where">
+      <h2 id="h-where">Ablage</h2>
+      <dl class="facts">
+        <dt>Datastore</dt><dd>${SERVER.datastore}</dd>
+        <dt>Namespace</dt><dd>${SERVER.ns}</dd>
+        <dt>Aufbewahrung</dt><dd>7 tägliche, 4 wöchentliche und 6 monatliche Sicherungen je PC. Wird auf dem Server eingestellt.</dd>
+      </dl>
+    </section>`;
+}
+
+/* ---------------------------------------------------------------- settings (read only) */
+function viewSettings() {
+  const c = state.check;
+  const checkOut = !c ? '' : c === 'busy'
+    ? '<p class="hint" role="status">Verbindung wird geprüft …</p>'
+    : `<p class="hint" role="status">${c}</p>`;
+  return `<div class="topline"><a href="#/">Zurück</a></div>
+    <h1>Einstellungen</h1>
+    <p class="lead-text">So ist nestegg auf diesem PC eingerichtet. Ändern lässt sich das im Terminal mit <code>sudo nestegg init</code> oder in der Datei <code>/etc/nestegg/config.toml</code>.</p>
+    <div class="actions"><button class="btn primary" id="check"${c === 'busy' ? ' disabled' : ''}>Verbindung prüfen</button></div>
+    <div aria-live="polite">${checkOut}</div>
+
+    <section class="section" aria-labelledby="s1"><h2 id="s1">Backup-Server</h2>
+      <dl class="facts">
+        <dt>Adresse</dt><dd>${SERVER.addr}</dd>
+        <dt>Datastore</dt><dd>${SERVER.datastore}</dd>
+        <dt>Namespace</dt><dd>${SERVER.ns}</dd>
+        <dt>Zugang</dt><dd>API-Token <code>backup@pbs!desktop</code>, verschlüsselt auf diesem PC gespeichert</dd>
+        <dt>Name auf dem Server</dt><dd><code>desktop</code></dd>
+      </dl></section>
+
+    <section class="section" aria-labelledby="s2"><h2 id="s2">Server aufwecken</h2>
+      <dl class="facts">
+        <dt>Wake-on-LAN</dt><dd>Eingeschaltet</dd>
+        <dt>MAC-Adresse</dt><dd>${SERVER.mac}</dd>
+        <dt>Höchstens warten</dt><dd>5 Minuten, danach gilt die Nacht als „Server nicht erreichbar“</dd>
+      </dl></section>
+
+    <section class="section" aria-labelledby="s3"><h2 id="s3">Wann gesichert wird</h2>
+      <dl class="facts">
+        <dt>Zeitfenster</dt><dd>Jede Nacht ab 01:30, spätestens bis 05:00</dd>
+        <dt>Nachholen</dt><dd>Ja. War der PC aus, wird die Sicherung beim nächsten Einschalten nachgeholt.</dd>
+        <dt>Überfällig nach</dt><dd>3 Tagen ohne erfolgreiche Sicherung</dd>
+        <dt>Aufbewahrung</dt><dd>7 tägliche, 4 wöchentliche, 6 monatliche. Wird auf dem Server eingestellt.</dd>
+      </dl></section>
+
+    <section class="section" aria-labelledby="s4"><h2 id="s4">Was gesichert wird</h2>
+      <dl class="facts">
+        <dt>Ordner</dt><dd><span class="paths"><code>/home</code><code>/etc</code><code>/root</code><code>/usr/local</code></span></dd>
+        <dt>Zusätzlich</dt><dd>Liste der installierten Programme, Dienste und Laufwerke, damit sich der PC nach einer Neuinstallation wieder einrichten lässt</dd>
+        <dt>Ausgenommen</dt><dd><span class="paths"><code>**/.cache</code><code>**/node_modules</code><code>**/.local/share/Trash</code></span></dd>
+        <dt>Verschlüsselung</dt><dd>Eingeschaltet. Kopie des Schlüssels gespeichert am 12. September 2026.</dd>
+      </dl></section>
+
+    <section class="section" aria-labelledby="s5"><h2 id="s5">Weiteren PC hinzufügen</h2>
+      <p class="notice">Auf dem neuen PC nestegg installieren und im Terminal diesen Befehl ausführen. Den Code erhältst du beim Einrichten auf dem Server; er gilt für einen PC.</p>
+      <div class="cmd"><code>sudo nestegg init --einladung &lt;EINLADUNGSCODE&gt;</code><button class="btn" data-copy="sudo nestegg init --einladung <EINLADUNGSCODE>">Befehl kopieren</button></div>
+      <p class="hint">Danach erscheint der PC hier in der Liste, sobald er seine erste Sicherung gemacht hat.</p>
+    </section>`;
+}
+function runCheck() {
+  state.check = 'busy'; refresh();
+  setTimeout(() => {
+    state.check = 'Der Server antwortet gerade nicht, er schläft. Wake-on-LAN ist eingerichtet, um 01:30 wird er geweckt. Zugang und Schlüssel auf diesem PC sind in Ordnung.';
+    refresh();
+  }, 1400);
+}
+
+/* ---------------------------------------------------------------- restore */
+const SNAPS = (() => {
+  const pc = PCS.arbeitsrechner, out = [];
+  for (let i = 13; i >= 0 && out.length < 7; i--) if ('ol'.includes(pc.nights[i])) out.push({ d: NIGHTS[i], t: pc.times[i], g: 'Letzte Tage' });
+  [[2026, 9, 31], [2026, 9, 24], [2026, 9, 17], [2026, 9, 10]].forEach(([y, m, d]) => out.push({ d: new Date(y, m, d), t: '01:41', g: 'Wöchentlich' }));
+  [[2026, 8, 30], [2026, 7, 31], [2026, 6, 31], [2026, 5, 30], [2026, 4, 31], [2026, 3, 30]].forEach(([y, m, d]) => out.push({ d: new Date(y, m, d), t: '01:43', g: 'Monatlich' }));
+  return out;
+})();
+
+/* file tree of the snapshot: [name, sizeGB, children?] */
+const TREE = {
+  '/home': { s: 380.2, c: ['/home/alice'] },
+  '/home/alice': { s: 380.2, c: ['/home/alice/Dokumente', '/home/alice/Bilder', '/home/alice/Musik', '/home/alice/Downloads', '/home/alice/.config'] },
+  '/home/alice/Dokumente': { s: 6.4, c: ['/home/alice/Dokumente/Steuer 2025', '/home/alice/Dokumente/Verträge', '/home/alice/Dokumente/Rezepte.odt', '/home/alice/Dokumente/Lebenslauf.pdf'] },
+  '/home/alice/Dokumente/Steuer 2025': { s: 0.31, c: ['/home/alice/Dokumente/Steuer 2025/Belege', '/home/alice/Dokumente/Steuer 2025/Erklärung.pdf'] },
+  '/home/alice/Dokumente/Steuer 2025/Belege': { s: 0.29 },
+  '/home/alice/Dokumente/Steuer 2025/Erklärung.pdf': { s: 0.02, f: 1 },
+  '/home/alice/Dokumente/Verträge': { s: 0.08 },
+  '/home/alice/Dokumente/Rezepte.odt': { s: 0.004, f: 1 },
+  '/home/alice/Dokumente/Lebenslauf.pdf': { s: 0.001, f: 1 },
+  '/home/alice/Bilder': { s: 214.0, c: ['/home/alice/Bilder/2026', '/home/alice/Bilder/2025', '/home/alice/Bilder/Familie'] },
+  '/home/alice/Bilder/2026': { s: 38.5, c: ['/home/alice/Bilder/2026/Urlaub Ostsee', '/home/alice/Bilder/2026/Garten'] },
+  '/home/alice/Bilder/2026/Urlaub Ostsee': { s: 2.1 },
+  '/home/alice/Bilder/2026/Garten': { s: 0.7 },
+  '/home/alice/Bilder/2025': { s: 61.0 },
+  '/home/alice/Bilder/Familie': { s: 114.5 },
+  '/home/alice/Musik': { s: 96.3 },
+  '/home/alice/Downloads': { s: 61.9 },
+  '/home/alice/.config': { s: 1.6 },
+  '/etc': { s: 0.02, c: ['/etc/fstab', '/etc/hosts', '/etc/ssh', '/etc/apt'] },
+  '/etc/fstab': { s: 0.000001, f: 1 }, '/etc/hosts': { s: 0.000001, f: 1 }, '/etc/ssh': { s: 0.0004 }, '/etc/apt': { s: 0.002 },
+  '/root': { s: 0.001 },
+  '/usr/local': { s: 0.4, c: ['/usr/local/bin', '/usr/local/share'] },
+  '/usr/local/bin': { s: 0.1 }, '/usr/local/share': { s: 0.3 },
+  'Inventar': { s: 0.003, label: 'Liste der Programme, Dienste und Laufwerke' },
+};
+const ROOTS = ['/home', '/etc', '/root', '/usr/local', 'Inventar'];
+const nameOf = p => TREE[p].label || (ROOTS.includes(p) ? p : p.split('/').pop());
+function fmtSize(gb) {
+  if (gb >= 1000) return (gb / 1000).toFixed(1).replace('.', ',') + ' TB';
+  if (gb >= 1) return (gb >= 10 ? Math.round(gb) : gb.toFixed(1).replace('.', ',')) + ' GB';
+  if (gb >= 0.001) return Math.max(1, Math.round(gb * 1000)) + ' MB';
+  return Math.max(1, Math.round(gb * 1e6)) + ' KB';
+}
+const parentSelected = p => [...state.restore.sel].some(s => s !== p && p.startsWith(s + '/'));
+function selTotal() {
+  const sel = [...state.restore.sel];
+  return sel.reduce((a, p) => a + TREE[p].s, 0);
+}
+
+function restoreFrame(step, body) {
+  const titles = ['Stand wählen', 'Dateien wählen', 'Zielordner festlegen'];
+  return `<div class="topline">${step ? '<a href="#/pc/arbeitsrechner">Abbrechen</a>' : '<span></span>'}<span class="who">Arbeitsrechner</span></div>
+    <h1>Dateien wiederherstellen</h1>
+    ${step ? `<p class="stepline">Schritt ${step} von 3: ${titles[step - 1]}</p>` : ''}
+    ${body}`;
+}
+
+function viewRestore1() {
+  const r = state.restore;
+  if (r.snap == null) r.snap = 0;
+  const older = r.snap >= 7 || state.olderSnaps;
+  const groups = ['Letzte Tage', 'Wöchentlich', 'Monatlich'].filter(g => older || g === 'Letzte Tage').map(g => {
+    const items = SNAPS.map((s, i) => ({ s, i })).filter(x => x.s.g === g).map(({ s, i }) => `
+      <label class="choice"><input type="radio" name="snap" value="${i}"${r.snap === i ? ' checked' : ''}>
+        <span>${long(s.d)} ${s.d.getFullYear()}</span><span class="side">${s.t}</span></label>`).join('');
+    return `<div class="choice-group"><h2>${g}</h2><div class="choices">${items}</div></div>`;
+  }).join('');
+  return restoreFrame(1, `
+    <p class="lead-text" style="margin-top:24px">Von welchem Tag sollen die Dateien stammen? Nimm den letzten Stand, an dem sie noch in Ordnung waren.</p>
+    <div style="margin-top:26px">${groups}</div>
+    ${older ? '' : '<p style="margin-top:14px"><button class="linkbtn" id="olderSnaps">Ältere Stände zeigen (10 weitere, bis April 2026)</button></p>'}
+    <div class="selbar"><span class="muted" id="snapSel">${long(SNAPS[r.snap].d)}</span><a class="btn primary" href="#/restore/2">Dateien dieses Stands anzeigen</a></div>`);
+}
+
+function nodeHtml(p, depth) {
+  const n = TREE[p], r = state.restore;
+  const hasKids = !!n.c, open = r.open.has(p);
+  const inherited = parentSelected(p);
+  const checked = inherited || r.sel.has(p);
+  const idp = 'n' + btoa(unescape(encodeURIComponent(p))).replace(/[^a-z0-9]/gi, '');
+  const twist = hasKids
+    ? `<button class="twist" data-toggle="${esc(p)}" aria-expanded="${open}" aria-label="${esc(nameOf(p))} ${open ? 'zuklappen' : 'aufklappen'}"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M3 1.5 7 5 3 8.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>`
+    : '<span></span>';
+  let html = `<li><div class="node${n.f ? '' : ' dir'}" style="padding-left:${depth * 22}px">
+    ${twist}<input type="checkbox" id="${idp}" data-sel="${esc(p)}"${checked ? ' checked' : ''}${inherited ? ' disabled' : ''}>
+    <label for="${idp}">${esc(nameOf(p))}</label><span class="size">${fmtSize(n.s)}</span></div>`;
+  if (hasKids && open) html += `<ul>${n.c.map(k => nodeHtml(k, depth + 1)).join('')}</ul>`;
+  return html + '</li>';
+}
+function treeHtml() {
+  const r = state.restore, q = r.q.trim().toLowerCase();
+  if (q) {
+    const hits = Object.keys(TREE).filter(p => nameOf(p).toLowerCase().includes(q));
+    if (!hits.length) return `<p class="empty">Nichts gefunden für „${esc(r.q)}“. In diesem Stand gibt es keine Datei und keinen Ordner mit diesem Namen.</p>`;
+    return `<ul class="tree" aria-label="Suchergebnisse">${hits.map(p => {
+      const idp = 'h' + btoa(unescape(encodeURIComponent(p))).replace(/[^a-z0-9]/gi, '');
+      const inherited = parentSelected(p);
+      return `<li><div class="node${TREE[p].f ? '' : ' dir'}"><span></span><input type="checkbox" id="${idp}" data-sel="${esc(p)}"${inherited || r.sel.has(p) ? ' checked' : ''}${inherited ? ' disabled' : ''}>
+        <label for="${idp}">${esc(nameOf(p))}<span class="hit-path">${esc(p)}</span></label><span class="size">${fmtSize(TREE[p].s)}</span></div></li>`;
+    }).join('')}</ul>`;
+  }
+  return `<ul class="tree" aria-label="Dateien im Stand">${ROOTS.map(p => nodeHtml(p, 0)).join('')}</ul>`;
+}
+function selSummary() {
+  const n = state.restore.sel.size;
+  return n ? `${n} ${n === 1 ? 'Element' : 'Elemente'} ausgewählt, zusammen ${fmtSize(selTotal())}` : 'Noch nichts ausgewählt';
+}
+function viewRestore2() {
+  const r = state.restore;
+  if (r.snap == null) r.snap = 0;
+  const s = SNAPS[r.snap];
+  return restoreFrame(2, `
+    <p class="lead-text" style="margin-top:24px">Stand vom ${long(s.d)} ${s.d.getFullYear()}, ${s.t}. <a class="linkbtn" href="#/restore/1">Anderen Stand wählen</a></p>
+    <div style="margin-top:26px">
+      <label class="field-label" for="q">Datei oder Ordner suchen</label>
+      <input class="input" id="q" type="search" autocomplete="off" placeholder="zum Beispiel Steuer" value="${esc(r.q)}">
+    </div>
+    <div id="tree">${treeHtml()}</div>
+    <div class="selbar"><span class="muted" id="selSum" aria-live="polite">${selSummary()}</span>
+      <a class="btn primary" id="toTarget" href="#/restore/3"${r.sel.size ? '' : ' aria-disabled="true" tabindex="-1" style="pointer-events:none;background:var(--bg2);color:var(--faint)"'}>Zielordner festlegen</a></div>`);
+}
+
+const EXISTING = ['Dokumente', 'Bilder', 'Musik', 'Downloads', 'nestegg-restore-2026-10-12'];
+function folderProblem(name) {
+  if (!name.trim()) return 'Bitte einen Namen für den neuen Ordner angeben.';
+  if (name.includes('/')) return 'Der Name darf keinen Schrägstrich enthalten.';
+  if (EXISTING.includes(name.trim())) return `Den Ordner /home/alice/${name.trim()} gibt es schon. nestegg schreibt nur in einen neuen Ordner, bitte einen anderen Namen wählen.`;
+  return '';
+}
+function viewRestore3() {
+  const r = state.restore;
+  if (!r.sel.size) { location.hash = '#/restore/2'; return ''; }
+  const s = SNAPS[r.snap];
+  if (!r.folder) r.folder = `nestegg-restore-${iso(s.d)}`;
+  const prob = folderProblem(r.folder);
+  return restoreFrame(3, `
+    <p class="lead-text" style="margin-top:24px">nestegg legt einen neuen Ordner an und schreibt nur dort hinein. Vorhandene Dateien werden nie überschrieben. Danach kannst du dir in Ruhe heraussuchen, was du brauchst.</p>
+    <div style="margin-top:28px">
+      <label class="field-label" for="folder">Name des neuen Ordners</label>
+      <div class="prefix"><code>/home/alice/</code><input class="input mono" id="folder" autocomplete="off" spellcheck="false" value="${esc(r.folder)}" aria-describedby="folderHint"></div>
+      <p class="hint${prob ? ' bad' : ''}" id="folderHint" aria-live="polite">${prob || 'Diesen Ordner gibt es noch nicht. Er gehört nachher dir (alice).'}</p>
+    </div>
+    <section class="summary" aria-labelledby="h-sum">
+      <h2 id="h-sum">Zusammenfassung</h2>
+      <dl class="facts">
+        <dt>Stand</dt><dd>${long(s.d)} ${s.d.getFullYear()}, ${s.t}</dd>
+        <dt>Auswahl</dt><dd><ul>${[...r.sel].map(p => `<li><code>${esc(TREE[p].label ? 'Liste der Programme, Dienste und Laufwerke' : p)}</code></li>`).join('')}</ul></dd>
+        <dt>Größe</dt><dd>${fmtSize(selTotal())}</dd>
+        <dt>Zielordner</dt><dd><code id="sumFolder">/home/alice/${esc(r.folder)}</code></dd>
+      </dl>
+    </section>
+    <div class="selbar"><a class="linkbtn" href="#/restore/2">Auswahl ändern</a>
+      <button class="btn primary" id="doRestore"${prob ? ' disabled' : ''}>In den neuen Ordner wiederherstellen</button></div>`);
+}
+function viewRestoreDone() {
+  const r = state.restore, d = r.done;
+  if (!d) { location.hash = '#/restore/1'; return ''; }
+  const target = `/home/alice/${esc(r.folder)}`;
+  const body = d.pct < 100
+    ? `<p class="lead">Dateien werden zurückgeholt.</p>
+       <div class="bar" role="progressbar" aria-label="Wiederherstellen" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${d.pct}"><i style="width:${d.pct}%"></i></div>
+       <p class="hint">${d.pct} %, Ziel <code>${target}</code></p>`
+    : `<p class="lead">Fertig. Die Dateien liegen jetzt in <code>${target}</code>.</p>
+       <p class="lead-text">${r.sel.size} ${r.sel.size === 1 ? 'Element' : 'Elemente'}, zusammen ${fmtSize(selTotal())}, Stand vom ${long(SNAPS[r.snap].d)}. An deinen übrigen Dateien wurde nichts verändert.</p>
+       <div class="actions"><a class="btn primary" href="#/pc/arbeitsrechner" id="finish">Zurück zum Arbeitsrechner</a></div>`;
+  return restoreFrame(0, `<div style="margin-top:26px" aria-live="polite">${body}</div>`);
+}
+function startRestore() {
+  state.restore.done = { pct: 0 };
+  location.hash = '#/restore/done';
+  const t = setInterval(() => {
+    const d = state.restore.done; if (!d) return clearInterval(t);
+    d.pct = Math.min(100, d.pct + 9);
+    if (d.pct >= 100) clearInterval(t);
+    refresh();
+  }, 250);
+}
+
+/* ---------------------------------------------------------------- router */
+function parse() {
+  const h = location.hash.replace(/^#\/?/, '');
+  const [a, b] = h.split('/');
+  if (a === 'pc' && PCS[b]) return { view: 'pc', id: b };
+  if (a === 'server') return { view: 'server' };
+  if (a === 'settings') return { view: 'settings' };
+  if (a === 'restore') return { view: 'restore', step: b || '1' };
+  return { view: 'home' };
+}
+let lastKey = '';
+function refresh(fromNav) {
+  const route = parse();
+  const focus = route.view === 'restore' || route.view === 'settings';
+  document.body.className = [focus ? 'focus' : '', route.view === 'home' ? 'r-list' : ''].join(' ').trim();
+  renderList(route);
+  let html = '';
+  if (route.view === 'home') html = viewSelf();
+  if (route.view === 'pc') html = route.id === 'arbeitsrechner' ? viewSelf() : viewOther(route.id);
+  if (route.view === 'server') html = viewServer();
+  if (route.view === 'settings') html = viewSettings();
+  if (route.view === 'restore') html = ({ '1': viewRestore1, '2': viewRestore2, '3': viewRestore3, done: viewRestoreDone }[route.step] || viewRestore1)();
+  if (!html) return;
+  // keep open <details> across live refreshes
+  const openDet = [...document.querySelectorAll('details.run[open] .when')].map(e => e.parentElement.textContent);
+  $('#main').innerHTML = `<div class="main-inner">${html}</div>`;
+  document.querySelectorAll('details.run').forEach(d => { if (openDet.includes(d.querySelector('summary').textContent)) d.open = true; });
+  document.title = { home: 'Arbeitsrechner', pc: PCS[route.id]?.name, server: 'Backup-Server', settings: 'Einstellungen', restore: 'Wiederherstellen' }[route.view] + ' – nestegg';
+  const key = location.hash;
+  if (fromNav && key !== lastKey) {
+    window.scrollTo(0, 0);
+    if (lastKey) $('#main').focus({ preventScroll: true });
+  }
+  lastKey = key;
+}
+window.addEventListener('hashchange', () => refresh(true));
+
+/* ---------------------------------------------------------------- events */
+document.addEventListener('click', e => {
+  const t = e.target.closest('button, a');
+  if (!t) return;
+  if (t.id === 'runNow') startRun();
+  if (t.id === 'cancelRun') { clearInterval(state.run.timer); state.run = null; refresh(); }
+  if (t.id === 'check') runCheck();
+  if (t.id === 'olderSnaps') { state.olderSnaps = true; refresh(); document.querySelector('input[name="snap"][value="7"]')?.focus(); }
+  if (t.id === 'doRestore') startRestore();
+  if (t.id === 'finish') { state.restore = { snap: null, sel: new Set(), open: new Set(['/home', '/home/alice']), q: '', folder: '', done: null }; }
+  if (t.dataset.copy) {
+    navigator.clipboard?.writeText(t.dataset.copy).catch(() => {});
+    const old = t.textContent; t.textContent = 'Kopiert';
+    setTimeout(() => { t.textContent = old; }, 1600);
+  }
+  if (t.dataset.more) {
+    const id = t.dataset.more;
+    state.showAll.has(id) ? state.showAll.delete(id) : state.showAll.add(id);
+    refresh();
+    $(`[data-more="${id}"]`)?.focus();
+  }
+  if (t.dataset.toggle) {
+    const p = t.dataset.toggle, o = state.restore.open;
+    o.has(p) ? o.delete(p) : o.add(p);
+    $('#tree').innerHTML = treeHtml();
+    $(`[data-toggle="${CSS.escape(p)}"]`)?.focus();
+  }
+});
+document.addEventListener('change', e => {
+  const t = e.target;
+  if (t.name === 'snap') {
+    state.restore.snap = +t.value; state.restore.folder = '';
+    $('#snapSel').textContent = long(SNAPS[+t.value].d);
+  }
+  if (t.dataset.sel) {
+    const p = t.dataset.sel, s = state.restore.sel;
+    if (t.checked) { s.add(p); [...s].forEach(x => { if (x.startsWith(p + '/')) s.delete(x); }); }
+    else s.delete(p);
+    const scrollY = window.scrollY;
+    refresh();
+    window.scrollTo(0, scrollY);
+    document.getElementById(t.id)?.focus();
+  }
+});
+document.addEventListener('input', e => {
+  const t = e.target;
+  if (t.id === 'q') { state.restore.q = t.value; $('#tree').innerHTML = treeHtml(); }
+  if (t.id === 'folder') {
+    state.restore.folder = t.value;
+    const prob = folderProblem(t.value), hint = $('#folderHint');
+    hint.textContent = prob || 'Diesen Ordner gibt es noch nicht. Er gehört nachher dir (alice).';
+    hint.classList.toggle('bad', !!prob);
+    $('#doRestore').disabled = !!prob;
+    $('#sumFolder').textContent = '/home/alice/' + t.value;
+  }
+});
+
+refresh(true);
+</script>
+</body>
+</html>
