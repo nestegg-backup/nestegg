@@ -382,6 +382,88 @@ fn status_works_with_read_only_lock_file_during_run() {
     assert_eq!(status["health"], "running");
 }
 
+#[test]
+fn promised_run_that_cannot_get_the_lock_is_recorded_as_cancelled() {
+    let env = Env::new();
+    let lock_file = fs::File::create(env.root().join("run/run.lock")).unwrap();
+    let _held = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive).unwrap();
+    let id = "20261108T120000Z-manual-abcd";
+    fs::write(
+        env.root().join("state/current.json"),
+        serde_json::json!({"id": id, "trigger": "manual", "state": "starting",
+                           "started_at": "2026-11-08T12:00:00Z"})
+        .to_string(),
+    )
+    .unwrap();
+    let out = env.run(&["run", "--trigger", "manual", "--run-id", id]);
+    assert_eq!(code(&out), 0);
+    let record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(env.root().join(format!("state/runs/{id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["state"], "cancelled");
+    assert_eq!(record["error"]["kind"], "already_running");
+    assert!(!env.root().join("state/current.json").exists());
+}
+
+#[test]
+fn confirmation_requires_exporting_the_current_key() {
+    let env = Env::new();
+    env.set_key_exported(false);
+    let key_cmd = |args: &[&str]| {
+        env.command(args)
+            .env("NESTEGG_ALLOW_NON_ROOT", "1")
+            .env_remove("SUDO_UID")
+            .output()
+            .unwrap()
+    };
+    let out = key_cmd(&["key", "confirm-exported"]);
+    assert_eq!(code(&out), 1, "confirm without export must fail");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not been exported"));
+    let export = env.root().join("exported-key.json");
+    assert_eq!(
+        code(&key_cmd(&["key", "export", export.to_str().unwrap()])),
+        0
+    );
+    assert_eq!(
+        fs::metadata(&export).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // Key replaced after the export: confirming must fail.
+    write_secret(&env.root().join("cred/encryption-key"), "{\"other\":2}");
+    assert_eq!(code(&key_cmd(&["key", "confirm-exported"])), 1);
+    // Export the new key, then confirm works and backups run.
+    let export2 = env.root().join("exported-key-2.json");
+    assert_eq!(
+        code(&key_cmd(&["key", "export", export2.to_str().unwrap()])),
+        0
+    );
+    assert_eq!(code(&key_cmd(&["key", "confirm-exported"])), 0);
+    assert_eq!(code(&env.run(&["run"])), 0);
+    // Export refuses to overwrite.
+    assert_eq!(
+        code(&key_cmd(&["key", "export", export2.to_str().unwrap()])),
+        1
+    );
+}
+
+#[test]
+fn restore_target_with_dotdot_is_rejected() {
+    let env = Env::new();
+    let out = env
+        .command(&[
+            "restore",
+            "host/test/2026-11-06T21:20:00Z",
+            "etc.pxar",
+            "/root/missing/../../tmp/x",
+        ])
+        .env("NESTEGG_ALLOW_NON_ROOT", "1")
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("'..'"));
+}
+
 // ---------------------------------------------------------------- daemon
 
 struct Daemon(Child);

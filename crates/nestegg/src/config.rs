@@ -331,8 +331,16 @@ impl Config {
             if !seen.insert(&source.archive) {
                 bail!("archive name '{}' is used twice", source.archive);
             }
-            if !source.path.is_absolute() {
-                bail!("source path {} must be absolute", source.path.display());
+            if !source.path.is_absolute()
+                || source
+                    .path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "source path {} must be absolute and must not contain '..'",
+                    source.path.display()
+                );
             }
         }
         if let Some(wake) = &self.wake {

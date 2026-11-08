@@ -90,26 +90,42 @@ pub fn parse_fstab(text: &str) -> Vec<FstabEntry> {
         .collect()
 }
 
-pub fn load() -> (Vec<Mount>, Vec<FstabEntry>) {
-    let read = |var: &str, default: &str| {
-        let path = std::env::var_os(var)
+/// Read the mount table and fstab. The mount table must be readable; a
+/// missing fstab counts as empty.
+pub fn load() -> anyhow::Result<(Vec<Mount>, Vec<FstabEntry>)> {
+    use anyhow::Context;
+    let path = |var: &str, default: &str| {
+        std::env::var_os(var)
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(default));
-        std::fs::read_to_string(path).unwrap_or_default()
+            .unwrap_or_else(|| PathBuf::from(default))
     };
-    (
-        parse_mountinfo(&read("NESTEGG_MOUNTINFO", "/proc/self/mountinfo")),
-        parse_fstab(&read("NESTEGG_FSTAB", "/etc/fstab")),
-    )
+    let mountinfo = path("NESTEGG_MOUNTINFO", "/proc/self/mountinfo");
+    let mounts = std::fs::read_to_string(&mountinfo)
+        .with_context(|| format!("cannot read mount table {}", mountinfo.display()))?;
+    let fstab_path = path("NESTEGG_FSTAB", "/etc/fstab");
+    let fstab = match std::fs::read_to_string(&fstab_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", fstab_path.display())),
+    };
+    Ok((parse_mountinfo(&mounts), parse_fstab(&fstab)))
 }
 
+/// A real mount at `point`. An autofs trigger alone does not count: the
+/// actual file system appears as a second mount on the same point.
 fn is_mounted(mounts: &[Mount], point: &Path) -> bool {
-    mounts.iter().any(|m| m.point == point)
+    mounts
+        .iter()
+        .any(|m| m.point == point && m.fstype != "autofs")
 }
 
-/// Check one source.
-/// - `require_mount`: the source itself must be a mount point.
-/// - every auto-mounted fstab entry at or below the source must be mounted.
+/// Check one source (pass the canonical path).
+/// - `require_mount`: the source itself must be a mounted file system.
+/// - every fstab file system at or above the source (except `/`) must be
+///   mounted, also `noauto` ones: otherwise the source is just a directory
+///   on the wrong disk.
+/// - auto-mounted fstab file systems below the source must be mounted;
+///   `noauto` ones only warn.
 /// - mounted data file systems below the source that are not `covered`
 ///   (another source or `include_dev`) produce a warning.
 pub fn check_source(
@@ -127,22 +143,27 @@ pub fn check_source(
         ));
     }
     for entry in fstab {
-        let at_or_below = entry.point == source || entry.point.starts_with(source);
-        if !at_or_below || source == Path::new("/") && entry.point != source {
+        if entry.point == Path::new("/") || is_mounted(mounts, &entry.point) {
             continue;
         }
-        if is_mounted(mounts, &entry.point) {
-            continue;
-        }
-        if entry.noauto {
+        let governs = source.starts_with(&entry.point);
+        let below = !governs && entry.point.starts_with(source);
+        if governs {
+            check.errors.push(format!(
+                "{} ({}) holds {} but is not mounted; refusing to back up the empty mount point",
+                entry.point.display(),
+                entry.fstype,
+                source.display()
+            ));
+        } else if below && entry.noauto {
             check.warnings.push(format!(
                 "{} ({}) is listed in /etc/fstab with noauto and is not mounted",
                 entry.point.display(),
                 entry.fstype
             ));
-        } else {
+        } else if below {
             check.errors.push(format!(
-                "{} ({}) is listed in /etc/fstab but not mounted; refusing to back up an empty mount point",
+                "{} ({}) is listed in /etc/fstab but not mounted; refusing to back up an incomplete source",
                 entry.point.display(),
                 entry.fstype
             ));
@@ -247,13 +268,59 @@ UUID=e none swap sw 0 0
     }
 
     #[test]
+    fn missing_parent_mount_fails_for_subdirectory_source() {
+        let c = check_source(
+            &p("/srv/data/Documents"),
+            false,
+            &[],
+            &parse_mountinfo(MOUNTINFO),
+            &parse_fstab(FSTAB),
+        );
+        assert_eq!(c.errors.len(), 1, "{c:?}");
+    }
+
+    #[test]
+    fn noauto_parent_of_source_fails() {
+        let c = check_source(
+            &p("/mnt/usb/backup"),
+            false,
+            &[],
+            &parse_mountinfo(MOUNTINFO),
+            &parse_fstab(FSTAB),
+        );
+        assert_eq!(c.errors.len(), 1, "{c:?}");
+    }
+
+    #[test]
+    fn autofs_placeholder_is_not_mounted() {
+        let info = "22 1 259:2 / / rw - ext4 /dev/sda1 rw\n30 22 0:40 / /srv/data rw - autofs systemd-1 rw\n";
+        let c = check_source(
+            &p("/srv/data"),
+            true,
+            &[],
+            &parse_mountinfo(info),
+            &parse_fstab(FSTAB),
+        );
+        assert_eq!(c.errors.len(), 2, "{c:?}");
+        let mounted = format!("{info}31 30 8:17 / /srv/data rw - xfs /dev/sdb1 rw\n");
+        let c = check_source(
+            &p("/srv/data"),
+            true,
+            &[],
+            &parse_mountinfo(&mounted),
+            &parse_fstab(FSTAB),
+        );
+        assert!(c.errors.is_empty(), "{c:?}");
+    }
+
+    #[test]
     fn require_mount_without_fstab() {
         let c = check_source(&p("/data"), true, &[], &parse_mountinfo(MOUNTINFO), &[]);
         assert_eq!(c.errors.len(), 1);
     }
 
     #[test]
-    fn noauto_only_warns_and_pseudo_fs_ignored() {
+    fn noauto_below_source_only_warns_and_pseudo_fs_ignored() {
         let c = check_source(
             &p("/mnt"),
             false,
@@ -270,7 +337,9 @@ UUID=e none swap sw 0 0
             &parse_mountinfo(MOUNTINFO),
             &parse_fstab(FSTAB),
         );
-        assert!(root.errors.is_empty(), "{root:?}");
+        // /srv/data (auto, below "/") is not mounted: the source is incomplete.
+        assert_eq!(root.errors.len(), 1, "{root:?}");
+        assert!(root.errors[0].contains("/srv/data"));
         assert!(
             root.warnings
                 .iter()

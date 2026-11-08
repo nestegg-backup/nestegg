@@ -59,6 +59,11 @@ impl RunLock {
             .write(true)
             .open(paths.lock_file())
             .with_context(|| format!("cannot open {}", paths.lock_file().display()))?;
+        // Group members probe the lock read-only; do not depend on the umask.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o644));
+        }
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
             Ok(lock) => Ok(Some(RunLock { _lock: lock })),
             Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
@@ -137,6 +142,25 @@ impl Reporter<'_> {
 pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     let Some(_lock) = RunLock::try_acquire(paths)? else {
         eprintln!("another backup run is in progress");
+        // A run promised by the daemon (pre-assigned ID) gets a final record
+        // so it does not stay "starting" forever. state.json belongs to the
+        // run holding the lock and is not touched.
+        if let Some(id) = options
+            .run_id
+            .as_deref()
+            .filter(|id| crate::state::is_valid_run_id(id))
+        {
+            let store = Store::new(paths);
+            let mut run = Run::new(options.trigger, Utc::now());
+            run.id = id.to_string();
+            run.error = Some(RunError {
+                kind: ErrorKind::AlreadyRunning,
+                message: "another backup run was already in progress".into(),
+            });
+            run.finish(RunState::Cancelled, Utc::now());
+            store.record_run_only(&run)?;
+            store.clear_current_if(id)?;
+        }
         return Ok(RunExit::AlreadyRunning);
     };
     let store = Store::new(paths);
@@ -243,7 +267,19 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
     }
 
     // 2. Sources.
-    let (mounts, fstab) = crate::mounts::load();
+    let (mounts, fstab) = match crate::mounts::load() {
+        Ok(t) => t,
+        Err(e) => {
+            rep.fail(
+                RunState::Failed,
+                RunError {
+                    kind: ErrorKind::Internal,
+                    message: format!("{e:#}"),
+                },
+            );
+            return Ok(());
+        }
+    };
     let mut covered: Vec<PathBuf> = config
         .backup
         .sources
@@ -251,11 +287,16 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         .map(|s| s.path.clone())
         .collect();
     covered.extend(config.backup.include_dev.iter().cloned());
+    let covered: Vec<PathBuf> = covered
+        .into_iter()
+        .map(|p| fs::canonicalize(&p).unwrap_or(p))
+        .collect();
     let mut archives = Vec::new();
     for source in &config.backup.sources {
         if source.path.exists() {
+            let canonical = fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone());
             let check = crate::mounts::check_source(
-                &source.path,
+                &canonical,
                 source.require_mount,
                 &covered,
                 &mounts,

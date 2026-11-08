@@ -37,7 +37,10 @@ on_client bash -c '
   echo "cache" > /home/alice/.cache/big/blob
   echo "dep" > /home/alice/project/node_modules/x/index.js
   chmod 640 /home/alice/Documents/report.txt
+  cp /bin/true /home/alice/Documents/tool-with-capability
   chown -R alice:alice /home/alice
+  # after chown: chown clears file capabilities
+  setcap cap_net_raw+ep /home/alice/Documents/tool-with-capability
 '
 
 echo "== setup with the nestegg CLI"
@@ -92,10 +95,16 @@ on_client bash -c 'echo keep > /root/victim && ln -s /root/victim /home/alice/ev
 check "export refuses a planted symlink" bash -c "! docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg key export /home/alice/evil-key.json >/dev/null 2>&1"
 check "symlink target untouched" bash -c "[[ \$(docker exec $client cat /root/victim) == keep ]]"
 as_sudo_alice nestegg key export /home/alice/key-copy.json >/dev/null
+check "confirm after export of the same key works" on_client nestegg key confirm-exported
 check "export as sudo user: owned by user, mode 600" bash -c "[[ \$(docker exec $client stat -c '%U %a' /home/alice/key-copy.json) == 'alice 600' ]]"
 check "export cannot write where the user may not" bash -c "! docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg key export /etc/nestegg-key.json >/dev/null 2>&1"
-as_sudo_alice nestegg restore "$snapshot" etc.pxar /home/alice/restore-etc >/dev/null 2>&1 || true
-check "restore into user dir runs as the user" bash -c "[[ \$(docker exec $client stat -c '%U' /home/alice/restore-etc/hostname 2>/dev/null) == alice ]]"
+check "restore into user dir succeeds (exit code)" as_sudo_alice nestegg restore "$snapshot" home.pxar /home/alice/restore-home
+check "user restore: full content matches" on_client diff -r /home/alice/Documents /home/alice/restore-home/alice/Documents
+check "user restore: files owned by the user" bash -c "[[ -z \$(docker exec $client find /home/alice/restore-home ! -user alice) ]]"
+check "user restore: capability not applied" bash -c "[[ -z \$(docker exec $client getcap /home/alice/restore-home/alice/Documents/tool-with-capability) ]]"
+check "root restore keeps the capability" bash -c "docker exec $client getcap /root/restore-home/alice/Documents/tool-with-capability | grep -q cap_net_raw"
+check "relative restore target is resolved" bash -c "docker exec -w /root $client nestegg restore $snapshot etc.pxar relative-restore >/dev/null 2>&1 && docker exec $client test -e /root/relative-restore/hostname"
+check "restore target with .. is refused" bash -c "! docker exec $client nestegg restore $snapshot etc.pxar /root/missing/../../tmp/x >/dev/null 2>&1"
 check "restore into /tmp without sudo user is refused" bash -c "! docker exec $client nestegg restore $snapshot etc.pxar /tmp/restore-etc >/dev/null 2>&1"
 
 on_client sed -i 's/^encryption = true/encryption = false/' /etc/nestegg/config.toml
@@ -108,6 +117,7 @@ on_client sed -i 's/^encryption = false/encryption = true/' /etc/nestegg/config.
 on_client nestegg key create --force --allow-plain >/dev/null
 check "new key blocks backups until exported" bash -c "! docker exec $client nestegg backup >/dev/null 2>&1"
 check "status shows key not exported" bash -c "docker exec $client nestegg status | grep -q 'KEY NOT EXPORTED'"
+check "confirm before exporting the new key is refused" bash -c "! docker exec $client nestegg key confirm-exported >/dev/null 2>&1"
 on_client nestegg key export /root/nestegg-key-2.json >/dev/null
 on_client nestegg key confirm-exported >/dev/null
 check "backup runs again after confirming the new key" on_client nestegg backup

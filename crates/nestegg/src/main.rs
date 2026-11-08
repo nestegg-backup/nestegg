@@ -91,6 +91,12 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Internal: create a new 0600 file from stdin (runs as the sudo user).
+    #[command(name = "__write-new-file", hide = true)]
+    WriteNewFile { path: PathBuf },
+    /// Internal: print a file (runs as the sudo user).
+    #[command(name = "__read-file", hide = true)]
+    ReadFile { path: PathBuf },
     /// Run the local API daemon (used by nestegg.service).
     #[command(hide = true)]
     Daemon,
@@ -257,6 +263,18 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
                 force: force || !matches!(trigger, TriggerArg::Timer),
             };
             Ok(execute(paths, &options)?.code() as u8)
+        }
+        Cmd::WriteNewFile { path } => {
+            let mut data = Vec::new();
+            std::io::stdin().read_to_end(&mut data)?;
+            secrets::create_new_private_file(&path, &data)?;
+            Ok(0)
+        }
+        Cmd::ReadFile { path } => {
+            let data =
+                std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+            std::io::stdout().write_all(&data)?;
+            Ok(0)
         }
         Cmd::Daemon => {
             let rt = tokio::runtime::Runtime::new()?;
@@ -449,7 +467,10 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
     // Key changes and backup runs exclude each other (same lock), so a run
     // never sees a half-replaced key or overwrites the key state.
     let _lock = match &cmd {
-        KeyCmd::Create { .. } | KeyCmd::ConfirmExported => Some(
+        KeyCmd::Create { .. }
+        | KeyCmd::ConfirmExported
+        | KeyCmd::Export { .. }
+        | KeyCmd::Paperkey { .. } => Some(
             nestegg::run::RunLock::try_acquire(paths)?
                 .context("a backup is running; try again when it has finished")?,
         ),
@@ -495,6 +516,7 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             println!("Then confirm:  sudo nestegg key confirm-exported");
         }
         KeyCmd::Paperkey { format, output } => {
+            let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;
             let tmp = temp_key(paths)?;
             let fmt = match format {
                 PaperFormat::Text => "text",
@@ -511,10 +533,12 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                 }
                 None => std::io::stdout().write_all(&data)?,
             }
+            record_export(&store, &key)?;
         }
         KeyCmd::Export { file } => {
             let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;
             write_user_file(&file, key.as_bytes())?;
+            record_export(&store, &key)?;
             println!(
                 "Key written to {}. Move it to a safe place outside this computer.",
                 file.display()
@@ -524,9 +548,15 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             if !secrets_store.exists(secrets::ENCRYPTION_KEY) {
                 bail!("no encryption key exists yet");
             }
-            // Bind the confirmation to the key that is stored right now.
+            // Only confirm the key that was actually written out.
             let digest = secrets::digest(&secrets_store.load(secrets::ENCRYPTION_KEY)?);
             let mut state = store.load_state()?;
+            if state.key_last_exported_digest.as_deref() != Some(digest.as_str()) {
+                bail!(
+                    "the current key has not been exported yet; run `nestegg key paperkey` or \
+                     `nestegg key export <file>` first"
+                );
+            }
             state.key_digest = Some(digest.clone());
             state.key_exported_digest = Some(digest);
             store.save_state(&state)?;
@@ -555,22 +585,20 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
     Ok(0)
 }
 
-/// The account that invoked sudo, if any.
-fn sudo_user() -> Option<(u32, u32)> {
-    let uid = std::env::var("SUDO_UID").ok()?.parse().ok()?;
-    let gid = std::env::var("SUDO_GID").ok()?.parse().ok()?;
-    (uid != 0).then_some((uid, gid))
+/// Remember which key was exported (paper key or file), under the run lock.
+fn record_export(store: &Store, key: &Secret) -> Result<()> {
+    let mut state = store.load_state()?;
+    state.key_last_exported_digest = Some(secrets::digest(key));
+    store.save_state(&state)
 }
 
-/// Create a new mode-0600 file at a user-chosen path. When called through
-/// sudo, the file is created with the invoking user's identity, so the
-/// kernel applies that user's permissions and the file is owned by them;
-/// it never follows a symlink and never replaces an existing file.
+/// Create a new mode-0600 file at a user-chosen path. Through sudo, a
+/// helper process with the invoking user's identity creates it, so the
+/// kernel applies that user's permissions and the file belongs to them. It
+/// never follows a symlink and never replaces an existing file.
 fn write_user_file(path: &Path, data: &[u8]) -> Result<()> {
-    match sudo_user() {
-        Some((uid, gid)) if is_root() => {
-            secrets::as_user(uid, gid, || secrets::create_new_private_file(path, data))
-        }
+    match nestegg::identity::UserIdentity::from_sudo()? {
+        Some(user) if is_root() => nestegg::identity::write_new_file_as(&user, path, data),
         _ => secrets::create_new_private_file(path, data),
     }
 }
@@ -878,20 +906,35 @@ fn history(paths: &Paths, limit: usize, json: bool) -> Result<u8> {
 /// True if `target`'s existing ancestors are real directories that only
 /// root can modify. Then writing there as root cannot be redirected by
 /// another user (no symlink swaps, no renames).
-fn root_controlled_parent(target: &Path) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
+/// Absolute form of a restore target. `..` is rejected anywhere, so the
+/// path that is checked is exactly the path the client uses.
+fn absolute_target(target: &Path) -> Result<PathBuf> {
+    if target
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("the restore target must not contain '..'");
+    }
     let absolute = if target.is_absolute() {
         target.to_path_buf()
     } else {
         std::env::current_dir()?.join(target)
     };
+    if absolute.parent().is_none() {
+        bail!("invalid restore target");
+    }
+    Ok(absolute)
+}
+
+fn root_controlled_parent(absolute: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
     let mut current = PathBuf::from("/");
     let parent = absolute.parent().unwrap_or(Path::new("/"));
     for component in parent.components() {
-        if let std::path::Component::Normal(name) = component {
-            current.push(name);
-        } else if let std::path::Component::ParentDir = component {
-            return Ok(false);
+        match component {
+            std::path::Component::Normal(name) => current.push(name),
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            _ => return Ok(false),
         }
         let meta = match std::fs::symlink_metadata(&current) {
             Ok(m) => m,
@@ -915,6 +958,7 @@ fn restore(
     no_key: bool,
 ) -> Result<u8> {
     require_root("restore")?;
+    let target = &absolute_target(target)?;
     if std::fs::symlink_metadata(target).is_ok() {
         bail!(
             "{} already exists; restores only go into a new directory",
@@ -924,18 +968,17 @@ fn restore(
     // Writing as root into a directory another user controls could be
     // redirected (symlink swap during the restore). In that case restore
     // with the invoking user's identity instead.
+    let sudo = nestegg::identity::UserIdentity::from_sudo()?;
     let run_as = if root_controlled_parent(target)? {
         None
-    } else if let Some((uid, gid)) = sudo_user() {
-        let home = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))?
-            .map(|u| u.dir)
-            .unwrap_or_else(|| PathBuf::from("/"));
+    } else if let Some(user) = sudo.clone() {
         eprintln!(
-            "note: {} is not in a root-controlled directory; restoring with your user's \
-             permissions (files will be owned by you)",
+            "note: {} is not in a root-controlled directory; the files are restored \
+             into a private staging directory first and then copied with your user's \
+             permissions (owned by you; ACLs, xattrs and capabilities are dropped)",
             target.display()
         );
-        Some(client::RunAs { uid, gid, home })
+        Some(user)
     } else {
         bail!(
             "{} is inside a directory that other users can modify. Restore into a \
@@ -946,8 +989,8 @@ fn restore(
     let key = if no_key {
         client::RestoreKey::Without
     } else if let Some(path) = keyfile {
-        let bytes = match sudo_user() {
-            Some((uid, gid)) => secrets::as_user(uid, gid, || Ok(std::fs::read(path)?))?,
+        let bytes = match &sudo {
+            Some(user) => nestegg::identity::read_file_as(user, path)?,
             None => std::fs::read(path)?,
         };
         client::RestoreKey::File(Secret::new(bytes))
@@ -957,17 +1000,39 @@ fn restore(
     let cfg = Config::load(&paths.config_file)?;
     let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
     let mut stderr = std::io::stderr();
-    client.restore(
-        &client::RestoreRequest {
-            snapshot,
-            archive,
-            target,
-            patterns,
-            key,
-            run_as,
-        },
-        &mut stderr,
-    )?;
+    match run_as {
+        None => client.restore(
+            &client::RestoreRequest {
+                snapshot,
+                archive,
+                target,
+                patterns,
+                key,
+            },
+            &mut stderr,
+        )?,
+        Some(user) => {
+            // Root restores into a directory only root can reach, then the
+            // tree is copied into the user's target with the user's identity.
+            let staging_root = paths.state_dir.join("restore-staging");
+            secrets::create_private_dir(&staging_root)?;
+            let staging = staging_root.join(format!("{:016x}", rand::random::<u64>()));
+            let result = client
+                .restore(
+                    &client::RestoreRequest {
+                        snapshot,
+                        archive,
+                        target: &staging,
+                        patterns,
+                        key,
+                    },
+                    &mut stderr,
+                )
+                .and_then(|()| nestegg::identity::copy_tree_as(&user, &staging, target));
+            let _ = std::fs::remove_dir_all(&staging);
+            result?;
+        }
+    }
     println!("Restored into {}", target.display());
     Ok(0)
 }

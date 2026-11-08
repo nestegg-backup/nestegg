@@ -242,19 +242,12 @@ pub enum RestoreKey {
     Without,
 }
 
-pub struct RunAs {
-    pub uid: u32,
-    pub gid: u32,
-    pub home: PathBuf,
-}
-
 pub struct RestoreRequest<'a> {
     pub snapshot: &'a str,
     pub archive: &'a str,
     pub target: &'a Path,
     pub patterns: &'a [String],
     pub key: RestoreKey,
-    pub run_as: Option<RunAs>,
 }
 
 /// Find the crypt mode of `archive` (e.g. `home.pxar`) in the JSON of
@@ -442,8 +435,7 @@ impl<'a> Client<'a> {
     ///
     /// The key is only passed when the archive is signed or encrypted (or
     /// an explicit key is given); passing a key for an unsigned archive makes
-    /// the client reject it. With `run_as`, the client runs with that user's
-    /// identity, so every file is written with the user's permissions.
+    /// the client reject it.
     pub fn restore(&self, request: &RestoreRequest<'_>, log: &mut dyn Write) -> Result<()> {
         let key = match &request.key {
             RestoreKey::Without => None,
@@ -473,26 +465,11 @@ impl<'a> Client<'a> {
         if let Some(key) = &key {
             fds.add(key, KEY_FD)?;
             cmd.args(["--keyfd", &KEY_FD.to_string()]);
+        } else {
+            // Without this the client falls back to its own default key.
+            cmd.args(["--crypt-mode", "none"]);
         }
         self.add_namespace(&mut cmd);
-        if let Some(user) = &request.run_as {
-            use std::os::unix::process::CommandExt;
-            // An unprivileged restore cannot set foreign owners, ACLs,
-            // privileged xattrs or device nodes; skip those instead of
-            // aborting.
-            cmd.args([
-                "--ignore-ownership",
-                "true",
-                "--ignore-acls",
-                "true",
-                "--ignore-xattrs",
-                "true",
-                "--ignore-extract-device-errors",
-                "true",
-            ]);
-            cmd.uid(user.uid).gid(user.gid).env("HOME", &user.home);
-            cmd.current_dir("/");
-        }
         fds.apply(&mut cmd);
         let (status, tail) = run_streaming(&mut cmd, log, |_| {})?;
         if !status.success() {

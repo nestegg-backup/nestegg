@@ -157,6 +157,10 @@ pub struct State {
     /// invalidates the confirmation automatically.
     #[serde(default)]
     pub key_exported_digest: Option<String>,
+    /// SHA-256 of the key that `key export` / `key paperkey` last wrote out.
+    /// `key confirm-exported` only accepts the current key if it matches.
+    #[serde(default)]
+    pub key_last_exported_digest: Option<String>,
 }
 
 impl State {
@@ -258,6 +262,23 @@ impl Store {
 
     pub fn save_current(&self, run: &Run) -> Result<()> {
         write_json_atomic(&self.paths.current_run_file(), run)
+    }
+
+    /// Remove `current.json` only if it still describes run `id` (another
+    /// run may have replaced it in the meantime).
+    pub fn clear_current_if(&self, id: &str) -> Result<()> {
+        match self.load_current() {
+            Ok(Some(run)) if run.id == id => self.clear_current(),
+            _ => Ok(()),
+        }
+    }
+
+    /// Write a run record without touching `state.json` (for runs that
+    /// never got the run lock).
+    pub fn record_run_only(&self, run: &Run) -> Result<()> {
+        let dir = self.paths.runs_dir();
+        fs::create_dir_all(&dir)?;
+        write_json_atomic(&dir.join(format!("{}.json", run.id)), run)
     }
 
     pub fn clear_current(&self) -> Result<()> {

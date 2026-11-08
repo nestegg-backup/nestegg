@@ -180,7 +180,7 @@ async fn start_run(AxState(app): AxState<App>) -> ApiResult<(StatusCode, Json<Ru
         let store = Store::new(&app.paths);
         store.save_current(&run)?;
         if let Err(e) = spawn_run(&run.id) {
-            let _ = store.clear_current();
+            let _ = store.clear_current_if(&run.id);
             return Err(e);
         }
         Ok(Ok(run))

@@ -232,27 +232,6 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Run `f` with the effective user, group and supplementary groups of
-/// another account, so the kernel applies that user's permissions to every
-/// path lookup (no symlink or ownership tricks against root). Only call from
-/// single-threaded code (the CLI), because credentials are per thread.
-pub fn as_user<T>(uid: u32, gid: u32, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    use nix::unistd::{Gid, Uid, getgroups, setegid, seteuid, setgroups};
-    let saved_groups = getgroups()?;
-    setgroups(&[Gid::from_raw(gid)]).context("setgroups")?;
-    setegid(Gid::from_raw(gid)).context("setegid")?;
-    if let Err(e) = seteuid(Uid::from_raw(uid)) {
-        let _ = setegid(Gid::from_raw(0));
-        let _ = setgroups(&saved_groups);
-        return Err(e).context("seteuid");
-    }
-    let result = f();
-    seteuid(Uid::from_raw(0)).context("cannot restore root privileges")?;
-    setegid(Gid::from_raw(0)).context("cannot restore root group")?;
-    setgroups(&saved_groups).context("cannot restore groups")?;
-    result
-}
-
 /// SHA-256 of a secret, used to bind "key exported" to one specific key.
 pub fn digest(secret: &Secret) -> String {
     use sha2::{Digest, Sha256};
