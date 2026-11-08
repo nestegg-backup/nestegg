@@ -223,10 +223,12 @@ pub fn copy_tree_as(user: &UserIdentity, source: &Path, target: &Path) -> Result
                 String::from_utf8_lossy(&unpacked.stderr).trim()
             );
             if !pack_status.success() && !pack_stderr.is_empty() {
-                msg.push_str(&format!(
-                    "; packing reported: {}",
-                    String::from_utf8_lossy(&pack_stderr).trim()
-                ));
+                // Last lines only: the packer may have printed thousands of
+                // harmless warnings before it was stopped.
+                let text = String::from_utf8_lossy(&pack_stderr);
+                let lines: Vec<&str> = text.lines().collect();
+                let tail = lines[lines.len().saturating_sub(5)..].join("; ");
+                msg.push_str(&format!("; packing reported: {tail}"));
             }
             bail!(msg);
         }

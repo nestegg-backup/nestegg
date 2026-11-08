@@ -23,17 +23,39 @@ pub struct StagingDir {
 impl StagingDir {
     /// Create a fresh staging directory below `root` (created with mode 0700).
     pub fn create(root: &Path) -> Result<StagingDir> {
+        use std::os::unix::fs::MetadataExt;
         crate::secrets::create_private_dir(root)?;
-        let id = format!("{:016x}", rand::random::<u64>());
-        let lock_path = root.join(format!("{id}.lock"));
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .with_context(|| format!("cannot create {}", lock_path.display()))?;
-        let lock = Flock::lock(file, FlockArg::LockExclusive)
-            .map_err(|(_, e)| e)
-            .context("cannot lock staging directory")?;
+        for _ in 0..10 {
+            let id = format!("{:016x}", rand::random::<u64>());
+            let lock_path = root.join(format!("{id}.lock"));
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+                .with_context(|| format!("cannot create {}", lock_path.display()))?;
+            let lock = Flock::lock(file, FlockArg::LockExclusive)
+                .map_err(|(_, e)| e)
+                .context("cannot lock staging directory")?;
+            // A concurrent cleanup may have removed the lock file between
+            // creating and locking it; then the lock protects nothing.
+            let held = lock.metadata()?;
+            let still_there = fs::metadata(&lock_path)
+                .map(|m| m.dev() == held.dev() && m.ino() == held.ino())
+                .unwrap_or(false);
+            if !still_there {
+                continue;
+            }
+            return Self::finish(root, id, lock_path, lock);
+        }
+        anyhow::bail!("could not create a staging directory (lock file kept disappearing)")
+    }
+
+    fn finish(
+        root: &Path,
+        id: String,
+        lock_path: PathBuf,
+        lock: Flock<File>,
+    ) -> Result<StagingDir> {
         let dir = root.join(&id);
         fs::create_dir(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
@@ -138,36 +160,85 @@ pub fn cleanup_stale(root: &Path) -> Vec<String> {
 }
 
 /// Remove a directory tree that belongs to the caller, also if it contains
-/// read-only directories: directories get `u+rwx` before they are emptied.
-/// Symlinks are removed, never followed; other file systems are not entered.
+/// read-only directories: directories get `u+rwx` (only if missing) before
+/// they are emptied. Symlinks are removed, never followed; other file
+/// systems are not entered. Iterative (no descriptor per level). Continues
+/// after errors and reports the first one.
 pub fn remove_tree(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let meta =
+    let top =
         fs::symlink_metadata(path).with_context(|| format!("cannot stat {}", path.display()))?;
-    remove_tree_inner(path, meta.dev())
-}
-
-fn remove_tree_inner(path: &Path, dev: u64) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.is_dir() {
+    if !top.is_dir() {
         return fs::remove_file(path).with_context(|| format!("cannot remove {}", path.display()));
     }
-    if meta.dev() != dev {
-        anyhow::bail!(
-            "{} is on another file system; not removing it",
-            path.display()
-        );
+    let dev = top.dev();
+    let mut first_error: Option<anyhow::Error> = None;
+    let mut note = |e: anyhow::Error| {
+        if first_error.is_none() {
+            first_error = Some(e);
+        }
+    };
+    // Directories in discovery order; removed in reverse order afterwards.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let meta = match fs::symlink_metadata(&dir) {
+            Ok(m) => m,
+            Err(e) => {
+                note(anyhow::Error::new(e).context(format!("cannot stat {}", dir.display())));
+                continue;
+            }
+        };
+        if meta.dev() != dev {
+            note(anyhow::anyhow!(
+                "{} is on another file system; not removing it",
+                dir.display()
+            ));
+            continue;
+        }
+        if meta.mode() & 0o700 != 0o700
+            && let Err(e) = fs::set_permissions(
+                &dir,
+                fs::Permissions::from_mode((meta.mode() & 0o7777) | 0o700),
+            )
+        {
+            note(anyhow::Error::new(e).context(format!("cannot make {} writable", dir.display())));
+            continue;
+        }
+        let entries: Vec<PathBuf> = match fs::read_dir(&dir) {
+            Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+            Err(e) => {
+                note(anyhow::Error::new(e).context(format!("cannot read {}", dir.display())));
+                continue;
+            }
+        };
+        dirs.push(dir);
+        for entry in entries {
+            match fs::symlink_metadata(&entry) {
+                Ok(m) if m.is_dir() => stack.push(entry),
+                Ok(_) => {
+                    if let Err(e) = fs::remove_file(&entry) {
+                        note(
+                            anyhow::Error::new(e)
+                                .context(format!("cannot remove {}", entry.display())),
+                        );
+                    }
+                }
+                Err(e) => {
+                    note(anyhow::Error::new(e).context(format!("cannot stat {}", entry.display())))
+                }
+            }
+        }
     }
-    fs::set_permissions(
-        path,
-        fs::Permissions::from_mode((meta.mode() & 0o7777) | 0o700),
-    )
-    .with_context(|| format!("cannot make {} writable", path.display()))?;
-    for entry in fs::read_dir(path)? {
-        remove_tree_inner(&entry?.path(), dev)?;
+    for dir in dirs.iter().rev() {
+        if let Err(e) = fs::remove_dir(dir) {
+            note(anyhow::Error::new(e).context(format!("cannot remove {}", dir.display())));
+        }
     }
-    fs::remove_dir(path).with_context(|| format!("cannot remove {}", path.display()))
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +282,31 @@ mod tests {
             0,
             "lock files removed"
         );
+    }
+
+    #[test]
+    fn remove_tree_handles_deep_trees() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("deep");
+        let mut p = tree.clone();
+        for _ in 0..300 {
+            p.push("d");
+        }
+        fs::create_dir_all(&p).unwrap();
+        fs::write(p.join("f"), "x").unwrap();
+        remove_tree(&tree).unwrap();
+        assert!(!tree.exists());
+    }
+
+    #[test]
+    fn cleanup_does_not_remove_a_lock_that_is_held() {
+        let root = tempfile::tempdir().unwrap();
+        // Orphaned-looking lock file (no directory) that someone holds.
+        let lock_path = root.path().join("0123456789abcdef.lock");
+        let file = File::create(&lock_path).unwrap();
+        let _held = Flock::lock(file, FlockArg::LockExclusive).unwrap();
+        cleanup_stale(root.path());
+        assert!(lock_path.exists());
     }
 
     #[test]

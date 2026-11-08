@@ -1008,9 +1008,18 @@ fn free_bytes(path: &Path) -> Result<u64> {
     Ok(stat.blocks_available() as u64 * stat.fragment_size() as u64)
 }
 
-fn device_of(path: &Path) -> Result<u64> {
+/// Identity of the storage behind `path`. btrfs subvolumes and ZFS datasets
+/// have different device numbers but share one pool; they are recognised by
+/// identical totals and free space, and then treated as one.
+fn storage_of(path: &Path) -> Result<(u64, u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    Ok(std::fs::metadata(path)?.dev())
+    let dev = std::fs::metadata(path)?.dev();
+    let st = nix::sys::statvfs::statvfs(path)?;
+    Ok((dev, st.blocks() as u64, st.blocks_free() as u64))
+}
+
+fn same_storage(a: (u64, u64, u64), b: (u64, u64, u64)) -> bool {
+    a.0 == b.0 || (a.1 == b.1 && a.2 == b.2)
 }
 
 /// Nearest existing ancestor of `path`.
@@ -1052,8 +1061,14 @@ fn check_staging_space(
         }
     };
     let target_dir = existing_ancestor(target.parent().unwrap_or(Path::new("/")));
-    let staging_dev = device_of(staging_root)?;
-    let target_dev = device_of(&target_dir)?;
+    let staging_storage = storage_of(staging_root)?;
+    let target_storage = storage_of(&target_dir)?;
+    let staging_dev = staging_storage.0;
+    let target_dev = if same_storage(staging_storage, target_storage) {
+        staging_dev
+    } else {
+        target_storage.0
+    };
     for (dev, need) in space_requirements(size, staging_dev, target_dev) {
         let dir = if dev == staging_dev {
             staging_root
@@ -1089,6 +1104,26 @@ struct RestoreArgs<'a> {
     keyfile: Option<&'a Path>,
     no_key: bool,
     staging_dir: Option<&'a Path>,
+}
+
+/// Keep the process alive on Ctrl+C / SIGTERM / SIGHUP during a restore:
+/// the child processes (same process group for Ctrl+C) end, their failure
+/// propagates and the normal cleanup removes staging and partial copies.
+/// A handler (not SIG_IGN) is used so children get default behaviour.
+fn install_restore_signal_handlers() {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    extern "C" fn note(_: nix::libc::c_int) {}
+    let action = SigAction::new(
+        SigHandler::Handler(note),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    for sig in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
+        // SAFETY: the handler does nothing.
+        unsafe {
+            let _ = sigaction(sig, &action);
+        }
+    }
 }
 
 fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
@@ -1157,6 +1192,7 @@ fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
             &mut stderr,
         )?,
         Some(user) => {
+            install_restore_signal_handlers();
             // Root restores into a directory only root can reach, then the
             // tree is copied into the user's target with the user's identity.
             let staging_root = match staging_dir {
@@ -1172,6 +1208,13 @@ fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
                 }
                 None => paths.state_dir.join("restore-staging"),
             };
+            let parent = target.parent().unwrap_or(Path::new("/"));
+            if !parent.is_dir() {
+                bail!(
+                    "{} does not exist; create it first (the restore creates only the last directory)",
+                    parent.display()
+                );
+            }
             secrets::create_private_dir(&staging_root)?;
             for warning in nestegg::staging::cleanup_stale(&staging_root) {
                 eprintln!("warning: {warning}");
@@ -1235,6 +1278,13 @@ mod tests {
                 .iter()
                 .all(|(_, need)| *need >= size && *need < 2 * size)
         );
+    }
+
+    #[test]
+    fn subvolumes_sharing_a_pool_count_as_one() {
+        assert!(same_storage((1, 100, 50), (2, 100, 50)));
+        assert!(same_storage((1, 100, 50), (1, 200, 10)));
+        assert!(!same_storage((1, 100, 50), (2, 100, 49)));
     }
 
     #[test]

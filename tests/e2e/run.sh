@@ -25,7 +25,7 @@ DOCKER_BUILDKIT=0 docker build -q --build-arg BASE="$base" -t "$client_image" -f
 start_pbs
 
 echo "== starting client ($base)"
-docker run -d --name "$client" --network "$net" \
+docker run -d --name "$client" --network "$net" --tmpfs /mnt/small:size=2m,mode=1777 \
   -v "$bin:/usr/local/bin/nestegg:ro" "$client_image" sleep infinity >/dev/null
 on_client bash -c '
   set -e
@@ -117,6 +117,11 @@ check "user restore with 3000 sockets did not hang (warnings shown)" bash -c "[[
 check "user restore: read-only directory restored" on_client test -f /home/alice/restore-home/alice/Archive/frozen/note.txt
 long_name="$(printf 'r%.0s' $(seq 1 240))"
 check "user restore into a 240-character target name" bash -c "docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg restore $snapshot etc.pxar /home/alice/$long_name >/dev/null 2>&1 && docker exec $client test -f /home/alice/$long_name/hostname"
+check "failing user restore (target full) reports an error" bash -c "! docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg restore $snapshot home.pxar /mnt/small/target --pattern 'alice/Documents/photo.bin' >/tmp/nestegg-fail.log 2>&1"
+check "failing user restore: error names the cause" grep -qi "no space" /tmp/nestegg-fail.log
+check "failing user restore: no partial copy left" bash -c "[[ -z \$(docker exec $client ls -A /mnt/small) ]]"
+check "failing user restore: staging cleaned up" bash -c "[[ -z \$(docker exec $client ls -A /var/lib/nestegg/restore-staging) ]]"
+check "restore into missing parent fails before any work" bash -c "docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg restore $snapshot etc.pxar /home/alice/missing/target 2>&1 | grep -q 'does not exist'"
 check "user restore: sparse file stays sparse" bash -c "[[ \$(docker exec $client du -k /home/alice/restore-home/alice/Documents/sparse.img | cut -f1) -lt 1024 ]]"
 check "user restore: no partial directory left" bash -c "[[ -z \$(docker exec $client find /home/alice -maxdepth 1 -name '.*nestegg-partial*') ]]"
 check "user restore: staging cleaned up" bash -c "[[ -z \$(docker exec $client ls -A /var/lib/nestegg/restore-staging) ]]"
