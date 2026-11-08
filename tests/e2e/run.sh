@@ -13,6 +13,13 @@ net="nestegg-e2e-$$"
 pbs="nestegg-e2e-pbs-$$"
 client="nestegg-e2e-client-$$"
 client_image="nestegg-e2e-client:$(echo "$base" | tr ':/' '--')"
+
+cleanup() {
+  [[ -n "${KEEP:-}" ]] && { echo "(KEEP set: containers $pbs $client left running)"; return; }
+  docker rm -f "$pbs" "$client" >/dev/null 2>&1 || true
+  docker network rm "$net" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 [[ -x "$bin" ]] || { echo "nestegg binary not found: $bin (run cargo build first)"; exit 2; }
 bin="$(realpath "$bin")"
 # shellcheck source=lib.sh
