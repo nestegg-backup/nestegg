@@ -26,6 +26,21 @@ Planned for the first releases:
 See [docs/roadmap.md](docs/roadmap.md), [docs/architecture.md](docs/architecture.md)
 and the [decision records](docs/decisions/).
 
+## Development
+
+```sh
+cargo test                                   # unit and integration tests
+cargo clippy --all-targets -- -D warnings
+cargo build && tests/e2e/run.sh              # real PBS + client in containers
+cargo deb -p nestegg && tests/e2e/systemd.sh # package + systemd services
+```
+
+The end-to-end scripts start a disposable Proxmox Backup Server from the
+official packages in Docker; nothing outside the containers is touched.
+`systemd.sh` needs the host cgroup namespace and should only run on a
+disposable machine or CI runner. Setup and configuration:
+[docs/configuration.md](docs/configuration.md).
+
 "Proxmox" is a registered trademark of Proxmox Server Solutions GmbH. nestegg
 is an independent project and not affiliated with or endorsed by Proxmox.
 

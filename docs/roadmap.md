@@ -14,7 +14,7 @@ unreachable or asleep, desktop integration, credential storage. Results go
 to `docs/research/` and feed into v0.1 design. Work on v0.1 does not wait
 for this.
 
-## v0.1 – Terminal backup for one machine
+## v0.1 – Terminal backup for one machine (implemented, not released)
 
 Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
 
