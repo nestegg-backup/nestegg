@@ -1,0 +1,387 @@
+openapi: 3.1.0
+info:
+  title: nestegg local API
+  version: 0.1.0
+  summary: Local control API of the nestegg daemon.
+  description: |
+    Served by `nestegg daemon` on the Unix socket `/run/nestegg/api.sock`
+    and forwarded unchanged by `nestegg ui` under `http://127.0.0.1:<port>/api/v1/`.
+
+    Conventions
+    - All timestamps are RFC 3339 strings in UTC (`2026-11-08T21:30:12Z`).
+    - Durations are integer seconds, sizes integer bytes.
+    - Unknown fields must be ignored by clients (the API may add fields).
+    - Errors use the `Error` schema with a stable machine-readable `code`.
+    - When accessed through `nestegg ui`, every request must carry the session
+      token, either as `Authorization: Bearer <token>` or, for the first page
+      load only, as `?token=<token>` (the server then sets an HttpOnly cookie).
+  license:
+    name: AGPL-3.0-or-later
+    identifier: AGPL-3.0-or-later
+servers:
+  - url: /api/v1
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness and version information.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+  /status:
+    get:
+      operationId: getStatus
+      summary: Everything the dashboard needs in one call.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+  /runs:
+    get:
+      operationId: listRuns
+      summary: Run history, newest first.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs:
+                    type: array
+                    items: { $ref: "#/components/schemas/Run" }
+    post:
+      operationId: startRun
+      summary: Start a backup now.
+      responses:
+        "202":
+          description: Accepted; the run is starting.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "409":
+          description: A run is already in progress.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /runs/{runId}:
+    get:
+      operationId: getRun
+      summary: One run including the tail of its log.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunDetail" }
+        "404":
+          description: Unknown run.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /snapshots:
+    get:
+      operationId: listSnapshots
+      summary: Snapshots of this machine on the PBS, newest first.
+      description: Requires the PBS to be reachable; returns 503 `pbs_unreachable` otherwise.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [snapshots]
+                properties:
+                  snapshots:
+                    type: array
+                    items: { $ref: "#/components/schemas/Snapshot" }
+        "503":
+          description: PBS not reachable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /snapshots/{snapshotTime}/browse:
+    get:
+      operationId: browseSnapshot
+      summary: List a directory inside an archive of a snapshot (planned for v0.2).
+      parameters:
+        - name: snapshotTime
+          in: path
+          required: true
+          schema: { type: string, format: date-time }
+        - name: archive
+          in: query
+          required: true
+          schema: { type: string, examples: ["home.pxar"] }
+        - name: path
+          in: query
+          schema: { type: string, default: "/" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries]
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: "#/components/schemas/DirEntry" }
+        "501":
+          description: Not implemented yet.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /restores:
+    post:
+      operationId: startRestore
+      summary: Restore files from a snapshot into a new directory (planned for v0.2).
+      description: |
+        The target directory must not exist yet and is created with the
+        requesting user as owner. Restores never overwrite existing files.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RestoreRequest" }
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Restore" }
+        "501":
+          description: Not implemented yet.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /restores/{restoreId}:
+    get:
+      operationId: getRestore
+      parameters:
+        - name: restoreId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Restore" }
+  /config:
+    get:
+      operationId: getConfig
+      summary: Effective configuration with secrets removed.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigView" }
+components:
+  parameters:
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema: { type: string, examples: ["20261108T213012Z-timer"] }
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable identifier.
+          enum: [run_in_progress, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
+        message: { type: string, description: Human-readable English text. }
+    Health:
+      type: object
+      required: [version, api_version]
+      properties:
+        version: { type: string, examples: ["0.1.0"] }
+        api_version: { type: string, examples: ["1"] }
+    Status:
+      type: object
+      required: [machine, pbs, schedule, encryption, health]
+      properties:
+        machine:
+          type: object
+          required: [hostname, backup_id]
+          properties:
+            hostname: { type: string, examples: ["desktop"] }
+            backup_id: { type: string, examples: ["desktop"] }
+            os: { type: string, examples: ["Linux Mint 22.2"] }
+        pbs:
+          type: object
+          required: [server, datastore]
+          properties:
+            server: { type: string, examples: ["pbs.example.com:8007"] }
+            datastore: { type: string, examples: ["backups"] }
+            namespace: { type: [string, "null"], examples: ["desktops"] }
+            reachable: { type: [boolean, "null"], description: Result of the last check; null if never checked. }
+            checked_at: { type: [string, "null"], format: date-time }
+            wake_on_lan: { type: boolean, description: Wake-on-LAN is configured. }
+        schedule:
+          type: object
+          required: [enabled]
+          properties:
+            enabled: { type: boolean }
+            calendar: { type: string, examples: ["daily"] }
+            next_run: { type: [string, "null"], format: date-time }
+        current_run:
+          oneOf:
+            - $ref: "#/components/schemas/Run"
+            - type: "null"
+        last_run:
+          oneOf:
+            - $ref: "#/components/schemas/Run"
+            - type: "null"
+        last_success:
+          oneOf:
+            - $ref: "#/components/schemas/Run"
+            - type: "null"
+        health:
+          type: string
+          description: |
+            Summary for the dashboard.
+            `ok` – last success within the overdue threshold;
+            `running` – a run is in progress;
+            `overdue` – no success within the threshold;
+            `failing` – the last run failed;
+            `never` – no successful backup yet;
+            `unconfigured` – setup not finished.
+          enum: [ok, running, overdue, failing, never, unconfigured]
+        overdue_after_hours: { type: integer, examples: [36] }
+        encryption:
+          type: object
+          required: [enabled]
+          properties:
+            enabled: { type: boolean }
+            key_fingerprint: { type: [string, "null"], description: Fingerprint of the encryption key (not secret). }
+            key_exported: { type: boolean, description: The user confirmed that the key was exported (paper key or file). }
+    Run:
+      type: object
+      required: [id, trigger, state, started_at]
+      properties:
+        id: { type: string }
+        trigger: { type: string, enum: [timer, manual, cli] }
+        state:
+          type: string
+          enum: [starting, waking_pbs, inventory, uploading, finishing, succeeded, failed, pbs_unreachable, cancelled]
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, "null"], format: date-time }
+        duration_seconds: { type: [integer, "null"] }
+        snapshot: { type: [string, "null"], examples: ["host/desktop/2026-11-08T21:30:12Z"] }
+        archives:
+          type: array
+          items:
+            type: object
+            required: [name, source]
+            properties:
+              name: { type: string, examples: ["home.pxar"] }
+              source: { type: string, examples: ["/home"] }
+              size_bytes: { type: [integer, "null"] }
+        uploaded_bytes: { type: [integer, "null"] }
+        warnings:
+          type: array
+          items: { type: string }
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/RunError"
+            - type: "null"
+    RunError:
+      type: object
+      required: [kind, message]
+      properties:
+        kind:
+          type: string
+          enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, internal]
+        message: { type: string }
+    RunDetail:
+      allOf:
+        - $ref: "#/components/schemas/Run"
+        - type: object
+          properties:
+            log_tail:
+              type: array
+              description: Last lines of the run log (secrets are never logged).
+              items: { type: string }
+    Snapshot:
+      type: object
+      required: [time, snapshot]
+      properties:
+        time: { type: string, format: date-time }
+        snapshot: { type: string, examples: ["host/desktop/2026-11-08T21:30:12Z"] }
+        size_bytes: { type: [integer, "null"] }
+        archives:
+          type: array
+          items: { type: string, examples: ["home.pxar.didx"] }
+        encrypted: { type: [boolean, "null"] }
+        verified: { type: [string, "null"], enum: [ok, failed, null] }
+        protected: { type: boolean }
+        comment: { type: [string, "null"] }
+    DirEntry:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string }
+        type: { type: string, enum: [file, directory, symlink, other] }
+        size_bytes: { type: [integer, "null"] }
+        modified: { type: [string, "null"], format: date-time }
+    RestoreRequest:
+      type: object
+      required: [snapshot_time, archive, paths, target_dir]
+      properties:
+        snapshot_time: { type: string, format: date-time }
+        archive: { type: string, examples: ["home.pxar"] }
+        paths:
+          type: array
+          description: Paths inside the archive; empty restores the whole archive.
+          items: { type: string, examples: ["/alice/Documents/report.odt"] }
+        target_dir: { type: string, examples: ["/home/alice/nestegg-restore-2026-11-08"] }
+    Restore:
+      type: object
+      required: [id, state]
+      properties:
+        id: { type: string }
+        state: { type: string, enum: [running, succeeded, failed] }
+        target_dir: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, "null"], format: date-time }
+        error: { type: [string, "null"] }
+    ConfigView:
+      type: object
+      description: Configuration as loaded, without any secret values.
+      properties:
+        backup_id: { type: string }
+        sources:
+          type: array
+          items:
+            type: object
+            required: [archive, path]
+            properties:
+              archive: { type: string }
+              path: { type: string }
+        excludes:
+          type: array
+          items: { type: string }
+        schedule: { type: string }
+        encryption: { type: boolean }
+        overdue_after_hours: { type: integer }

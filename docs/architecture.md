@@ -1,0 +1,95 @@
+# Architecture
+
+nestegg is a thin, careful layer around the official `proxmox-backup-client`.
+It never touches backup data itself: chunking, deduplication, encryption,
+transfer and restore stay in the official client.
+
+```
+            ┌──────────────── one desktop ────────────────────────────────┐
+            │                                                             │
+ systemd    │  nestegg-backup.timer ──► nestegg-backup.service            │
+            │                              (oneshot, root)                │
+            │                              `nestegg run --trigger timer`  │
+            │                                     │                       │
+            │                                     ▼                       │
+            │   /etc/nestegg/config.toml   ┌──────────────┐   proxmox-    │
+            │   systemd credentials ─────► │ run pipeline │ ─►backup-  ───┼──► PBS
+            │                              └──────────────┘   client      │   (HTTPS 8007)
+            │                                     │ state + history       │
+            │                                     ▼                       │
+            │                          /var/lib/nestegg/                  │
+            │                                     ▲                       │
+            │  nestegg.service (root daemon) ─────┘                       │
+            │     JSON API on /run/nestegg/api.sock (0660 root:nestegg)   │
+            │        ▲                         ▲                          │
+            │        │                         │                          │
+            │  `nestegg status` …        `nestegg ui` (user in group      │
+            │  (CLI, any group member)    nestegg): HTTP on 127.0.0.1,    │
+            │                             random port + one-time token,   │
+            │                             serves ui/dist + proxies /api   │
+            └─────────────────────────────────────────────────────────────┘
+```
+
+## Components
+
+| Component | Runs as | Job |
+|---|---|---|
+| `nestegg run` | root, started by the timer or the daemon | One backup run: lock, optional Wake-on-LAN, wait for PBS, build system inventory, call `proxmox-backup-client backup`, upload status report, record result. |
+| `nestegg-backup.timer` | systemd | Daily schedule, `Persistent=true` (catch-up after the machine was off), randomized delay. |
+| `nestegg daemon` (`nestegg.service`) | root | Local JSON API over a Unix socket. Reads state/history, lists snapshots, starts runs (`systemctl start nestegg-backup.service`) and restores. |
+| `nestegg <command>` | user in group `nestegg`, or root | CLI. Read commands go through the socket; `init`, `credentials` and `key` need root. |
+| `nestegg ui` | user in group `nestegg` | Starts a local HTTP server on `127.0.0.1:<random>` with a one-time token in the URL, opens the browser, serves the embedded web UI from `ui/dist`, and forwards `/api/v1/*` to the socket. |
+
+Authorization is done by Unix permissions on the socket (group `nestegg`).
+The browser side is protected by the random port, loopback binding and a
+per-session token. Nothing listens on a network interface.
+
+## Run pipeline
+
+1. Acquire `/run/nestegg/run.lock` (no overlapping runs).
+2. Check sources exist (missing configured sources fail the run instead of
+   silently producing an incomplete backup).
+3. PBS availability: `GET https://<pbs>:8007/api2/json/ping` (no
+   authentication). If unreachable and Wake-on-LAN is configured, send the
+   magic packet and poll until `wake.timeout`. Still unreachable → state
+   `pbs_unreachable` (distinct from failure); the timer retries next time.
+4. Generate the system inventory into `/var/lib/nestegg/inventory/`
+   (package selections, manually installed packages, Flatpak/Snap lists,
+   enabled units, `lsblk`/`findmnt` output, OS release).
+5. `proxmox-backup-client backup` with one archive per source
+   (`home.pxar:/home`, `etc.pxar:/etc`, …, `inventory.pxar:…`),
+   `--backup-type host --backup-id <id> [--ns <ns>]`, excludes, optional
+   `--keyfile`, `--change-detection-mode`, rate limit. Secrets come from
+   systemd credentials or `*_FILE` environment variables, never from
+   arguments.
+6. Upload a JSON status report as the snapshot log
+   (`snapshot upload-log`), so the read-only overview can show details.
+7. Write the run record (`/var/lib/nestegg/runs/<id>.json`) and update
+   `state.json`.
+
+## Files
+
+| Path | Content |
+|---|---|
+| `/etc/nestegg/config.toml` | Configuration (no secrets). |
+| `/etc/nestegg/credentials/` | Encrypted credentials (`*.cred`, `systemd-creds`) or root-only plain files. |
+| `/var/lib/nestegg/state.json` | Last run, last success, next run. |
+| `/var/lib/nestegg/runs/` | Run history, one JSON file per run, pruned to a configurable count. |
+| `/var/lib/nestegg/inventory/` | Generated system inventory (backed up). |
+| `/run/nestegg/` | Lock file and API socket. |
+
+## Interfaces
+
+- API contract between daemon and UI: [`api/openapi.yaml`](../api/openapi.yaml).
+  It is the single source of truth; the UI never talks to the PBS directly.
+- Configuration reference: `docs/configuration.md` (follows with v0.1).
+
+## Repository layout
+
+| Path | Owner | Content |
+|---|---|---|
+| `crates/nestegg/` | core | Rust binary: CLI, run pipeline, daemon, UI server. |
+| `api/openapi.yaml` | core (changes reviewed by UI) | HTTP API contract. |
+| `ui/` | UI | Web UI source; build output `ui/dist/` is embedded into the binary. |
+| `packaging/` | core | systemd units, Debian packaging. |
+| `docs/` | both | Decisions, architecture, research. |

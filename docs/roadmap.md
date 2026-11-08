@@ -33,21 +33,19 @@ Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
 
 ## v0.2 – Desktop integration
 
-- Graphical interface: status, run now, restore, notifications when a backup
-  is overdue.
+- Local web UI (`nestegg ui`): status, run now, history, restore,
+  notifications when a backup is overdue. Contract: `api/openapi.yaml`.
 - `.deb` packages.
 
 ## v0.3 – Overview of several machines
 
 - One place that shows every machine: last verified success, next run,
   overdue or offline, encryption key backed up yes/no.
-- Architecture to be decided (read-only status from the PBS itself vs. a small
-  central service).
+- Read-only from the PBS (Audit role) plus the status report each machine
+  uploads with its snapshot; no central service (decision 0003).
 
-## Open decisions before v0.1
+## Decided
 
-- Implementation language (Rust aligns with the official Proxmox crates;
-  Python is faster to start with).
-- Project name and license.
-- Backup scope defaults: home directory only, or whole system with
-  file-level or block-level backups.
+Language, project name, license, scope defaults and the technical baseline
+are recorded in `docs/decisions/0003-product-and-technical-baseline.md` and
+`docs/decisions/0004-name-license-organisation.md`.

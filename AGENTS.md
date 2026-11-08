@@ -43,6 +43,10 @@ and coding agents alike.
 
 ## Project conventions
 
+- Several agents may work on this project at the same time. Each agent works
+  in its own git worktree and branch and only touches the paths it owns
+  (see the repository layout in `docs/architecture.md`). Before committing,
+  check `git status` for files you did not create.
 - Repository documentation and code comments are written in English.
 - Decisions are recorded in `docs/decisions/` (one file per decision).
 - Do not reimplement the PBS protocol, chunk store or encryption; build on
