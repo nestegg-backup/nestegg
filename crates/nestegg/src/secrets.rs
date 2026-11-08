@@ -192,22 +192,79 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
+fn random_suffix() -> String {
+    format!("{:016x}", rand::random::<u64>())
+}
+
+/// Create `path` exclusively (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600) and
+/// write `bytes`. Fails if anything exists at `path`, including a symlink.
+pub fn create_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    // The umask can only remove bits; make the mode explicit on the open fd.
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
     Ok(())
 }
+
+/// Atomically replace `path` with a mode-0600 file. The temporary file has a
+/// random name and is created exclusively, so a pre-placed file or symlink
+/// cannot redirect the write. Meant for directories controlled by the caller
+/// (credentials, state, runtime directories).
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().context("path without parent")?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("invalid file name")?;
+    let tmp = dir.join(format!(".{name}.{}.tmp", random_suffix()));
+    if let Err(e) = create_new_private_file(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))?;
+    Ok(())
+}
+
+/// Run `f` with the effective user, group and supplementary groups of
+/// another account, so the kernel applies that user's permissions to every
+/// path lookup (no symlink or ownership tricks against root). Only call from
+/// single-threaded code (the CLI), because credentials are per thread.
+pub fn as_user<T>(uid: u32, gid: u32, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use nix::unistd::{Gid, Uid, getgroups, setegid, seteuid, setgroups};
+    let saved_groups = getgroups()?;
+    setgroups(&[Gid::from_raw(gid)]).context("setgroups")?;
+    setegid(Gid::from_raw(gid)).context("setegid")?;
+    if let Err(e) = seteuid(Uid::from_raw(uid)) {
+        let _ = setegid(Gid::from_raw(0));
+        let _ = setgroups(&saved_groups);
+        return Err(e).context("seteuid");
+    }
+    let result = f();
+    seteuid(Uid::from_raw(0)).context("cannot restore root privileges")?;
+    setegid(Gid::from_raw(0)).context("cannot restore root group")?;
+    setgroups(&saved_groups).context("cannot restore groups")?;
+    result
+}
+
+/// SHA-256 of a secret, used to bind "key exported" to one specific key.
+pub fn digest(secret: &Secret) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(secret.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Source descriptors are moved to this number or higher; targets must be
+/// below it.
+const FIRST_SOURCE_FD: i32 = 64;
 
 /// A pipe whose read end is inherited by a child process at a fixed file
 /// descriptor number. The secret is written before the child starts, so it
@@ -229,10 +286,22 @@ impl FdPassing {
         if secret.as_bytes().len() > 60 * 1024 {
             bail!("secret too large for fd passing");
         }
+        if !(3..FIRST_SOURCE_FD).contains(&target_fd) {
+            bail!("target descriptor {target_fd} out of range");
+        }
         let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC)?;
         let mut file = fs::File::from(write);
         file.write_all(secret.as_bytes())?;
         drop(file);
+        // Keep the source descriptor above every possible target number, so
+        // one dup2 can never overwrite the source of another mapping.
+        let high = nix::fcntl::fcntl(
+            &read,
+            nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(FIRST_SOURCE_FD),
+        )?;
+        drop(read);
+        // SAFETY: `high` is a freshly duplicated descriptor owned by nobody else.
+        let read = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(high) };
         self.entries.push((read, target_fd));
         Ok(target_fd)
     }
@@ -298,6 +367,61 @@ mod tests {
         )
         .unwrap();
         assert!(store.load(PASSWORD).is_err());
+    }
+
+    #[test]
+    fn fd_mapping_does_not_clobber_sources() {
+        // Occupy low descriptors so pipes would naturally land on 10/11.
+        let mut fds = FdPassing::new();
+        fds.add(&Secret::new(b"PASSWORD".to_vec()), 10).unwrap();
+        fds.add(&Secret::new(b"KEY".to_vec()), 11).unwrap();
+        for (src, _) in &fds.entries {
+            assert!(src.as_raw_fd() >= FIRST_SOURCE_FD);
+        }
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg("echo $(cat <&10) $(cat <&11)");
+        fds.apply(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "PASSWORD KEY");
+    }
+
+    #[test]
+    fn create_new_refuses_existing_files_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(create_new_private_file(&link, b"x").is_err());
+        assert!(create_new_private_file(&victim, b"x").is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        let fresh = dir.path().join("fresh");
+        create_new_private_file(&fresh, b"x").unwrap();
+        assert_eq!(fs::metadata(&fresh).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn atomic_write_ignores_planted_tmp_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        // The old implementation wrote through `<name>.tmp`.
+        std::os::unix::fs::symlink(&victim, dir.path().join("secret.tmp")).unwrap();
+        write_private_file(&dir.path().join("secret"), b"new").unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(fs::read(dir.path().join("secret")).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(dir.path().join("secret")).unwrap().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn digest_is_stable() {
+        let a = digest(&Secret::new(b"k".to_vec()));
+        assert_eq!(a.len(), 64);
+        assert_eq!(a, digest(&Secret::new(b"k".to_vec())));
+        assert_ne!(a, digest(&Secret::new(b"l".to_vec())));
     }
 
     #[test]

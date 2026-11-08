@@ -26,9 +26,12 @@ records `docs/decisions/0003-*.md` first.
 2. **Build output in `ui/dist/`** (static files: `index.html` + assets). The
    Rust binary embeds this directory at compile time; there is no Node.js at
    runtime. Keep the bundle small.
-3. **Auth:** the first page load arrives as `/?token=<token>`; the server sets
-   an HttpOnly cookie and the UI must not store the token in localStorage.
-   Relative URLs only (`api/v1/status`, not absolute hosts).
+3. **Auth:** `nestegg ui` opens `/#token=<token>`. On load, read the token
+   from `location.hash`, store it in `sessionStorage`, remove it from the
+   address bar (`history.replaceState`) and send it as
+   `Authorization: Bearer <token>` with every `api/v1/*` request. No cookies,
+   no localStorage. A 401 means the session ended: show "open the address
+   printed by `nestegg ui`". Relative URLs only (`api/v1/status`).
 4. **License:** all dependencies must be AGPL-3.0-compatible (MIT, BSD,
    Apache-2.0, ISC, MPL-2.0, GPL/AGPL are fine). Run a license check before
    adding dependencies.
@@ -54,6 +57,6 @@ records `docs/decisions/0003-*.md` first.
   core side updates the contract and the daemon.
 - Until the daemon is ready, develop against a mock that returns the
   examples from the OpenAPI contract (e.g. a small dev-server middleware in
-  `ui/`). `nestegg ui --dev-proxy` support for a Vite-style dev server will
-  be added on the core side.
+  `ui/`). Against the real daemon: `nestegg ui --dev-proxy http://127.0.0.1:5173`
+  forwards everything except `/api/` to a Vite-style dev server.
 - Integration into `main` happens via merge of the `ui` branch after review.

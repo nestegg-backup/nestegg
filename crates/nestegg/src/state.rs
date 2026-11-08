@@ -123,7 +123,12 @@ pub fn run_id(trigger: Trigger, now: DateTime<Utc>) -> String {
         Trigger::Manual => "manual",
         Trigger::Cli => "cli",
     };
-    format!("{}-{t}", now.format("%Y%m%dT%H%M%SZ"))
+    // Random suffix: two runs started within the same second stay distinct.
+    format!(
+        "{}-{t}-{:04x}",
+        now.format("%Y%m%dT%H%M%SZ"),
+        rand::random::<u16>()
+    )
 }
 
 /// Run IDs end up in file names; only accept what [`run_id`] produces.
@@ -141,10 +146,23 @@ pub struct State {
     pub pbs_reachable: Option<bool>,
     #[serde(default, with = "rfc3339_opt")]
     pub pbs_checked_at: Option<DateTime<Utc>>,
+    /// Fingerprint reported by `proxmox-backup-client key show`.
     #[serde(default)]
     pub key_fingerprint: Option<String>,
+    /// SHA-256 of the current key file (not secret; set by `key create`).
     #[serde(default)]
-    pub key_exported: bool,
+    pub key_digest: Option<String>,
+    /// SHA-256 of the key the user confirmed as exported. Backups only run
+    /// when this matches the key actually loaded, so replacing the key
+    /// invalidates the confirmation automatically.
+    #[serde(default)]
+    pub key_exported_digest: Option<String>,
+}
+
+impl State {
+    pub fn key_exported(&self) -> bool {
+        self.key_digest.is_some() && self.key_digest == self.key_exported_digest
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -345,15 +363,30 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let dir = path.parent().context("path without parent")?;
     fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
-        ".{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
+        ".{}.{:016x}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("state"),
+        rand::random::<u64>()
     ));
-    {
-        let mut file =
-            fs::File::create(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
+    let write = || -> Result<()> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Exclusive, no symlinks; 0644 so group members can read state
+        // through the 0750 state directory.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&tmp)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(0o644))?;
         serde_json::to_writer_pretty(&mut file, value)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
     fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))?;
     Ok(())
@@ -419,7 +452,10 @@ mod tests {
     #[test]
     fn run_ids_are_safe_file_names() {
         let id = run_id(Trigger::Manual, t(21));
-        assert_eq!(id, "20261108T210000Z-manual");
+        assert!(id.starts_with("20261108T210000Z-manual-"));
+        let ids: std::collections::HashSet<_> =
+            (0..20).map(|_| run_id(Trigger::Manual, t(21))).collect();
+        assert!(ids.len() > 1);
         assert!(is_valid_run_id(&id));
         assert!(!is_valid_run_id("../etc/passwd"));
         assert!(!is_valid_run_id(""));

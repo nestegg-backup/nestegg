@@ -3,8 +3,12 @@
 //!
 //! Security model
 //! - Binds to 127.0.0.1 only, random port by default.
-//! - A random session token is required. The first request carries it as
-//!   `?token=`; the server answers with an HttpOnly, SameSite=Strict cookie.
+//! - The static UI files are public (they contain no data). Every `/api/`
+//!   request needs `Authorization: Bearer <token>`. The token is handed to
+//!   the page in the URL fragment (`/#token=…`), which browsers never send to
+//!   servers; the page keeps it in `sessionStorage` (isolated per origin,
+//!   including the port). No cookies: they are shared between all ports of
+//!   127.0.0.1 and could leak the token to other local services.
 //! - The Host header must name the loopback address (DNS rebinding).
 //! - The browser is opened through a private redirect file, so the token
 //!   never appears in another process' command line.
@@ -18,8 +22,8 @@ use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use hyper_util::rt::TokioIo;
 use rust_embed::RustEmbed;
 
@@ -27,8 +31,6 @@ use rust_embed::RustEmbed;
 #[folder = "../../ui/dist/"]
 #[allow_missing = true]
 struct Assets;
-
-const COOKIE: &str = "nestegg_session";
 
 #[derive(Clone)]
 struct Ui {
@@ -65,7 +67,7 @@ pub async fn serve(options: UiOptions) -> Result<()> {
         socket: options.socket.clone(),
         dev_proxy: options.dev_proxy.clone(),
     };
-    let url = format!("http://127.0.0.1:{port}/?token={}", ui.token);
+    let url = format!("http://127.0.0.1:{port}/#token={}", ui.token);
     if !options.socket.exists() {
         eprintln!(
             "warning: daemon socket {} not found - is nestegg.service running?",
@@ -94,34 +96,24 @@ async fn handle(State(ui): State<Ui>, req: Request) -> Response {
     if !host_allowed(req.headers(), ui.port) {
         return (StatusCode::MISDIRECTED_REQUEST, "invalid Host header").into_response();
     }
-    // Token login.
-    if let Some(token) = query_token(req.uri()) {
-        if constant_time_eq(token.as_bytes(), ui.token.as_bytes()) {
-            let mut resp = Redirect::to("/").into_response();
-            let cookie = format!("{COOKIE}={}; HttpOnly; SameSite=Strict; Path=/", ui.token);
-            if let Ok(v) = HeaderValue::from_str(&cookie) {
-                resp.headers_mut().insert(header::SET_COOKIE, v);
-            }
-            return resp;
-        }
-        return unauthorized();
-    }
-    if !authorized(req.headers(), &ui.token) {
-        return unauthorized();
-    }
-    if req.method() != Method::GET
-        && req.method() != Method::HEAD
-        && !origin_allowed(req.headers(), ui.port)
-    {
-        return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
-    }
     let path = req.uri().path().to_string();
     let mut resp = if path.starts_with("/api/") {
+        if !authorized(req.headers(), &ui.token) {
+            return unauthorized();
+        }
+        if req.method() != Method::GET
+            && req.method() != Method::HEAD
+            && !origin_allowed(req.headers(), ui.port)
+        {
+            return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
+        }
         forward_to_socket(&ui.socket, req).await
     } else if let Some(dev) = &ui.dev_proxy {
         forward_to_dev(dev, req).await
-    } else {
+    } else if req.method() == Method::GET || req.method() == Method::HEAD {
         static_file(&path)
+    } else {
+        (StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response()
     };
     if ui.dev_proxy.is_none() {
         let headers = resp.headers_mut();
@@ -163,39 +155,21 @@ fn origin_allowed(headers: &HeaderMap, port: u16) -> bool {
     }
 }
 
-fn query_token(uri: &Uri) -> Option<String> {
-    uri.query()?
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("token="))
-        .map(String::from)
-}
-
 fn authorized(headers: &HeaderMap, token: &str) -> bool {
-    if let Some(auth) = headers
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        && let Some(bearer) = auth.strip_prefix("Bearer ")
-    {
-        return constant_time_eq(bearer.as_bytes(), token.as_bytes());
-    }
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|kv| {
-            kv.trim()
-                .strip_prefix(&format!("{COOKIE}="))
-                .map(String::from)
-        })
-        .any(|value| constant_time_eq(value.as_bytes(), token.as_bytes()))
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+        .is_some_and(|bearer| constant_time_eq(bearer.as_bytes(), token.as_bytes()))
 }
 
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        "Not authorized. Open the address printed by `nestegg ui` in your terminal.\n",
+        axum::Json(serde_json::json!({
+            "code": "forbidden",
+            "message": "missing or wrong session token; open the address printed by `nestegg ui`",
+        })),
     )
         .into_response()
 }
@@ -370,48 +344,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_without_token() {
+    async fn api_rejects_without_token() {
         let resp = router(ui())
-            .oneshot(get("/").body(Body::empty()).unwrap())
+            .oneshot(get("/api/v1/status").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn token_login_sets_cookie() {
-        let resp = router(ui())
-            .oneshot(get("/?token=abc123").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        let cookie = resp.headers()[header::SET_COOKIE].to_str().unwrap();
-        assert!(cookie.contains("nestegg_session=abc123"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Strict"));
-    }
-
-    #[tokio::test]
-    async fn wrong_token_rejected() {
-        let resp = router(ui())
-            .oneshot(get("/?token=nope").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn cookie_grants_access_and_sets_security_headers() {
+    async fn api_rejects_wrong_token_and_cookies() {
         let resp = router(ui())
             .oneshot(
-                get("/")
+                get("/api/v1/status")
+                    .header(header::AUTHORIZATION, "Bearer nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = router(ui())
+            .oneshot(
+                get("/api/v1/status")
                     .header(header::COOKIE, "nestegg_session=abc123")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn static_page_is_public_sets_no_cookie_and_has_security_headers() {
+        let resp = router(ui())
+            .oneshot(get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!resp.headers().contains_key(header::SET_COOKIE));
         assert!(resp.headers().contains_key(header::CONTENT_SECURITY_POLICY));
         assert_eq!(resp.headers()[header::X_FRAME_OPTIONS], "DENY");
     }
@@ -419,8 +391,9 @@ mod tests {
     #[tokio::test]
     async fn foreign_host_rejected() {
         let req = HttpRequest::builder()
-            .uri("/?token=abc123")
+            .uri("/api/v1/status")
             .header(header::HOST, "evil.example.com:4242")
+            .header(header::AUTHORIZATION, "Bearer abc123")
             .body(Body::empty())
             .unwrap();
         let resp = router(ui()).oneshot(req).await.unwrap();

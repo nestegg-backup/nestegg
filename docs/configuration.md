@@ -67,6 +67,7 @@ keep_runs = 200                 # local run history
 include_dev = []                # extra mount points, e.g. ["/boot/efi"]
 sources = [
   { archive = "home", path = "/home" },
+  # { archive = "data", path = "/srv/data", require_mount = true },
   { archive = "etc", path = "/etc" },
   { archive = "root", path = "/root", optional = true },
   { archive = "usr-local", path = "/usr/local", optional = true },
@@ -84,6 +85,12 @@ Notes:
   a source need an own source entry or `include_dev`.
 - **Missing sources fail the run** unless marked `optional = true`. A missing
   data disk must not silently produce an incomplete "successful" backup.
+- **Unmounted disks fail the run.** If `/etc/fstab` lists a file system at or
+  below a source (without `noauto`) and it is not mounted, the run fails
+  instead of backing up the empty mount point. `require_mount = true` makes
+  the source itself mandatory as a mount point, also without an fstab entry.
+  Separate file systems mounted below a source that are not backed up (no
+  own source, not in `include_dev`) are reported as warnings.
 - **Excludes** use the `proxmox-backup-client --exclude` syntax
   (gitignore-like). Excluded directories are not read at all.
 - **Schedule:** the timer checks hourly; a backup runs when the last success
@@ -126,7 +133,21 @@ sudo nestegg restore host/desktop/2026-11-08T21:30:12Z home.pxar /root/restore-d
      --pattern 'alice/Documents/**'
 ```
 
-Restores always go into a new directory and never overwrite files. Because
+Restores always go into a new directory and never overwrite files.
+
+- Into a root-owned location (e.g. `/root/restore-…`): runs as root and
+  restores original owners and permissions.
+- Into a directory other users can modify (e.g. your home, via `sudo`): runs
+  with the invoking user's identity, so nothing can be redirected; files are
+  owned by you, foreign owners, ACLs and special files are skipped.
+- The key is used only for encrypted or signed archives. For backups made
+  with an older key, pass its exported copy: `--keyfile old-key.json`.
+
+The key confirmation (`nestegg key confirm-exported`) is bound to the exact
+key that is stored. Replacing the key (`nestegg key create --force`) blocks
+backups again until the new key has been exported and confirmed.
+
+Because
 backups are normal PBS snapshots, they can also be restored with plain
 `proxmox-backup-client` (with the exported key) or through the PBS web UI
 (unencrypted backups only).

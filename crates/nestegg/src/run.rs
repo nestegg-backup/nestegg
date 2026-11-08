@@ -74,14 +74,28 @@ pub fn active_run(paths: &Paths) -> Result<Option<Run>> {
     let Some(current) = store.load_current()? else {
         return Ok(None);
     };
-    if !paths.lock_file().exists() {
-        return Ok(None);
+    let young = Utc::now() - current.started_at <= Duration::seconds(60);
+    match lock_is_held(paths) {
+        // A run holds the lock.
+        Some(true) => Ok(Some(current)),
+        // No lock holder: a fresh reservation (run still starting) counts,
+        // an old leftover from a crashed run does not.
+        Some(false) => Ok(young.then_some(current)),
+        // Lock file missing or unreadable for this user: trust current.json
+        // while it is fresh or still being updated.
+        None => Ok(young.then_some(current)),
     }
-    let lock_free = RunLock::try_acquire(paths)?.is_some();
-    if lock_free && Utc::now() - current.started_at > Duration::seconds(60) {
-        return Ok(None);
+}
+
+/// Probe the run lock without write access, so group members can call it.
+/// `None` if the lock file cannot be opened.
+fn lock_is_held(paths: &Paths) -> Option<bool> {
+    let file = File::open(paths.lock_file()).ok()?;
+    match Flock::lock(file, FlockArg::LockSharedNonblock) {
+        Ok(_shared) => Some(false),
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Some(true),
+        Err(_) => None,
     }
-    Ok(Some(current))
 }
 
 struct Reporter<'a> {
@@ -215,7 +229,8 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             );
             return Ok(());
         }
-        if !state.key_exported {
+        let key_digest = secrets::digest(&secrets.load(secrets::ENCRYPTION_KEY)?);
+        if state.key_exported_digest.as_deref() != Some(key_digest.as_str()) {
             rep.fail(
                 RunState::Failed,
                 config_error(
@@ -228,9 +243,45 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
     }
 
     // 2. Sources.
+    let (mounts, fstab) = crate::mounts::load();
+    let mut covered: Vec<PathBuf> = config
+        .backup
+        .sources
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    covered.extend(config.backup.include_dev.iter().cloned());
     let mut archives = Vec::new();
     for source in &config.backup.sources {
         if source.path.exists() {
+            let check = crate::mounts::check_source(
+                &source.path,
+                source.require_mount,
+                &covered,
+                &mounts,
+                &fstab,
+            );
+            for w in check.warnings {
+                rep.warn(w);
+            }
+            if !check.errors.is_empty() {
+                if source.optional {
+                    rep.warn(format!(
+                        "optional source {} skipped: {}",
+                        source.path.display(),
+                        check.errors.join("; ")
+                    ));
+                    continue;
+                }
+                rep.fail(
+                    RunState::Failed,
+                    RunError {
+                        kind: ErrorKind::SourceMissing,
+                        message: check.errors.join("; "),
+                    },
+                );
+                return Ok(());
+            }
             archives.push(ArchiveSpec {
                 name: source.archive.clone(),
                 path: source.path.clone(),
@@ -310,7 +361,21 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
 
     // 5. Backup.
     let backup_id = config.effective_backup_id();
-    let backup_time = Utc::now().timestamp();
+    // The PBS rejects a snapshot that is not newer than the previous one
+    // (second precision); wait if the last backup was in this second.
+    let previous = state
+        .last_success
+        .as_ref()
+        .and_then(|r| r.snapshot.as_deref())
+        .and_then(crate::client::snapshot_epoch);
+    let mut backup_time = Utc::now().timestamp();
+    if let Some(prev) = previous {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while backup_time <= prev && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            backup_time = Utc::now().timestamp();
+        }
+    }
     let spec = BackupSpec {
         backup_id: backup_id.clone(),
         namespace: config.pbs.namespace.clone(),

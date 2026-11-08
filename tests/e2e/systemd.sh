@@ -17,6 +17,7 @@ pbs="nestegg-e2e-pbs-$$"
 client="nestegg-e2e-sd-$$"
 
 cleanup() {
+  [[ -n "${KEEP:-}" ]] && { echo "(KEEP set: containers $pbs $client left running)"; return; }
   docker rm -f "$pbs" "$client" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
 }
@@ -90,9 +91,10 @@ docker exec -d -u alice "$client" bash -c 'nestegg ui --no-browser --port 18080 
 sleep 2
 token="$(on_client sed -n 's/.*token=\([0-9a-f]*\).*/\1/p' /tmp/ui.out | head -1)"
 check "ui prints a token" test -n "$token"
-check "ui rejects requests without token" bash -c "[[ \$(docker exec $client curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/v1/status) == 401 ]]"
-check "ui proxies the API with token" bash -c "docker exec $client curl -sf -H 'Authorization: Bearer $token' http://127.0.0.1:18080/api/v1/status | grep -q '\"health\":\"ok\"'"
-check "ui login sets cookie" bash -c "docker exec $client curl -s -D - -o /dev/null 'http://127.0.0.1:18080/?token=$token' | grep -qi 'set-cookie: nestegg_session'"
+check "ui URL carries the token in the fragment" on_client grep -q '/#token=' /tmp/ui.out
+check "ui rejects API requests without token" bash -c "[[ \$(docker exec $client curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/v1/status) == 401 ]]"
+check "ui proxies the API with bearer token" bash -c "docker exec $client curl -sf -H 'Authorization: Bearer $token' http://127.0.0.1:18080/api/v1/status | grep -q '\"health\":\"ok\"'"
+check "ui sets no cookies" bash -c "! docker exec $client curl -s -D - -o /dev/null http://127.0.0.1:18080/ | grep -qi 'set-cookie'"
 check "ui only listens on loopback" bash -c "docker exec $client grep -qi ' 0100007F:46A0 ' /proc/net/tcp && ! docker exec $client grep -qi ' 00000000:46A0 ' /proc/net/tcp"
 
 echo "== removal keeps credentials"

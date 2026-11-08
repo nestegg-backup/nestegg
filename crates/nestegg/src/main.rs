@@ -66,6 +66,13 @@ enum Cmd {
         /// Only restore paths matching this pattern (repeatable).
         #[arg(long)]
         pattern: Vec<String>,
+        /// Use this key file (e.g. an exported key of an older key) instead
+        /// of the stored key.
+        #[arg(long, conflicts_with = "no_key")]
+        keyfile: Option<PathBuf>,
+        /// Do not pass any key (unencrypted, unsigned backups).
+        #[arg(long)]
+        no_key: bool,
     },
     /// Show the configuration.
     Config {
@@ -216,7 +223,17 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
             archive,
             target,
             pattern,
-        } => restore(paths, &snapshot, &archive, &target, &pattern),
+            keyfile,
+            no_key,
+        } => restore(
+            paths,
+            &snapshot,
+            &archive,
+            &target,
+            &pattern,
+            keyfile.as_deref(),
+            no_key,
+        ),
         Cmd::Config { example } => {
             if example {
                 print!(
@@ -429,6 +446,15 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
     require_root("key management")?;
     let store = Store::new(paths);
     let secrets_store = SecretStore::new(&paths.credentials_dir);
+    // Key changes and backup runs exclude each other (same lock), so a run
+    // never sees a half-replaced key or overwrites the key state.
+    let _lock = match &cmd {
+        KeyCmd::Create { .. } | KeyCmd::ConfirmExported => Some(
+            nestegg::run::RunLock::try_acquire(paths)?
+                .context("a backup is running; try again when it has finished")?,
+        ),
+        _ => None,
+    };
     match cmd {
         KeyCmd::Create { allow_plain, force } => {
             if secrets_store.exists(secrets::ENCRYPTION_KEY) && !force {
@@ -447,10 +473,17 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             client::local::create_key(&tmp.0)?;
             let fingerprint = client::local::key_fingerprint(&tmp.0)?;
             let key = Secret::new(std::fs::read(&tmp.0)?);
-            let storage = secrets_store.store(secrets::ENCRYPTION_KEY, &key, allow_plain)?;
+            // Invalidate any previous export confirmation before the key is
+            // replaced. (Backups compare against the digest of the key that
+            // is actually loaded, so a failure here cannot let them run.)
             let mut state = store.load_state()?;
+            state.key_exported_digest = None;
+            state.key_digest = None;
+            state.key_fingerprint = None;
+            store.save_state(&state)?;
+            let storage = secrets_store.store(secrets::ENCRYPTION_KEY, &key, allow_plain)?;
             state.key_fingerprint = Some(fingerprint.clone());
-            state.key_exported = false;
+            state.key_digest = Some(secrets::digest(&key));
             store.save_state(&state)?;
             println!("Encryption key created (fingerprint {fingerprint}).");
             if storage == Storage::SystemdCreds {
@@ -488,11 +521,14 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             );
         }
         KeyCmd::ConfirmExported => {
-            let mut state = store.load_state()?;
-            if state.key_fingerprint.is_none() && !secrets_store.exists(secrets::ENCRYPTION_KEY) {
+            if !secrets_store.exists(secrets::ENCRYPTION_KEY) {
                 bail!("no encryption key exists yet");
             }
-            state.key_exported = true;
+            // Bind the confirmation to the key that is stored right now.
+            let digest = secrets::digest(&secrets_store.load(secrets::ENCRYPTION_KEY)?);
+            let mut state = store.load_state()?;
+            state.key_digest = Some(digest.clone());
+            state.key_exported_digest = Some(digest);
             store.save_state(&state)?;
             println!("Noted. Backups can run now.");
         }
@@ -512,29 +548,31 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             );
             println!(
                 "exported:     {}",
-                if state.key_exported { "yes" } else { "NO" }
+                if state.key_exported() { "yes" } else { "NO" }
             );
         }
     }
     Ok(0)
 }
 
-/// Write a file with mode 0600, owned by the invoking sudo user if any.
+/// The account that invoked sudo, if any.
+fn sudo_user() -> Option<(u32, u32)> {
+    let uid = std::env::var("SUDO_UID").ok()?.parse().ok()?;
+    let gid = std::env::var("SUDO_GID").ok()?.parse().ok()?;
+    (uid != 0).then_some((uid, gid))
+}
+
+/// Create a new mode-0600 file at a user-chosen path. When called through
+/// sudo, the file is created with the invoking user's identity, so the
+/// kernel applies that user's permissions and the file is owned by them;
+/// it never follows a symlink and never replaces an existing file.
 fn write_user_file(path: &Path, data: &[u8]) -> Result<()> {
-    if path.exists() {
-        bail!("{} already exists", path.display());
+    match sudo_user() {
+        Some((uid, gid)) if is_root() => {
+            secrets::as_user(uid, gid, || secrets::create_new_private_file(path, data))
+        }
+        _ => secrets::create_new_private_file(path, data),
     }
-    secrets::write_private_file(path, data)?;
-    if let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID"))
-        && let (Ok(uid), Ok(gid)) = (uid.parse::<u32>(), gid.parse::<u32>())
-    {
-        let _ = nix::unistd::chown(
-            path,
-            Some(nix::unistd::Uid::from_raw(uid)),
-            Some(nix::unistd::Gid::from_raw(gid)),
-        );
-    }
-    Ok(())
 }
 
 fn check(paths: &Paths) -> Result<u8> {
@@ -585,9 +623,9 @@ fn check(paths: &Paths) -> Result<u8> {
         );
         let state = Store::new(paths).load_state()?;
         report(
-            state.key_exported,
+            state.key_exported(),
             "encryption key exported",
-            if state.key_exported {
+            if state.key_exported() {
                 String::new()
             } else {
                 "run `nestegg key confirm-exported` after exporting".into()
@@ -837,24 +875,99 @@ fn history(paths: &Paths, limit: usize, json: bool) -> Result<u8> {
     Ok(0)
 }
 
+/// True if `target`'s existing ancestors are real directories that only
+/// root can modify. Then writing there as root cannot be redirected by
+/// another user (no symlink swaps, no renames).
+fn root_controlled_parent(target: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let absolute = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(target)
+    };
+    let mut current = PathBuf::from("/");
+    let parent = absolute.parent().unwrap_or(Path::new("/"));
+    for component in parent.components() {
+        if let std::path::Component::Normal(name) = component {
+            current.push(name);
+        } else if let std::path::Component::ParentDir = component {
+            return Ok(false);
+        }
+        let meta = match std::fs::symlink_metadata(&current) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(e.into()),
+        };
+        if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn restore(
     paths: &Paths,
     snapshot: &str,
     archive: &str,
     target: &Path,
     patterns: &[String],
+    keyfile: Option<&Path>,
+    no_key: bool,
 ) -> Result<u8> {
     require_root("restore")?;
-    if target.exists() {
+    if std::fs::symlink_metadata(target).is_ok() {
         bail!(
             "{} already exists; restores only go into a new directory",
             target.display()
         );
     }
+    // Writing as root into a directory another user controls could be
+    // redirected (symlink swap during the restore). In that case restore
+    // with the invoking user's identity instead.
+    let run_as = if root_controlled_parent(target)? {
+        None
+    } else if let Some((uid, gid)) = sudo_user() {
+        let home = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))?
+            .map(|u| u.dir)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        eprintln!(
+            "note: {} is not in a root-controlled directory; restoring with your user's \
+             permissions (files will be owned by you)",
+            target.display()
+        );
+        Some(client::RunAs { uid, gid, home })
+    } else {
+        bail!(
+            "{} is inside a directory that other users can modify. Restore into a \
+             root-owned location (e.g. /root/restore) or run via sudo from the owning user.",
+            target.display()
+        );
+    };
+    let key = if no_key {
+        client::RestoreKey::Without
+    } else if let Some(path) = keyfile {
+        let bytes = match sudo_user() {
+            Some((uid, gid)) => secrets::as_user(uid, gid, || Ok(std::fs::read(path)?))?,
+            None => std::fs::read(path)?,
+        };
+        client::RestoreKey::File(Secret::new(bytes))
+    } else {
+        client::RestoreKey::Auto
+    };
     let cfg = Config::load(&paths.config_file)?;
     let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
     let mut stderr = std::io::stderr();
-    client.restore(snapshot, archive, target, patterns, &mut stderr)?;
+    client.restore(
+        &client::RestoreRequest {
+            snapshot,
+            archive,
+            target,
+            patterns,
+            key,
+            run_as,
+        },
+        &mut stderr,
+    )?;
     println!("Restored into {}", target.display());
     Ok(0)
 }

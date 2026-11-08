@@ -123,6 +123,10 @@ pub struct Source {
     /// missing source fails the run.
     #[serde(default)]
     pub optional: bool,
+    /// The path must be a mounted file system (protects against backing up
+    /// the empty mount point of a disk that failed to mount).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_mount: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,6 +244,7 @@ pub fn default_sources() -> Vec<Source> {
         archive: archive.to_string(),
         path: PathBuf::from(path),
         optional,
+        require_mount: false,
     })
     .collect()
 }

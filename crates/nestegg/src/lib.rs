@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod daemon;
 pub mod inventory;
+pub mod mounts;
 pub mod run;
 pub mod secrets;
 pub mod state;

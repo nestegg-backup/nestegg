@@ -84,10 +84,39 @@ check "pattern restore limits files" bash -c "docker exec $client test -e /root/
 check "restore with plain client and exported key" docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$client" \
   bash -c "proxmox-backup-client restore '$snapshot' etc.pxar /root/restore-etc --ns desktops --keyfile /root/nestegg-key.json --repository admin@pbs@pbs.e2e.test:store1 >/dev/null 2>&1 && test -e /root/restore-etc/hostname"
 
+echo "== review findings: export, restore as user, key handling"
+alice_uid="$(on_client id -u alice)"
+alice_gid="$(on_client id -g alice)"
+as_sudo_alice() { docker exec -e SUDO_UID="$alice_uid" -e SUDO_GID="$alice_gid" "$client" "$@"; }
+on_client bash -c 'echo keep > /root/victim && ln -s /root/victim /home/alice/evil-key.json'
+check "export refuses a planted symlink" bash -c "! docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg key export /home/alice/evil-key.json >/dev/null 2>&1"
+check "symlink target untouched" bash -c "[[ \$(docker exec $client cat /root/victim) == keep ]]"
+as_sudo_alice nestegg key export /home/alice/key-copy.json >/dev/null
+check "export as sudo user: owned by user, mode 600" bash -c "[[ \$(docker exec $client stat -c '%U %a' /home/alice/key-copy.json) == 'alice 600' ]]"
+check "export cannot write where the user may not" bash -c "! docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg key export /etc/nestegg-key.json >/dev/null 2>&1"
+as_sudo_alice nestegg restore "$snapshot" etc.pxar /home/alice/restore-etc >/dev/null 2>&1 || true
+check "restore into user dir runs as the user" bash -c "[[ \$(docker exec $client stat -c '%U' /home/alice/restore-etc/hostname 2>/dev/null) == alice ]]"
+check "restore into /tmp without sudo user is refused" bash -c "! docker exec $client nestegg restore $snapshot etc.pxar /tmp/restore-etc >/dev/null 2>&1"
+
+on_client sed -i 's/^encryption = true/encryption = false/' /etc/nestegg/config.toml
+check "unencrypted backup succeeds" on_client nestegg run --trigger manual
+plain_snapshot="$(on_client nestegg snapshots --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
+check "unencrypted snapshot restores while a key exists" on_client nestegg restore "$plain_snapshot" etc.pxar /root/restore-plain
+check "older encrypted snapshot still restores" on_client nestegg restore "$snapshot" etc.pxar /root/restore-enc
+on_client sed -i 's/^encryption = false/encryption = true/' /etc/nestegg/config.toml
+
+on_client nestegg key create --force --allow-plain >/dev/null
+check "new key blocks backups until exported" bash -c "! docker exec $client nestegg backup >/dev/null 2>&1"
+check "status shows key not exported" bash -c "docker exec $client nestegg status | grep -q 'KEY NOT EXPORTED'"
+on_client nestegg key export /root/nestegg-key-2.json >/dev/null
+on_client nestegg key confirm-exported >/dev/null
+check "backup runs again after confirming the new key" on_client nestegg backup
+check "old snapshot restores with old exported key" on_client nestegg restore "$snapshot" etc.pxar /root/restore-oldkey --keyfile /root/nestegg-key.json
+
 echo "== second backup and timer behaviour"
 check "manual second backup succeeds" on_client nestegg run --trigger manual
 check "timer run is skipped when not due" bash -c "docker exec $client nestegg run --trigger timer 2>&1 | grep -q 'not due'"
-check "two snapshots listed" bash -c "[[ \$(docker exec $client nestegg snapshots --json | grep -c '\"snapshot\"') == 2 ]]"
+check "four snapshots listed" bash -c "[[ \$(docker exec $client nestegg snapshots --json | grep -c '\"snapshot\"') == 4 ]]"
 
 echo "== daemon API"
 on_client bash -c 'nestegg daemon >/var/log/nestegg-daemon.log 2>&1 &'
