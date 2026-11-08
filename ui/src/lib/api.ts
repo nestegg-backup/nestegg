@@ -1,0 +1,109 @@
+// Thin client for the local API. Relative URLs only: the page is served by
+// `nestegg ui` (or the Vite dev server) and the session cookie is HttpOnly,
+// so the token never touches JavaScript.
+
+import type {
+  ConfigView,
+  DirEntry,
+  HealthInfo,
+  MachinesResponse,
+  Restore,
+  RestoreRequest,
+  Run,
+  RunDetail,
+  SessionInfo,
+  Snapshot,
+  Status,
+} from "./types";
+
+export type FailureKind =
+  | "unauthorized" // 401: session cookie missing or wrong
+  | "daemon" // 502 from `nestegg ui` or network error: daemon not reachable
+  | "not_implemented" // 501
+  | "not_found" // 404
+  | "conflict" // 409
+  | "pbs_unreachable" // 503
+  | "bad_request" // 400
+  | "other";
+
+export class ApiFailure extends Error {
+  constructor(
+    readonly kind: FailureKind,
+    readonly status: number,
+    readonly code: string | null,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+function kindOf(status: number, code: string | null): FailureKind {
+  if (status === 401) return "unauthorized";
+  if (status === 501 || code === "not_implemented") return "not_implemented";
+  if (status === 503 || code === "pbs_unreachable") return "pbs_unreachable";
+  if (status === 502) return "daemon";
+  if (status === 404) return "not_found";
+  if (status === 409) return "conflict";
+  if (status === 400) return "bad_request";
+  return "other";
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`api/v1/${path}`, {
+      credentials: "same-origin",
+      cache: "no-store",
+      ...init,
+      headers: { Accept: "application/json", ...(init?.body ? { "Content-Type": "application/json" } : {}) },
+    });
+  } catch (e) {
+    throw new ApiFailure("daemon", 0, null, e instanceof Error ? e.message : String(e));
+  }
+  if (!res.ok) {
+    let code: string | null = null;
+    let message = res.statusText;
+    const text = await res.text().catch(() => "");
+    try {
+      const body = JSON.parse(text) as { code?: unknown; message?: unknown };
+      if (typeof body.code === "string") code = body.code;
+      if (typeof body.message === "string") message = body.message;
+    } catch {
+      if (text.trim()) message = text.trim();
+    }
+    throw new ApiFailure(kindOf(res.status, code), res.status, code, message);
+  }
+  return (await res.json()) as T;
+}
+
+const q = (s: string) => encodeURIComponent(s);
+
+export const api = {
+  health: () => request<HealthInfo>("health"),
+  status: () => request<Status>("status"),
+  runs: (limit = 200) => request<{ runs: Run[] }>(`runs?limit=${limit}`).then((r) => r.runs),
+  run: (id: string) => request<RunDetail>(`runs/${q(id)}`),
+  startRun: () => request<Run>("runs", { method: "POST" }),
+  snapshots: () => request<{ snapshots: Snapshot[] }>("snapshots").then((r) => r.snapshots),
+  browse: (time: string, archive: string, path: string) =>
+    request<{ entries: DirEntry[] }>(`snapshots/${q(time)}/browse?archive=${q(archive)}&path=${q(path)}`).then(
+      (r) => r.entries,
+    ),
+  startRestore: (body: RestoreRequest) =>
+    request<Restore>("restores", { method: "POST", body: JSON.stringify(body) }),
+  restore: (id: string) => request<Restore>(`restores/${q(id)}`),
+  config: () => request<ConfigView>("config"),
+  // Proposed endpoints (API-REQUESTS.md). A 404 means "not offered by this daemon".
+  machines: () => request<MachinesResponse>("machines"),
+  session: () => request<SessionInfo>("session"),
+};
+
+/** Undefined when the endpoint does not exist (404/501), the value otherwise. */
+export async function optional<T>(p: Promise<T>): Promise<T | undefined> {
+  try {
+    return await p;
+  } catch (e) {
+    if (e instanceof ApiFailure && (e.kind === "not_found" || e.kind === "not_implemented")) return undefined;
+    throw e;
+  }
+}

@@ -1,0 +1,37 @@
+name: ui
+
+on:
+  push:
+    paths: ["ui/**", ".github/workflows/ui.yml"]
+  pull_request:
+    paths: ["ui/**", ".github/workflows/ui.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  ui:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+      - run: npm run licenses
+      - run: npm run check
+      - run: npm test
+      - run: npm run test:tz
+      - run: npm run build
+      - name: No references to other origins in the build output
+        run: |
+          if grep -rEo 'https?://[^"'"'"' )]+' dist --include='*.html' --include='*.js' --include='*.css' \
+             | grep -vE 'https?://(www\.w3\.org|svelte\.dev)'; then
+            echo "dist/ references another origin" >&2
+            exit 1
+          fi

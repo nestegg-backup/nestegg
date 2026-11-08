@@ -37,8 +37,104 @@ records `docs/decisions/0003-*.md` first.
    `pbs.example.com`, `/home/alice`.
 6. **Accessible and responsive:** keyboard usable, readable at phone width
    (the overview will be opened from phones later), light and dark mode.
-7. **Language:** English UI strings, kept in one place so translations
-   (German first) can be added.
+7. **Language:** German and English from the start (decision 0005). The
+   language follows the browser (`navigator.languages`: German if the first
+   entry starts with `de`, English otherwise). All strings live in
+   `src/i18n/de.ts` and `src/i18n/en.ts` with identical keys.
+
+## Development
+
+Requires Node.js 22 and npm.
+
+```sh
+cd ui
+npm ci
+npm run dev          # http://127.0.0.1:5173 with the mock API
+npm run check        # svelte-check / TypeScript
+npm test             # vitest
+npm run test:tz      # the same tests in Pacific/Auckland and America/Los_Angeles
+npm run build        # writes dist/
+npm run licenses     # licence check of all installed packages
+```
+
+### Mock API
+
+`npm run dev` serves `/api/v1/*` from a mock (`mock/world.ts`, a Vite
+dev-server middleware; it is not part of the build). It answers the
+endpoints of `api/openapi.yaml` plus the proposals in `API-REQUESTS.md`,
+with placeholder data only. Pick a scenario with a query parameter on the
+page URL; the choice is kept in a cookie and reloading with the parameter
+resets it:
+
+| `?scenario=` | What it shows |
+|---|---|
+| `ok` (default) | 14 days of backups, one night without server, one day without backup |
+| `running` | a backup in progress that finishes after about 15 s |
+| `overdue` | last success 3 days ago, the server has not answered since |
+| `failing` | last run failed (folder not mounted) |
+| `never` | set up, no backup yet |
+| `unconfigured` | setup not finished (`/config` answers 500 like the daemon) |
+| `pbs_unreachable` | last attempts did not reach the server, still within the threshold |
+| `key_not_exported` | backups blocked until the key export is confirmed |
+| `daemon_down` | every call answers 502, like `nestegg ui` without the daemon |
+| `unauthorized` | every call answers 401 |
+
+Add faults to any scenario with `&fault=a,b`:
+
+| Fault | Effect |
+|---|---|
+| `down` | every call answers 502, like a daemon that stopped after the page loaded |
+| `runs` | `/runs` answers 500 |
+| `config` | `/config` answers 500 |
+| `schedule_off` | the timer is disabled |
+| `no_run_details` | `/status` leaves out `last_run` and `last_success` (allowed by the contract) |
+
+`down` can also be switched while the page is open:
+`curl -X POST 'http://127.0.0.1:5173/__mock/fault?down=1'` (and `down=0`); it
+applies to the scenario the browser chose last.
+
+Add `&daemon=today` to get only what the daemon offers today: no
+`/machines` and `/session` (404), browse and restore answer 501.
+
+"Back up now" in the mock runs through all phases in about 20 s; in
+`pbs_unreachable` and `overdue` it ends with "server not reachable".
+Restoring into `/home/alice/Dokumente` (or another existing folder of the
+mock) answers `409 target_exists`.
+
+To use another port, set `NESTEGG_UI_PORT` (not `--port`), so the HMR
+websocket uses the same port.
+
+### With the real daemon
+
+The built UI is embedded into the binary by `cargo build` (see
+`crates/nestegg/src/ui.rs`). Build the UI first; otherwise the binary serves
+a placeholder page. If `target/` existed before `ui/dist/` did, run
+`cargo clean -p nestegg` once.
+
+To develop against a running daemon, start the dev server and let
+`nestegg ui` forward everything except `/api/` to it:
+
+```sh
+npm run dev
+nestegg ui --dev-proxy http://127.0.0.1:5173
+```
+
+Open the address printed by `nestegg ui`. API calls then go to the daemon
+socket, not to the mock.
+
+### Structure
+
+| Path | Content |
+|---|---|
+| `src/App.svelte` | Layout (list and detail; two screens below 760 px) and hash routing |
+| `src/components/` | Views: this PC, other PCs, server, settings, restore flow |
+| `src/lib/api.ts` | API client (relative URLs, no token handling – the session cookie is HttpOnly) |
+| `src/lib/derive.ts`, `src/lib/text.ts` | State derivation and status sentences (unit-tested) |
+| `src/lib/format.ts` | Date, size and duration formatting |
+| `src/i18n/` | German and English strings |
+| `src/styles/tokens.css` | Colour tokens, dark (reference) and light |
+| `mock/` | Dev-server mock of the API |
+| `tests/` | Vitest: derivation, formatting, i18n key parity, contrast (WCAG AA), mock |
 
 ## Working agreement between agents
 
