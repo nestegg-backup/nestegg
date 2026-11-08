@@ -25,12 +25,13 @@ pub struct UserIdentity {
 impl UserIdentity {
     /// The account that invoked sudo (`SUDO_UID`), if any and not root.
     pub fn from_sudo() -> Result<Option<UserIdentity>> {
-        let Some(uid) = std::env::var("SUDO_UID")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-        else {
+        let Ok(raw) = std::env::var("SUDO_UID") else {
             return Ok(None);
         };
+        let uid: u32 = raw
+            .trim()
+            .parse()
+            .with_context(|| format!("SUDO_UID '{raw}' is not a valid user id"))?;
         if uid == 0 {
             return Ok(None);
         }
@@ -58,7 +59,9 @@ impl UserIdentity {
         let gid = self.gid;
         let groups: Vec<nix::libc::gid_t> = self.groups.clone();
         cmd.env("HOME", &self.home).current_dir("/");
-        // SAFETY: only async-signal-safe system calls between fork and exec.
+        // SAFETY: no allocation between fork and exec; only plain system
+        // calls (setgroups is not on the POSIX async-signal-safe list but is
+        // a direct system call wrapper in glibc and musl on Linux).
         unsafe {
             cmd.pre_exec(move || {
                 if nix::libc::setgroups(groups.len(), groups.as_ptr()) != 0
@@ -122,66 +125,150 @@ pub fn read_file_as(user: &UserIdentity, path: &Path) -> Result<Vec<u8>> {
     helper(user, &["__read-file".as_ref(), path.as_os_str()], None)
 }
 
-/// Copy the directory tree `source` (readable by root) into the new
-/// directory `target` with `user`'s identity: root packs the tree with tar,
-/// a tar process running as the user unpacks it. Ownership, ACLs, extended
-/// attributes and file capabilities are not transferred.
-pub fn copy_tree_as(user: &UserIdentity, source: &Path, target: &Path) -> Result<()> {
-    let mkdir = {
-        let mut cmd = Command::new("mkdir");
-        cmd.arg("--")
-            .arg(target)
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped());
-        user.apply(&mut cmd);
-        cmd.output().context("cannot run mkdir")?
-    };
-    if !mkdir.status.success() {
-        bail!(
-            "cannot create {}: {}",
-            target.display(),
-            String::from_utf8_lossy(&mkdir.stderr).trim()
-        );
-    }
-    let mut pack = Command::new("tar")
-        .arg("-C")
-        .arg(source)
-        .args(["-c", "-f", "-", "--numeric-owner", "."])
+fn run_as(user: &UserIdentity, program: &str, args: &[&std::ffi::OsStr]) -> Result<()> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("cannot run tar")?;
-    let pack_out = pack.stdout.take().context("no tar output")?;
-    let mut unpack = Command::new("tar");
-    unpack
-        .arg("-C")
-        .arg(target)
-        .args([
-            "-x",
-            "-f",
-            "-",
-            "--no-same-owner",
-            "--delay-directory-restore",
-        ])
-        .stdin(Stdio::from(pack_out))
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    user.apply(&mut unpack);
-    let unpacked = unpack.output().context("cannot run tar as the user")?;
-    let packed = pack.wait_with_output()?;
-    if !packed.status.success() {
+    user.apply(&mut cmd);
+    let out = cmd
+        .output()
+        .with_context(|| format!("cannot run {program}"))?;
+    if !out.status.success() {
         bail!(
-            "packing the restored files failed: {}",
-            String::from_utf8_lossy(&packed.stderr).trim()
-        );
-    }
-    if !unpacked.status.success() {
-        bail!(
-            "copying into {} failed: {}",
-            target.display(),
-            String::from_utf8_lossy(&unpacked.stderr).trim()
+            "{program} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(())
+}
+
+/// Copy the directory tree `source` (readable by root) to the new path
+/// `target` with `user`'s identity. Root packs the tree with tar, a tar
+/// process running as the user unpacks it into a temporary sibling
+/// directory, which is renamed to `target` only after everything succeeded
+/// (never replacing an existing path). On failure the partial copy is
+/// removed with the user's identity. Ownership, ACLs, extended attributes
+/// and file capabilities are not transferred; sparse files stay sparse.
+/// Returns tar's warnings (e.g. skipped sockets).
+pub fn copy_tree_as(user: &UserIdentity, source: &Path, target: &Path) -> Result<Vec<String>> {
+    let parent = target.parent().context("restore target has no parent")?;
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("invalid restore target name")?;
+    let partial = parent.join(format!(
+        ".{name}.nestegg-partial-{:08x}",
+        rand::random::<u32>()
+    ));
+    run_as(
+        user,
+        "mkdir",
+        &[
+            "-m".as_ref(),
+            "0700".as_ref(),
+            "--".as_ref(),
+            partial.as_os_str(),
+        ],
+    )?;
+
+    let result = (|| -> Result<Vec<String>> {
+        let mut pack = Command::new("tar")
+            .arg("-C")
+            .arg(source)
+            .args(["-c", "-f", "-", "--sparse", "--numeric-owner", "."])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("cannot run tar")?;
+        let pack_out = pack.stdout.take().context("no tar output")?;
+        let pack_err = pack.stderr.take().context("no tar stderr")?;
+        // Drain the packer's stderr concurrently; otherwise a full pipe can
+        // block both tar processes.
+        let err_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(pack_err), &mut buf);
+            buf
+        });
+        let mut unpack = Command::new("tar");
+        unpack
+            .arg("-C")
+            .arg(&partial)
+            .args([
+                "-x",
+                "-f",
+                "-",
+                "--no-same-owner",
+                "--delay-directory-restore",
+            ])
+            .stdin(Stdio::from(pack_out))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        user.apply(&mut unpack);
+        let unpacked = match unpack.output() {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = pack.kill();
+                let _ = pack.wait();
+                let _ = err_reader.join();
+                return Err(e).context("cannot run tar as the user");
+            }
+        };
+        if !unpacked.status.success() {
+            let _ = pack.kill();
+        }
+        let pack_status = pack.wait()?;
+        let pack_stderr = err_reader.join().unwrap_or_default();
+        if !unpacked.status.success() {
+            bail!(
+                "copying the restored files failed: {}",
+                String::from_utf8_lossy(&unpacked.stderr).trim()
+            );
+        }
+        if !pack_status.success() {
+            bail!(
+                "packing the restored files failed: {}",
+                String::from_utf8_lossy(&pack_stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&pack_stderr)
+            .lines()
+            .chain(String::from_utf8_lossy(&unpacked.stderr).lines())
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
+    })();
+
+    let result = result.and_then(|warnings| {
+        helper(
+            user,
+            &[
+                "__rename-noreplace".as_ref(),
+                partial.as_os_str(),
+                target.as_os_str(),
+            ],
+            None,
+        )?;
+        Ok(warnings)
+    });
+    if result.is_err() {
+        if let Err(e) = run_as(
+            user,
+            "rm",
+            &[
+                "-rf".as_ref(),
+                "--one-file-system".as_ref(),
+                "--".as_ref(),
+                partial.as_os_str(),
+            ],
+        ) {
+            eprintln!(
+                "warning: could not remove partial copy {}: {e:#}",
+                partial.display()
+            );
+        }
+    }
+    result
 }

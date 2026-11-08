@@ -73,6 +73,10 @@ enum Cmd {
         /// Do not pass any key (unencrypted, unsigned backups).
         #[arg(long)]
         no_key: bool,
+        /// Root-owned directory for the temporary copy when restoring into a
+        /// user directory (default: /var/lib/nestegg/restore-staging).
+        #[arg(long)]
+        staging_dir: Option<PathBuf>,
     },
     /// Show the configuration.
     Config {
@@ -97,6 +101,9 @@ enum Cmd {
     /// Internal: print a file (runs as the sudo user).
     #[command(name = "__read-file", hide = true)]
     ReadFile { path: PathBuf },
+    /// Internal: rename without replacing an existing path (runs as the sudo user).
+    #[command(name = "__rename-noreplace", hide = true)]
+    RenameNoReplace { from: PathBuf, to: PathBuf },
     /// Run the local API daemon (used by nestegg.service).
     #[command(hide = true)]
     Daemon,
@@ -231,14 +238,18 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
             pattern,
             keyfile,
             no_key,
+            staging_dir,
         } => restore(
             paths,
-            &snapshot,
-            &archive,
-            &target,
-            &pattern,
-            keyfile.as_deref(),
-            no_key,
+            &RestoreArgs {
+                snapshot: &snapshot,
+                archive: &archive,
+                target: &target,
+                patterns: &pattern,
+                keyfile: keyfile.as_deref(),
+                no_key,
+                staging_dir: staging_dir.as_deref(),
+            },
         ),
         Cmd::Config { example } => {
             if example {
@@ -274,6 +285,10 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
             let data =
                 std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
             std::io::stdout().write_all(&data)?;
+            Ok(0)
+        }
+        Cmd::RenameNoReplace { from, to } => {
+            rename_noreplace(&from, &to)?;
             Ok(0)
         }
         Cmd::Daemon => {
@@ -597,6 +612,7 @@ fn record_export(store: &Store, key: &Secret) -> Result<()> {
 /// kernel applies that user's permissions and the file belongs to them. It
 /// never follows a symlink and never replaces an existing file.
 fn write_user_file(path: &Path, data: &[u8]) -> Result<()> {
+    let path = &absolute_user_path(path)?;
     match nestegg::identity::UserIdentity::from_sudo()? {
         Some(user) if is_root() => nestegg::identity::write_new_file_as(&user, path, data),
         _ => secrets::create_new_private_file(path, data),
@@ -948,15 +964,100 @@ fn root_controlled_parent(absolute: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn restore(
-    paths: &Paths,
-    snapshot: &str,
-    archive: &str,
-    target: &Path,
-    patterns: &[String],
-    keyfile: Option<&Path>,
+/// Make a user-supplied path absolute against the current directory
+/// (helpers run with cwd `/`). Symlinks are not resolved here; access is
+/// checked later with the user's identity.
+fn absolute_user_path(path: &Path) -> Result<PathBuf> {
+    Ok(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    })
+}
+
+fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from_c = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    let to_c = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: valid NUL-terminated paths, AT_FDCWD.
+    let rc = unsafe {
+        nix::libc::renameat2(
+            nix::libc::AT_FDCWD,
+            from_c.as_ptr(),
+            nix::libc::AT_FDCWD,
+            to_c.as_ptr(),
+            nix::libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("cannot rename to {}", to.display()));
+    }
+    Ok(())
+}
+
+/// Remove staging directories left behind by interrupted restores (older
+/// than one day; concurrent restores use fresh directories).
+fn remove_stale_staging(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(24 * 3600));
+        if old && let Err(e) = std::fs::remove_dir_all(entry.path()) {
+            eprintln!(
+                "warning: could not remove stale staging {}: {e}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
+/// Refuse to start when the staging file system obviously lacks space.
+fn check_staging_space(client: &Client, snapshot: &str, archive: &str, dir: &Path) -> Result<()> {
+    let Some(size) = client.archive_size(snapshot, archive).unwrap_or(None) else {
+        return Ok(());
+    };
+    let stat = nix::sys::statvfs::statvfs(dir)?;
+    let free = stat.blocks_available() as u64 * stat.fragment_size() as u64;
+    if free < size + size / 20 {
+        bail!(
+            "the archive is about {} MiB but only {} MiB are free in {}; choose another \
+             root-owned location with --staging-dir or restore into a root-owned target",
+            size / (1024 * 1024),
+            free / (1024 * 1024),
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RestoreArgs<'a> {
+    snapshot: &'a str,
+    archive: &'a str,
+    target: &'a Path,
+    patterns: &'a [String],
+    keyfile: Option<&'a Path>,
     no_key: bool,
-) -> Result<u8> {
+    staging_dir: Option<&'a Path>,
+}
+
+fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
+    let RestoreArgs {
+        snapshot,
+        archive,
+        target,
+        patterns,
+        keyfile,
+        no_key,
+        staging_dir,
+    } = *args;
     require_root("restore")?;
     let target = &absolute_target(target)?;
     if std::fs::symlink_metadata(target).is_ok() {
@@ -989,9 +1090,10 @@ fn restore(
     let key = if no_key {
         client::RestoreKey::Without
     } else if let Some(path) = keyfile {
+        let path = absolute_user_path(path)?;
         let bytes = match &sudo {
-            Some(user) => nestegg::identity::read_file_as(user, path)?,
-            None => std::fs::read(path)?,
+            Some(user) => nestegg::identity::read_file_as(user, &path)?,
+            None => std::fs::read(&path)?,
         };
         client::RestoreKey::File(Secret::new(bytes))
     } else {
@@ -1014,8 +1116,22 @@ fn restore(
         Some(user) => {
             // Root restores into a directory only root can reach, then the
             // tree is copied into the user's target with the user's identity.
-            let staging_root = paths.state_dir.join("restore-staging");
+            let staging_root = match staging_dir {
+                Some(dir) => {
+                    let dir = absolute_target(dir)?;
+                    if !dir.is_dir() || !root_controlled_parent(&dir.join("x"))? {
+                        bail!(
+                            "--staging-dir {} must be an existing directory that only root can modify",
+                            dir.display()
+                        );
+                    }
+                    dir.join("nestegg-restore-staging")
+                }
+                None => paths.state_dir.join("restore-staging"),
+            };
             secrets::create_private_dir(&staging_root)?;
+            remove_stale_staging(&staging_root);
+            check_staging_space(&client, snapshot, archive, &staging_root)?;
             let staging = staging_root.join(format!("{:016x}", rand::random::<u64>()));
             let result = client
                 .restore(
@@ -1029,8 +1145,17 @@ fn restore(
                     &mut stderr,
                 )
                 .and_then(|()| nestegg::identity::copy_tree_as(&user, &staging, target));
-            let _ = std::fs::remove_dir_all(&staging);
-            result?;
+            if staging.exists()
+                && let Err(e) = std::fs::remove_dir_all(&staging)
+            {
+                eprintln!(
+                    "warning: could not remove staging directory {}: {e}",
+                    staging.display()
+                );
+            }
+            for warning in result? {
+                eprintln!("warning: {warning}");
+            }
         }
     }
     println!("Restored into {}", target.display());

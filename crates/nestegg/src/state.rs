@@ -260,17 +260,32 @@ impl Store {
         Ok(Some(read_json(&path)?))
     }
 
+    /// All changes to `current.json` happen under this lock, so "read, compare,
+    /// remove" cannot interleave with another process replacing the file.
+    fn with_current_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        fs::create_dir_all(&self.paths.state_dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.paths.state_dir.join(".current.lock"))?;
+        let _guard = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, e)| e)
+            .context("cannot lock current run file")?;
+        f()
+    }
+
     pub fn save_current(&self, run: &Run) -> Result<()> {
-        write_json_atomic(&self.paths.current_run_file(), run)
+        self.with_current_lock(|| write_json_atomic(&self.paths.current_run_file(), run))
     }
 
     /// Remove `current.json` only if it still describes run `id` (another
     /// run may have replaced it in the meantime).
     pub fn clear_current_if(&self, id: &str) -> Result<()> {
-        match self.load_current() {
-            Ok(Some(run)) if run.id == id => self.clear_current(),
+        self.with_current_lock(|| match self.load_current() {
+            Ok(Some(run)) if run.id == id => self.remove_current_file(),
             _ => Ok(()),
-        }
+        })
     }
 
     /// Write a run record without touching `state.json` (for runs that
@@ -282,6 +297,10 @@ impl Store {
     }
 
     pub fn clear_current(&self) -> Result<()> {
+        self.with_current_lock(|| self.remove_current_file())
+    }
+
+    fn remove_current_file(&self) -> Result<()> {
         match fs::remove_file(self.paths.current_run_file()) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),

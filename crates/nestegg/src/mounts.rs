@@ -108,7 +108,34 @@ pub fn load() -> anyhow::Result<(Vec<Mount>, Vec<FstabEntry>)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", fstab_path.display())),
     };
-    Ok((parse_mountinfo(&mounts), parse_fstab(&fstab)))
+    let fstab = parse_fstab(&fstab)
+        .into_iter()
+        .map(|mut e| {
+            e.point = resolve_mount_point(&e.point);
+            e
+        })
+        .collect();
+    Ok((parse_mountinfo(&mounts), fstab))
+}
+
+/// Normalise an fstab mount point the same way sources are normalised
+/// (symlinks resolved), without entering the mount point itself: the parent
+/// is canonicalised, and only if the last component is a symlink it is
+/// followed. Unresolvable paths are kept as written.
+pub fn resolve_mount_point(point: &Path) -> PathBuf {
+    let (Some(parent), Some(name)) = (point.parent(), point.file_name()) else {
+        return point.to_path_buf();
+    };
+    let Ok(parent) = std::fs::canonicalize(parent) else {
+        return point.to_path_buf();
+    };
+    let joined = parent.join(name);
+    match std::fs::symlink_metadata(&joined) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::canonicalize(&joined).unwrap_or(joined)
+        }
+        _ => joined,
+    }
 }
 
 /// A real mount at `point`. An autofs trigger alone does not count: the
@@ -311,6 +338,25 @@ UUID=e none swap sw 0 0
             &parse_fstab(FSTAB),
         );
         assert!(c.errors.is_empty(), "{c:?}");
+    }
+
+    #[test]
+    fn symlinked_fstab_mount_point_is_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("disk");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("disk-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+        assert_eq!(resolve_mount_point(&link), real);
+        let fstab = vec![FstabEntry {
+            point: resolve_mount_point(&link),
+            fstype: "ext4".into(),
+            noauto: false,
+        }];
+        let source = real.join("Documents");
+        let c = check_source(&source, false, &[], &parse_mountinfo(MOUNTINFO), &fstab);
+        assert_eq!(c.errors.len(), 1, "{c:?}");
     }
 
     #[test]

@@ -139,10 +139,13 @@ Restores always go into a new directory and never overwrite files.
   restores original owners and permissions.
 - Into a directory other users can modify (e.g. your home, via `sudo`): the
   archive is first restored as root into a private staging directory under
-  `/var/lib/nestegg/restore-staging/` (needs temporary space there), then
-  copied into the target by a process running as you. Nothing can be
-  redirected; the files are owned by you; ACLs, extended attributes and file
-  capabilities are not copied.
+  `/var/lib/nestegg/restore-staging/` (needs temporary space there; choose
+  another root-owned location with `--staging-dir`), then copied by a process
+  running as you into a temporary sibling directory, which is renamed to the
+  target only when the copy is complete. Nothing can be redirected; the files
+  are owned by you; ACLs, extended attributes, file capabilities and sockets
+  are not copied (skipped entries are listed as warnings). Sparse files stay
+  sparse.
 - The key is used only for encrypted or signed archives. For backups made
   with an older key, pass its exported copy: `--keyfile old-key.json`.
 

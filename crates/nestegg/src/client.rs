@@ -250,6 +250,37 @@ pub struct RestoreRequest<'a> {
     pub key: RestoreKey,
 }
 
+fn archive_candidates(archive: &str) -> Vec<String> {
+    let base = archive
+        .strip_suffix(".pxar")
+        .or_else(|| archive.strip_suffix(".mpxar"))
+        .or_else(|| archive.strip_suffix(".ppxar"))
+        .unwrap_or(archive);
+    ["pxar", "mpxar", "ppxar", "img"]
+        .iter()
+        .flat_map(|ext| [format!("{base}.{ext}.didx"), format!("{base}.{ext}.fidx")])
+        .chain([format!("{archive}.blob"), archive.to_string()])
+        .collect()
+}
+
+/// Sum of the sizes of the files belonging to `archive` in the JSON of
+/// `snapshot files`.
+pub fn size_for_archive(json: &str, archive: &str) -> Option<u64> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let candidates = archive_candidates(archive);
+    let sizes: Vec<u64> = value
+        .as_array()?
+        .iter()
+        .filter(|f| {
+            f["filename"]
+                .as_str()
+                .is_some_and(|n| candidates.iter().any(|c| c == n))
+        })
+        .filter_map(|f| f["size"].as_u64())
+        .collect();
+    (!sizes.is_empty()).then(|| sizes.iter().sum())
+}
+
 /// Find the crypt mode of `archive` (e.g. `home.pxar`) in the JSON of
 /// `snapshot files`. Split archives (`home.mpxar`/`home.ppxar`) count too.
 pub fn crypt_mode_for_archive(json: &str, archive: &str) -> Option<String> {
@@ -416,6 +447,19 @@ impl<'a> Client<'a> {
     /// Crypt mode (`none`, `sign-only`, `encrypt`) of an archive in a
     /// snapshot, from `snapshot files`. `None` if the archive is not found.
     pub fn archive_crypt_mode(&self, snapshot: &str, archive: &str) -> Result<Option<String>> {
+        Ok(crypt_mode_for_archive(
+            &self.snapshot_files(snapshot)?,
+            archive,
+        ))
+    }
+
+    /// Size in bytes of an archive (sum of its index files), if listed.
+    pub fn archive_size(&self, snapshot: &str, archive: &str) -> Result<Option<u64>> {
+        Ok(size_for_archive(&self.snapshot_files(snapshot)?, archive))
+    }
+
+    /// JSON of `snapshot files`.
+    pub fn snapshot_files(&self, snapshot: &str) -> Result<String> {
         let mut fds = FdPassing::new();
         let mut cmd = self.command(&mut fds)?;
         cmd.args(["snapshot", "files", snapshot, "--output-format", "json"]);
@@ -425,10 +469,7 @@ impl<'a> Client<'a> {
         if !output.status.success() {
             bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
         }
-        Ok(crypt_mode_for_archive(
-            &String::from_utf8_lossy(&output.stdout),
-            archive,
-        ))
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Restore an archive (or the paths matching `patterns`) into `target`.
@@ -754,6 +795,15 @@ mod tests {
         assert_eq!(snaps[0].comment.as_deref(), Some("nestegg ok"));
         assert_eq!(snaps[1].archives, vec!["a.pxar.didx".to_string()]);
         assert_eq!(snaps[1].encrypted, None);
+    }
+
+    #[test]
+    fn archive_size_lookup() {
+        let json = r#"[{"filename":"home.pxar.didx","crypt-mode":"encrypt","size":1000},
+                       {"filename":"data.mpxar.didx","size":10},{"filename":"data.ppxar.didx","size":90}]"#;
+        assert_eq!(size_for_archive(json, "home.pxar"), Some(1000));
+        assert_eq!(size_for_archive(json, "data.pxar"), Some(100));
+        assert_eq!(size_for_archive(json, "nope.pxar"), None);
     }
 
     #[test]

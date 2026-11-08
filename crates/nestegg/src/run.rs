@@ -62,13 +62,26 @@ impl RunLock {
         // Group members probe the lock read-only; do not depend on the umask.
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = file.set_permissions(fs::Permissions::from_mode(0o644));
+            file.set_permissions(fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("cannot set mode of {}", paths.lock_file().display()))?;
         }
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => Ok(Some(RunLock { _lock: lock })),
-            Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
-            Err((_, e)) => Err(e).context("cannot lock run file"),
+        // A short retry: a reader that briefly holds a shared lock (older
+        // versions, fallback probe) must not make a start fail.
+        let mut file = file;
+        for attempt in 0..10 {
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => return Ok(Some(RunLock { _lock: lock })),
+                Err((f, nix::errno::Errno::EWOULDBLOCK)) => {
+                    if attempt == 9 || lock_is_held(paths) == Some(true) {
+                        return Ok(None);
+                    }
+                    file = f;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err((_, e)) => return Err(e).context("cannot lock run file"),
+            }
         }
+        Ok(None)
     }
 }
 
@@ -94,13 +107,45 @@ pub fn active_run(paths: &Paths) -> Result<Option<Run>> {
 
 /// Probe the run lock without write access, so group members can call it.
 /// `None` if the lock file cannot be opened.
+/// Primary method: look the lock up in `/proc/locks` (no lock is taken, so
+/// a status query can never disturb a starting run). Fallback: a shared
+/// non-blocking probe.
 fn lock_is_held(paths: &Paths) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(paths.lock_file()).ok()?;
+    if let Ok(locks) = fs::read_to_string("/proc/locks") {
+        return Some(proc_locks_has_write_flock(&locks, meta.dev(), meta.ino()));
+    }
     let file = File::open(paths.lock_file()).ok()?;
     match Flock::lock(file, FlockArg::LockSharedNonblock) {
         Ok(_shared) => Some(false),
         Err((_, nix::errno::Errno::EWOULDBLOCK)) => Some(true),
         Err(_) => None,
     }
+}
+
+/// `/proc/locks` lines look like
+/// `1: FLOCK  ADVISORY  WRITE 1234 00:19:5678 0 EOF` (device as hex
+/// major:minor, inode decimal). Blocked waiters are prefixed with `->`.
+pub fn proc_locks_has_write_flock(locks: &str, dev: u64, ino: u64) -> bool {
+    let major = nix::sys::stat::major(dev);
+    let minor = nix::sys::stat::minor(dev);
+    locks.lines().any(|line| {
+        if line.contains("->") {
+            return false;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 || fields[1] != "FLOCK" || fields[3] != "WRITE" {
+            return false;
+        }
+        let mut id = fields[5].split(':');
+        let (Some(ma), Some(mi), Some(i)) = (id.next(), id.next(), id.next()) else {
+            return false;
+        };
+        u64::from_str_radix(ma, 16).ok() == Some(major)
+            && u64::from_str_radix(mi, 16).ok() == Some(minor)
+            && i.parse::<u64>().ok() == Some(ino)
+    })
 }
 
 struct Reporter<'a> {
@@ -232,7 +277,7 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     let final_state = rep.run.state;
     rep.line(&format!("run finished: {:?}", final_state));
     store.record_finished(&rep.run, keep)?;
-    store.clear_current()?;
+    store.clear_current_if(&rep.run.id)?;
     Ok(match final_state {
         RunState::Succeeded => RunExit::Succeeded,
         RunState::PbsUnreachable => RunExit::PbsUnreachable,
@@ -266,7 +311,14 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         }
     }
 
-    // 2. Sources.
+    // 2. Sources. Resolve the paths first: touching a path may trigger an
+    // automount, and the mount table must be read afterwards.
+    let resolved: Vec<Option<PathBuf>> = config
+        .backup
+        .sources
+        .iter()
+        .map(|s| fs::canonicalize(&s.path).ok())
+        .collect();
     let (mounts, fstab) = match crate::mounts::load() {
         Ok(t) => t,
         Err(e) => {
@@ -292,9 +344,8 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         .map(|p| fs::canonicalize(&p).unwrap_or(p))
         .collect();
     let mut archives = Vec::new();
-    for source in &config.backup.sources {
-        if source.path.exists() {
-            let canonical = fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone());
+    for (source, canonical) in config.backup.sources.iter().zip(resolved) {
+        if let Some(canonical) = canonical {
             let check = crate::mounts::check_source(
                 &canonical,
                 source.require_mount,
@@ -529,6 +580,34 @@ mod tests {
         let notes = snapshot_notes(&run, 42);
         assert!(notes.lines().next().unwrap().contains("ok, 42 s"));
         assert!(!notes.contains("/home"));
+    }
+
+    #[test]
+    fn proc_locks_parsing() {
+        let dev = nix::sys::stat::makedev(0, 0x19);
+        let text = "1: FLOCK  ADVISORY  WRITE 1234 00:19:5678 0 EOF\n2: POSIX  ADVISORY  WRITE 99 00:19:1 0 EOF\n";
+        assert!(proc_locks_has_write_flock(text, dev, 5678));
+        assert!(!proc_locks_has_write_flock(text, dev, 1));
+        assert!(!proc_locks_has_write_flock(
+            "1: FLOCK  ADVISORY  READ 1 00:19:5678 0 EOF\n",
+            dev,
+            5678
+        ));
+    }
+
+    #[test]
+    fn held_lock_is_visible_without_taking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: dir.path().join("c.toml"),
+            credentials_dir: dir.path().join("cred"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+        };
+        let lock = RunLock::try_acquire(&paths).unwrap().unwrap();
+        assert_eq!(lock_is_held(&paths), Some(true));
+        drop(lock);
+        assert_eq!(lock_is_held(&paths), Some(false));
     }
 
     #[test]
