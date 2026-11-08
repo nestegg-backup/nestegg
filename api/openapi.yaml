@@ -110,7 +110,10 @@ paths:
         - $ref: "#/components/parameters/RunId"
       responses:
         "202":
-          description: Cancellation requested; the run ends with state `cancelled`.
+          description: |
+            Cancellation requested. The run normally ends with state
+            `cancelled`; if the client had already finished, the run
+            completes as `succeeded`.
           content:
             application/json:
               schema:
@@ -119,6 +122,11 @@ paths:
                   cancelling: { type: boolean }
         "404":
           description: No running backup with this ID.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`cannot_cancel`: still starting (retry) or already finishing."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -264,9 +272,15 @@ paths:
         The target directory must not exist yet; for users other than root
         it is created with the caller's identity and the files belong to
         them (ACLs, xattrs, capabilities and sockets are not copied).
-        Restores never overwrite existing files. With `archives`, each
-        archive goes into `<target_dir>/<archive name without .pxar>/`.
-        One restore at a time.
+        Restores never overwrite existing files. With `archives` (takes
+        precedence over `archive`), each archive goes into
+        `<target_dir>/<archive name without .pxar>/`; an archive may be
+        listed only once. One restore at a time. For non-root callers the
+        home directory is mapped onto the archive using the source paths
+        recorded in the snapshot's status report; snapshots without that
+        information can only be restored by root. Paths are matched
+        literally (no globbing). Some problems (e.g. no matching files)
+        only show up in the job's `error`.
       requestBody:
         required: true
         content:
@@ -296,6 +310,9 @@ paths:
   /restores/{restoreId}:
     get:
       operationId: getRestore
+      description: |
+        Jobs are kept in memory (last 20) and are visible only to the user
+        who started them (and root).
       parameters:
         - name: restoreId
           in: path
@@ -307,6 +324,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Restore" }
+        "404":
+          description: Unknown job (or started by another user).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
   /config:
     get:
       operationId: getConfig
@@ -332,7 +354,7 @@ components:
         code:
           type: string
           description: Stable identifier.
-          enum: [run_in_progress, restore_in_progress, target_exists, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
+          enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
         message: { type: string, description: Human-readable English text. }
     Health:
       type: object

@@ -595,6 +595,9 @@ pub struct ReportContext {
     pub os: Option<String>,
     pub key_exported: Option<bool>,
     pub sources: Vec<String>,
+    /// `home.pxar` → canonical source path, so later restores can map home
+    /// directories onto archive paths of exactly this snapshot.
+    pub archive_sources: serde_json::Map<String, serde_json::Value>,
     pub overdue_after_hours: u32,
 }
 
@@ -609,6 +612,18 @@ fn report_context(config: &Config, state: &crate::state::State) -> ReportContext
             .iter()
             .map(|s| s.path.display().to_string())
             .collect(),
+        archive_sources: config
+            .backup
+            .sources
+            .iter()
+            .map(|s| {
+                let path = fs::canonicalize(&s.path).unwrap_or_else(|_| s.path.clone());
+                (
+                    format!("{}.pxar", s.archive),
+                    serde_json::json!(path.display().to_string()),
+                )
+            })
+            .collect(),
         overdue_after_hours: config.overdue_after_hours,
     }
 }
@@ -617,6 +632,13 @@ fn report_context(config: &Config, state: &crate::state::State) -> ReportContext
 /// the JSON below is the status report read by the overview of all
 /// machines (`GET /api/v1/machines`). It contains no file names.
 pub fn snapshot_notes(run: &Run, duration_seconds: i64, ctx: &ReportContext) -> String {
+    // Only archives that are part of this snapshot.
+    let archive_sources: serde_json::Map<String, serde_json::Value> = ctx
+        .archive_sources
+        .iter()
+        .filter(|(name, _)| run.archives.iter().any(|a| &a.name == *name))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let report = serde_json::json!({
         "nestegg": env!("CARGO_PKG_VERSION"),
         "nestegg_version": env!("CARGO_PKG_VERSION"),
@@ -633,6 +655,7 @@ pub fn snapshot_notes(run: &Run, duration_seconds: i64, ctx: &ReportContext) -> 
         "os": ctx.os,
         "key_exported": ctx.key_exported,
         "sources": ctx.sources,
+        "archive_sources": archive_sources,
         "overdue_after_hours": ctx.overdue_after_hours,
     });
     format!(
@@ -676,6 +699,7 @@ mod tests {
             os: None,
             key_exported: Some(true),
             sources: vec!["/home".into()],
+            archive_sources: Default::default(),
             overdue_after_hours: 36,
         };
         let notes = snapshot_notes(&run, 42, &ctx);

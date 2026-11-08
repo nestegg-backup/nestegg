@@ -461,14 +461,20 @@ impl<'a> Client<'a> {
             .stderr(file)
             .status()
             .context("cannot run proxmox-backup-client")?;
-        let text = std::fs::read_to_string(&tmp).unwrap_or_default();
-        if !status.success()
-            || !text
-                .lines()
-                .any(|l| crate::catalog::parse_line(l).is_some())
-        {
+        // Stream the check instead of loading a possibly huge dump.
+        let valid = status.success()
+            && std::fs::File::open(&tmp)
+                .map(|f| {
+                    BufReader::new(f)
+                        .lines()
+                        .map_while(Result::ok)
+                        .any(|l| crate::catalog::parse_line(&l).is_some())
+                })
+                .unwrap_or(false);
+        if !valid {
+            let tail = tail_of_file(&tmp, 2048);
             let _ = std::fs::remove_file(&tmp);
-            let last = text
+            let last = tail
                 .lines()
                 .rev()
                 .find(|l| !l.trim().is_empty())
@@ -544,7 +550,7 @@ impl<'a> Client<'a> {
         cmd.args(backup_args(spec));
         fds.apply(&mut cmd);
         let mut stats = Vec::new();
-        let (status, tail) = run_streaming(&mut cmd, log, |line| {
+        let (status, tail, killed) = run_streaming_cancellable(&mut cmd, log, |line| {
             if let Some(s) = parse_archive_stats(line) {
                 on_archive(&s);
                 stats.push(s);
@@ -554,7 +560,10 @@ impl<'a> Client<'a> {
             kind: ErrorKind::ClientMissing,
             message: format!("{e:#}"),
         })?;
-        if crate::cancel::requested() {
+        // Only a client that was actually stopped counts as cancelled; if it
+        // finished successfully first, the snapshot exists and the run
+        // completes normally.
+        if killed && !status.success() {
             return Err(RunError {
                 kind: ErrorKind::Cancelled,
                 message: "the backup was cancelled".into(),
@@ -780,8 +789,18 @@ fn last_error_line(tail: &[String]) -> Option<String> {
 fn run_streaming(
     cmd: &mut Command,
     log: &mut dyn Write,
-    mut on_line: impl FnMut(&str),
+    on_line: impl FnMut(&str),
 ) -> Result<(std::process::ExitStatus, Vec<String>)> {
+    run_streaming_cancellable(cmd, log, on_line).map(|(status, tail, _)| (status, tail))
+}
+
+/// Like [`run_streaming`]; also reports whether the child was stopped
+/// because a cancel was requested.
+fn run_streaming_cancellable(
+    cmd: &mut Command,
+    log: &mut dyn Write,
+    mut on_line: impl FnMut(&str),
+) -> Result<(std::process::ExitStatus, Vec<String>, bool)> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
@@ -831,7 +850,20 @@ fn run_streaming(
     }
     let status = child.wait()?;
     let _ = log.flush();
-    Ok((status, tail))
+    Ok((status, tail, killed))
+}
+
+/// Last `max` bytes of a file as text.
+fn tail_of_file(path: &Path, max: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(max)));
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 pub fn parse_time(s: &str) -> Option<DateTime<Utc>> {

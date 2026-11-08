@@ -240,7 +240,11 @@ pub fn execute(
             RestoreError::BadRequest("the restore target must be an absolute path".into()).into(),
         );
     }
-    if std::fs::symlink_metadata(target).is_ok() {
+    let exists = match requester {
+        Requester::User(user) => crate::identity::exists_as(user, target)?,
+        Requester::Root { .. } => std::fs::symlink_metadata(target).is_ok(),
+    };
+    if exists {
         return Err(RestoreError::TargetExists(target.to_path_buf()).into());
     }
     let direct = matches!(requester, Requester::Root { .. }) && root_controlled_parent(target)?;
@@ -259,6 +263,9 @@ pub fn execute(
             },
             log,
         )?;
+        if !job.patterns.is_empty() && std::fs::symlink_metadata(target).is_err() {
+            bail!("no files matched the selected paths");
+        }
         progress
             .restored_bytes
             .store(dir_size(target), Ordering::Relaxed);
@@ -286,7 +293,7 @@ pub fn execute(
         None => paths.state_dir.join("restore-staging"),
     };
     let parent = target.parent().unwrap_or(Path::new("/"));
-    if !parent.is_dir() {
+    if !crate::identity::is_dir_as(user, parent)? {
         return Err(RestoreError::BadRequest(format!(
             "{} does not exist; create it first (the restore creates only the last directory)",
             parent.display()
@@ -347,13 +354,23 @@ pub struct UserScope {
     pub prefix: String,
 }
 
-/// Map a user's home directory onto an archive of this configuration:
-/// `home = /home/alice`, source `home.pxar` → `/home` gives `/alice`.
-pub fn user_scope(config: &Config, archive: &str, home: &Path) -> Option<UserScope> {
-    let name = archive.strip_suffix(".pxar").unwrap_or(archive);
-    let source = config.backup.sources.iter().find(|s| s.archive == name)?;
-    let source_path = std::fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone());
-    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+/// Map a user's home directory onto an archive: `home = /home/alice` and
+/// the archive's source path `/home` give `/alice`. `source_path` must come
+/// from the snapshot itself (its status report), not from the current
+/// configuration, which may have changed since.
+pub fn user_scope(source_path: &Path, home: &Path, uid: u32) -> Option<UserScope> {
+    use std::os::unix::fs::MetadataExt;
+    // The home directory must be a real directory owned by the caller and
+    // not the root directory (system accounts).
+    let home = std::fs::canonicalize(home).ok()?;
+    if home == Path::new("/") {
+        return None;
+    }
+    let meta = std::fs::metadata(&home).ok()?;
+    if !meta.is_dir() || meta.uid() != uid {
+        return None;
+    }
+    let source_path = source_path.to_path_buf();
     let rel = home.strip_prefix(&source_path).ok()?;
     if rel.as_os_str().is_empty() {
         // The archive is the home directory itself (e.g. source `/home/alice`).
@@ -392,8 +409,23 @@ impl UserScope {
     }
 }
 
+/// Escape glob metacharacters so a path matches only itself.
+fn escape_glob(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Patterns for `proxmox-backup-client restore --pattern` that select the
-/// given archive-internal paths and everything below them.
+/// given archive-internal paths and everything below them. Patterns are
+/// anchored at the archive root (leading `/`) and glob characters in names
+/// are escaped: an unanchored `alice` would match every directory named
+/// `alice` anywhere in the archive.
 pub fn patterns_for(paths: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for p in paths {
@@ -401,8 +433,9 @@ pub fn patterns_for(paths: &[String]) -> Vec<String> {
         if rel.is_empty() {
             return Vec::new(); // whole archive
         }
-        out.push(rel.to_string());
-        out.push(format!("{rel}/**"));
+        let escaped = escape_glob(rel);
+        out.push(format!("/{escaped}"));
+        out.push(format!("/{escaped}/**"));
     }
     out
 }
@@ -451,23 +484,24 @@ mod tests {
 
     #[test]
     fn user_scope_mapping() {
-        let mut c = crate::config::example("pbs.example.com", "backups", "backup@pbs!desktop");
-        c.backup.sources = vec![crate::config::Source {
-            archive: "home".into(),
-            path: "/nonexistent-home-root".into(),
-            optional: false,
-            require_mount: false,
-        }];
-        let scope = user_scope(&c, "home.pxar", Path::new("/nonexistent-home-root/alice")).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let homes = std::fs::canonicalize(root.path()).unwrap();
+        let alice = homes.join("alice");
+        std::fs::create_dir(&alice).unwrap();
+        let uid = std::fs::metadata(&alice).unwrap().uid();
+        let scope = user_scope(&homes, &alice, uid).unwrap();
         assert_eq!(scope.prefix, "/alice");
+        // Not owned by the caller, root directory, outside the source.
+        assert!(user_scope(&homes, &alice, uid + 1).is_none());
+        assert!(user_scope(Path::new("/"), Path::new("/"), 0).is_none());
+        assert!(user_scope(Path::new("/elsewhere"), &alice, uid).is_none());
         assert!(scope.contains("/alice"));
         assert!(scope.contains("/alice/Documents"));
         assert!(!scope.contains("/alicex"));
         assert!(!scope.contains("/bob"));
         assert!(scope.is_ancestor("/"));
         assert!(!scope.is_ancestor("/bob"));
-        assert!(user_scope(&c, "etc.pxar", Path::new("/nonexistent-home-root/alice")).is_none());
-        assert!(user_scope(&c, "home.pxar", Path::new("/elsewhere/alice")).is_none());
     }
 
     #[test]
@@ -481,8 +515,15 @@ mod tests {
         assert_eq!(
             patterns_for(&["/alice/Documents".into()]),
             vec![
-                "alice/Documents".to_string(),
-                "alice/Documents/**".to_string()
+                "/alice/Documents".to_string(),
+                "/alice/Documents/**".to_string()
+            ]
+        );
+        assert_eq!(
+            patterns_for(&["/alice/[ab]*?.txt".into()]),
+            vec![
+                r"/alice/\[ab\]\*\?.txt".to_string(),
+                r"/alice/\[ab\]\*\?.txt/**".to_string()
             ]
         );
         assert!(patterns_for(&["/".into()]).is_empty());

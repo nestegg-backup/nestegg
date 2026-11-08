@@ -32,6 +32,10 @@ struct App {
     /// Serialises "check for an active run, reserve, spawn".
     start: Arc<Mutex<()>>,
     restores: Arc<Mutex<HashMap<String, RestoreJob>>>,
+    /// Serialises catalog dumps (one dump per snapshot, no duplicates).
+    catalog: Arc<Mutex<()>>,
+    /// Status reports of snapshots (`archive_sources`), by snapshot path.
+    reports: Arc<Mutex<HashMap<String, serde_json::Value>>>,
 }
 
 /// Credentials of the process on the other end of the socket.
@@ -65,6 +69,8 @@ fn requester(peer: &PeerInfo) -> ApiResult<crate::restore::Requester> {
 
 #[derive(Clone, serde::Serialize)]
 struct RestoreJob {
+    #[serde(skip)]
+    owner: u32,
     id: String,
     state: &'static str,
     target_dir: String,
@@ -144,6 +150,8 @@ pub fn router(paths: Paths) -> Router {
             paths,
             start: Default::default(),
             restores: Default::default(),
+            catalog: Default::default(),
+            reports: Default::default(),
         })
 }
 
@@ -365,6 +373,61 @@ fn snapshot_of(config: &Config, time: &str) -> ApiResult<String> {
     ))
 }
 
+/// Source path of `archive` as recorded in the snapshot's status report.
+/// Unprivileged access is refused for snapshots without this information.
+fn snapshot_source(
+    app: &App,
+    config: &Config,
+    snapshot: &str,
+    archive: &str,
+) -> ApiResult<PathBuf> {
+    let cached = app
+        .reports
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(snapshot)
+        .cloned();
+    let report = match cached {
+        Some(r) => r,
+        None => {
+            if !crate::wake::is_reachable(config, std::time::Duration::from_secs(3)) {
+                return Err(pbs_unreachable());
+            }
+            let client =
+                crate::client::Client::new(config, SecretStore::new(&app.paths.credentials_dir));
+            let notes = client
+                .notes(snapshot)
+                .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+            let report = crate::run::parse_report(&notes).unwrap_or(serde_json::Value::Null);
+            app.reports
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(snapshot.to_string(), report.clone());
+            report
+        }
+    };
+    report["archive_sources"][archive]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            forbidden(
+                "this snapshot has no source information; restore it with `sudo nestegg restore`",
+            )
+        })
+}
+
+fn user_scope_for(
+    app: &App,
+    config: &Config,
+    snapshot: &str,
+    archive: &str,
+    user: &crate::identity::UserIdentity,
+) -> ApiResult<crate::restore::UserScope> {
+    let source = snapshot_source(app, config, snapshot, archive)?;
+    crate::restore::user_scope(&source, &user.home, user.uid)
+        .ok_or_else(|| forbidden("this archive does not contain your home directory"))
+}
+
 fn check_archive_name(archive: &str) -> ApiResult<()> {
     let ok = archive.ends_with(".pxar")
         && archive.len() > 5
@@ -404,8 +467,9 @@ async fn browse(
     AxState(app): AxState<App>,
     peer: PeerInfo,
     UrlPath(time): UrlPath<String>,
-    Query(q): Query<BrowseQuery>,
+    q: std::result::Result<Query<BrowseQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let Query(q) = q.map_err(|e| bad_request(e.body_text()))?;
     let requester = requester(&peer)?;
     check_archive_name(&q.archive)?;
     let path = crate::restore::normalize_archive_path(q.path.as_deref().unwrap_or("/"))
@@ -416,34 +480,39 @@ async fn browse(
     })
     .await?;
     let snapshot = snapshot_of(&config, &time)?;
-    let scope = match &requester {
-        crate::restore::Requester::User(user) => {
-            let scope = crate::restore::user_scope(&config, &q.archive, &user.home)
-                .ok_or_else(|| forbidden("this archive does not contain your home directory"))?;
-            if !scope.contains(&path) && !scope.is_ancestor(&path) {
-                return Err(forbidden("you can only browse your own home directory"));
-            }
-            Some(scope)
-        }
-        crate::restore::Requester::Root { .. } => None,
-    };
-    let paths = app.paths.clone();
     let archive = q.archive.clone();
     let entries =
         tokio::task::spawn_blocking(move || -> ApiResult<Vec<crate::catalog::DirEntry>> {
-            let cache = crate::catalog::cache_path(&paths.runtime_dir, &snapshot);
-            if !cache.exists() {
-                if !crate::wake::is_reachable(&config, std::time::Duration::from_secs(3)) {
-                    return Err(pbs_unreachable());
+            let scope = match &requester {
+                crate::restore::Requester::User(user) => {
+                    let scope = user_scope_for(&app, &config, &snapshot, &archive, user)?;
+                    if !scope.contains(&path) && !scope.is_ancestor(&path) {
+                        return Err(forbidden("you can only browse your own home directory"));
+                    }
+                    Some(scope)
                 }
-                crate::secrets::create_private_dir(cache.parent().unwrap_or(Path::new("/")))
-                    .map_err(ApiError::internal)?;
-                let client =
-                    crate::client::Client::new(&config, SecretStore::new(&paths.credentials_dir));
-                client
-                    .catalog_dump(&snapshot, &cache)
-                    .map_err(|e| ApiError::internal(format!("{e:#}")))?;
-                crate::catalog::prune_cache(&paths.runtime_dir, 5);
+                crate::restore::Requester::Root { .. } => None,
+            };
+            // Catalogs list every file name of the machine: root-only directory
+            // on disk (not /run, which is RAM).
+            let cache_root = app.paths.state_dir.join("catalog-cache");
+            let cache = crate::catalog::cache_path(&cache_root, &snapshot);
+            {
+                let _one_dump_at_a_time = app.catalog.lock().unwrap_or_else(|e| e.into_inner());
+                if !cache.exists() {
+                    if !crate::wake::is_reachable(&config, std::time::Duration::from_secs(3)) {
+                        return Err(pbs_unreachable());
+                    }
+                    crate::secrets::create_private_dir(&cache_root).map_err(ApiError::internal)?;
+                    let client = crate::client::Client::new(
+                        &config,
+                        SecretStore::new(&app.paths.credentials_dir),
+                    );
+                    client
+                        .catalog_dump(&snapshot, &cache)
+                        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+                    crate::catalog::prune_dir(&cache_root, 5, &cache);
+                }
             }
             crate::catalog::list_children(&cache, &archive, &path, scope.as_ref())
                 .map_err(|e| ApiError::internal(format!("{e:#}")))
@@ -473,9 +542,14 @@ struct RestoreBody {
 async fn start_restore(
     AxState(app): AxState<App>,
     peer: PeerInfo,
-    Json(body): Json<RestoreBody>,
+    body: std::result::Result<Json<RestoreBody>, axum::extract::rejection::JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<RestoreJob>)> {
+    let Json(body) = body.map_err(|e| bad_request(e.body_text()))?;
     let requester = requester(&peer)?;
+    let owner = match &requester {
+        crate::restore::Requester::User(u) => u.uid,
+        crate::restore::Requester::Root { .. } => 0,
+    };
     let mut selections: Vec<ArchivePaths> = match (body.archives, body.archive) {
         (Some(list), _) if !list.is_empty() => list,
         (_, Some(archive)) => vec![ArchivePaths {
@@ -489,12 +563,14 @@ async fn start_restore(
         return Err(bad_request("target_dir must be an absolute path"));
     }
     crate::restore::absolute_target(&target).map_err(restore_error)?;
-    if std::fs::symlink_metadata(&target).is_ok() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "target_exists",
-            format!("{} already exists", target.display()),
-        ));
+    {
+        let mut seen = std::collections::HashSet::new();
+        if let Some(dup) = selections.iter().find(|s| !seen.insert(s.archive.clone())) {
+            return Err(bad_request(format!(
+                "archive {} is listed twice",
+                dup.archive
+            )));
+        }
     }
     let config = blocking({
         let p = app.paths.clone();
@@ -503,26 +579,68 @@ async fn start_restore(
     .await?;
     let snapshot = snapshot_of(&config, &body.snapshot_time)?;
     // Validate archives and paths; unprivileged users are limited to their
-    // own home directory.
-    for sel in &mut selections {
-        check_archive_name(&sel.archive)?;
-        let mut normalized = Vec::new();
-        for p in &sel.paths {
-            normalized.push(crate::restore::normalize_archive_path(p).map_err(restore_error)?);
-        }
-        if let crate::restore::Requester::User(user) = &requester {
-            let scope = crate::restore::user_scope(&config, &sel.archive, &user.home)
-                .ok_or_else(|| forbidden("this archive does not contain your home directory"))?;
-            if normalized.is_empty() || normalized.iter().any(|p| p == "/") {
-                normalized = vec![scope.prefix.clone()];
+    // own home directory, as recorded in the snapshot.
+    let (selections, config, snapshot, requester) = {
+        let app = app.clone();
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || -> ApiResult<_> {
+            let exists = match &requester {
+                crate::restore::Requester::User(u) => crate::identity::exists_as(u, &target)
+                    .map_err(|e| ApiError::internal(format!("{e:#}")))?,
+                crate::restore::Requester::Root { .. } => {
+                    std::fs::symlink_metadata(&target).is_ok()
+                }
+            };
+            if exists {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "target_exists",
+                    format!("{} already exists", target.display()),
+                ));
             }
-            if let Some(p) = normalized.iter().find(|p| !scope.contains(p)) {
-                return Err(forbidden(format!("{p} is outside your home directory")));
+            if selections.len() > 1
+                && matches!(requester, crate::restore::Requester::Root { .. })
+                && !crate::restore::root_controlled_parent(&target).map_err(ApiError::internal)?
+            {
+                return Err(forbidden(
+                    "as root, restore several archives only into a root-owned location",
+                ));
             }
-        }
-        sel.paths = normalized;
-    }
+            for sel in &mut selections {
+                check_archive_name(&sel.archive)?;
+                let mut normalized = Vec::new();
+                for p in &sel.paths {
+                    normalized
+                        .push(crate::restore::normalize_archive_path(p).map_err(restore_error)?);
+                }
+                if let crate::restore::Requester::User(user) = &requester {
+                    let scope = user_scope_for(&app, &config, &snapshot, &sel.archive, user)?;
+                    if normalized.is_empty() || normalized.iter().any(|p| p == "/") {
+                        normalized = vec![scope.prefix.clone()];
+                    }
+                    if let Some(p) = normalized.iter().find(|p| !scope.contains(p)) {
+                        return Err(forbidden(format!("{p} is outside your home directory")));
+                    }
+                }
+                sel.paths = normalized;
+            }
+            Ok((selections, config, snapshot, requester))
+        })
+        .await
+        .map_err(ApiError::internal)??
+    };
     let mut jobs = app.restores.lock().unwrap_or_else(|e| e.into_inner());
+    // Keep the 20 most recent finished jobs.
+    let mut finished: Vec<(String, Option<chrono::DateTime<Utc>>)> = jobs
+        .values()
+        .filter(|j| j.state != "running")
+        .map(|j| (j.id.clone(), j.finished_at))
+        .collect();
+    finished.sort_by_key(|(_, t)| *t);
+    let excess = finished.len().saturating_sub(20);
+    for (id, _) in finished.into_iter().take(excess) {
+        jobs.remove(&id);
+    }
     if jobs.values().any(|j| j.state == "running") {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -531,11 +649,12 @@ async fn start_restore(
         ));
     }
     let id = format!(
-        "{}-{:04x}",
+        "{}-{:016x}",
         Utc::now().format("%Y%m%dT%H%M%SZ"),
-        rand::random::<u16>()
+        rand::random::<u64>()
     );
     let job = RestoreJob {
+        owner,
         id: id.clone(),
         state: "running",
         target_dir: target.display().to_string(),
@@ -680,11 +799,17 @@ fn run_restore_job(
 
 async fn get_restore(
     AxState(app): AxState<App>,
+    peer: PeerInfo,
     UrlPath(id): UrlPath<String>,
 ) -> ApiResult<Json<RestoreJob>> {
+    let caller = match requester(&peer)? {
+        crate::restore::Requester::User(u) => u.uid,
+        crate::restore::Requester::Root { .. } => 0,
+    };
     let jobs = app.restores.lock().unwrap_or_else(|e| e.into_inner());
     let mut job = jobs
         .get(&id)
+        .filter(|j| caller == 0 || j.owner == caller)
         .cloned()
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "unknown restore"))?;
     if job.state == "running" {

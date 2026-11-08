@@ -30,8 +30,13 @@ docker run -d --name "$client" --network "$net" --tmpfs /mnt/small:size=2m,mode=
 on_client bash -c '
   set -e
   useradd -m alice
+  useradd -m bob
+  mkdir -p /home/bob/alice && echo "bob only" > /home/bob/alice/secret.txt
+  chown -R bob:bob /home/bob && chmod 700 /home/bob
   mkdir -p /home/alice/Documents /home/alice/.cache/big /home/alice/project/node_modules/x
   echo "quarterly report" > /home/alice/Documents/report.txt
+  echo "brackets" > "/home/alice/Documents/[ab].txt"
+  echo "plain a" > /home/alice/Documents/a.txt
   head -c 3000000 /dev/urandom > /home/alice/Documents/photo.bin
   ln -s Documents/report.txt /home/alice/link-to-report
   echo "cache" > /home/alice/.cache/big/blob
@@ -164,6 +169,7 @@ check "socket mode is 0660" bash -c "[[ \$(docker exec $client stat -c '%a' /run
 
 echo "== API as unprivileged user: session, browse, restore, machines, cancel"
 on_client usermod -aG nestegg alice
+on_client usermod -aG nestegg bob
 API="docker exec -u alice $client curl -s --unix-socket /run/nestegg/api.sock"
 latest="$(on_client nestegg snapshots --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
 ltime="${latest##*/}"
@@ -185,6 +191,24 @@ check "API restore: owned by the caller" bash -c "[[ -z \$(docker exec $client f
 check "API restore: only the selected folder" bash -c "! docker exec $client test -e /home/alice/api-restore/alice/.bashrc"
 check "API restore outside the own home is refused" bash -c "$API -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[\"/root\"],\"target_dir\":\"/home/alice/x1\"}' http://localhost/api/v1/restores | grep -q 403"
 check "API restore into an existing target is 409" bash -c "$API -X POST -H 'Content-Type: application/json' -d '{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[],\"target_dir\":\"/home/alice/api-restore\"}' http://localhost/api/v1/restores | grep -q target_exists"
+full_resp="$($API -X POST -H 'Content-Type: application/json' -d "{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[],\"target_dir\":\"/home/alice/api-full\"}" http://localhost/api/v1/restores)"
+full_id="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$full_resp")"
+for _ in $(seq 1 120); do
+  fstate="$($API "http://localhost/api/v1/restores/$full_id" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+  [[ "$fstate" != running ]] && break
+  sleep 1
+done
+check "API restore of the whole own home succeeded" test "$fstate" = succeeded
+check "another user's directory named like the caller is NOT restored" bash -c "[[ \$(docker exec $client ls -A /home/alice/api-full) == alice ]]"
+glob_resp="$($API -X POST -H 'Content-Type: application/json' -d "{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[\"/alice/Documents/[ab].txt\"],\"target_dir\":\"/home/alice/api-glob\"}" http://localhost/api/v1/restores)"
+glob_id="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$glob_resp")"
+for _ in $(seq 1 60); do
+  gstate="$($API "http://localhost/api/v1/restores/$glob_id" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+  [[ "$gstate" != running ]] && break
+  sleep 1
+done
+check "glob characters in a name are taken literally" bash -c "docker exec $client test -f '/home/alice/api-glob/alice/Documents/[ab].txt' && ! docker exec $client test -e /home/alice/api-glob/alice/Documents/a.txt"
+check "restore job of another user is not visible" bash -c "docker exec -u bob $client curl -s -o /dev/null -w '%{http_code}' --unix-socket /run/nestegg/api.sock http://localhost/api/v1/restores/$glob_id | grep -q '403\|404'"
 check "machines lists this PC with its report" bash -c "$API http://localhost/api/v1/machines | grep -q '\"hostname\":'"
 check "pbs info: reachable" bash -c "$API http://localhost/api/v1/pbs | grep -q '\"reachable\":true'"
 check "connection check via API" bash -c "$API -X POST http://localhost/api/v1/pbs/check | grep -q 'PBS login and datastore access'"

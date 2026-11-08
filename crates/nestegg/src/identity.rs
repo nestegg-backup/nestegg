@@ -79,6 +79,12 @@ impl UserIdentity {
         let gid = self.gid;
         let groups: Vec<nix::libc::gid_t> = self.groups.clone();
         cmd.env("HOME", &self.home).current_dir("/");
+        // Already running as this user (unprivileged daemon, tests): nothing
+        // to switch. Any other unprivileged identity cannot switch at all,
+        // and the pre_exec below then fails with EPERM.
+        if nix::unistd::geteuid().as_raw() == uid && uid != 0 {
+            return;
+        }
         // SAFETY: no allocation between fork and exec; only plain system
         // calls (setgroups is not on the POSIX async-signal-safe list but is
         // a direct system call wrapper in glibc and musl on Linux).
@@ -299,4 +305,29 @@ pub fn make_dir_as(user: &UserIdentity, path: &Path) -> Result<()> {
             path.as_os_str(),
         ],
     )
+}
+
+/// Whether `path` exists (or is a dangling symlink), checked with `user`'s
+/// permissions, so root's view does not leak into the answer.
+pub fn exists_as(user: &UserIdentity, path: &Path) -> Result<bool> {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "test -e \"$1\" || test -L \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    user.apply(&mut cmd);
+    Ok(cmd.status().context("cannot run test")?.success())
+}
+
+/// Whether `path` is a directory, checked with `user`'s permissions.
+pub fn is_dir_as(user: &UserIdentity, path: &Path) -> Result<bool> {
+    let mut cmd = Command::new("test");
+    cmd.arg("-d")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    user.apply(&mut cmd);
+    Ok(cmd.status().context("cannot run test")?.success())
 }

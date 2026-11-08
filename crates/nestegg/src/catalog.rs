@@ -32,30 +32,59 @@ pub struct Line {
     pub modified: Option<String>,
 }
 
-/// Parse a quoted string with backslash escapes; returns (value, rest).
+/// Parse a quoted string in Rust debug notation (`\"`, `\\`, `\n`, `\t`,
+/// `\r`, `\0`, `\xNN`, `\u{NNNN}`); returns (value, rest). Invalid UTF-8
+/// byte sequences become U+FFFD.
 fn parse_quoted(s: &str) -> Option<(String, &str)> {
     let s = s.strip_prefix('"')?;
-    let mut out: Vec<u8> = Vec::new();
     let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'"' => return Some((String::from_utf8_lossy(&out).into_owned(), &s[i + 1..])),
-            b'\\' if i + 1 < bytes.len() => {
-                match bytes[i + 1] {
-                    b'n' => out.push(b'\n'),
-                    b't' => out.push(b'\t'),
-                    b'r' => out.push(b'\r'),
-                    b'0' => out.push(0),
-                    b'x' if i + 3 < bytes.len() => {
-                        let v = u8::from_str_radix(&s[i + 2..i + 4], 16).ok()?;
-                        out.push(v);
-                        i += 2;
-                    }
-                    other => out.push(other),
+            b'\\' if i + 1 < bytes.len() => match bytes[i + 1] {
+                b'n' => {
+                    out.push(b'\n');
+                    i += 2;
                 }
-                i += 2;
-            }
+                b't' => {
+                    out.push(b'\t');
+                    i += 2;
+                }
+                b'r' => {
+                    out.push(b'\r');
+                    i += 2;
+                }
+                b'0' => {
+                    out.push(0);
+                    i += 2;
+                }
+                b'x' => {
+                    let hex = bytes.get(i + 2..i + 4)?;
+                    let v = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+                    out.push(v);
+                    i += 4;
+                }
+                b'u' => {
+                    // \u{XXXX}
+                    let rest = bytes.get(i + 2..)?;
+                    if rest.first() != Some(&b'{') {
+                        return None;
+                    }
+                    let end = rest.iter().position(|b| *b == b'}')?;
+                    let code =
+                        u32::from_str_radix(std::str::from_utf8(&rest[1..end]).ok()?, 16).ok()?;
+                    let c = char::from_u32(code)?;
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    i += 2 + end + 1;
+                }
+                other => {
+                    out.push(other);
+                    i += 2;
+                }
+            },
             b => {
                 out.push(b);
                 i += 1;
@@ -162,24 +191,22 @@ pub fn list_children(
     Ok(out)
 }
 
-/// Cache file for the catalog of `snapshot`.
-pub fn cache_path(runtime_dir: &Path, snapshot: &str) -> PathBuf {
+/// Cache file for the catalog of `snapshot` inside `cache_dir`.
+pub fn cache_path(cache_dir: &Path, snapshot: &str) -> PathBuf {
     let digest = crate::secrets::digest(&crate::secrets::Secret::new(snapshot.as_bytes().to_vec()));
-    runtime_dir
-        .join("catalog")
-        .join(format!("{}.txt", &digest[..32]))
+    cache_dir.join(format!("{}.txt", &digest[..32]))
 }
 
-/// Keep the newest `keep` cached catalogs.
-pub fn prune_cache(runtime_dir: &Path, keep: usize) {
-    let dir = runtime_dir.join("catalog");
-    let Ok(rd) = fs::read_dir(&dir) else { return };
+/// Keep the newest `keep` files in `dir`, never removing `keep_this`.
+pub fn prune_dir(dir: &Path, keep: usize, keep_this: &Path) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
         .flatten()
+        .filter(|e| e.path() != keep_this && e.path().extension().is_some_and(|x| x == "txt"))
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
     files.sort();
-    let excess = files.len().saturating_sub(keep);
+    let excess = (files.len() + 1).saturating_sub(keep);
     for (_, path) in files.into_iter().take(excess) {
         let _ = fs::remove_file(path);
     }
@@ -216,6 +243,14 @@ f "./etc.pxar.didx/hostname" 5 2026-11-08T19:17:36Z
         assert_eq!(l.size, Some(5));
         let d = parse_line(r#"d "./home.pxar.didx"    "#).unwrap();
         assert_eq!(d.size, None);
+    }
+
+    #[test]
+    fn unicode_escapes_and_bad_input() {
+        let l = parse_line(r#"f "./h/Cafe\u{301}" 1 2026-11-08T19:17:36Z"#).unwrap();
+        assert_eq!(l.path, "./h/Cafe\u{301}");
+        // Non-ASCII after \x must not panic.
+        assert!(parse_line("f \"./h/\\xä\" 1").is_none());
     }
 
     #[test]
