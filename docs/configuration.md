@@ -76,6 +76,12 @@ excludes = ["**/.cache", "**/node_modules", "**/.local/share/Trash"]
 
 [schedule]
 interval_hours = 24
+
+# Optional: read-only token for the overview of all machines in the
+# namespace (role DatastoreAudit or DatastoreReader on the namespace).
+# Store its secret with: sudo nestegg credentials set-password --overview
+# [overview]
+# auth_id = "overview@pbs!desktop"
 ```
 
 Notes:
@@ -97,6 +103,22 @@ Notes:
   is older than `interval_hours`. If the PBS is unreachable, the run ends
   with state `pbs_unreachable` and the next hourly check tries again.
 
+## Web interface and API permissions
+
+`nestegg ui` (run as a member of group `nestegg`) talks to the local daemon.
+The daemon identifies the caller by the socket credentials:
+
+- Everyone in the group can see the status, start and cancel backups and
+  run the connection check.
+- Browsing and restoring is limited to the caller's own home directory
+  (other homes and archives such as `/etc` are refused). Restored files are
+  written with the caller's identity into a new directory.
+- root (`sudo nestegg restore …`) may restore everything.
+
+The overview of all machines reads each machine's last snapshot and the
+status report stored in its notes. Without `[overview]` credentials only the
+machine's own backups are visible.
+
 ## Secrets
 
 Stored in `/etc/nestegg/credentials/` (mode 0700):
@@ -104,6 +126,7 @@ Stored in `/etc/nestegg/credentials/` (mode 0700):
 | File | Content |
 |---|---|
 | `password.cred` / `password` | Password or API token secret |
+| `overview-password.cred` / `overview-password` | Secret of the optional read-only overview token |
 | `encryption-key.cred` / `encryption-key` | Encryption key (`proxmox-backup-client` key file without password) |
 
 `*.cred` files are encrypted with `systemd-creds` (bound to the TPM when

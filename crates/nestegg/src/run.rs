@@ -30,6 +30,7 @@ pub enum RunExit {
     PbsUnreachable,
     NotDue,
     AlreadyRunning,
+    Cancelled,
 }
 
 impl RunExit {
@@ -37,7 +38,9 @@ impl RunExit {
     /// systemd unit can treat it as "try again later", not as a failure.
     pub fn code(self) -> i32 {
         match self {
-            RunExit::Succeeded | RunExit::NotDue | RunExit::AlreadyRunning => 0,
+            RunExit::Succeeded | RunExit::NotDue | RunExit::AlreadyRunning | RunExit::Cancelled => {
+                0
+            }
             RunExit::PbsUnreachable => 75,
             RunExit::Failed => 1,
         }
@@ -177,6 +180,21 @@ impl Reporter<'_> {
         self.run.warnings.push(message);
     }
 
+    /// Finish as cancelled if a cancel was requested. Returns true then.
+    fn cancelled(&mut self) -> bool {
+        if crate::cancel::requested() && !self.run.state.is_finished() {
+            self.fail(
+                RunState::Cancelled,
+                RunError {
+                    kind: ErrorKind::Cancelled,
+                    message: "the backup was cancelled".into(),
+                },
+            );
+            return true;
+        }
+        false
+    }
+
     fn fail(&mut self, state: RunState, error: RunError) {
         self.line(&format!("error: {}", error.message));
         self.run.error = Some(error);
@@ -208,6 +226,7 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
         }
         return Ok(RunExit::AlreadyRunning);
     };
+    crate::cancel::install_handler();
     let store = Store::new(paths);
     let config = Config::load(&paths.config_file);
     let state = store.load_state()?;
@@ -234,6 +253,24 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
         .append(true)
         .open(store.log_path(&run.id))
         .context("cannot open run log")?;
+    // Lets the daemon cancel this run (`POST /runs/{id}/cancel`).
+    let pid_file = paths.runtime_dir.join("run.pid");
+    let _ = crate::secrets::write_private_file(
+        &pid_file,
+        format!("{} {}\n", std::process::id(), run.id).as_bytes(),
+    )
+    .and_then(|()| {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(fs::set_permissions(
+            &pid_file,
+            fs::Permissions::from_mode(0o644),
+        )?)
+    });
+    run.expected_bytes = state
+        .last_success
+        .as_ref()
+        .map(|r| r.archives.iter().filter_map(|a| a.size_bytes).sum::<u64>())
+        .filter(|b| *b > 0);
     let mut rep = Reporter {
         store: &store,
         run,
@@ -278,9 +315,11 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     rep.line(&format!("run finished: {:?}", final_state));
     store.record_finished(&rep.run, keep)?;
     store.clear_current_if(&rep.run.id)?;
+    let _ = fs::remove_file(&pid_file);
     Ok(match final_state {
         RunState::Succeeded => RunExit::Succeeded,
         RunState::PbsUnreachable => RunExit::PbsUnreachable,
+        RunState::Cancelled => RunExit::Cancelled,
         _ => RunExit::Failed,
     })
 }
@@ -406,6 +445,9 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         &format!("checking PBS {}:{}", config.pbs.server, config.pbs.port),
     );
     let availability = wake::ensure_available(config, |msg| rep.line(msg))?;
+    if rep.cancelled() {
+        return Ok(());
+    }
     state.pbs_checked_at = Some(Utc::now());
     state.pbs_reachable = Some(availability != Availability::Unreachable);
     rep.store.save_state(&state)?;
@@ -431,6 +473,9 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         }
     }
 
+    if rep.cancelled() {
+        return Ok(());
+    }
     // 4. Inventory.
     if config.backup.inventory {
         rep.phase(RunState::Inventory, "writing system inventory");
@@ -481,18 +526,26 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
     };
     let snapshot = snapshot_path(&backup_id, backup_time);
     rep.phase(RunState::Uploading, &format!("backing up to {snapshot}"));
+    if rep.cancelled() {
+        return Ok(());
+    }
     let client = Client::new(config, secrets);
-    let outcome = {
-        let log = &mut rep.log;
-        client.backup(&spec, log)
-    };
+    let mut log = rep.log.try_clone().context("cannot duplicate log handle")?;
+    let outcome = client.backup(&spec, &mut log, &mut |stats| {
+        // Live progress for the dashboard after each finished archive.
+        rep.run.processed_bytes =
+            Some(rep.run.processed_bytes.unwrap_or(0) + stats.total_bytes.unwrap_or(0));
+        rep.run.uploaded_bytes =
+            Some(rep.run.uploaded_bytes.unwrap_or(0) + stats.uploaded_bytes.unwrap_or(0));
+        let _ = rep.store.save_current(&rep.run);
+    });
     let outcome = match outcome {
         Ok(o) => o,
         Err(error) => {
-            let state = if error.kind == ErrorKind::PbsUnreachable {
-                RunState::PbsUnreachable
-            } else {
-                RunState::Failed
+            let state = match error.kind {
+                ErrorKind::PbsUnreachable => RunState::PbsUnreachable,
+                ErrorKind::Cancelled => RunState::Cancelled,
+                _ => RunState::Failed,
             };
             rep.fail(state, error);
             return Ok(());
@@ -521,7 +574,7 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
     // 6. Notes on the snapshot, readable by the read-only overview.
     rep.phase(RunState::Finishing, "writing snapshot notes");
     let duration = (Utc::now() - rep.run.started_at).num_seconds();
-    let notes = snapshot_notes(&rep.run, duration);
+    let notes = snapshot_notes(&rep.run, duration, &report_context(config, &state));
     if let Err(e) = client.set_notes(&snapshot, &notes) {
         rep.warn(format!("could not write snapshot notes: {e:#}"));
     }
@@ -536,25 +589,66 @@ fn config_error(message: &str) -> RunError {
     }
 }
 
-/// First line is shown as the snapshot comment in PBS. The JSON below it
-/// contains no paths or personal data.
-pub fn snapshot_notes(run: &Run, duration_seconds: i64) -> String {
-    let summary = serde_json::json!({
+/// Facts about this machine that go into the snapshot report.
+pub struct ReportContext {
+    pub hostname: String,
+    pub os: Option<String>,
+    pub key_exported: Option<bool>,
+    pub sources: Vec<String>,
+    pub overdue_after_hours: u32,
+}
+
+fn report_context(config: &Config, state: &crate::state::State) -> ReportContext {
+    ReportContext {
+        hostname: crate::config::hostname(),
+        os: crate::status::os_name(),
+        key_exported: config.backup.encryption.then(|| state.key_exported()),
+        sources: config
+            .backup
+            .sources
+            .iter()
+            .map(|s| s.path.display().to_string())
+            .collect(),
+        overdue_after_hours: config.overdue_after_hours,
+    }
+}
+
+/// Snapshot notes: the first line is shown as the snapshot comment in PBS;
+/// the JSON below is the status report read by the overview of all
+/// machines (`GET /api/v1/machines`). It contains no file names.
+pub fn snapshot_notes(run: &Run, duration_seconds: i64, ctx: &ReportContext) -> String {
+    let report = serde_json::json!({
         "nestegg": env!("CARGO_PKG_VERSION"),
+        "nestegg_version": env!("CARGO_PKG_VERSION"),
+        "reported_at": crate::state::format_time(Utc::now()),
+        "result": "succeeded",
         "run": run.id,
+        "run_started_at": crate::state::format_time(run.started_at),
         "trigger": run.trigger,
         "duration_seconds": duration_seconds,
         "uploaded_bytes": run.uploaded_bytes,
         "archives": run.archives.iter().map(|a| &a.name).collect::<Vec<_>>(),
         "warnings": run.warnings.len(),
+        "hostname": ctx.hostname,
+        "os": ctx.os,
+        "key_exported": ctx.key_exported,
+        "sources": ctx.sources,
+        "overdue_after_hours": ctx.overdue_after_hours,
     });
     format!(
         "nestegg {}: ok, {} s, {} warnings\n\n{}",
         env!("CARGO_PKG_VERSION"),
         duration_seconds,
         run.warnings.len(),
-        summary
+        report
     )
+}
+
+/// Extract the JSON report from snapshot notes (text after the first blank
+/// line, or the whole text if it is JSON).
+pub fn parse_report(notes: &str) -> Option<serde_json::Value> {
+    let body = notes.split_once("\n\n").map(|(_, b)| b).unwrap_or(notes);
+    serde_json::from_str(body.trim()).ok()
 }
 
 #[cfg(test)]
@@ -577,9 +671,22 @@ mod tests {
             source: "/home".into(),
             size_bytes: None,
         });
-        let notes = snapshot_notes(&run, 42);
+        let ctx = ReportContext {
+            hostname: "desktop".into(),
+            os: None,
+            key_exported: Some(true),
+            sources: vec!["/home".into()],
+            overdue_after_hours: 36,
+        };
+        let notes = snapshot_notes(&run, 42, &ctx);
+        let report = parse_report(&notes).unwrap();
+        assert_eq!(report["result"], "succeeded");
+        assert_eq!(report["hostname"], "desktop");
         assert!(notes.lines().next().unwrap().contains("ok, 42 s"));
-        assert!(!notes.contains("/home"));
+        assert!(
+            !notes.contains("home.pxar:"),
+            "no client arguments in notes"
+        );
     }
 
     #[test]

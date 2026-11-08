@@ -324,11 +324,161 @@ pub struct BackupOutcome {
 pub struct Client<'a> {
     config: &'a Config,
     secrets: SecretStore,
+    /// Overrides `pbs.auth_id` (read-only overview credentials).
+    auth_id: Option<String>,
+    password_secret: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupInfo {
+    pub backup_type: String,
+    pub backup_id: String,
+    pub last_backup: Option<i64>,
+    pub backup_count: Option<u64>,
+}
+
+/// Convert the JSON of `list --output-format json`.
+pub fn parse_group_list(json: &str) -> Result<Vec<GroupInfo>> {
+    let value: Value = serde_json::from_str(json).context("unexpected group list output")?;
+    Ok(value
+        .as_array()
+        .context("group list is not an array")?
+        .iter()
+        .filter_map(|g| {
+            Some(GroupInfo {
+                backup_type: g["backup-type"].as_str()?.to_string(),
+                backup_id: g["backup-id"].as_str()?.to_string(),
+                last_backup: g["last-backup"].as_i64(),
+                backup_count: g["backup-count"].as_u64(),
+            })
+        })
+        .collect())
 }
 
 impl<'a> Client<'a> {
     pub fn new(config: &'a Config, secrets: SecretStore) -> Client<'a> {
-        Client { config, secrets }
+        Client {
+            config,
+            secrets,
+            auth_id: None,
+            password_secret: secrets::PASSWORD,
+        }
+    }
+
+    /// Client with other credentials (e.g. the read-only overview token).
+    pub fn with_credentials(
+        config: &'a Config,
+        secrets: SecretStore,
+        auth_id: &str,
+        password_secret: &'static str,
+    ) -> Client<'a> {
+        Client {
+            config,
+            secrets,
+            auth_id: Some(auth_id.to_string()),
+            password_secret,
+        }
+    }
+
+    fn repository(&self) -> String {
+        match &self.auth_id {
+            Some(id) => format!(
+                "{id}@{}:{}:{}",
+                self.config.pbs.server, self.config.pbs.port, self.config.pbs.datastore
+            ),
+            None => self.config.repository(),
+        }
+    }
+
+    fn output(&self, args: &[&str], with_namespace: bool) -> Result<String> {
+        let mut fds = FdPassing::new();
+        let mut cmd = self.command(&mut fds)?;
+        cmd.args(args);
+        if with_namespace {
+            self.add_namespace(&mut cmd);
+        }
+        fds.apply(&mut cmd);
+        let output = cmd.output().context("cannot run proxmox-backup-client")?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Backup groups in the configured namespace.
+    pub fn list_groups(&self) -> Result<Vec<GroupInfo>> {
+        parse_group_list(&self.output(&["list", "--output-format", "json"], true)?)
+    }
+
+    /// Snapshots of any group (`host/<id>`).
+    pub fn list_group_snapshots(&self, group: &str) -> Result<Vec<SnapshotInfo>> {
+        parse_snapshot_list(&self.output(
+            &["snapshot", "list", group, "--output-format", "json"],
+            true,
+        )?)
+    }
+
+    pub fn notes(&self, snapshot: &str) -> Result<String> {
+        self.output(&["snapshot", "notes", "show", snapshot], true)
+    }
+
+    /// Datastore usage `(used, total)`; `None` if the token may not see it.
+    pub fn datastore_usage(&self) -> Result<Option<(u64, u64)>> {
+        let v: Value =
+            serde_json::from_str(&self.output(&["status", "--output-format", "json"], false)?)
+                .context("unexpected status output")?;
+        let (used, total) = (
+            v["used"].as_u64().unwrap_or(0),
+            v["total"].as_u64().unwrap_or(0),
+        );
+        Ok((total > 0).then_some((used, total)))
+    }
+
+    /// Write the catalog of `snapshot` to `out` (see [`crate::catalog`]).
+    pub fn catalog_dump(&self, snapshot: &str, out: &Path) -> Result<()> {
+        let files = self.snapshot_files(snapshot)?;
+        let needs_key =
+            crypt_mode_for_archive(&files, "catalog.pcat1.didx").is_some_and(|m| m != "none");
+        let mut fds = FdPassing::new();
+        let mut cmd = self.command(&mut fds)?;
+        cmd.args(["catalog", "dump", snapshot]);
+        if needs_key {
+            let key = self.secrets.load(secrets::ENCRYPTION_KEY)?;
+            fds.add(&key, KEY_FD)?;
+            cmd.args(["--keyfd", &KEY_FD.to_string()]);
+        } else {
+            cmd.args(["--crypt-mode", "none"]);
+        }
+        self.add_namespace(&mut cmd);
+        fds.apply(&mut cmd);
+        // The client prints the catalog through its logger (stderr), so both
+        // streams go into the file.
+        let tmp = out.with_extension(format!("{:08x}.tmp", rand::random::<u32>()));
+        let file = std::fs::File::create(&tmp)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        let status = cmd
+            .stdout(file.try_clone()?)
+            .stderr(file)
+            .status()
+            .context("cannot run proxmox-backup-client")?;
+        let text = std::fs::read_to_string(&tmp).unwrap_or_default();
+        if !status.success()
+            || !text
+                .lines()
+                .any(|l| crate::catalog::parse_line(l).is_some())
+        {
+            let _ = std::fs::remove_file(&tmp);
+            let last = text
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            bail!("catalog dump failed: {last}");
+        }
+        std::fs::rename(&tmp, out)?;
+        Ok(())
     }
 
     /// Base command with repository, fingerprint and password descriptor.
@@ -348,11 +498,11 @@ impl<'a> Client<'a> {
         ] {
             cmd.env_remove(var);
         }
-        cmd.env("PBS_REPOSITORY", self.config.repository());
+        cmd.env("PBS_REPOSITORY", self.repository());
         if let Some(fp) = &self.config.pbs.fingerprint {
             cmd.env("PBS_FINGERPRINT", fp);
         }
-        let password = self.secrets.load(secrets::PASSWORD)?;
+        let password = self.secrets.load(self.password_secret)?;
         let fd = fds.add(&trim_secret(password), PASSWORD_FD)?;
         cmd.env("PBS_PASSWORD_FD", fd.to_string());
         cmd.stdin(Stdio::null());
@@ -370,6 +520,7 @@ impl<'a> Client<'a> {
         &self,
         spec: &BackupSpec,
         log: &mut dyn Write,
+        on_archive: &mut dyn FnMut(&ArchiveStats),
     ) -> std::result::Result<BackupOutcome, RunError> {
         let internal = |e: anyhow::Error| RunError {
             kind: ErrorKind::Internal,
@@ -395,6 +546,7 @@ impl<'a> Client<'a> {
         let mut stats = Vec::new();
         let (status, tail) = run_streaming(&mut cmd, log, |line| {
             if let Some(s) = parse_archive_stats(line) {
+                on_archive(&s);
                 stats.push(s);
             }
         })
@@ -402,6 +554,12 @@ impl<'a> Client<'a> {
             kind: ErrorKind::ClientMissing,
             message: format!("{e:#}"),
         })?;
+        if crate::cancel::requested() {
+            return Err(RunError {
+                kind: ErrorKind::Cancelled,
+                message: "the backup was cancelled".into(),
+            });
+        }
         if !status.success() {
             return Err(RunError {
                 kind: classify_failure(&tail),
@@ -648,12 +806,24 @@ fn run_streaming(
     }
     drop(tx);
     let mut tail: Vec<String> = Vec::new();
-    for line in rx {
-        let _ = writeln!(log, "{line}");
-        on_line(&line);
-        tail.push(line);
-        if tail.len() > 40 {
-            tail.remove(0);
+    let mut killed = false;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            Ok(line) => {
+                let _ = writeln!(log, "{line}");
+                on_line(&line);
+                tail.push(line);
+                if tail.len() > 40 {
+                    tail.remove(0);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if !killed && crate::cancel::requested() {
+            let _ = writeln!(log, "cancel requested, stopping proxmox-backup-client");
+            let _ = child.kill();
+            killed = true;
         }
     }
     for r in readers {
@@ -795,6 +965,15 @@ mod tests {
         assert_eq!(snaps[0].comment.as_deref(), Some("nestegg ok"));
         assert_eq!(snaps[1].archives, vec!["a.pxar.didx".to_string()]);
         assert_eq!(snaps[1].encrypted, None);
+    }
+
+    #[test]
+    fn group_list_parsing() {
+        let json = r#"[{"backup-count":4,"backup-id":"e2e-desktop","backup-type":"host","files":[],"last-backup":1794165464,"owner":"x"}]"#;
+        let g = parse_group_list(json).unwrap();
+        assert_eq!(g[0].backup_id, "e2e-desktop");
+        assert_eq!(g[0].last_backup, Some(1_794_165_464));
+        assert_eq!(g[0].backup_count, Some(4));
     }
 
     #[test]

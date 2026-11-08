@@ -53,6 +53,7 @@ pub enum ErrorKind {
     ClientFailed,
     AlreadyRunning,
     Config,
+    Cancelled,
     Internal,
 }
 
@@ -87,6 +88,13 @@ pub struct Run {
     pub archives: Vec<ArchiveInfo>,
     #[serde(default)]
     pub uploaded_bytes: Option<u64>,
+    /// Total size of the archives of the last successful run (estimate for
+    /// a progress bar).
+    #[serde(default)]
+    pub expected_bytes: Option<u64>,
+    /// Total size of the archives finished so far in this run.
+    #[serde(default)]
+    pub processed_bytes: Option<u64>,
     #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(default)]
@@ -105,6 +113,8 @@ impl Run {
             snapshot: None,
             archives: Vec::new(),
             uploaded_bytes: None,
+            expected_bytes: None,
+            processed_bytes: None,
             warnings: Vec::new(),
             error: None,
         }

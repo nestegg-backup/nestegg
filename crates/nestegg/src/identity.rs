@@ -53,6 +53,24 @@ impl UserIdentity {
         }))
     }
 
+    /// The account with this uid (for API requests, from socket credentials).
+    pub fn from_uid(uid: u32) -> Result<UserIdentity> {
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))?
+            .with_context(|| format!("user id {uid} does not exist"))?;
+        let name = CString::new(user.name.clone())?;
+        let groups = nix::unistd::getgrouplist(&name, user.gid)
+            .context("cannot determine the user's groups")?
+            .into_iter()
+            .map(|g| g.as_raw())
+            .collect();
+        Ok(UserIdentity {
+            uid,
+            gid: user.gid.as_raw(),
+            groups,
+            home: user.dir,
+        })
+    }
+
     /// Make `cmd` drop to this identity in the child, after any earlier
     /// `pre_exec` hooks (e.g. file descriptor passing) have run.
     pub fn apply(&self, cmd: &mut Command) {
@@ -267,4 +285,18 @@ pub fn copy_tree_as(user: &UserIdentity, source: &Path, target: &Path) -> Result
         }
     }
     result
+}
+
+/// Create the directory `path` (mode 0700) as `user`.
+pub fn make_dir_as(user: &UserIdentity, path: &Path) -> Result<()> {
+    run_as(
+        user,
+        "mkdir",
+        &[
+            "-m".as_ref(),
+            "0700".as_ref(),
+            "--".as_ref(),
+            path.as_os_str(),
+        ],
+    )
 }

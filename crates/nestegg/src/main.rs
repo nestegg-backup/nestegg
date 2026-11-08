@@ -161,6 +161,9 @@ enum CredCmd {
         /// Store as root-only file if systemd-creds is unavailable.
         #[arg(long)]
         allow_plain: bool,
+        /// Store the secret of the read-only overview token (`[overview]`).
+        #[arg(long)]
+        overview: bool,
     },
 }
 
@@ -227,7 +230,10 @@ fn main() -> ExitCode {
 fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
     match cmd {
         Cmd::Init(args) => init(paths, args),
-        Cmd::Credentials(CredCmd::SetPassword { allow_plain }) => set_password(paths, allow_plain),
+        Cmd::Credentials(CredCmd::SetPassword {
+            allow_plain,
+            overview,
+        }) => set_password(paths, allow_plain, overview),
         Cmd::Key(k) => key(paths, k),
         Cmd::Check => check(paths),
         Cmd::Backup => backup_now(paths),
@@ -447,11 +453,16 @@ fn read_secret_line(prompt: &str) -> Result<Secret> {
     Ok(Secret::new(value.into_bytes()))
 }
 
-fn set_password(paths: &Paths, allow_plain: bool) -> Result<u8> {
+fn set_password(paths: &Paths, allow_plain: bool, overview: bool) -> Result<u8> {
     require_root("storing credentials")?;
-    let secret = read_secret_line("PBS password or API token secret: ")?;
+    let (name, prompt) = if overview {
+        (secrets::OVERVIEW_PASSWORD, "Overview token secret: ")
+    } else {
+        (secrets::PASSWORD, "PBS password or API token secret: ")
+    };
+    let secret = read_secret_line(prompt)?;
     let store = SecretStore::new(&paths.credentials_dir);
-    match store.store(secrets::PASSWORD, &secret, allow_plain)? {
+    match store.store(name, &secret, allow_plain)? {
         Storage::SystemdCreds => println!("Stored encrypted with systemd-creds."),
         Storage::PlainFile => println!("Stored as root-only file."),
     }
@@ -627,103 +638,26 @@ fn write_user_file(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 fn check(paths: &Paths) -> Result<u8> {
-    let mut failed = false;
-    let mut report = |ok: bool, what: &str, detail: String| {
-        println!(
-            "[{}] {what}{}",
-            if ok { " ok " } else { "FAIL" },
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        );
-        failed |= !ok;
-    };
-    let cfg = match Config::load(&paths.config_file) {
-        Ok(c) => {
-            report(
-                true,
-                "configuration",
-                paths.config_file.display().to_string(),
-            );
-            c
-        }
-        Err(e) => {
-            report(false, "configuration", format!("{e:#}"));
-            return Ok(1);
-        }
-    };
-    match client::local::version() {
-        Ok(v) => report(true, "proxmox-backup-client", v),
-        Err(e) => report(false, "proxmox-backup-client", format!("{e:#}")),
-    }
-    let secrets_store = SecretStore::new(&paths.credentials_dir);
-    let pw = secrets_store.load(secrets::PASSWORD);
-    report(
-        pw.is_ok(),
-        "password / token secret",
-        pw.err().map(|e| format!("{e:#}")).unwrap_or_default(),
-    );
-    if cfg.backup.encryption {
-        let key = secrets_store.load(secrets::ENCRYPTION_KEY);
-        report(
-            key.is_ok(),
-            "encryption key",
-            key.err().map(|e| format!("{e:#}")).unwrap_or_default(),
-        );
-        let state = Store::new(paths).load_state()?;
-        report(
-            state.key_exported(),
-            "encryption key exported",
-            if state.key_exported() {
-                String::new()
-            } else {
-                "run `nestegg key confirm-exported` after exporting".into()
-            },
-        );
-    }
-    for source in &cfg.backup.sources {
-        let exists = source.path.exists();
-        report(
-            exists || source.optional,
-            &format!("source {}", source.archive),
-            format!(
-                "{}{}",
-                source.path.display(),
-                if !exists { " (missing)" } else { "" }
-            ),
-        );
-    }
-    let reachable = nestegg::wake::is_reachable(&cfg, std::time::Duration::from_secs(5));
-    report(
-        reachable || cfg.wake.is_some(),
-        "PBS reachable",
-        if reachable {
-            format!("{}:{}", cfg.pbs.server, cfg.pbs.port)
-        } else if cfg.wake.is_some() {
-            "not now (Wake-on-LAN configured; a run will wake it)".into()
-        } else {
-            "no answer".into()
+    let items = nestegg::check::run(
+        paths,
+        &nestegg::check::CheckOptions {
+            wake: false,
+            login: is_root(),
         },
     );
-    if reachable && is_root() {
-        let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
-        match client.list_snapshots(&cfg.effective_backup_id()) {
-            Ok(s) => report(
-                true,
-                "PBS login and datastore access",
-                format!("{} snapshots", s.len()),
-            ),
-            Err(e) => report(false, "PBS login and datastore access", format!("{e:#}")),
-        }
+    for item in &items {
+        println!(
+            "[{}] {}{}",
+            if item.ok { " ok " } else { "FAIL" },
+            item.name,
+            if item.detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", item.detail)
+            }
+        );
     }
-    report(
-        nestegg::status::timer_enabled(),
-        "backup timer enabled",
-        nestegg::status::TIMER_UNIT.into(),
-    );
-    Ok(u8::from(failed))
+    Ok(u8::from(!nestegg::check::passed(&items)?))
 }
 
 // ---------- commands that work through the daemon for non-root users ----------
@@ -926,51 +860,6 @@ fn history(paths: &Paths, limit: usize, json: bool) -> Result<u8> {
     Ok(0)
 }
 
-/// True if `target`'s existing ancestors are real directories that only
-/// root can modify. Then writing there as root cannot be redirected by
-/// another user (no symlink swaps, no renames).
-/// Absolute form of a restore target. `..` is rejected anywhere, so the
-/// path that is checked is exactly the path the client uses.
-fn absolute_target(target: &Path) -> Result<PathBuf> {
-    if target
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        bail!("the restore target must not contain '..'");
-    }
-    let absolute = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(target)
-    };
-    if absolute.parent().is_none() {
-        bail!("invalid restore target");
-    }
-    Ok(absolute)
-}
-
-fn root_controlled_parent(absolute: &Path) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let mut current = PathBuf::from("/");
-    let parent = absolute.parent().unwrap_or(Path::new("/"));
-    for component in parent.components() {
-        match component {
-            std::path::Component::Normal(name) => current.push(name),
-            std::path::Component::RootDir | std::path::Component::CurDir => {}
-            _ => return Ok(false),
-        }
-        let meta = match std::fs::symlink_metadata(&current) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-            Err(e) => return Err(e.into()),
-        };
-        if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// Make a user-supplied path absolute against the current directory
 /// (helpers run with cwd `/`). Symlinks are not resolved here; access is
 /// checked later with the user's identity.
@@ -999,98 +888,6 @@ fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
     if rc != 0 {
         return Err(std::io::Error::last_os_error())
             .with_context(|| format!("cannot rename to {}", to.display()));
-    }
-    Ok(())
-}
-
-fn free_bytes(path: &Path) -> Result<u64> {
-    let stat = nix::sys::statvfs::statvfs(path)?;
-    Ok(stat.blocks_available() as u64 * stat.fragment_size() as u64)
-}
-
-/// Identity of the storage behind `path`. btrfs subvolumes and ZFS datasets
-/// have different device numbers but share one pool; they are recognised by
-/// identical totals and free space, and then treated as one.
-fn storage_of(path: &Path) -> Result<(u64, u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let dev = std::fs::metadata(path)?.dev();
-    let st = nix::sys::statvfs::statvfs(path)?;
-    Ok((dev, st.blocks() as u64, st.blocks_free() as u64))
-}
-
-fn same_storage(a: (u64, u64, u64), b: (u64, u64, u64)) -> bool {
-    a.0 == b.0 || (a.1 == b.1 && a.2 == b.2)
-}
-
-/// Nearest existing ancestor of `path`.
-fn existing_ancestor(path: &Path) -> PathBuf {
-    let mut p = path.to_path_buf();
-    while !p.exists() {
-        if !p.pop() {
-            return PathBuf::from("/");
-        }
-    }
-    p
-}
-
-/// Space needed per file system for a staged restore of `size` bytes: the
-/// staging copy and the user's copy exist at the same time.
-pub fn space_requirements(size: u64, staging_dev: u64, target_dev: u64) -> Vec<(u64, u64)> {
-    let need = size + size / 20;
-    if staging_dev == target_dev {
-        vec![(staging_dev, need * 2)]
-    } else {
-        vec![(staging_dev, need), (target_dev, need)]
-    }
-}
-
-/// Check free space for a staged restore. With patterns only part of the
-/// archive is restored, so the archive size only produces a hint.
-fn check_staging_space(
-    client: &Client,
-    args: &RestoreArgs<'_>,
-    staging_root: &Path,
-    target: &Path,
-) -> Result<()> {
-    let size = match client.archive_size(args.snapshot, args.archive) {
-        Ok(Some(size)) => size,
-        Ok(None) => return Ok(()),
-        Err(e) => {
-            eprintln!("warning: could not determine the archive size: {e:#}");
-            return Ok(());
-        }
-    };
-    let target_dir = existing_ancestor(target.parent().unwrap_or(Path::new("/")));
-    let staging_storage = storage_of(staging_root)?;
-    let target_storage = storage_of(&target_dir)?;
-    let staging_dev = staging_storage.0;
-    let target_dev = if same_storage(staging_storage, target_storage) {
-        staging_dev
-    } else {
-        target_storage.0
-    };
-    for (dev, need) in space_requirements(size, staging_dev, target_dev) {
-        let dir = if dev == staging_dev {
-            staging_root
-        } else {
-            target_dir.as_path()
-        };
-        let free = free_bytes(dir)?;
-        if free < need {
-            let msg = format!(
-                "a staged restore of this archive (about {} MiB) needs about {} MiB in {}, \
-                 but only {} MiB are free; use --staging-dir on another file system or \
-                 restore into a root-owned target",
-                size / (1024 * 1024),
-                need / (1024 * 1024),
-                dir.display(),
-                free / (1024 * 1024)
-            );
-            if args.patterns.is_empty() {
-                bail!(msg);
-            }
-            eprintln!("warning: {msg} (only matching files are restored, continuing)");
-        }
     }
     Ok(())
 }
@@ -1127,120 +924,48 @@ fn install_restore_signal_handlers() {
 }
 
 fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
-    let RestoreArgs {
-        snapshot,
-        archive,
-        target,
-        patterns,
-        keyfile,
-        no_key,
-        staging_dir,
-    } = *args;
+    use nestegg::restore::{self, Job, Progress, Requester};
     require_root("restore")?;
-    let target = &absolute_target(target)?;
-    if std::fs::symlink_metadata(target).is_ok() {
-        bail!(
-            "{} already exists; restores only go into a new directory",
-            target.display()
-        );
-    }
-    // Writing as root into a directory another user controls could be
-    // redirected (symlink swap during the restore). In that case restore
-    // with the invoking user's identity instead.
+    let target = restore::absolute_target(args.target)?;
     let sudo = nestegg::identity::UserIdentity::from_sudo()?;
-    let run_as = if root_controlled_parent(target)? {
-        None
-    } else if let Some(user) = sudo.clone() {
-        eprintln!(
-            "note: {} is not in a root-controlled directory; the files are restored \
-             into a private staging directory first and then copied with your user's \
-             permissions (owned by you; ACLs, xattrs and capabilities are dropped)",
-            target.display()
-        );
-        Some(user)
-    } else {
-        bail!(
-            "{} is inside a directory that other users can modify. Restore into a \
-             root-owned location (e.g. /root/restore) or run via sudo from the owning user.",
-            target.display()
-        );
-    };
-    let key = if no_key {
+    let key = if args.no_key {
         client::RestoreKey::Without
-    } else if let Some(path) = keyfile {
+    } else if let Some(path) = args.keyfile {
         let path = absolute_user_path(path)?;
-        let bytes = match &sudo {
-            Some(user) => nestegg::identity::read_file_as(user, &path)?,
-            None => std::fs::read(&path)?,
-        };
-        client::RestoreKey::File(Secret::new(bytes))
+        client::RestoreKey::File(restore::read_user_key(&path, sudo.as_ref())?)
     } else {
         client::RestoreKey::Auto
     };
-    let cfg = Config::load(&paths.config_file)?;
-    let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
-    let mut stderr = std::io::stderr();
-    match run_as {
-        None => client.restore(
-            &client::RestoreRequest {
-                snapshot,
-                archive,
-                target,
-                patterns,
-                key,
-            },
-            &mut stderr,
-        )?,
-        Some(user) => {
-            install_restore_signal_handlers();
-            // Root restores into a directory only root can reach, then the
-            // tree is copied into the user's target with the user's identity.
-            let staging_root = match staging_dir {
-                Some(dir) => {
-                    let dir = absolute_target(dir)?;
-                    if !dir.is_dir() || !root_controlled_parent(&dir.join("x"))? {
-                        bail!(
-                            "--staging-dir {} must be an existing directory that only root can modify",
-                            dir.display()
-                        );
-                    }
-                    dir.join("nestegg-restore-staging")
-                }
-                None => paths.state_dir.join("restore-staging"),
-            };
-            let parent = target.parent().unwrap_or(Path::new("/"));
-            if !parent.is_dir() {
-                bail!(
-                    "{} does not exist; create it first (the restore creates only the last directory)",
-                    parent.display()
-                );
-            }
-            secrets::create_private_dir(&staging_root)?;
-            for warning in nestegg::staging::cleanup_stale(&staging_root) {
-                eprintln!("warning: {warning}");
-            }
-            check_staging_space(&client, args, &staging_root, target)?;
-            let staging = nestegg::staging::StagingDir::create(&staging_root)?;
-            let data = staging.path().join("data");
-            let result = client
-                .restore(
-                    &client::RestoreRequest {
-                        snapshot,
-                        archive,
-                        target: &data,
-                        patterns,
-                        key,
-                    },
-                    &mut stderr,
-                )
-                .and_then(|()| nestegg::identity::copy_tree_as(&user, &data, target));
-            if let Err(e) = staging.remove() {
-                eprintln!("warning: {e:#}");
-            }
-            for warning in result? {
-                eprintln!("warning: {warning}");
-            }
+    if !restore::root_controlled_parent(&target)? {
+        if sudo.is_some() {
+            eprintln!(
+                "note: {} is not in a root-controlled directory; the files are restored \
+                 into a private staging directory first and then copied with your user's \
+                 permissions (owned by you; ACLs, xattrs and capabilities are dropped)",
+                target.display()
+            );
         }
+        install_restore_signal_handlers();
+    }
+    let cfg = Config::load(&paths.config_file)?;
+    let mut stderr = std::io::stderr();
+    let warnings = restore::execute(
+        paths,
+        &cfg,
+        Job {
+            snapshot: args.snapshot,
+            archive: args.archive,
+            target: &target,
+            patterns: args.patterns,
+            key,
+            staging_dir: args.staging_dir,
+        },
+        &Requester::Root { sudo },
+        &Progress::default(),
+        &mut stderr,
+    )?;
+    for warning in warnings {
+        eprintln!("warning: {warning}");
     }
     println!("Restored into {}", target.display());
     Ok(0)
@@ -1258,39 +983,5 @@ fn human_bytes(b: u64) -> String {
         format!("{b} B")
     } else {
         format!("{v:.1} {}", UNITS[i])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn staged_restore_needs_space_for_both_copies() {
-        let size = 100 * 1024 * 1024 * 1024u64;
-        let same = space_requirements(size, 1, 1);
-        assert_eq!(same.len(), 1);
-        assert!(same[0].1 >= 2 * size, "two copies on one file system");
-        let split = space_requirements(size, 1, 2);
-        assert_eq!(split.len(), 2);
-        assert!(
-            split
-                .iter()
-                .all(|(_, need)| *need >= size && *need < 2 * size)
-        );
-    }
-
-    #[test]
-    fn subvolumes_sharing_a_pool_count_as_one() {
-        assert!(same_storage((1, 100, 50), (2, 100, 50)));
-        assert!(same_storage((1, 100, 50), (1, 200, 10)));
-        assert!(!same_storage((1, 100, 50), (2, 100, 49)));
-    }
-
-    #[test]
-    fn restore_targets_are_normalised() {
-        assert!(absolute_target(Path::new("/a/../b")).is_err());
-        assert!(absolute_target(Path::new("rel")).unwrap().is_absolute());
-        assert!(absolute_target(Path::new("/")).is_err());
     }
 }

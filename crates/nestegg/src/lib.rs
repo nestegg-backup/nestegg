@@ -1,12 +1,16 @@
 //! nestegg – unattended, encrypted backups of Linux desktops to a Proxmox
 //! Backup Server. See `docs/architecture.md`.
 
+pub mod cancel;
+pub mod catalog;
+pub mod check;
 pub mod client;
 pub mod config;
 pub mod daemon;
 pub mod identity;
 pub mod inventory;
 pub mod mounts;
+pub mod restore;
 pub mod run;
 pub mod secrets;
 pub mod staging;

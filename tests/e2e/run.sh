@@ -162,6 +162,52 @@ check "daemon status endpoint" bash -c "docker exec $client curl -sf --unix-sock
 check "daemon snapshots endpoint" bash -c "docker exec $client curl -sf --unix-socket /run/nestegg/api.sock http://localhost/api/v1/snapshots | grep -q e2e-desktop"
 check "socket mode is 0660" bash -c "[[ \$(docker exec $client stat -c '%a' /run/nestegg/api.sock) == 660 ]]"
 
+echo "== API as unprivileged user: session, browse, restore, machines, cancel"
+on_client usermod -aG nestegg alice
+API="docker exec -u alice $client curl -s --unix-socket /run/nestegg/api.sock"
+latest="$(on_client nestegg snapshots --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
+ltime="${latest##*/}"
+check "session identifies the caller" bash -c "$API http://localhost/api/v1/session | grep -q '\"user\":\"alice\"'"
+check "browse root shows only the own home" bash -c "[[ \$($API 'http://localhost/api/v1/snapshots/$ltime/browse?archive=home.pxar&path=/' | grep -o '\"name\":\"[^\"]*\"' | sort -u | tr -d '\n') == '\"name\":\"alice\"' ]]"
+check "browse inside the own home" bash -c "$API 'http://localhost/api/v1/snapshots/$ltime/browse?archive=home.pxar&path=/alice/Documents' | grep -q report.txt"
+check "browse of another archive is refused" bash -c "$API -o /dev/null -w '%{http_code}' 'http://localhost/api/v1/snapshots/$ltime/browse?archive=etc.pxar&path=/' | grep -q 403"
+restore_resp="$($API -X POST -H 'Content-Type: application/json' -d "{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[\"/alice/Documents\"],\"target_dir\":\"/home/alice/api-restore\"}" http://localhost/api/v1/restores)"
+restore_id="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$restore_resp")"
+check "restore accepted" test -n "$restore_id"
+for _ in $(seq 1 60); do
+  rstate="$($API "http://localhost/api/v1/restores/$restore_id" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+  [[ "$rstate" != running ]] && break
+  sleep 1
+done
+check "API restore succeeded" test "$rstate" = succeeded
+check "API restore: content matches" on_client cmp /home/alice/Documents/report.txt /home/alice/api-restore/alice/Documents/report.txt
+check "API restore: owned by the caller" bash -c "[[ -z \$(docker exec $client find /home/alice/api-restore ! -user alice) ]]"
+check "API restore: only the selected folder" bash -c "! docker exec $client test -e /home/alice/api-restore/alice/.bashrc"
+check "API restore outside the own home is refused" bash -c "$API -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[\"/root\"],\"target_dir\":\"/home/alice/x1\"}' http://localhost/api/v1/restores | grep -q 403"
+check "API restore into an existing target is 409" bash -c "$API -X POST -H 'Content-Type: application/json' -d '{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[],\"target_dir\":\"/home/alice/api-restore\"}' http://localhost/api/v1/restores | grep -q target_exists"
+check "machines lists this PC with its report" bash -c "$API http://localhost/api/v1/machines | grep -q '\"hostname\":'"
+check "pbs info: reachable" bash -c "$API http://localhost/api/v1/pbs | grep -q '\"reachable\":true'"
+check "connection check via API" bash -c "$API -X POST http://localhost/api/v1/pbs/check | grep -q 'PBS login and datastore access'"
+
+# Cancel a running backup: throttle the upload and add new data.
+on_client sed -i 's/^\[backup\]$/[backup]\nrate_limit = "100KiB"/' /etc/nestegg/config.toml
+on_client bash -c 'head -c 20000000 /dev/urandom > /home/alice/big-new-file.bin'
+run_resp="$($API -X POST http://localhost/api/v1/runs)"
+run_id="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$run_resp")"
+for _ in $(seq 1 60); do
+  $API http://localhost/api/v1/status | grep -q '"state":"uploading"' && break
+  sleep 1
+done
+check "cancel request accepted" bash -c "$API -o /dev/null -w '%{http_code}' -X POST http://localhost/api/v1/runs/$run_id/cancel | grep -q 202"
+for _ in $(seq 1 60); do
+  $API "http://localhost/api/v1/runs/$run_id" | grep -q '"state":"cancelled"' && break
+  sleep 1
+done
+check "cancelled run recorded as cancelled" bash -c "$API http://localhost/api/v1/runs/$run_id | grep -q '\"state\":\"cancelled\"'"
+check "no backup client left running" bash -c "! docker exec $client pgrep -f 'proxmox-backup-client backup' >/dev/null"
+on_client sed -i '/^rate_limit = "100KiB"$/d' /etc/nestegg/config.toml
+on_client rm -f /home/alice/big-new-file.bin
+
 echo "== token cannot delete backups"
 check "token is not allowed to forget snapshots" bash -c "! docker exec -e PBS_PASSWORD='$token_secret' -e PBS_FINGERPRINT='$fp' $client \
   proxmox-backup-client snapshot forget '$snapshot' --ns desktops --repository 'backup@pbs!desktop@pbs.e2e.test:store1' >/dev/null 2>&1"
