@@ -53,6 +53,24 @@ impl UserIdentity {
         }))
     }
 
+    /// The account with this uid (for API requests, from socket credentials).
+    pub fn from_uid(uid: u32) -> Result<UserIdentity> {
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))?
+            .with_context(|| format!("user id {uid} does not exist"))?;
+        let name = CString::new(user.name.clone())?;
+        let groups = nix::unistd::getgrouplist(&name, user.gid)
+            .context("cannot determine the user's groups")?
+            .into_iter()
+            .map(|g| g.as_raw())
+            .collect();
+        Ok(UserIdentity {
+            uid,
+            gid: user.gid.as_raw(),
+            groups,
+            home: user.dir,
+        })
+    }
+
     /// Make `cmd` drop to this identity in the child, after any earlier
     /// `pre_exec` hooks (e.g. file descriptor passing) have run.
     pub fn apply(&self, cmd: &mut Command) {
@@ -61,6 +79,12 @@ impl UserIdentity {
         let gid = self.gid;
         let groups: Vec<nix::libc::gid_t> = self.groups.clone();
         cmd.env("HOME", &self.home).current_dir("/");
+        // Already running as this user (unprivileged daemon, tests): nothing
+        // to switch. Any other unprivileged identity cannot switch at all,
+        // and the pre_exec below then fails with EPERM.
+        if nix::unistd::geteuid().as_raw() == uid && uid != 0 {
+            return;
+        }
         // SAFETY: no allocation between fork and exec; only plain system
         // calls (setgroups is not on the POSIX async-signal-safe list but is
         // a direct system call wrapper in glibc and musl on Linux).
@@ -267,4 +291,43 @@ pub fn copy_tree_as(user: &UserIdentity, source: &Path, target: &Path) -> Result
         }
     }
     result
+}
+
+/// Create the directory `path` (mode 0700) as `user`.
+pub fn make_dir_as(user: &UserIdentity, path: &Path) -> Result<()> {
+    run_as(
+        user,
+        "mkdir",
+        &[
+            "-m".as_ref(),
+            "0700".as_ref(),
+            "--".as_ref(),
+            path.as_os_str(),
+        ],
+    )
+}
+
+/// Whether `path` exists (or is a dangling symlink), checked with `user`'s
+/// permissions, so root's view does not leak into the answer.
+pub fn exists_as(user: &UserIdentity, path: &Path) -> Result<bool> {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "test -e \"$1\" || test -L \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    user.apply(&mut cmd);
+    Ok(cmd.status().context("cannot run test")?.success())
+}
+
+/// Whether `path` is a directory, checked with `user`'s permissions.
+pub fn is_dir_as(user: &UserIdentity, path: &Path) -> Result<bool> {
+    let mut cmd = Command::new("test");
+    cmd.arg("-d")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    user.apply(&mut cmd);
+    Ok(cmd.status().context("cannot run test")?.success())
 }

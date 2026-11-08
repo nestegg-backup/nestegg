@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: nestegg local API
-  version: 0.1.0
+  version: 0.2.0
   summary: Local control API of the nestegg daemon.
   description: |
     Served by `nestegg daemon` on the Unix socket `/run/nestegg/api.sock`
@@ -20,6 +20,11 @@ info:
       every request. No cookies are used (cookies are shared across all ports
       of 127.0.0.1). Static UI files are served without a token.
     - Run IDs look like `20261108T213012Z-manual-a3f9` (random suffix).
+    - Permissions: the daemon identifies the caller by the Unix socket
+      credentials (for `nestegg ui`: the user who started it). root may
+      browse and restore everything; other users (members of group
+      `nestegg`) only paths inside their own home directory, and their
+      restores are written with their own identity (files owned by them).
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
@@ -97,6 +102,103 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+  /runs/{runId}/cancel:
+    post:
+      operationId: cancelRun
+      summary: Cancel the running backup with this ID.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "202":
+          description: |
+            Cancellation requested. The run normally ends with state
+            `cancelled`; if the client had already finished, the run
+            completes as `succeeded`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelling: { type: boolean }
+        "404":
+          description: No running backup with this ID.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`cannot_cancel`: still starting (retry) or already finishing."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /session:
+    get:
+      operationId: getSession
+      summary: The user on the other end of the socket.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionInfo" }
+  /pbs:
+    get:
+      operationId: getPbs
+      summary: Facts about the backup server.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PbsInfo" }
+  /pbs/check:
+    post:
+      operationId: checkPbs
+      summary: Run the checks of `nestegg check` (configuration, client, secrets, sources, reachability, login).
+      parameters:
+        - name: wake
+          in: query
+          description: Wake the PBS via Wake-on-LAN if it does not answer.
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [checks, checked_at]
+                properties:
+                  checked_at: { type: string, format: date-time }
+                  checks:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, ok, detail]
+                      properties:
+                        name: { type: string, examples: ["PBS reachable"] }
+                        ok: { type: boolean }
+                        detail: { type: string }
+  /machines:
+    get:
+      operationId: listMachines
+      summary: Backup groups (machines) in this PC's PBS namespace with their last status report.
+      description: |
+        Uses the read-only overview credentials (`[overview]` in the
+        configuration) when set up; otherwise only this machine's own
+        backups are visible (`complete: false`). The report is the JSON a
+        machine stores in the notes of each successful snapshot; failed runs
+        create no snapshot and therefore no report.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MachinesResponse" }
+        "503":
+          description: PBS not reachable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
   /snapshots:
     get:
       operationId: listSnapshots
@@ -122,7 +224,12 @@ paths:
   /snapshots/{snapshotTime}/browse:
     get:
       operationId: browseSnapshot
-      summary: List a directory inside an archive of a snapshot (planned for v0.2).
+      summary: List a directory inside an archive of a snapshot.
+      description: |
+        The first call for a snapshot reads its catalog from the PBS (needs
+        the PBS to be reachable); later calls use a local cache. Users other
+        than root see only their own home directory (ancestors show only the
+        branch towards it).
       parameters:
         - name: snapshotTime
           in: path
@@ -147,18 +254,33 @@ paths:
                   entries:
                     type: array
                     items: { $ref: "#/components/schemas/DirEntry" }
-        "501":
-          description: Not implemented yet.
+        "403":
+          description: Outside the caller's home directory.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: PBS not reachable (catalog not cached yet).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
   /restores:
     post:
       operationId: startRestore
-      summary: Restore files from a snapshot into a new directory (planned for v0.2).
+      summary: Restore files from a snapshot into a new directory.
       description: |
-        The target directory must not exist yet and is created with the
-        requesting user as owner. Restores never overwrite existing files.
+        The target directory must not exist yet; for users other than root
+        it is created with the caller's identity and the files belong to
+        them (ACLs, xattrs, capabilities and sockets are not copied).
+        Restores never overwrite existing files. With `archives` (takes
+        precedence over `archive`), each archive goes into
+        `<target_dir>/<archive name without .pxar>/`; an archive may be
+        listed only once. One restore at a time. For non-root callers the
+        home directory is mapped onto the archive using the source paths
+        recorded in the snapshot's status report; snapshots without that
+        information can only be restored by root. Paths are matched
+        literally (no globbing). Some problems (e.g. no matching files)
+        only show up in the job's `error`.
       requestBody:
         required: true
         content:
@@ -170,14 +292,27 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Restore" }
-        "501":
-          description: Not implemented yet.
+        "400":
+          description: Invalid request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: Paths outside the caller's home directory.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`target_exists` or `restore_in_progress`."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
   /restores/{restoreId}:
     get:
       operationId: getRestore
+      description: |
+        Jobs are kept in memory (last 20) and are visible only to the user
+        who started them (and root).
       parameters:
         - name: restoreId
           in: path
@@ -189,6 +324,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Restore" }
+        "404":
+          description: Unknown job (or started by another user).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
   /config:
     get:
       operationId: getConfig
@@ -214,7 +354,7 @@ components:
         code:
           type: string
           description: Stable identifier.
-          enum: [run_in_progress, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
+          enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
         message: { type: string, description: Human-readable English text. }
     Health:
       type: object
@@ -248,7 +388,8 @@ components:
           required: [enabled]
           properties:
             enabled: { type: boolean }
-            calendar: { type: string, examples: ["daily"] }
+            calendar: { type: string, examples: ["every 24 h (checked hourly)"] }
+            interval_hours: { type: integer, examples: [24] }
             next_run: { type: [string, "null"], format: date-time }
         current_run:
           oneOf:
@@ -303,7 +444,9 @@ components:
               name: { type: string, examples: ["home.pxar"] }
               source: { type: string, examples: ["/home"] }
               size_bytes: { type: [integer, "null"] }
-        uploaded_bytes: { type: [integer, "null"] }
+        uploaded_bytes: { type: [integer, "null"], description: Uploaded (new) data; updated after each finished archive during a run. }
+        expected_bytes: { type: [integer, "null"], description: Total archive size of the last successful run (progress estimate). }
+        processed_bytes: { type: [integer, "null"], description: Total size of the archives finished so far in this run. }
         warnings:
           type: array
           items: { type: string }
@@ -317,7 +460,7 @@ components:
       properties:
         kind:
           type: string
-          enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, internal]
+          enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, cancelled, internal]
         message: { type: string }
     RunDetail:
       allOf:
@@ -352,14 +495,23 @@ components:
         modified: { type: [string, "null"], format: date-time }
     RestoreRequest:
       type: object
-      required: [snapshot_time, archive, paths, target_dir]
+      required: [snapshot_time, target_dir]
+      description: Either `archive` (+ `paths`) or `archives`.
       properties:
         snapshot_time: { type: string, format: date-time }
         archive: { type: string, examples: ["home.pxar"] }
         paths:
           type: array
-          description: Paths inside the archive; empty restores the whole archive.
+          description: "Paths inside the archive (with everything below them); empty restores the whole archive (for non-root callers: their whole home directory)."
           items: { type: string, examples: ["/alice/Documents/report.odt"] }
+        archives:
+          type: array
+          items:
+            type: object
+            required: [archive]
+            properties:
+              archive: { type: string }
+              paths: { type: array, items: { type: string } }
         target_dir: { type: string, examples: ["/home/alice/nestegg-restore-2026-11-08"] }
     Restore:
       type: object
@@ -371,6 +523,9 @@ components:
         started_at: { type: string, format: date-time }
         finished_at: { type: [string, "null"], format: date-time }
         error: { type: [string, "null"] }
+        restored_bytes: { type: integer, description: Bytes restored so far (staging copy). }
+        total_bytes: { type: [integer, "null"], description: Expected total when whole archives are restored. }
+        warnings: { type: array, items: { type: string } }
     ConfigView:
       type: object
       description: Configuration as loaded, without any secret values.
@@ -388,5 +543,61 @@ components:
           type: array
           items: { type: string }
         schedule: { type: string }
+        interval_hours: { type: integer }
         encryption: { type: boolean }
         overdue_after_hours: { type: integer }
+    SessionInfo:
+      type: object
+      required: [user, home, uid, root]
+      properties:
+        user: { type: string, examples: ["alice"] }
+        home: { type: string, examples: ["/home/alice"] }
+        uid: { type: integer }
+        root: { type: boolean }
+    PbsInfo:
+      type: object
+      required: [server, datastore, reachable, overview_configured]
+      properties:
+        server: { type: string, examples: ["pbs.example.com:8007"] }
+        datastore: { type: string }
+        namespace: { type: [string, "null"] }
+        reachable: { type: boolean }
+        used_bytes: { type: [integer, "null"], description: Needs read access to the datastore status; null otherwise. }
+        total_bytes: { type: [integer, "null"] }
+        overview_configured: { type: boolean }
+    MachinesResponse:
+      type: object
+      required: [read_at, complete, machines]
+      properties:
+        read_at: { type: string, format: date-time }
+        complete: { type: boolean, description: false if only this machine's own backups are visible (no overview credentials). }
+        machines:
+          type: array
+          items:
+            type: object
+            required: [backup_id, recent_snapshots]
+            properties:
+              backup_id: { type: string, examples: ["media"] }
+              hostname: { type: [string, "null"] }
+              os: { type: [string, "null"] }
+              last_snapshot: { type: [string, "null"], format: date-time }
+              recent_snapshots:
+                type: array
+                description: Snapshot times of the last 14 days, newest first.
+                items: { type: string, format: date-time }
+              size_bytes: { type: [integer, "null"] }
+              report:
+                description: Status report from the notes of the last snapshot.
+                type: [object, "null"]
+                properties:
+                  reported_at: { type: string, format: date-time }
+                  result: { type: string, enum: [succeeded] }
+                  run_started_at: { type: string, format: date-time }
+                  hostname: { type: string }
+                  os: { type: [string, "null"] }
+                  key_exported: { type: [boolean, "null"] }
+                  sources: { type: array, items: { type: string } }
+                  overdue_after_hours: { type: integer }
+                  nestegg_version: { type: string }
+                  uploaded_bytes: { type: [integer, "null"] }
+                  duration_seconds: { type: integer }

@@ -79,6 +79,18 @@ pub struct Config {
     pub backup: BackupConfig,
     #[serde(default)]
     pub schedule: ScheduleConfig,
+    /// Optional read-only credentials for the overview of all machines in
+    /// the namespace (role DatastoreAudit or DatastoreReader). Without it,
+    /// the overview only shows the machine's own backups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overview: Option<OverviewConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OverviewConfig {
+    /// `user@realm!token` with read-only access to the namespace.
+    pub auth_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -346,6 +358,11 @@ impl Config {
         if let Some(wake) = &self.wake {
             parse_mac(&wake.mac).context("wake.mac")?;
         }
+        if let Some(o) = &self.overview
+            && !o.auth_id.contains('@')
+        {
+            bail!("overview.auth_id must look like user@realm!token");
+        }
         if self.schedule.interval_hours == 0 {
             bail!("schedule.interval_hours must be at least 1");
         }
@@ -420,6 +437,7 @@ pub fn example(server: &str, datastore: &str, auth_id: &str) -> Config {
         wake: None,
         backup: BackupConfig::default(),
         schedule: ScheduleConfig::default(),
+        overview: None,
     }
 }
 

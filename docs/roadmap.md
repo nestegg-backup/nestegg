@@ -31,13 +31,13 @@ Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
 - Tests: unit tests plus an end-to-end test against a disposable PBS in a VM
   or container, on clean Ubuntu LTS and Linux Mint images.
 
-## v0.2 – Desktop integration
+## v0.2 – Desktop integration (API implemented, UI in progress)
 
 - Local web UI (`nestegg ui`): status, run now, history, restore,
   notifications when a backup is overdue. Contract: `api/openapi.yaml`.
 - `.deb` packages.
 
-## v0.3 – Overview of several machines
+## v0.3 – Overview of several machines (API implemented)
 
 - One place that shows every machine: last verified success, next run,
   overdue or offline, encryption key backed up yes/no.

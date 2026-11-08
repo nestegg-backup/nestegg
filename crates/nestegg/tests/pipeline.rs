@@ -495,10 +495,20 @@ fn start_daemon(env: &Env) -> Daemon {
 }
 
 fn request(socket: &PathBuf, method: &str, path: &str) -> (u16, serde_json::Value) {
+    request_body(socket, method, path, "")
+}
+
+fn request_body(
+    socket: &PathBuf,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (u16, serde_json::Value) {
     let mut s = UnixStream::connect(socket).unwrap();
     write!(
         s,
-        "{method} {path} HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+        "{method} {path} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
     )
     .unwrap();
     let mut buf = String::new();
@@ -606,7 +616,51 @@ fn daemon_serves_status_runs_and_snapshots() {
 
     let (code, err) = request(&socket, "GET", "/api/v1/runs/..%2Fetc");
     assert_eq!(code, 404, "{err}");
-    let (code, err) = request(&socket, "POST", "/api/v1/restores");
-    assert_eq!(code, 501, "{err}");
-    assert_eq!(err["code"], "not_implemented");
+    // Restores and browsing: the test user's home is not part of the
+    // configured sources, so both are refused for this (non-root) caller.
+    let (code, err) = request_body(
+        &socket,
+        "POST",
+        "/api/v1/restores",
+        r#"{"snapshot_time":"2026-11-06T21:20:00Z","archive":"home.pxar","paths":[],"target_dir":"/tmp/nestegg-test-target-does-not-exist"}"#,
+    );
+    assert_eq!(code, 403, "{err}");
+    assert_eq!(err["code"], "forbidden");
+    let (code, err) = request(
+        &socket,
+        "GET",
+        "/api/v1/snapshots/2026-11-06T21:20:00Z/browse?archive=home.pxar&path=/",
+    );
+    assert_eq!(code, 403, "{err}");
+    let (code, err) = request(
+        &socket,
+        "GET",
+        "/api/v1/snapshots/2026-11-06T21:20:00Z/browse?archive=..%2Fx&path=/",
+    );
+    assert_eq!(code, 400, "{err}");
+
+    let (code, session) = request(&socket, "GET", "/api/v1/session");
+    assert_eq!(code, 200);
+    assert_eq!(session["uid"], nix::unistd::getuid().as_raw());
+
+    let (code, cfg) = request(&socket, "GET", "/api/v1/config");
+    assert_eq!(code, 200);
+    assert_eq!(cfg["interval_hours"], 24);
+
+    let (code, err) = request(
+        &socket,
+        "POST",
+        "/api/v1/runs/20261108T000000Z-manual-0000/cancel",
+    );
+    assert_eq!(code, 404, "{err}");
+
+    let (code, checks) = request(&socket, "POST", "/api/v1/pbs/check");
+    assert_eq!(code, 200, "{checks}");
+    assert!(
+        checks["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "PBS reachable" && c["ok"] == true)
+    );
 }

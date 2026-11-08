@@ -21,6 +21,8 @@ use nix::fcntl::OFlag;
 
 pub const PASSWORD: &str = "password";
 pub const ENCRYPTION_KEY: &str = "encryption-key";
+/// Secret of the read-only overview token (optional).
+pub const OVERVIEW_PASSWORD: &str = "overview-password";
 
 /// Secret bytes that are wiped from memory when dropped.
 pub struct Secret(Vec<u8>);

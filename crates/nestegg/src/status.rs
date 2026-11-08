@@ -46,6 +46,7 @@ pub struct PbsStatus {
 pub struct Schedule {
     pub enabled: bool,
     pub calendar: String,
+    pub interval_hours: u32,
     #[serde(with = "crate::state::rfc3339_opt")]
     pub next_run: Option<DateTime<Utc>>,
 }
@@ -103,6 +104,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
         schedule: Schedule {
             enabled: timer,
             calendar: format!("every {interval} h (checked hourly)"),
+            interval_hours: interval,
             next_run: (timer && current.is_none()).then(|| next_due(&state, interval, now)),
         },
         health: health(
@@ -134,6 +136,7 @@ pub fn config_view(config: &Config) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "excludes": config.backup.excludes,
         "schedule": format!("every {} h", config.schedule.interval_hours),
+        "interval_hours": config.schedule.interval_hours,
         "encryption": config.backup.encryption,
         "overdue_after_hours": config.overdue_after_hours,
     })

@@ -70,7 +70,12 @@ pub fn ensure_available(config: &Config, mut on_wake: impl FnMut(&str)) -> Resul
     let deadline = Duration::from_secs(wake.timeout_seconds);
     let mut last_packet = Instant::now();
     while start.elapsed() < deadline {
-        std::thread::sleep(Duration::from_secs(5));
+        for _ in 0..10 {
+            if crate::cancel::requested() {
+                return Ok(Availability::Unreachable);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
         if is_reachable(config, probe) {
             return Ok(Availability::ReachableAfterWake {
                 waited_seconds: start.elapsed().as_secs(),

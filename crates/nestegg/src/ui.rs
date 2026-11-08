@@ -27,8 +27,11 @@ use axum::response::{IntoResponse, Response};
 use hyper_util::rt::TokioIo;
 use rust_embed::RustEmbed;
 
+/// Built web UI. `build.rs` points `NESTEGG_UI_DIST` at `ui/dist` when it
+/// exists (and makes Cargo rebuild when it changes), otherwise at an empty
+/// directory, so the binary then serves a placeholder page.
 #[derive(RustEmbed)]
-#[folder = "../../ui/dist/"]
+#[folder = "$NESTEGG_UI_DIST"]
 #[allow_missing = true]
 struct Assets;
 
