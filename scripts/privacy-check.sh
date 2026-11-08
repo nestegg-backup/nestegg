@@ -64,7 +64,15 @@ run_gitleaks() {
   local args=(--no-banner --redact --config "$repo_root/.gitleaks.toml")
   case "$1" in
     staged) gitleaks protect --staged "${args[@]}" || fail "gitleaks reported findings in staged changes." ;;
-    tree)   gitleaks detect --no-git --source "$repo_root" "${args[@]}" || fail "gitleaks reported findings in the working tree." ;;
+    tree)
+      # Only tracked files (with uncommitted changes), not build output or
+      # other ignored files.
+      local tmp
+      tmp="$(mktemp -d)"
+      (cd "$repo_root" && git ls-files -z | tar --null -T - -cf -) | tar -C "$tmp" -xf -
+      gitleaks detect --no-git --source "$tmp" "${args[@]}" || fail "gitleaks reported findings in tracked files."
+      rm -rf "$tmp"
+      ;;
   esac
 }
 
