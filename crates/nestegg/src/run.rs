@@ -319,6 +319,17 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         .iter()
         .map(|s| fs::canonicalize(&s.path).ok())
         .collect();
+    let mut covered: Vec<PathBuf> = config
+        .backup
+        .sources
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    covered.extend(config.backup.include_dev.iter().cloned());
+    let covered: Vec<PathBuf> = covered
+        .into_iter()
+        .map(|p| fs::canonicalize(&p).unwrap_or(p))
+        .collect();
     let (mounts, fstab) = match crate::mounts::load() {
         Ok(t) => t,
         Err(e) => {
@@ -332,17 +343,6 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             return Ok(());
         }
     };
-    let mut covered: Vec<PathBuf> = config
-        .backup
-        .sources
-        .iter()
-        .map(|s| s.path.clone())
-        .collect();
-    covered.extend(config.backup.include_dev.iter().cloned());
-    let covered: Vec<PathBuf> = covered
-        .into_iter()
-        .map(|p| fs::canonicalize(&p).unwrap_or(p))
-        .collect();
     let mut archives = Vec::new();
     for (source, canonical) in config.backup.sources.iter().zip(resolved) {
         if let Some(canonical) = canonical {

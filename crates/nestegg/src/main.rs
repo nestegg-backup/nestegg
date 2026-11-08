@@ -104,6 +104,9 @@ enum Cmd {
     /// Internal: rename without replacing an existing path (runs as the sudo user).
     #[command(name = "__rename-noreplace", hide = true)]
     RenameNoReplace { from: PathBuf, to: PathBuf },
+    /// Internal: remove an own directory tree (runs as the sudo user).
+    #[command(name = "__remove-tree", hide = true)]
+    RemoveTree { path: PathBuf },
     /// Run the local API daemon (used by nestegg.service).
     #[command(hide = true)]
     Daemon,
@@ -289,6 +292,10 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
         }
         Cmd::RenameNoReplace { from, to } => {
             rename_noreplace(&from, &to)?;
+            Ok(0)
+        }
+        Cmd::RemoveTree { path } => {
+            nestegg::staging::remove_tree(&path)?;
             Ok(0)
         }
         Cmd::Daemon => {
@@ -996,43 +1003,79 @@ fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove staging directories left behind by interrupted restores (older
-/// than one day; concurrent restores use fresh directories).
-fn remove_stale_staging(root: &Path) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let old = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > std::time::Duration::from_secs(24 * 3600));
-        if old && let Err(e) = std::fs::remove_dir_all(entry.path()) {
-            eprintln!(
-                "warning: could not remove stale staging {}: {e}",
-                entry.path().display()
-            );
+fn free_bytes(path: &Path) -> Result<u64> {
+    let stat = nix::sys::statvfs::statvfs(path)?;
+    Ok(stat.blocks_available() as u64 * stat.fragment_size() as u64)
+}
+
+fn device_of(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)?.dev())
+}
+
+/// Nearest existing ancestor of `path`.
+fn existing_ancestor(path: &Path) -> PathBuf {
+    let mut p = path.to_path_buf();
+    while !p.exists() {
+        if !p.pop() {
+            return PathBuf::from("/");
         }
+    }
+    p
+}
+
+/// Space needed per file system for a staged restore of `size` bytes: the
+/// staging copy and the user's copy exist at the same time.
+pub fn space_requirements(size: u64, staging_dev: u64, target_dev: u64) -> Vec<(u64, u64)> {
+    let need = size + size / 20;
+    if staging_dev == target_dev {
+        vec![(staging_dev, need * 2)]
+    } else {
+        vec![(staging_dev, need), (target_dev, need)]
     }
 }
 
-/// Refuse to start when the staging file system obviously lacks space.
-fn check_staging_space(client: &Client, snapshot: &str, archive: &str, dir: &Path) -> Result<()> {
-    let Some(size) = client.archive_size(snapshot, archive).unwrap_or(None) else {
-        return Ok(());
+/// Check free space for a staged restore. With patterns only part of the
+/// archive is restored, so the archive size only produces a hint.
+fn check_staging_space(
+    client: &Client,
+    args: &RestoreArgs<'_>,
+    staging_root: &Path,
+    target: &Path,
+) -> Result<()> {
+    let size = match client.archive_size(args.snapshot, args.archive) {
+        Ok(Some(size)) => size,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            eprintln!("warning: could not determine the archive size: {e:#}");
+            return Ok(());
+        }
     };
-    let stat = nix::sys::statvfs::statvfs(dir)?;
-    let free = stat.blocks_available() as u64 * stat.fragment_size() as u64;
-    if free < size + size / 20 {
-        bail!(
-            "the archive is about {} MiB but only {} MiB are free in {}; choose another \
-             root-owned location with --staging-dir or restore into a root-owned target",
-            size / (1024 * 1024),
-            free / (1024 * 1024),
-            dir.display()
-        );
+    let target_dir = existing_ancestor(target.parent().unwrap_or(Path::new("/")));
+    let staging_dev = device_of(staging_root)?;
+    let target_dev = device_of(&target_dir)?;
+    for (dev, need) in space_requirements(size, staging_dev, target_dev) {
+        let dir = if dev == staging_dev {
+            staging_root
+        } else {
+            target_dir.as_path()
+        };
+        let free = free_bytes(dir)?;
+        if free < need {
+            let msg = format!(
+                "a staged restore of this archive (about {} MiB) needs about {} MiB in {}, \
+                 but only {} MiB are free; use --staging-dir on another file system or \
+                 restore into a root-owned target",
+                size / (1024 * 1024),
+                need / (1024 * 1024),
+                dir.display(),
+                free / (1024 * 1024)
+            );
+            if args.patterns.is_empty() {
+                bail!(msg);
+            }
+            eprintln!("warning: {msg} (only matching files are restored, continuing)");
+        }
     }
     Ok(())
 }
@@ -1130,28 +1173,26 @@ fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
                 None => paths.state_dir.join("restore-staging"),
             };
             secrets::create_private_dir(&staging_root)?;
-            remove_stale_staging(&staging_root);
-            check_staging_space(&client, snapshot, archive, &staging_root)?;
-            let staging = staging_root.join(format!("{:016x}", rand::random::<u64>()));
+            for warning in nestegg::staging::cleanup_stale(&staging_root) {
+                eprintln!("warning: {warning}");
+            }
+            check_staging_space(&client, args, &staging_root, target)?;
+            let staging = nestegg::staging::StagingDir::create(&staging_root)?;
+            let data = staging.path().join("data");
             let result = client
                 .restore(
                     &client::RestoreRequest {
                         snapshot,
                         archive,
-                        target: &staging,
+                        target: &data,
                         patterns,
                         key,
                     },
                     &mut stderr,
                 )
-                .and_then(|()| nestegg::identity::copy_tree_as(&user, &staging, target));
-            if staging.exists()
-                && let Err(e) = std::fs::remove_dir_all(&staging)
-            {
-                eprintln!(
-                    "warning: could not remove staging directory {}: {e}",
-                    staging.display()
-                );
+                .and_then(|()| nestegg::identity::copy_tree_as(&user, &data, target));
+            if let Err(e) = staging.remove() {
+                eprintln!("warning: {e:#}");
             }
             for warning in result? {
                 eprintln!("warning: {warning}");
@@ -1174,5 +1215,32 @@ fn human_bytes(b: u64) -> String {
         format!("{b} B")
     } else {
         format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_restore_needs_space_for_both_copies() {
+        let size = 100 * 1024 * 1024 * 1024u64;
+        let same = space_requirements(size, 1, 1);
+        assert_eq!(same.len(), 1);
+        assert!(same[0].1 >= 2 * size, "two copies on one file system");
+        let split = space_requirements(size, 1, 2);
+        assert_eq!(split.len(), 2);
+        assert!(
+            split
+                .iter()
+                .all(|(_, need)| *need >= size && *need < 2 * size)
+        );
+    }
+
+    #[test]
+    fn restore_targets_are_normalised() {
+        assert!(absolute_target(Path::new("/a/../b")).is_err());
+        assert!(absolute_target(Path::new("rel")).unwrap().is_absolute());
+        assert!(absolute_target(Path::new("/")).is_err());
     }
 }

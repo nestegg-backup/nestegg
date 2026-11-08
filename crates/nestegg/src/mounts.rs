@@ -99,22 +99,24 @@ pub fn load() -> anyhow::Result<(Vec<Mount>, Vec<FstabEntry>)> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(default))
     };
-    let mountinfo = path("NESTEGG_MOUNTINFO", "/proc/self/mountinfo");
-    let mounts = std::fs::read_to_string(&mountinfo)
-        .with_context(|| format!("cannot read mount table {}", mountinfo.display()))?;
+    // Normalise fstab paths first: path lookups may trigger automounts,
+    // which must be visible in the mount table read afterwards.
     let fstab_path = path("NESTEGG_FSTAB", "/etc/fstab");
     let fstab = match std::fs::read_to_string(&fstab_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", fstab_path.display())),
     };
-    let fstab = parse_fstab(&fstab)
+    let fstab: Vec<FstabEntry> = parse_fstab(&fstab)
         .into_iter()
         .map(|mut e| {
             e.point = resolve_mount_point(&e.point);
             e
         })
         .collect();
+    let mountinfo = path("NESTEGG_MOUNTINFO", "/proc/self/mountinfo");
+    let mounts = std::fs::read_to_string(&mountinfo)
+        .with_context(|| format!("cannot read mount table {}", mountinfo.display()))?;
     Ok((parse_mountinfo(&mounts), fstab))
 }
 

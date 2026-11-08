@@ -25,8 +25,10 @@ pub struct UserIdentity {
 impl UserIdentity {
     /// The account that invoked sudo (`SUDO_UID`), if any and not root.
     pub fn from_sudo() -> Result<Option<UserIdentity>> {
-        let Ok(raw) = std::env::var("SUDO_UID") else {
-            return Ok(None);
+        let raw = match std::env::var("SUDO_UID") {
+            Ok(v) => v,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => bail!("SUDO_UID is not a valid user id"),
         };
         let uid: u32 = raw
             .trim()
@@ -154,14 +156,8 @@ fn run_as(user: &UserIdentity, program: &str, args: &[&std::ffi::OsStr]) -> Resu
 /// Returns tar's warnings (e.g. skipped sockets).
 pub fn copy_tree_as(user: &UserIdentity, source: &Path, target: &Path) -> Result<Vec<String>> {
     let parent = target.parent().context("restore target has no parent")?;
-    let name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("invalid restore target name")?;
-    let partial = parent.join(format!(
-        ".{name}.nestegg-partial-{:08x}",
-        rand::random::<u32>()
-    ));
+    // Short name independent of the target name (length limits, encodings).
+    let partial = parent.join(format!(".nestegg-partial-{:016x}", rand::random::<u64>()));
     run_as(
         user,
         "mkdir",
@@ -222,10 +218,17 @@ pub fn copy_tree_as(user: &UserIdentity, source: &Path, target: &Path) -> Result
         let pack_status = pack.wait()?;
         let pack_stderr = err_reader.join().unwrap_or_default();
         if !unpacked.status.success() {
-            bail!(
+            let mut msg = format!(
                 "copying the restored files failed: {}",
                 String::from_utf8_lossy(&unpacked.stderr).trim()
             );
+            if !pack_status.success() && !pack_stderr.is_empty() {
+                msg.push_str(&format!(
+                    "; packing reported: {}",
+                    String::from_utf8_lossy(&pack_stderr).trim()
+                ));
+            }
+            bail!(msg);
         }
         if !pack_status.success() {
             bail!(
@@ -254,16 +257,7 @@ pub fn copy_tree_as(user: &UserIdentity, source: &Path, target: &Path) -> Result
         Ok(warnings)
     });
     if result.is_err() {
-        if let Err(e) = run_as(
-            user,
-            "rm",
-            &[
-                "-rf".as_ref(),
-                "--one-file-system".as_ref(),
-                "--".as_ref(),
-                partial.as_os_str(),
-            ],
-        ) {
+        if let Err(e) = helper(user, &["__remove-tree".as_ref(), partial.as_os_str()], None) {
             eprintln!(
                 "warning: could not remove partial copy {}: {e:#}",
                 partial.display()

@@ -115,6 +115,17 @@ descriptors, never via command line arguments, environment values or logs.
 exists on this computer and the disk fails, the backups are lost. That is why
 backups refuse to run until `nestegg key confirm-exported` was executed.
 
+## Limitations
+
+- The daemon, the timer runs and the CLI must run in the same PID namespace
+  (normal desktop installation). Running some of them inside a container
+  that shares `/run/nestegg` and `/var/lib/nestegg` with the host is not
+  supported: "is a backup running?" is detected via `/proc/locks`, which only
+  shows locks of the own PID namespace. A second backup can still never run
+  in parallel (exclusive lock), but status display may be wrong.
+- Staged restores into user directories need temporary space for a second
+  copy (see Restore).
+
 ## Files
 
 | Path | Content |

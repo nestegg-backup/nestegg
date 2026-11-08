@@ -48,6 +48,8 @@ for (1..3000) {
 }
 PERL
   chown -R alice: /home/alice/sockets
+  mkdir -p /home/alice/Archive/frozen && echo old > /home/alice/Archive/frozen/note.txt
+  chmod 0555 /home/alice/Archive/frozen
   truncate -s 64M /home/alice/Documents/sparse.img && chown alice: /home/alice/Documents/sparse.img
   # after chown: chown clears file capabilities
   setcap cap_net_raw+ep /home/alice/Documents/tool-with-capability
@@ -112,6 +114,9 @@ check "restore into user dir succeeds (exit code)" bash -c "docker exec -e SUDO_
 check "user restore: full content matches" on_client diff -r /home/alice/Documents /home/alice/restore-home/alice/Documents
 check "user restore: files owned by the user" bash -c "[[ -z \$(docker exec $client find /home/alice/restore-home ! -user alice) ]]"
 check "user restore with 3000 sockets did not hang (warnings shown)" bash -c "[[ \$(grep -c 'socket ignored' /tmp/nestegg-user-restore.log) -ge 3000 ]]"
+check "user restore: read-only directory restored" on_client test -f /home/alice/restore-home/alice/Archive/frozen/note.txt
+long_name="$(printf 'r%.0s' $(seq 1 240))"
+check "user restore into a 240-character target name" bash -c "docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg restore $snapshot etc.pxar /home/alice/$long_name >/dev/null 2>&1 && docker exec $client test -f /home/alice/$long_name/hostname"
 check "user restore: sparse file stays sparse" bash -c "[[ \$(docker exec $client du -k /home/alice/restore-home/alice/Documents/sparse.img | cut -f1) -lt 1024 ]]"
 check "user restore: no partial directory left" bash -c "[[ -z \$(docker exec $client find /home/alice -maxdepth 1 -name '.*nestegg-partial*') ]]"
 check "user restore: staging cleaned up" bash -c "[[ -z \$(docker exec $client ls -A /var/lib/nestegg/restore-staging) ]]"
