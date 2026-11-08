@@ -36,3 +36,9 @@ id = "pbs-env-credential"
 description = "Hard-coded PBS_PASSWORD / PBS_ENCRYPTION_PASSWORD value (placeholders must start with < or $)"
 regex = '''(?i)\bPBS_(PASSWORD|ENCRYPTION_PASSWORD)\s*=\s*["']?[^\s"'<$]{4,}'''
 keywords = ["pbs_password", "pbs_encryption_password"]
+
+# Public values that look like keys.
+[allowlist]
+description = "Published checksums of public signing keys"
+regexTarget = "line"
+regexes = ['''KEYRING_SHA256=[0-9a-f]{64}''']

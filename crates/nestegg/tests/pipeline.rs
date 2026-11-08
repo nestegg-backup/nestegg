@@ -77,7 +77,11 @@ impl Env {
         write_secret(&root.join("cred/encryption-key"), "{\"kdf\":null}");
         let pbs = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = pbs.local_addr().unwrap().port();
-        let env = Env { dir, pbs: Some(pbs), port };
+        let env = Env {
+            dir,
+            pbs: Some(pbs),
+            port,
+        };
         env.write_config("");
         env.set_key_exported(true);
         env
@@ -151,7 +155,8 @@ inventory = false
     }
 
     fn state(&self) -> serde_json::Value {
-        serde_json::from_str(&fs::read_to_string(self.root().join("state/state.json")).unwrap()).unwrap()
+        serde_json::from_str(&fs::read_to_string(self.root().join("state/state.json")).unwrap())
+            .unwrap()
     }
 
     fn close_pbs(&mut self) {
@@ -172,19 +177,33 @@ fn code(out: &Output) -> i32 {
 fn successful_run_records_state_and_passes_secrets_via_fds() {
     let env = Env::new();
     let out = env.run(&["run", "--trigger", "cli"]);
-    assert_eq!(code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let log = env.fake_log();
     assert!(log.contains("PW token-secret\n"), "password via fd: {log}");
     assert!(log.contains("KEY {\"kdf\":null}"), "key via fd: {log}");
-    assert!(!log.contains("LEAK"), "plain PBS_PASSWORD must be removed: {log}");
-    assert!(!log.contains("token-secret --"), "secret must not be an argument");
+    assert!(
+        !log.contains("LEAK"),
+        "plain PBS_PASSWORD must be removed: {log}"
+    );
+    assert!(
+        !log.contains("token-secret --"),
+        "secret must not be an argument"
+    );
     assert!(log.contains("REPO backup@pbs!test@127.0.0.1:"));
     assert!(log.contains("--ns desktops"));
     assert!(log.contains("--crypt-mode encrypt"));
     assert!(log.contains("--exclude **/.cache"));
     assert!(log.contains("snapshot notes update host/test/"));
-    assert!(!log.contains("opt.pxar"), "missing optional source is skipped");
+    assert!(
+        !log.contains("opt.pxar"),
+        "missing optional source is skipped"
+    );
 
     let state = env.state();
     assert_eq!(state["last_success"]["state"], "succeeded");
@@ -230,7 +249,11 @@ fn unreachable_pbs_is_its_own_state() {
 #[test]
 fn authentication_failure_is_classified() {
     let env = Env::new();
-    let out = env.command(&["run"]).env("FAKE_FAIL_AUTH", "1").output().unwrap();
+    let out = env
+        .command(&["run"])
+        .env("FAKE_FAIL_AUTH", "1")
+        .output()
+        .unwrap();
     assert_eq!(code(&out), 1);
     let state = env.state();
     assert_eq!(state["last_run"]["state"], "failed");
@@ -245,7 +268,12 @@ fn unexported_key_blocks_backups() {
     assert_eq!(code(&out), 1);
     let state = env.state();
     assert_eq!(state["last_run"]["error"]["kind"], "config");
-    assert!(state["last_run"]["error"]["message"].as_str().unwrap().contains("exported"));
+    assert!(
+        state["last_run"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exported")
+    );
     assert!(!env.fake_log().contains("ARGS backup"));
 }
 
@@ -273,10 +301,17 @@ fn unencrypted_mode_does_not_need_a_key() {
 #[test]
 fn world_readable_secret_is_refused() {
     let env = Env::new();
-    fs::set_permissions(env.root().join("cred/password"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(
+        env.root().join("cred/password"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
     let out = env.run(&["run"]);
     assert_eq!(code(&out), 1);
-    let msg = env.state()["last_run"]["error"]["message"].as_str().unwrap().to_string();
+    let msg = env.state()["last_run"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(msg.contains("accessible by other users"), "{msg}");
 }
 
@@ -301,7 +336,10 @@ fn start_daemon(env: &Env) -> Daemon {
     let socket = env.root().join("run/api.sock");
     let start = Instant::now();
     while !socket.exists() {
-        assert!(start.elapsed() < Duration::from_secs(10), "daemon did not start");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "daemon did not start"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     Daemon(child)
@@ -309,12 +347,19 @@ fn start_daemon(env: &Env) -> Daemon {
 
 fn request(socket: &PathBuf, method: &str, path: &str) -> (u16, serde_json::Value) {
     let mut s = UnixStream::connect(socket).unwrap();
-    write!(s, "{method} {path} HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n").unwrap();
+    write!(
+        s,
+        "{method} {path} HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+    )
+    .unwrap();
     let mut buf = String::new();
     s.read_to_string(&mut buf).unwrap();
     let (head, body) = buf.split_once("\r\n\r\n").unwrap();
     let code = head.split_whitespace().nth(1).unwrap().parse().unwrap();
-    (code, serde_json::from_str(body).unwrap_or(serde_json::Value::Null))
+    (
+        code,
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 #[test]
@@ -346,15 +391,27 @@ fn daemon_serves_status_runs_and_snapshots() {
             assert_eq!(status["last_success"]["id"], id.as_str());
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "run did not finish: {status}");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "run did not finish: {status}"
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
 
     let (code, detail) = request(&socket, "GET", &format!("/api/v1/runs/{id}"));
     assert_eq!(code, 200);
-    assert!(detail["log_tail"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("run finished")));
+    assert!(
+        detail["log_tail"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap().contains("run finished"))
+    );
     let log_text = detail["log_tail"].to_string();
-    assert!(!log_text.contains("token-secret"), "secrets must never appear in logs");
+    assert!(
+        !log_text.contains("token-secret"),
+        "secrets must never appear in logs"
+    );
 
     let (code, runs) = request(&socket, "GET", "/api/v1/runs?limit=5");
     assert_eq!(code, 200);
@@ -362,7 +419,10 @@ fn daemon_serves_status_runs_and_snapshots() {
 
     let (code, snaps) = request(&socket, "GET", "/api/v1/snapshots");
     assert_eq!(code, 200, "{snaps}");
-    assert_eq!(snaps["snapshots"][0]["snapshot"], "host/test/2026-11-06T21:20:00Z");
+    assert_eq!(
+        snaps["snapshots"][0]["snapshot"],
+        "host/test/2026-11-06T21:20:00Z"
+    );
 
     let (code, cfg) = request(&socket, "GET", "/api/v1/config");
     assert_eq!(code, 200);

@@ -116,6 +116,25 @@ mod tests {
     }
 
     #[test]
+    fn magic_packet_is_sent() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let wake = WakeConfig {
+            mac: "00:00:5e:00:53:01".into(),
+            broadcast: "127.0.0.1".parse().unwrap(),
+            port: receiver.local_addr().unwrap().port(),
+            timeout_seconds: 1,
+        };
+        send_magic_packet(&wake).unwrap();
+        let mut buf = [0u8; 200];
+        let (n, _) = receiver.recv_from(&mut buf).unwrap();
+        assert_eq!(n, 102);
+        assert_eq!(&buf[..102], &magic_packet([0, 0, 0x5e, 0, 0x53, 1])[..]);
+    }
+
+    #[test]
     fn unreachable_without_wake_config() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
