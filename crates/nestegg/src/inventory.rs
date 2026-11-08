@@ -90,6 +90,14 @@ pub fn generate(dir: &Path) -> Result<InventoryReport> {
             Err(_) => report.skipped.push((*name).to_string()),
         }
     }
+    // Machine-readable disk layout for the rescue stick.
+    match crate::layout::capture().and_then(|l| Ok(serde_json::to_vec_pretty(&l)?)) {
+        Ok(json) => {
+            fs::write(dir.join(crate::layout::LAYOUT_FILE), json)?;
+            report.written.push(crate::layout::LAYOUT_FILE.to_string());
+        }
+        Err(_) => report.skipped.push(crate::layout::LAYOUT_FILE.to_string()),
+    }
     let boot_mode = if Path::new("/sys/firmware/efi").exists() {
         "uefi"
     } else {

@@ -22,6 +22,8 @@ Planned for the first releases:
   rebuild after reinstalling
 - a local web UI for status, history and restore; later an overview of all
   machines in a household
+- a rescue stick (bootable ISO) that restores the whole computer onto an
+  empty disk: partitions, files, boot loader ([docs/rescue.md](docs/rescue.md))
 
 See [docs/roadmap.md](docs/roadmap.md), [docs/architecture.md](docs/architecture.md)
 and the [decision records](docs/decisions/).

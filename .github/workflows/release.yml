@@ -1,0 +1,74 @@
+name: release
+
+# Builds the downloads of a release: the .deb package and the rescue stick
+# image (ISO), each with a SHA-256 checksum. Runs the rescue end-to-end test
+# in VMs first. Tags create a DRAFT release; a maintainer publishes it by
+# hand. A manual run only keeps the files as workflow artifacts.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the web UI (embedded into the binary)
+        if: hashFiles('ui/package-lock.json') != ''
+        working-directory: ui
+        run: npm ci && npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-deb --locked
+      - run: cargo build --release
+      - run: cargo deb -p nestegg --no-build -o target/
+      - name: Build the rescue ISO
+        run: packaging/rescue/build.sh target/release/nestegg target/nestegg-rescue-amd64.iso
+      - name: Enable KVM for the test VMs
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf
+      - name: Rescue end-to-end test (backup, restore onto an empty disk, boot)
+        run: sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso debian-btrfs-uefi
+      - name: Checksums
+        run: |
+          cd target
+          for f in nestegg_*.deb; do sha256sum "$f" > "$f.sha256"; done
+          ls -l nestegg_*.deb* nestegg-rescue-amd64.iso*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nestegg-downloads
+          path: |
+            target/nestegg_*.deb
+            target/nestegg_*.deb.sha256
+            target/nestegg-rescue-amd64.iso
+            target/nestegg-rescue-amd64.iso.sha256
+
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nestegg-downloads
+          path: downloads
+      - name: Create a draft release with the downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" downloads/* --repo "$GITHUB_REPOSITORY" \
+            --draft --title "nestegg $GITHUB_REF_NAME" \
+            --notes "Downloads: nestegg_*.deb (Ubuntu, Linux Mint, Debian) and the rescue stick image nestegg-rescue-amd64.iso (write it to a USB stick, see docs/rescue.md). Verify with the .sha256 files."

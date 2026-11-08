@@ -1,0 +1,7 @@
+#!/bin/sh
+# Fixed host name, NetworkManager handles wired DHCP automatically.
+set -e
+echo nestegg-rescue > /etc/hostname
+systemctl enable NetworkManager.service || true
+nestegg --version
+proxmox-backup-client version --output-format text 2>/dev/null | head -1 || true

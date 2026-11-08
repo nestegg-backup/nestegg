@@ -78,6 +78,11 @@ enum Cmd {
         #[arg(long)]
         staging_dir: Option<PathBuf>,
     },
+    /// Restore this or another computer onto an empty disk (rescue stick).
+    Rescue {
+        #[command(subcommand)]
+        command: Option<nestegg::rescue::cli::RescueCmd>,
+    },
     /// Show the configuration.
     Config {
         /// Print an example configuration instead.
@@ -149,6 +154,10 @@ struct InitArgs {
     /// Disable client-side encryption (not recommended).
     #[arg(long)]
     no_encryption: bool,
+    /// Back up only the configured folders, not the whole system (no
+    /// restore onto an empty disk with the rescue stick).
+    #[arg(long)]
+    no_system: bool,
     /// Overwrite an existing configuration.
     #[arg(long)]
     force: bool,
@@ -236,6 +245,7 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
         }) => set_password(paths, allow_plain, overview),
         Cmd::Key(k) => key(paths, k),
         Cmd::Check => check(paths),
+        Cmd::Rescue { command } => nestegg::rescue::cli::run(command),
         Cmd::Backup => backup_now(paths),
         Cmd::Status { json } => status(paths, json),
         Cmd::History { limit, json } => history(paths, limit, json),
@@ -353,6 +363,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
     cfg.pbs.fingerprint = args.fingerprint;
     cfg.backup_id = args.backup_id;
     cfg.backup.encryption = !args.no_encryption;
+    cfg.backup.system = !args.no_system;
     if let Some(mac) = args.wake_mac {
         cfg.wake = Some(config::WakeConfig {
             mac,

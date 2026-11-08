@@ -1,6 +1,6 @@
 # 0003 – Product and technical baseline
 
-- Status: accepted
+- Status: accepted (bare-metal restore changed by 0006)
 - Date: 2026-11-08
 
 ## Decisions
@@ -20,4 +20,5 @@
 
 - Own implementation of the PBS protocol, chunking or encryption.
 - Non-Debian distributions (possible later via the static client).
-- Disk images and bare-metal restore.
+- Disk images. (Bare-metal restore is now in scope, file-level, with a
+  rescue stick: see 0006.)

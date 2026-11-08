@@ -351,9 +351,42 @@ pub struct UserScope {
 /// `home = /home/alice`, source `home.pxar` → `/home` gives `/alice`.
 pub fn user_scope(config: &Config, archive: &str, home: &Path) -> Option<UserScope> {
     let name = archive.strip_suffix(".pxar").unwrap_or(archive);
-    let source = config.backup.sources.iter().find(|s| s.archive == name)?;
-    let source_path = std::fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone());
+    let source_path = if config.backup.system && name == crate::layout::SYSTEM_ARCHIVE {
+        // The full system backup is `/`; it is not in the configured sources.
+        PathBuf::from("/")
+    } else {
+        let source = config.backup.sources.iter().find(|s| s.archive == name)?;
+        std::fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone())
+    };
     let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if config.backup.system && name == crate::layout::SYSTEM_ARCHIVE {
+        // Service accounts have homes like `/`, `/var/backups` or `/run/...`:
+        // in the full system backup that would expose system files.
+        let first = home
+            .components()
+            .nth(1)
+            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+        let system_dirs = [
+            "bin",
+            "boot",
+            "dev",
+            "etc",
+            "lib",
+            "lib32",
+            "lib64",
+            "nonexistent",
+            "proc",
+            "run",
+            "sbin",
+            "sys",
+            "tmp",
+            "usr",
+            "var",
+        ];
+        if first.is_none_or(|f| system_dirs.contains(&f.as_str())) {
+            return None;
+        }
+    }
     let rel = home.strip_prefix(&source_path).ok()?;
     if rel.as_os_str().is_empty() {
         // The archive is the home directory itself (e.g. source `/home/alice`).
@@ -468,6 +501,24 @@ mod tests {
         assert!(!scope.is_ancestor("/bob"));
         assert!(user_scope(&c, "etc.pxar", Path::new("/nonexistent-home-root/alice")).is_none());
         assert!(user_scope(&c, "home.pxar", Path::new("/elsewhere/alice")).is_none());
+        assert!(user_scope(&c, "system.pxar", Path::new("/nonexistent-home-root/alice")).is_none());
+        let mut sys = c.clone();
+        sys.backup.system = true;
+        let scope = user_scope(
+            &sys,
+            "system.pxar",
+            Path::new("/nonexistent-home-root/alice"),
+        )
+        .unwrap();
+        assert_eq!(scope.prefix, "/nonexistent-home-root/alice");
+        assert!(!scope.contains("/etc"));
+        assert!(scope.is_ancestor("/nonexistent-home-root"));
+        for home in ["/", "/var/backups", "/run/systemd", "/etc"] {
+            assert!(
+                user_scope(&sys, "system.pxar", Path::new(home)).is_none(),
+                "{home}"
+            );
+        }
     }
 
     #[test]

@@ -37,6 +37,17 @@ Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
   notifications when a backup is overdue. Contract: `api/openapi.yaml`.
 - `.deb` packages.
 
+## v0.2.x – Rescue stick (implemented, not released)
+
+- Full system backup (`backup.system`, default for new installations) with
+  the disk layout recorded in every snapshot.
+- Bootable rescue ISO (UEFI and BIOS) with a restore wizard that recreates a
+  bootable system on an empty disk (`nestegg rescue`), optional LUKS2.
+- Release artifacts as the download page: `.deb` and rescue ISO with
+  checksums, attached to tagged releases by CI.
+- Decision: `docs/decisions/0006-bare-metal-restore-rescue-stick.md`,
+  guide: `docs/rescue.md`.
+
 ## v0.3 – Overview of several machines (API implemented)
 
 - One place that shows every machine: last verified success, next run,

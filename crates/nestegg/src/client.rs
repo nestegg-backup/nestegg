@@ -182,6 +182,9 @@ pub struct SnapshotInfo {
     pub verified: Option<String>,
     pub protected: bool,
     pub comment: Option<String>,
+    /// Logical size of each archive (`system.pxar.didx` → bytes).
+    #[serde(skip)]
+    pub archive_bytes: Vec<(String, u64)>,
 }
 
 /// Convert the JSON of `snapshot list --output-format json`.
@@ -209,6 +212,10 @@ pub fn parse_snapshot_list(json: &str) -> Result<Vec<SnapshotInfo>> {
                     .map(String::from)
             })
             .collect();
+        let archive_bytes: Vec<(String, u64)> = files
+            .iter()
+            .filter_map(|f| Some((f["filename"].as_str()?.to_string(), f["size"].as_u64()?)))
+            .collect();
         let crypt_modes: Vec<&str> = files
             .iter()
             .filter_map(|f| f["crypt-mode"].as_str())
@@ -227,6 +234,7 @@ pub fn parse_snapshot_list(json: &str) -> Result<Vec<SnapshotInfo>> {
             verified: item["verification"]["state"].as_str().map(String::from),
             protected: item["protected"].as_bool().unwrap_or(false),
             comment: item["comment"].as_str().map(String::from),
+            archive_bytes,
         });
     }
     out.sort_by(|a, b| b.time.cmp(&a.time));
@@ -636,6 +644,25 @@ impl<'a> Client<'a> {
     /// an explicit key is given); passing a key for an unsigned archive makes
     /// the client reject it.
     pub fn restore(&self, request: &RestoreRequest<'_>, log: &mut dyn Write) -> Result<()> {
+        self.restore_with_args(request, &[], log)
+    }
+
+    /// Restore into a directory that already exists and may contain
+    /// (empty) mount points, as the rescue system does for a whole system.
+    pub fn restore_into_existing(
+        &self,
+        request: &RestoreRequest<'_>,
+        log: &mut dyn Write,
+    ) -> Result<()> {
+        self.restore_with_args(request, &["--allow-existing-dirs", "true"], log)
+    }
+
+    fn restore_with_args(
+        &self,
+        request: &RestoreRequest<'_>,
+        extra: &[&str],
+        log: &mut dyn Write,
+    ) -> Result<()> {
         let key = match &request.key {
             RestoreKey::Without => None,
             RestoreKey::File(secret) => Some(Secret::new(secret.as_bytes().to_vec())),
@@ -661,6 +688,7 @@ impl<'a> Client<'a> {
         for p in request.patterns {
             cmd.args(["--pattern", p]);
         }
+        cmd.args(extra);
         if let Some(key) = &key {
             fds.add(key, KEY_FD)?;
             cmd.args(["--keyfd", &KEY_FD.to_string()]);
