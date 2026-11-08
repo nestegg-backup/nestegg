@@ -1,0 +1,62 @@
+/*
+ * Design tokens. Dark is the reference (design decision 0005, variant C);
+ * the light variant is derived from the same roles and is used when the
+ * system prefers light. tests/contrast.test.ts checks WCAG AA for both.
+ */
+:root {
+  color-scheme: dark;
+  /* three surface levels, separated by lightness only */
+  --bg0: #1b1c1f; /* page / detail */
+  --bg1: #232428; /* list pane, quiet blocks inside the detail */
+  --bg2: #2e3035; /* selection, fields, blocks inside the list pane */
+  --bg2-hover: #383a40;
+  --hover: rgba(255, 255, 255, 0.03);
+  --rule: #2a2c30;
+  --field-border: #686b72;
+  --text: #ebebed;
+  --muted: #a9abb1;
+  --faint: #8e9198;
+  --mark: #6d7078; /* neutral marks: non-text, 3:1 on bg0 */
+  --accent: #7fa8f5;
+  --accent-hover: #95b7f7;
+  --on-accent: #15171b;
+  --ok: #86c49b;
+  --warn: #e2b56c;
+  --bad: #ef8f84;
+  --pbs: #c7a2e6;
+
+  --fs-s: 13px;
+  --fs-m: 15px;
+  --fs-l: 19px;
+  --fs-xl: 28px;
+  --sans: "Instrument Sans", system-ui, sans-serif;
+  --time-col: 56px; /* "01:42"; widened for 12-hour clocks below */
+  --mono: ui-monospace, "SF Mono", "DejaVu Sans Mono", Menlo, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg0: #f7f7f8;
+    --bg1: #eeeef0;
+    --bg2: #e2e3e6;
+    --bg2-hover: #d6d7db;
+    --hover: rgba(0, 0, 0, 0.035);
+    --rule: #e1e2e5;
+    --field-border: #7d8088;
+    --text: #1b1c1f;
+    --muted: #4d5057;
+    --faint: #5d6067;
+    --mark: #8b8e95;
+    --accent: #2c5cc5;
+    --accent-hover: #234fae;
+    --on-accent: #ffffff;
+    --ok: #286b40;
+    --warn: #865600;
+    --bad: #b23a2e;
+    --pbs: #7b4cb0;
+  }
+}
+
+/* English locales may use a 12-hour clock ("01:42 AM"). */
+:root:lang(en) { --time-col: 76px; }
