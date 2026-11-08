@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# Build a small, bootable "desktop" disk image that backs itself up with
+# nestegg on its first start. Runs inside a privileged container (loop
+# devices, debootstrap); called by tests/rescue/run.sh.
+#
+# Env: VARIANT (debian-btrfs-uefi | ubuntu-ext4-bios), IMAGE, PBS_IP, FP,
+#      TOKEN_SECRET; /work holds nestegg and receives the exported key.
+set -euo pipefail
+
+: "${VARIANT:?}" "${IMAGE:?}" "${PBS_IP:?}" "${FP:?}" "${TOKEN_SECRET:?}"
+export DEBIAN_FRONTEND=noninteractive
+mnt=/mnt/src
+
+apt-get update -qq
+apt-get install -y -qq debootstrap gdisk dosfstools btrfs-progs e2fsprogs curl ca-certificates \
+  ${EXTRA_HOST_PACKAGES:-} >/dev/null
+
+truncate -s 6G "$IMAGE"
+loop="$(losetup --find --show --partscan "$IMAGE")"
+cleanup() {
+  set +e
+  umount -R "$mnt" 2>/dev/null
+  losetup -d "$loop" 2>/dev/null
+}
+trap cleanup EXIT
+p() { echo "${loop}p$1"; }
+settle() { for _ in $(seq 50); do [[ -b "$(p "$1")" ]] && return; sleep 0.2; done; echo "no $(p "$1")"; exit 1; }
+
+case "$VARIANT" in
+  debian-btrfs-uefi)
+    suite=trixie; mirror=http://deb.debian.org/debian
+    components=main
+    sgdisk -n1:0:+256M -t1:ef00 -n2:0:+512M -t2:8200 -n3:0:0 -t3:8304 "$loop" >/dev/null
+    partx -u "$loop" || true
+    settle 3
+    mkfs.vfat -F 32 "$(p 1)" >/dev/null
+    mkswap "$(p 2)" >/dev/null
+    mkfs.btrfs -q -f "$(p 3)"
+    mkdir -p "$mnt"
+    mount "$(p 3)" "$mnt"
+    for sv in @ @home @snapshots; do btrfs -q subvolume create "$mnt/$sv"; done
+    umount "$mnt"
+    mount -o subvol=@ "$(p 3)" "$mnt"
+    mkdir -p "$mnt/home" "$mnt/.snapshots" "$mnt/boot/efi"
+    mount -o subvol=@home "$(p 3)" "$mnt/home"
+    mount -o subvol=@snapshots "$(p 3)" "$mnt/.snapshots"
+    mount "$(p 1)" "$mnt/boot/efi"
+    packages=linux-image-amd64,grub-efi-amd64,btrfs-progs,dosfstools,initramfs-tools,systemd-sysv,systemd-resolved,ca-certificates,libcap2-bin,dbus,udev,kmod
+    ;;
+  ubuntu-ext4-bios)
+    suite=noble; mirror=http://archive.ubuntu.com/ubuntu
+    components=main,universe # qrencode (needed by the PBS client) is in universe
+    sgdisk -n1:0:+1M -t1:ef02 -n2:0:+4G -t2:8304 -n3:0:0 -t3:8302 "$loop" >/dev/null
+    partx -u "$loop" || true
+    settle 3
+    mkfs.ext4 -q -F "$(p 2)"
+    mkfs.ext4 -q -F "$(p 3)"
+    mkdir -p "$mnt"
+    mount "$(p 2)" "$mnt"
+    mkdir -p "$mnt/home"
+    mount "$(p 3)" "$mnt/home"
+    packages=linux-image-virtual,grub-pc,initramfs-tools,cryptsetup,cryptsetup-initramfs,systemd-sysv,systemd-resolved,ca-certificates,libcap2-bin,dbus,udev,kmod
+    ;;
+  *) echo "unknown variant $VARIANT"; exit 2 ;;
+esac
+
+echo "== debootstrap $suite"
+debootstrap --variant=minbase --components="$components" --include="$packages" "$suite" "$mnt" "$mirror" >/dev/null
+
+for d in dev proc sys; do mount --rbind "/$d" "$mnt/$d"; mount --make-rslave "$mnt/$d"; done
+in_chroot() { chroot "$mnt" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive "$@"; }
+
+uuid() { blkid -s UUID -o value "$1"; }
+case "$VARIANT" in
+  debian-btrfs-uefi)
+    r="$(uuid "$(p 3)")"
+    cat > "$mnt/etc/fstab" <<EOF
+UUID=$r / btrfs defaults,subvol=@ 0 0
+UUID=$r /home btrfs defaults,subvol=@home 0 0
+UUID=$r /.snapshots btrfs defaults,subvol=@snapshots 0 0
+UUID=$(uuid "$(p 1)") /boot/efi vfat umask=0077 0 1
+UUID=$(uuid "$(p 2)") none swap sw 0 0
+EOF
+    echo "RESUME=UUID=$(uuid "$(p 2)")" > "$mnt/etc/initramfs-tools/conf.d/resume"
+    ;;
+  ubuntu-ext4-bios)
+    cat > "$mnt/etc/fstab" <<EOF
+UUID=$(uuid "$(p 2)") / ext4 errors=remount-ro 0 1
+UUID=$(uuid "$(p 3)") /home ext4 defaults 0 2
+/swapfile none swap sw 0 0
+EOF
+    fallocate -l 256M "$mnt/swapfile"; chmod 600 "$mnt/swapfile"; mkswap "$mnt/swapfile" >/dev/null
+    ;;
+esac
+
+echo "nestegg-e2e-src" > "$mnt/etc/hostname"
+printf '127.0.0.1 localhost\n127.0.1.1 nestegg-e2e-src\n' > "$mnt/etc/hosts"
+mkdir -p "$mnt/etc/systemd/network"
+printf '[Match]\nName=en*\n\n[Network]\nDHCP=yes\n' > "$mnt/etc/systemd/network/50-dhcp.network"
+in_chroot systemctl enable systemd-networkd systemd-resolved >/dev/null 2>&1
+in_chroot systemctl enable systemd-networkd-wait-online >/dev/null 2>&1 || true
+echo 'root:nestegg' | in_chroot chpasswd
+
+echo "== boot loader"
+cat > "$mnt/etc/default/grub" <<'EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=1
+GRUB_DISTRIBUTOR=`( . /etc/os-release; echo ${NAME:-Debian} ) 2>/dev/null || echo Debian`
+GRUB_CMDLINE_LINUX_DEFAULT=""
+GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
+GRUB_TERMINAL="console serial"
+GRUB_SERIAL_COMMAND="serial --speed=115200"
+GRUB_DISABLE_OS_PROBER=true
+EOF
+case "$VARIANT" in
+  debian-btrfs-uefi)
+    in_chroot grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian \
+      --no-nvram --force-extra-removable >/dev/null 2>&1
+    ;;
+  ubuntu-ext4-bios)
+    in_chroot grub-install --target=i386-pc "$loop" >/dev/null 2>&1
+    ;;
+esac
+in_chroot update-initramfs -u -k all >/dev/null 2>&1
+in_chroot update-grub >/dev/null 2>&1
+
+echo "== test data"
+in_chroot useradd -m -s /bin/bash alice
+head -c 20000000 /dev/urandom > "$mnt/home/alice/data.bin"
+echo "hello from alice" > "$mnt/home/alice/notes.txt"
+cp "$mnt/bin/true" "$mnt/home/alice/tool"
+in_chroot chown -R alice:alice /home/alice
+in_chroot setcap cap_net_raw+ep /home/alice/tool
+echo "system marker" > "$mnt/etc/nestegg-e2e-marker"
+mkdir -p "$mnt/tmp/junk" && echo junk > "$mnt/tmp/junk/file"
+sha="$(sha256sum "$mnt/home/alice/data.bin" | cut -d' ' -f1)"
+echo "$sha" > /work/data.sha256
+
+echo "== proxmox-backup-client and nestegg"
+curl -fsSL -o "$mnt/usr/share/keyrings/proxmox-archive-keyring.gpg" \
+  https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg
+echo "136673be77aba35dcce385b28737689ad64fd785a797e57897589aed08db6e45  $mnt/usr/share/keyrings/proxmox-archive-keyring.gpg" | sha256sum -c - >/dev/null
+printf 'Types: deb\nURIs: http://download.proxmox.com/debian/pbs-client\nSuites: trixie\nComponents: main\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n' \
+  > "$mnt/etc/apt/sources.list.d/pbs-client.sources"
+cp /etc/resolv.conf "$mnt/etc/resolv.conf.build" 2>/dev/null || true
+mv "$mnt/etc/resolv.conf" "$mnt/etc/resolv.conf.orig" 2>/dev/null || true
+cp /etc/resolv.conf "$mnt/etc/resolv.conf"
+in_chroot apt-get update -qq >/dev/null
+in_chroot apt-get install -y -qq --no-install-recommends proxmox-backup-client-static >/dev/null
+rm -f "$mnt/etc/resolv.conf" "$mnt/etc/resolv.conf.build"
+if [[ -e "$mnt/etc/resolv.conf.orig" || -L "$mnt/etc/resolv.conf.orig" ]]; then
+  mv "$mnt/etc/resolv.conf.orig" "$mnt/etc/resolv.conf"
+else
+  ln -s ../run/systemd/resolve/stub-resolv.conf "$mnt/etc/resolv.conf"
+fi
+install -m 0755 /work/nestegg "$mnt/usr/local/bin/nestegg"
+
+in_chroot nestegg init --server "$PBS_IP" --datastore store1 --namespace desktops \
+  --auth-id 'backup@pbs!desktop' --fingerprint "$FP" --backup-id e2e-src >/dev/null
+printf '%s\n' "$TOKEN_SECRET" | in_chroot nestegg credentials set-password --allow-plain >/dev/null
+in_chroot nestegg key create --allow-plain >/dev/null
+in_chroot nestegg key export /root/exported-key.json >/dev/null
+cp "$mnt/root/exported-key.json" /work/nestegg-key.json
+in_chroot nestegg key confirm-exported >/dev/null
+in_chroot nestegg rescue export-settings /root/nestegg-rescue.toml >/dev/null
+cp "$mnt/root/nestegg-rescue.toml" /work/nestegg-rescue.toml
+grep -q '^system = true' "$mnt/etc/nestegg/config.toml"
+
+# First start: back up and power off. A restored system (rescue report
+# present) prints its checks instead.
+install -m 0755 /dev/stdin "$mnt/usr/local/sbin/nestegg-e2e" <<'EOF'
+#!/bin/bash
+exec > /dev/ttyS0 2>&1
+if [[ -f /var/lib/nestegg/rescue-report.txt ]]; then
+  echo "E2E-RESTORED-BOOT"
+  echo "E2E-ROOT $(findmnt -n -o FSTYPE,OPTIONS /)"
+  echo "E2E-HOME $(findmnt -n -o FSTYPE,OPTIONS /home)"
+  echo "E2E-SNAPSHOTS $(findmnt -n -o FSTYPE,OPTIONS /.snapshots 2>/dev/null)"
+  echo "E2E-ESP $(findmnt -n -o FSTYPE /boot/efi 2>/dev/null)"
+  echo "E2E-BOOTPART $(findmnt -n -o FSTYPE /boot 2>/dev/null)"
+  echo "E2E-ROOTDEV $(findmnt -n -o SOURCE /)"
+  echo "E2E-SHA $(sha256sum /home/alice/data.bin | cut -d' ' -f1)"
+  echo "E2E-OWNER $(stat -c %U /home/alice/data.bin)"
+  echo "E2E-CAP $(getcap /home/alice/tool)"
+  echo "E2E-MARKER $(cat /etc/nestegg-e2e-marker)"
+  echo "E2E-TMPJUNK $(ls /tmp/junk 2>/dev/null | wc -l)"
+  echo "E2E-SWAP $(swapon --noheadings --show=TYPE | tr '\n' ' ')"
+  # This unit is itself part of the boot, so wait for all OTHER start jobs.
+  for _ in $(seq 180); do
+    [[ -z "$(systemctl list-jobs --no-legend | grep -v -e nestegg-e2e -e "\.target")" ]] && break
+    sleep 1
+  done
+  echo "E2E-FAILED-UNITS $(systemctl --failed --no-legend --plain | awk '{print $1}' | tr '\n' ' ')"
+  echo "E2E-DONE"
+else
+  echo "E2E-SOURCE-BOOT"
+  if nestegg backup; then echo "E2E-BACKUP-OK"; else echo "E2E-BACKUP-FAILED"; fi
+  cat /var/lib/nestegg/inventory/layout.json
+  echo "E2E-DONE"
+fi
+systemctl poweroff
+EOF
+cat > "$mnt/etc/systemd/system/nestegg-e2e.service" <<'EOF'
+[Unit]
+Description=nestegg rescue end-to-end check
+After=network-online.target local-fs.target swap.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nestegg-e2e
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target
+EOF
+in_chroot systemctl enable nestegg-e2e.service >/dev/null 2>&1
+# A serial login prompt would hang up ttyS0 under the check's feet.
+in_chroot systemctl mask serial-getty@ttyS0.service >/dev/null 2>&1
+in_chroot systemctl mask nestegg-backup.timer >/dev/null 2>&1 || true
+echo "== source image ready"

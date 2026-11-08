@@ -1,0 +1,3 @@
+# Official Proxmox repository with proxmox-backup-client-static.
+# The pinned key (config/archives/pbs-client.key.chroot) is added at build time.
+deb http://download.proxmox.com/debian/pbs-client trixie main

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Start the rescue system after 5 seconds without a key press, so the stick
+# also works on machines without a screen (serial console) or when nobody
+# selects the menu entry.
+set -e
+if [ -f boot/grub/config.cfg ]; then
+  printf '\nset timeout=5\nset default=0\nserial --speed=115200\nterminal_input --append serial\nterminal_output --append serial\n' >> boot/grub/config.cfg
+fi
+for f in isolinux/isolinux.cfg syslinux/syslinux.cfg; do
+  [ -f "$f" ] && sed -i 's/^timeout 0$/timeout 50/' "$f"
+done
+true

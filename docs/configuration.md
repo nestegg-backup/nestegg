@@ -61,6 +61,7 @@ timeout_seconds = 180
 [backup]
 encryption = true               # client-side encryption (recommended)
 inventory = true                # package lists, enabled units, disk layout
+system = true                   # whole system as system.pxar (rescue stick)
 # change_detection_mode = "metadata"   # legacy (default) | data | metadata
 # rate_limit = "20MiB"
 keep_runs = 200                 # local run history
@@ -85,6 +86,22 @@ interval_hours = 24
 ```
 
 Notes:
+
+- **Full system backup** (`system = true`, set by `nestegg init` unless
+  `--no-system` is given): `/` is backed up as `system.pxar` together with the
+  system's own mounts (`/home`, `/boot`, `/boot/efi`, `/var`, btrfs
+  subvolumes of the root device, …). Sources that lie on these file systems
+  become part of it; other sources stay separate archives: data disks,
+  network shares and FUSE mounts, bind mounts, and every source with
+  `require_mount = true`. `/tmp`, `/var/tmp`, downloaded packages and swap
+  files are excluded (an exclusion is dropped, with a note in the log, when
+  another source has the same path, because exclusions apply to every
+  archive). In system mode only the system's own fstab entries must be
+  mounted; a missing USB or network disk does not fail `system.pxar`. The
+  disk layout is stored as `layout.json` in `inventory.pxar`. Only with this
+  option can the rescue stick restore the computer onto an empty disk
+  (`docs/rescue.md`). Unprivileged users can restore their own home
+  directory from `system.pxar` in the web UI, like from `home.pxar`.
 
 - **Mount points are not crossed.** If `/home` is a separate file system it
   is still backed up, because it is its own source. Other mount points below

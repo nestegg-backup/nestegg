@@ -325,6 +325,47 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
 }
 
 fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()> {
+    // System mode: the effective sources depend on the current disk layout.
+    let system_config;
+    let mut system_layout = None;
+    let config = if config.backup.system {
+        // Touch the sources first: that triggers automounts, so the mount
+        // table read by capture() shows them.
+        for s in &config.backup.sources {
+            let _ = fs::canonicalize(&s.path);
+        }
+        match crate::layout::capture() {
+            Ok(layout) => {
+                let (c, notes) = crate::layout::system_mode_config(
+                    config,
+                    &layout,
+                    |p| fs::canonicalize(p).ok(),
+                    |p| p.symlink_metadata().is_ok(),
+                );
+                for n in notes {
+                    match n.strip_prefix("warning: ") {
+                        Some(w) => rep.warn(w.to_string()),
+                        None => rep.line(&n),
+                    }
+                }
+                system_config = c;
+                system_layout = Some(layout);
+                &system_config
+            }
+            Err(e) => {
+                rep.fail(
+                    RunState::Failed,
+                    RunError {
+                        kind: ErrorKind::Internal,
+                        message: format!("cannot read the disk layout: {e:#}"),
+                    },
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        config
+    };
     let secrets = SecretStore::new(&paths.credentials_dir);
     let mut state = rep.store.load_state()?;
 
@@ -365,6 +406,9 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         .map(|s| s.path.clone())
         .collect();
     covered.extend(config.backup.include_dev.iter().cloned());
+    if let Some(layout) = &system_layout {
+        covered.extend(crate::layout::intentionally_skipped(layout));
+    }
     let covered: Vec<PathBuf> = covered
         .into_iter()
         .map(|p| fs::canonicalize(&p).unwrap_or(p))
@@ -385,12 +429,26 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
     let mut archives = Vec::new();
     for (source, canonical) in config.backup.sources.iter().zip(resolved) {
         if let Some(canonical) = canonical {
+            // system.pxar only needs the system's own file systems; a missing
+            // USB or network disk listed in fstab is not part of it.
+            let system_fstab: Vec<crate::mounts::FstabEntry>;
+            let fstab_for_source = match &system_layout {
+                Some(layout) if source.archive == crate::layout::SYSTEM_ARCHIVE => {
+                    system_fstab = fstab
+                        .iter()
+                        .filter(|e| crate::layout::is_system_entry(layout, &e.spec, &e.point))
+                        .cloned()
+                        .collect();
+                    &system_fstab
+                }
+                _ => &fstab,
+            };
             let check = crate::mounts::check_source(
                 &canonical,
                 source.require_mount,
                 &covered,
                 &mounts,
-                &fstab,
+                fstab_for_source,
             );
             for w in check.warnings {
                 rep.warn(w);

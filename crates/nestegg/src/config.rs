@@ -176,6 +176,11 @@ pub struct BackupConfig {
     /// Add the generated system inventory as `inventory.pxar`.
     #[serde(default = "default_true")]
     pub inventory: bool,
+    /// Back up the whole operating system as `system.pxar` (needed for a
+    /// restore onto an empty disk with the rescue stick). Sources that lie
+    /// on the system file systems become part of it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub system: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_detection_mode: Option<ChangeDetectionMode>,
     /// Upload rate limit, e.g. `10MiB` (passed to `--rate`).
@@ -194,6 +199,7 @@ impl Default for BackupConfig {
             include_dev: Vec::new(),
             encryption: true,
             inventory: true,
+            system: false,
             change_detection_mode: None,
             rate_limit: None,
             keep_runs: default_keep_runs(),
@@ -337,8 +343,10 @@ impl Config {
                     source.archive
                 );
             }
-            if source.archive == "inventory" {
-                bail!("archive name 'inventory' is reserved");
+            if source.archive == "inventory"
+                || (self.backup.system && source.archive == crate::layout::SYSTEM_ARCHIVE)
+            {
+                bail!("archive name '{}' is reserved", source.archive);
             }
             if !seen.insert(&source.archive) {
                 bail!("archive name '{}' is used twice", source.archive);

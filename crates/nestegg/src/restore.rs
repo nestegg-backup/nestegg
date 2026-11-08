@@ -370,6 +370,34 @@ pub fn user_scope(source_path: &Path, home: &Path, uid: u32) -> Option<UserScope
     if !meta.is_dir() || meta.uid() != uid {
         return None;
     }
+    if source_path == Path::new("/") {
+        // Full system backup: service accounts have homes like
+        // `/var/backups` or `/run/...`, which would expose system files.
+        let first = home
+            .components()
+            .nth(1)
+            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+        let system_dirs = [
+            "bin",
+            "boot",
+            "dev",
+            "etc",
+            "lib",
+            "lib32",
+            "lib64",
+            "nonexistent",
+            "proc",
+            "run",
+            "sbin",
+            "sys",
+            "tmp",
+            "usr",
+            "var",
+        ];
+        if first.is_none_or(|f| system_dirs.contains(&f.as_str())) {
+            return None;
+        }
+    }
     let source_path = source_path.to_path_buf();
     let rel = home.strip_prefix(&source_path).ok()?;
     if rel.as_os_str().is_empty() {
@@ -502,6 +530,20 @@ mod tests {
         assert!(!scope.contains("/bob"));
         assert!(scope.is_ancestor("/"));
         assert!(!scope.is_ancestor("/bob"));
+        // Full system backup (source "/"): homes map onto their absolute
+        // path; system directories are refused.
+        // (The test home lives below /tmp, a system directory: refused.)
+        assert!(user_scope(Path::new("/"), &alice, uid).is_none());
+        let sys = UserScope {
+            prefix: "/home/alice".into(),
+        };
+        assert!(!sys.contains("/etc"));
+        for home in ["/var", "/run", "/etc", "/tmp"] {
+            assert!(
+                user_scope(Path::new("/"), Path::new(home), 0).is_none(),
+                "{home}"
+            );
+        }
     }
 
     #[test]

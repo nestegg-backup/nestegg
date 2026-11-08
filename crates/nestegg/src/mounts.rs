@@ -23,6 +23,8 @@ pub struct Mount {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FstabEntry {
+    /// Device field, e.g. `UUID=...` or `/dev/sda2`.
+    pub spec: String,
     pub point: PathBuf,
     pub fstype: String,
     pub noauto: bool,
@@ -82,6 +84,7 @@ pub fn parse_fstab(text: &str) -> Vec<FstabEntry> {
                 return None;
             }
             Some(FstabEntry {
+                spec: fields[0].to_string(),
                 point: PathBuf::from(unescape(fields[1])),
                 fstype: fields[2].to_string(),
                 noauto: fields[3].split(',').any(|o| o == "noauto"),
@@ -352,6 +355,7 @@ UUID=e none swap sw 0 0
         let real = std::fs::canonicalize(&real).unwrap();
         assert_eq!(resolve_mount_point(&link), real);
         let fstab = vec![FstabEntry {
+            spec: "UUID=x".into(),
             point: resolve_mount_point(&link),
             fstype: "ext4".into(),
             noauto: false,
