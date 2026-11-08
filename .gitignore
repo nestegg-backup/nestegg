@@ -1,0 +1,31 @@
+# Local configuration and credentials - never commit real values.
+*.local.toml
+*.local.yaml
+*.local.yml
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.kdbx
+*-encryption-key.json
+*.token
+secrets/
+credentials/
+
+# Runtime output
+*.log
+logs/
+state/
+*.catalog
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Agent tooling (local only)
+.claude/settings.local.json
