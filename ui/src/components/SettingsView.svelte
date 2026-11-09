@@ -431,7 +431,7 @@
       {#if status.encryption.enabled && status.encryption.key_exported}
         <p class="hint">{s.keyVerify}</p>
       {/if}
-      <Cmd label={s.changeIn} command="sudo nestegg init" />
+      <Cmd label={s.changeIn} command="sudoedit /etc/nestegg/config.toml" />
       <Cmd label={s.checkIn} command="sudo nestegg check" />
     </section>
   </div>

@@ -462,7 +462,7 @@ const de = {
     title: "Einstellungen",
     intro: "Änderungen werden sofort gespeichert und gelten ab der nächsten Sicherung.",
     introReadOnly:
-      "Diese nestegg-Version zeigt die Einstellungen nur an. Ändern lässt sich das im Terminal mit sudo nestegg init oder in der Datei /etc/nestegg/config.toml.",
+      "Diese nestegg-Version zeigt die Einstellungen nur an. Ändern lässt sich das im Terminal in der Datei /etc/nestegg/config.toml (sudoedit /etc/nestegg/config.toml).",
     offline: "Ohne Verbindung zum nestegg-Dienst lässt sich gerade nichts ändern.",
     unconfigured: "Noch nicht eingerichtet. Wie das geht, steht Schritt für Schritt auf der Seite des PCs.",
     unconfiguredLink: "Zur Einrichtung",

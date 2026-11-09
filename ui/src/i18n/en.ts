@@ -457,7 +457,7 @@ const en = {
     title: "Settings",
     intro: "Changes are saved immediately and apply from the next backup.",
     introReadOnly:
-      "This nestegg version only shows the settings. Change them in a terminal with sudo nestegg init or in the file /etc/nestegg/config.toml.",
+      "This nestegg version only shows the settings. Change them in a terminal in the file /etc/nestegg/config.toml (sudoedit /etc/nestegg/config.toml).",
     offline: "Nothing can be changed without a connection to the nestegg service.",
     unconfigured: "Not set up yet. How to do that is described step by step on the page of the computer.",
     unconfiguredLink: "Go to the setup",
