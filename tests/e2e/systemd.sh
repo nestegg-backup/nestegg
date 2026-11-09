@@ -4,7 +4,8 @@
 # unit and the daemon, and use the CLI and web UI as an unprivileged user.
 #
 # The systemd container needs the host cgroup namespace (--cgroupns=host with
-# a writable /sys/fs/cgroup). Only run this on a disposable test machine.
+# a writable /sys/fs/cgroup) and CAP_SYS_ADMIN without seccomp/AppArmor
+# confinement. Only run this on a disposable test machine.
 #
 # Usage: tests/e2e/systemd.sh [path/to/nestegg_*.deb]
 set -euo pipefail
@@ -37,7 +38,12 @@ DOCKER_BUILDKIT=0 docker build -q -t nestegg-e2e-systemd -f "$here/systemd-clien
 start_pbs
 
 echo "== starting systemd client and installing $(basename "$deb")"
+# CAP_SYS_ADMIN and no seccomp/AppArmor confinement let systemd create mount
+# namespaces. Without them systemd silently ignores the units' mount
+# sandboxing options, and the sandbox checks below would pass even with
+# options that hide paths (see docs/decisions/0007-systemd-unit-sandboxing.md).
 docker run -d -t --name "$client" --network "$net" --cgroupns=host \
+  --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
   -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
   -v "$deb:/tmp/nestegg.deb:ro" nestegg-e2e-systemd >/dev/null
 for _ in $(seq 1 30); do
@@ -45,7 +51,10 @@ for _ in $(seq 1 30); do
   [[ "$state" == running || "$state" == degraded ]] && break
   sleep 1
 done
-on_client bash -c 'useradd -m alice && echo "hello" > /home/alice/notes.txt && chown -R alice: /home/alice'
+check "systemd enforces mount sandboxing" bash -c "docker exec $client systemd-run --quiet --wait --pipe \
+  -p ProtectHome=read-only touch /root/.sandbox-probe 2>&1 | grep -q 'Read-only file system'"
+# shared/ is setgid: restores through the daemon unit must handle the bit.
+on_client bash -c 'useradd -m alice && echo "hello" > /home/alice/notes.txt && mkdir /home/alice/shared && chown -R alice: /home/alice && chmod 2775 /home/alice/shared'
 check "package installs" on_client bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -q /tmp/nestegg.deb >/tmp/apt.log 2>&1'
 check "group nestegg created" on_client getent group nestegg
 check "runtime dir from tmpfiles" bash -c "[[ \$(docker exec $client stat -c '%a %G' /run/nestegg) == '750 nestegg' ]]"
@@ -54,6 +63,12 @@ check "units installed" on_client systemctl cat nestegg.service nestegg-backup.s
 echo "== setup"
 on_client nestegg init --server pbs.e2e.test --datastore store1 --namespace desktops \
   --auth-id 'backup@pbs!desktop' --fingerprint "$fp" --backup-id sd-desktop >/dev/null
+# Kernel modules must reach timer snapshots: a sandbox option such as
+# ProtectKernelModules=yes hides /usr/lib/modules behind an empty tmpfs.
+# The container's overlay root makes nestegg skip system.pxar, so the
+# directory gets its own archive here; on a real disk it is in system.pxar.
+on_client bash -c 'mkdir -p /usr/lib/modules/0.0.0-nestegg-e2e && echo sentinel > /usr/lib/modules/0.0.0-nestegg-e2e/sentinel'
+on_client sed -i '0,/^\[\[backup\.sources\]\]$/s//[[backup.sources]]\narchive = "e2e-modules"\npath = "\/usr\/lib\/modules"\n\n&/' /etc/nestegg/config.toml
 docker exec -i "$client" nestegg credentials set-password <<<"$token_secret" >/dev/null
 check "password stored with systemd-creds" on_client test -f /etc/nestegg/credentials/password.cred
 check "no plain password file" bash -c "! docker exec $client test -e /etc/nestegg/credentials/password"
@@ -74,6 +89,12 @@ check "timer unit run succeeds" on_client systemctl start nestegg-backup.service
 check "unit result success" bash -c "[[ \$(docker exec $client systemctl show -p Result --value nestegg-backup.service) == success ]]"
 check "status ok for unprivileged user" bash -c "docker exec -u alice $client nestegg status | grep -q 'Health:       ok'"
 check "history readable by group member" bash -c "docker exec -u alice $client nestegg history | grep -q '^ok'"
+ROOT_API="docker exec $client curl -s --unix-socket /run/nestegg/api.sock"
+timer_snap="$(on_client nestegg snapshots --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
+timer_snap="${timer_snap##*/}"
+check "timer snapshot contains /usr/lib/modules" bash -c "
+  $ROOT_API 'http://localhost/api/v1/snapshots/$timer_snap/browse?archive=e2e-modules.pxar&path=/0.0.0-nestegg-e2e' | grep -q '\"name\":\"sentinel\"' ||
+  $ROOT_API 'http://localhost/api/v1/snapshots/$timer_snap/browse?archive=system.pxar&path=/usr/lib/modules/0.0.0-nestegg-e2e' | grep -q '\"name\":\"sentinel\"'"
 
 echo "== backup requested by the unprivileged user (daemon + systemd-run)"
 check "user can start a backup" bash -c "docker exec -u alice $client nestegg backup | grep -q 'Backup started'"
@@ -85,6 +106,35 @@ done
 check "manual run finished" test "${runs:-0}" -ge 2
 check "user can list snapshots via daemon" bash -c "[[ \$(docker exec -u alice $client nestegg snapshots --json | grep -c '\"snapshot\"') -ge 2 ]]"
 check "non-member is refused" bash -c "docker exec $client useradd -m bob && ! docker exec -u bob $client nestegg snapshots >/dev/null 2>&1"
+
+echo "== restore through the daemon unit (its sandbox applies to restores)"
+# Start an API restore of alice's home; prints the final state.
+# $1 runs the request: as_alice (root staging, then a copy as alice) or
+# on_client (root, direct restore into a root-owned directory).
+api_restore() {
+  local as="$1" target="$2" resp id state=""
+  resp="$("$as" curl -s --unix-socket /run/nestegg/api.sock -X POST -H 'Content-Type: application/json' \
+    -d "{\"snapshot_time\":\"$timer_snap\",\"archive\":\"home.pxar\",\"paths\":[\"/alice\"],\"target_dir\":\"$target\"}" \
+    http://localhost/api/v1/restores)"
+  id="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$resp")"
+  [[ -n "$id" ]] || { echo "rejected: $resp" >&2; return; }
+  for _ in $(seq 1 60); do
+    state="$("$as" curl -s --unix-socket /run/nestegg/api.sock "http://localhost/api/v1/restores/$id" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+    [[ "$state" != running ]] && break
+    sleep 1
+  done
+  echo "$state"
+}
+check "API restore into the home directory" test "$(api_restore as_alice /home/alice/api-restore)" = succeeded
+check "home restore: content arrived" on_client cmp /home/alice/notes.txt /home/alice/api-restore/alice/notes.txt
+# The copy as alice drops the setgid bit (tar without -p); the root restore
+# below checks that the bit itself survives the daemon's sandbox.
+check "home restore: directory from a setgid source restored" on_client test -d /home/alice/api-restore/alice/shared
+check "home restore: owned by the caller" bash -c "[[ -z \$(docker exec $client find /home/alice/api-restore ! -user alice) ]]"
+check "API restore into /tmp" test "$(api_restore as_alice /tmp/alice-api-restore)" = succeeded
+check "tmp restore: visible outside the daemon" on_client test -f /tmp/alice-api-restore/alice/notes.txt
+check "API restore as root into /root" test "$(api_restore on_client /root/api-restore)" = succeeded
+check "root restore: setgid bit kept" on_client test -g /root/api-restore/alice/shared
 
 echo "== web UI as unprivileged user"
 docker exec -d -u alice "$client" bash -c 'nestegg ui --no-browser --port 18080 > /tmp/ui.out 2>&1'

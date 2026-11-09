@@ -39,8 +39,9 @@ cargo deb -p nestegg && tests/e2e/systemd.sh # package + systemd services
 
 The end-to-end scripts start a disposable Proxmox Backup Server from the
 official packages in Docker; nothing outside the containers is touched.
-`systemd.sh` needs the host cgroup namespace and should only run on a
-disposable machine or CI runner. Setup and configuration:
+`systemd.sh` needs the host cgroup namespace and runs its systemd container
+with `CAP_SYS_ADMIN` and without seccomp/AppArmor confinement (so the units'
+sandboxing really applies); only run it on a disposable machine or CI runner. Setup and configuration:
 [docs/configuration.md](docs/configuration.md).
 
 "Proxmox" is a registered trademark of Proxmox Server Solutions GmbH. nestegg

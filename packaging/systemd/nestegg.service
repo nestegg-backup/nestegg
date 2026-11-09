@@ -9,15 +9,33 @@ Type=simple
 ExecStart=/usr/bin/nestegg daemon
 Restart=on-failure
 RestartSec=5s
+
+# Sandboxing. Restores requested through the API (web UI) run inside this
+# process and its child processes, so they share this unit's mount namespace
+# and restrictions:
+# - root extracts into /var/lib/nestegg/restore-staging, including setuid
+#   and setgid entries, or directly into any root-owned directory
+#   (/root, /etc, /usr/local, /opt, ...);
+# - a tar process running as the requesting user copies the files into a new
+#   directory the user owns, usually below /home or /tmp.
+# Therefore no option may make paths read-only, private or hidden
+# (ProtectSystem, ProtectHome, PrivateTmp, ProtectKernelModules,
+# ReadOnlyPaths, InaccessiblePaths, TemporaryFileSystem, PrivateDevices, ...)
+# and none may forbid setuid/setgid bits or identity changes
+# (RestrictSUIDSGID, PrivateUsers, User=, a CapabilityBoundingSet without
+# CAP_CHOWN/CAP_FOWNER/CAP_SETUID/...). A restore would fail with
+# "Read-only file system" or "Operation not permitted", or land in a private
+# directory nobody else can see. See
+# docs/decisions/0007-systemd-unit-sandboxing.md;
+# crates/nestegg/tests/units.rs enforces this.
 NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectHome=read-only
 ProtectKernelTunables=yes
-ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
 LockPersonality=yes
+# Blocks module loading like ProtectKernelModules=yes, but without hiding
+# /usr/lib/modules.
+CapabilityBoundingSet=~CAP_SYS_MODULE
+SystemCallFilter=~@module
 
 [Install]
 WantedBy=multi-user.target

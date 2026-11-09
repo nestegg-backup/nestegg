@@ -44,6 +44,15 @@ Authorization is done by Unix permissions on the socket (group `nestegg`).
 The browser side is protected by the random port, loopback binding and a
 per-session token. Nothing listens on a network interface.
 
+Both units are hardened only with options that restrict privileges
+(`NoNewPrivileges`, no module loading, read-only `/proc/sys` and `/sys`).
+Options that hide or lock paths (`PrivateTmp`, `ProtectSystem`,
+`ProtectHome`, `ProtectKernelModules`, ...) are not used: the backup unit
+must see the whole file system for `system.pxar`, and API restores run
+inside the daemon and write into home directories, `/tmp` and root-owned
+directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
+`crates/nestegg/tests/units.rs` enforces it.
+
 ## Run pipeline
 
 1. Acquire `/run/nestegg/run.lock` (no overlapping runs).

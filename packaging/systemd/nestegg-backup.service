@@ -13,8 +13,30 @@ Nice=10
 IOSchedulingClass=idle
 CPUSchedulingPolicy=batch
 TimeoutStartSec=12h
+
+# Sandboxing. This unit backs up the whole system (`/` as system.pxar) and
+# records the real mount table and disks for a bare-metal restore, so it
+# must see the file system exactly as it is on the host.
+#
+# Never add options that hide, mask or replace paths in this unit's mount
+# namespace: PrivateTmp, ProtectSystem, ProtectHome, ProtectKernelModules,
+# InaccessiblePaths, TemporaryFileSystem, Bind(ReadOnly)Paths, RootDirectory
+# and the like. They do not fail the run: proxmox-backup-client silently
+# archives the empty placeholder instead of the real directory.
+# ProtectKernelModules=yes, for example, mounts an empty tmpfs over
+# /usr/lib/modules, and a system restored from such a snapshot cannot build
+# an initramfs or load drivers. PrivateDevices, ProtectProc, ProcSubset and
+# PrivateUsers are ruled out too: the disk layout needs the real block
+# devices, /proc/swaps and the real file owners.
+# See docs/decisions/0007-systemd-unit-sandboxing.md.
+#
+# Allowed: options that only restrict privileges, and the two Protect*
+# options below, which only touch the /proc and /sys pseudo file systems
+# (never part of a backup). crates/nestegg/tests/units.rs enforces this.
 NoNewPrivileges=yes
-PrivateTmp=yes
 ProtectKernelTunables=yes
-ProtectKernelModules=yes
 ProtectControlGroups=yes
+# Blocks module loading like ProtectKernelModules=yes, but without hiding
+# /usr/lib/modules.
+CapabilityBoundingSet=~CAP_SYS_MODULE
+SystemCallFilter=~@module
