@@ -88,10 +88,17 @@ pub struct Fetched {
 /// private, root-only directory; the blob is restored into it.
 pub fn fetch(client: &Client, snapshot: &str, work: &Path) -> Result<Option<Fetched>> {
     let files = client.snapshot_files(snapshot)?;
-    let Some(crypt_mode) = crate::client::crypt_mode_for_archive(&files, ARCHIVE) else {
-        return Ok(None);
+    let size = crate::client::size_for_archive(&files, ARCHIVE);
+    // A listing without crypt modes (an old server) still shows the blob;
+    // the same case is accepted by the listing check in `verify`. Without a
+    // stated mode it counts as not encrypted, the cautious reading for the
+    // daemon (which then prefers the local run record).
+    let crypt_mode = match crate::client::crypt_mode_for_archive(&files, ARCHIVE) {
+        Some(mode) => mode,
+        None if size.is_some() => "none".to_string(),
+        None => return Ok(None),
     };
-    if let Some(size) = crate::client::size_for_archive(&files, ARCHIVE)
+    if let Some(size) = size
         && size > MAX_BYTES
     {
         bail!("the backup metadata of {snapshot} is too large ({size} bytes)");
