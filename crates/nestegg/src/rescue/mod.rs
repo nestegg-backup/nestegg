@@ -10,6 +10,7 @@ pub mod cli;
 pub mod exec;
 pub mod fixup;
 pub mod guard;
+pub mod paperkey;
 pub mod plan;
 
 use std::fs;
@@ -115,6 +116,18 @@ impl Session {
             }
         }
         Ok(Session { config, store_dir })
+    }
+
+    /// Replace the key used for this session (after a key was rejected).
+    pub fn set_key(&self, key: Option<&Secret>) -> Result<()> {
+        let key_path = self.store_dir.join(secrets::ENCRYPTION_KEY);
+        match key {
+            Some(k) => secrets::write_private_file(&key_path, k.as_bytes()),
+            None => {
+                let _ = fs::remove_file(&key_path);
+                Ok(())
+            }
+        }
     }
 
     pub fn client(&self) -> Client<'_> {
@@ -475,7 +488,7 @@ fn search_media(
             {
                 *settings = Some((kept, s));
             }
-        } else if name.ends_with(".json")
+        } else if key_candidate_name(&name)
             && looks_like_key(&path)
             && let Some(kept) = keep(&path)
         {
@@ -500,18 +513,46 @@ fn walk(dir: &Path, depth: u32) -> Vec<PathBuf> {
     out
 }
 
-/// A `proxmox-backup-client` key file (JSON with `kdf` and `data`).
-pub fn looks_like_key(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
-    if meta.len() > 64 * 1024 {
-        return false;
+/// Largest file looked at as a key: a paper key as html carries a QR code
+/// image and is about 180 KB.
+const MAX_KEY_FILE_BYTES: u64 = 1024 * 1024;
+
+/// File names worth opening: exported keys (`.json`) and paper keys saved
+/// as text or html under whatever name (`nestegg key paperkey --output`).
+fn key_candidate_name(lowercase_name: &str) -> bool {
+    match lowercase_name.rsplit_once('.') {
+        None => true,
+        Some((_, ext)) => matches!(
+            ext,
+            "json" | "txt" | "text" | "html" | "htm" | "md" | "key" | "asc"
+        ),
     }
-    fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v| v.get("kdf").is_some() && v.get("data").is_some())
+}
+
+/// Read a key from an exported key file (JSON) or a saved paper key (text
+/// or html). Only keys without password are supported.
+pub fn read_key(path: &Path) -> Result<paperkey::Key> {
+    let meta = fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
+    if !meta.is_file() || meta.len() > MAX_KEY_FILE_BYTES {
+        bail!("{} is not a key file", path.display());
+    }
+    let bytes = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let text = String::from_utf8_lossy(&bytes);
+    paperkey::from_file_text(&text).map_err(|e| match e {
+        paperkey::KeyTextError::NotAKey(m) => {
+            anyhow::anyhow!("{} is not a key file or paper key: {m}", path.display())
+        }
+        other => anyhow::anyhow!("{}: {other}", path.display()),
+    })
+}
+
+/// A key file or a saved paper key (a password-protected key counts: it is
+/// offered and then explained).
+pub fn looks_like_key(path: &Path) -> bool {
+    match read_key(path) {
+        Ok(_) => true,
+        Err(e) => e.to_string().contains("protected with a password"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -541,11 +582,17 @@ pub fn ask(prompt: &str, default: Option<&str>) -> Result<String> {
 pub fn ask_yes(prompt: &str, default_yes: bool) -> Result<bool> {
     let d = if default_yes { "Y/n" } else { "y/N" };
     let v = ask(&format!("{prompt} ({d})"), Some(""))?;
-    Ok(match v.to_lowercase().as_str() {
+    Ok(interpret_yes(&v, default_yes))
+}
+
+/// An empty answer means the default; everything that is not a clear yes is
+/// a no.
+pub fn interpret_yes(answer: &str, default_yes: bool) -> bool {
+    match answer.trim().to_lowercase().as_str() {
         "" => default_yes,
         "y" | "yes" | "j" | "ja" => true,
         _ => false,
-    })
+    }
 }
 
 pub fn ask_secret(prompt: &str) -> Result<Secret> {
@@ -666,6 +713,18 @@ mod tests {
     }
 
     #[test]
+    fn yes_no_answers() {
+        assert!(!interpret_yes("", false));
+        assert!(interpret_yes("", true));
+        for yes in ["y", "Y", "yes", "YES", " ja ", "j"] {
+            assert!(interpret_yes(yes, false), "{yes}");
+        }
+        for no in ["n", "no", "nein", "maybe", "yy", "ok", "1"] {
+            assert!(!interpret_yes(no, true), "{no}");
+        }
+    }
+
+    #[test]
     fn key_detection() {
         let dir = tempfile::tempdir().unwrap();
         let k = dir.path().join("key.json");
@@ -676,7 +735,57 @@ mod tests {
         .unwrap();
         let other = dir.path().join("other.json");
         fs::write(&other, r#"{"a":1}"#).unwrap();
-        assert!(looks_like_key(&k));
+        assert!(!looks_like_key(&k), "data is not a valid key value");
         assert!(!looks_like_key(&other));
+        let data = "RVhBTVBMRS1LRVktTk9ULUEtUkVBTC1LRVktMDEyMzQ=";
+        fs::write(
+            &k,
+            format!(r#"{{"kdf":null,"created":"x","modified":"x","data":"{data}"}}"#),
+        )
+        .unwrap();
+        assert!(looks_like_key(&k));
+        let paper = dir.path().join("paper.txt");
+        fs::write(
+            &paper,
+            format!(
+                "header\n{}\n{{\"kdf\":null,\"created\":\"x\",\"modified\":\"x\",\"data\":\"{data}\"}}\n{}\nQR\n",
+                paperkey::BEGIN,
+                paperkey::END
+            ),
+        )
+        .unwrap();
+        assert!(looks_like_key(&paper));
+        let protected = dir.path().join("protected.json");
+        fs::write(
+            &protected,
+            format!(
+                r#"{{"kdf":{{"Scrypt":{{"n":1}}}},"created":"x","modified":"x","data":"{data}"}}"#
+            ),
+        )
+        .unwrap();
+        assert!(looks_like_key(&protected));
+        assert!(
+            read_key(&protected)
+                .unwrap_err()
+                .to_string()
+                .contains("password")
+        );
+    }
+
+    #[test]
+    fn key_file_names() {
+        for n in [
+            "key.json",
+            "paperkey.txt",
+            "paper.html",
+            "paper.htm",
+            "paperkey",
+            "notes.md",
+        ] {
+            assert!(key_candidate_name(n), "{n}");
+        }
+        for n in ["photo.jpg", "backup.tar.gz", "movie.mkv"] {
+            assert!(!key_candidate_name(n), "{n}");
+        }
     }
 }

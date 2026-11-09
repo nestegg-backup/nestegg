@@ -13,7 +13,7 @@ use super::guard;
 use super::plan::{Target, human, make_plan};
 use super::{
     Disk, Inventory, Session, Settings, ask, ask_secret, ask_yes, booted_uefi, choose,
-    fetch_fingerprint, list_disks, scan_media, work_dir,
+    fetch_fingerprint, list_disks, paperkey, scan_media, work_dir,
 };
 use crate::secrets::Secret;
 
@@ -275,11 +275,40 @@ fn restore(a: RestoreArgs) -> Result<u8> {
     )
 }
 
+/// An exported key file or a saved paper key (text or html).
 fn read_key_file(path: &Path) -> Result<Secret> {
-    if !super::looks_like_key(path) {
-        bail!("{} is not a proxmox-backup-client key file", path.display());
+    Ok(Secret::new(super::read_key(path)?.json.into_bytes()))
+}
+
+/// Does this error from reading a backup come from the encryption key
+/// (wrong, missing, or not usable)?
+fn is_key_problem(e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}").to_lowercase();
+    ["key", "decrypt", "signature"]
+        .iter()
+        .any(|w| m.contains(w))
+}
+
+/// Decide whether to trust the certificate the server presented.
+/// Returns the fingerprint to pin, or `None` to rely on the certificate
+/// authorities of the system. Trusting needs an explicit yes: pressing Enter
+/// must never trust a certificate nobody has compared.
+fn decide_fingerprint(
+    fp: &str,
+    saved: Option<&str>,
+    yes_no: &mut dyn FnMut(&str, bool) -> Result<bool>,
+) -> Result<Option<String>> {
+    if saved == Some(fp) {
+        eprintln!("(matches the saved settings)");
+        return Ok(Some(fp.to_string()));
     }
-    Ok(Secret::new(fs::read(path)?))
+    eprintln!("Compare it with the fingerprint on the PBS dashboard (\"Show Fingerprint\").");
+    eprintln!("Answer no only if the PBS has a certificate from a trusted authority.");
+    if yes_no("Trust this certificate?", false)? {
+        Ok(Some(fp.to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
 fn system_archive_bytes(snaps: &[crate::client::SnapshotInfo], snapshot: &str) -> Option<u64> {
@@ -450,7 +479,7 @@ fn wizard() -> Result<u8> {
     };
 
     // Connection, repeated until the PBS answers.
-    let (session, backup_id) = loop {
+    let (session, backup_id, mut key) = loop {
         eprintln!("Step 1/4: backup server");
         settings.server = ask("PBS address (host name or IP)", Some(&settings.server))?;
         settings.port = ask("Port", Some(&settings.port.to_string()))?
@@ -480,16 +509,8 @@ fn wizard() -> Result<u8> {
         match fetch_fingerprint(&settings.server, settings.port) {
             Ok(fp) => {
                 eprintln!("Certificate fingerprint of the server:\n  {fp}");
-                if settings.fingerprint.as_deref() == Some(fp.as_str()) {
-                    eprintln!("(matches the saved settings)");
-                } else if ask_yes(
-                    "Does it match the fingerprint on the PBS dashboard? Answer no if the PBS has a trusted certificate",
-                    true,
-                )? {
-                    settings.fingerprint = Some(fp);
-                } else {
-                    settings.fingerprint = None;
-                }
+                settings.fingerprint =
+                    decide_fingerprint(&fp, settings.fingerprint.as_deref(), &mut ask_yes)?;
             }
             Err(e) => eprintln!("Could not read the certificate: {e:#}"),
         }
@@ -513,7 +534,14 @@ fn wizard() -> Result<u8> {
                 continue;
             }
             Err(e) => {
-                eprintln!("Login or listing failed: {e:#}\n");
+                eprintln!("Login or listing failed: {e:#}");
+                if settings.fingerprint.is_none() {
+                    eprintln!(
+                        "(No certificate was trusted. If the PBS uses its own certificate, \
+                         answer yes to \"Trust this certificate?\" next time.)"
+                    );
+                }
+                eprintln!();
                 continue;
             }
         };
@@ -525,7 +553,7 @@ fn wizard() -> Result<u8> {
             .and_then(|id| machines.iter().position(|m| m == id))
             .unwrap_or(0);
         let i = choose("Which computer", &machines, Some(default))?;
-        break (session, machines[i].clone());
+        break (session, machines[i].clone(), key);
     };
 
     let snaps = session.system_snapshots(&backup_id)?;
@@ -551,13 +579,59 @@ fn wizard() -> Result<u8> {
             )
         })
         .collect();
-    eprintln!("Backups of {backup_id} (newest first):");
-    let i = choose("Which backup", &items, Some(0))?;
-    let snapshot = snaps[i].snapshot.clone();
-    let backup_time = snaps[i].time.clone();
-    let archive_bytes = system_archive_bytes(&snaps, &snapshot);
-    eprintln!("Reading the disk layout of {snapshot} ...");
-    let inventory = session.inventory(&snapshot)?;
+    // The key is checked against the chosen backup right here, by reading
+    // its disk layout: a wrong key stops at this point, before any disk is
+    // looked at, let alone changed.
+    let (snapshot, backup_time, archive_bytes, inventory) = 'backup: loop {
+        eprintln!("Backups of {backup_id} (newest first):");
+        let i = choose("Which backup", &items, Some(0))?;
+        let snapshot = snaps[i].snapshot.clone();
+        let backup_time = snaps[i].time.clone();
+        let archive_bytes = system_archive_bytes(&snaps, &snapshot);
+        loop {
+            eprintln!("Reading the disk layout of {snapshot} (this checks the key) ...");
+            let e = match session.inventory(&snapshot) {
+                Ok(inventory) => {
+                    match (&key, snaps[i].encrypted) {
+                        (Some(_), Some(true)) => eprintln!("The key fits this backup."),
+                        (Some(_), _) => {
+                            eprintln!("This backup is not encrypted; the key is not needed.")
+                        }
+                        _ => {}
+                    }
+                    break 'backup (snapshot, backup_time, archive_bytes, inventory);
+                }
+                Err(e) => e,
+            };
+            eprintln!();
+            eprintln!("{e:#}");
+            let key_problem = is_key_problem(&e);
+            if key_problem {
+                eprintln!("The encryption key does not fit this backup (or none was given).");
+            } else {
+                eprintln!("The backup could not be read.");
+            }
+            eprintln!("Nothing was changed.");
+            let options = [
+                "Enter or select another key".to_string(),
+                "Choose another backup".to_string(),
+                "Try again with the same key".to_string(),
+                "Quit without changing anything".to_string(),
+            ];
+            match choose("What now", &options, Some(if key_problem { 0 } else { 2 }))? {
+                0 => {
+                    key = choose_key(&keys)?;
+                    session.set_key(key.as_ref())?;
+                }
+                1 => continue 'backup,
+                2 => {}
+                _ => {
+                    eprintln!("Stopped, nothing was changed.");
+                    return Ok(1);
+                }
+            }
+        }
+    };
     let recorded = inventory.recorded_ids();
 
     eprintln!();
@@ -673,31 +747,162 @@ fn wizard() -> Result<u8> {
     Ok(code)
 }
 
+/// Where the encryption key comes from: a key file or saved paper key on
+/// attached media or at a given path, or the paper key typed by hand.
 fn choose_key(found: &[PathBuf]) -> Result<Option<Secret>> {
     let mut default = found
         .first()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "-".into());
+        .unwrap_or_else(|| "type".into());
     if !found.is_empty() {
-        eprintln!("Key files found on attached media:");
+        eprintln!("Key files and paper keys found on attached media:");
         for k in found {
             eprintln!("  {}", k.display());
         }
     }
     loop {
-        let path = ask(
-            "Exported encryption key file ('-' = backup is not encrypted)",
-            Some(&default),
-        )?;
-        if path == "-" {
+        eprintln!(
+            "Encryption key: the path of a key file or a saved paper key, \
+             'type' to type the paper key by hand, '-' if the backup is not encrypted."
+        );
+        let answer = ask("Encryption key", Some(&default))?;
+        if answer == "-" {
             return Ok(None);
         }
-        match read_key_file(Path::new(&path)) {
+        if answer.eq_ignore_ascii_case("type") {
+            if let Some(k) = type_key()? {
+                return Ok(Some(k));
+            }
+            continue;
+        }
+        match read_key_file(Path::new(&answer)) {
             Ok(k) => return Ok(Some(k)),
             Err(e) => {
                 eprintln!("{e:#}");
-                default = "-".into();
+                default = "type".into();
             }
         }
+    }
+}
+
+/// Ask for the `data` line of a printed paper key. `None`: back to the
+/// choice of the key source.
+fn type_key() -> Result<Option<Secret>> {
+    eprintln!();
+    eprintln!("Type the paper key. Only the \"data\" line of it is needed:");
+    eprintln!("    \"data\": \"RVhBTVBMRS1LRVktTk9ULUEtUkVBTC1LRVktMDEyMzQ=\",");
+    eprintln!(
+        "Type the {} characters between the quotes, as one line. Upper and lower case",
+        paperkey::DATA_CHARS
+    );
+    eprintln!(
+        "matter, so do + / and the = at the end. Mind l (small L), I (capital i), 1, O and 0."
+    );
+    eprintln!(
+        "Quotes, commas and blanks are ignored. The text stays visible so you can compare it."
+    );
+    eprintln!("This console uses a US keyboard layout: on other keyboards + / = and quotes are on");
+    eprintln!("different keys. To change it, leave with Ctrl+C and run (example: German):");
+    eprintln!(
+        "    sed -i 's/^XKBLAYOUT=.*/XKBLAYOUT=\"de\"/' /etc/default/keyboard; setupcon -k --force"
+    );
+    loop {
+        let line = ask("Key (empty line = back)", Some(""))?;
+        if line.is_empty() {
+            return Ok(None);
+        }
+        match paperkey::from_typed(&line) {
+            Ok(k) => {
+                eprintln!("Key accepted. It is checked against the backup you choose next.");
+                return Ok(Some(Secret::new(k.json.into_bytes())));
+            }
+            Err(e) => eprintln!("{e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enter_does_not_trust_a_certificate() {
+        // Pressing Enter gives the default of the question.
+        let mut enter = |_: &str, default_yes: bool| Ok(default_yes);
+        assert_eq!(decide_fingerprint("aa:bb", None, &mut enter).unwrap(), None);
+        assert_eq!(
+            decide_fingerprint("aa:bb", Some("cc:dd"), &mut enter).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_yes_trusts_and_saved_match_needs_no_question() {
+        let mut yes = |_: &str, _: bool| Ok(true);
+        assert_eq!(
+            decide_fingerprint("aa:bb", None, &mut yes)
+                .unwrap()
+                .as_deref(),
+            Some("aa:bb")
+        );
+        let mut never = |_: &str, _: bool| -> Result<bool> { panic!("must not ask") };
+        assert_eq!(
+            decide_fingerprint("aa:bb", Some("aa:bb"), &mut never)
+                .unwrap()
+                .as_deref(),
+            Some("aa:bb")
+        );
+        let mut no = |_: &str, _: bool| Ok(false);
+        assert_eq!(decide_fingerprint("aa:bb", None, &mut no).unwrap(), None);
+    }
+
+    #[test]
+    fn key_problems_are_recognised() {
+        for m in [
+            "wrong key - unable to verify signature since manifest's key e4:84 does not match provided key 87:2f",
+            "missing key - manifest was created with key e4:84",
+            "this archive is encrypted or signed; pass the exported key with --keyfile",
+        ] {
+            assert!(is_key_problem(&anyhow::anyhow!("{m}")), "{m}");
+        }
+        let wrapped =
+            anyhow::anyhow!("wrong key").context("cannot read the inventory of this snapshot");
+        assert!(is_key_problem(&wrapped));
+        assert!(!is_key_problem(&anyhow::anyhow!("connection refused")));
+        assert!(!is_key_problem(&anyhow::anyhow!(
+            "this snapshot has no disk layout (made by an older nestegg)"
+        )));
+    }
+
+    #[test]
+    fn key_file_reader_takes_paper_keys_and_refuses_protected_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = "RVhBTVBMRS1LRVktTk9ULUEtUkVBTC1LRVktMDEyMzQ=";
+        let paper = dir.path().join("paper.txt");
+        fs::write(
+            &paper,
+            format!(
+                "{}\n{{\"kdf\":null,\"created\":\"a\",\"modified\":\"b\",\"data\":\"{data}\"}}\n{}\n",
+                paperkey::BEGIN,
+                paperkey::END
+            ),
+        )
+        .unwrap();
+        let secret = read_key_file(&paper).unwrap();
+        assert!(String::from_utf8_lossy(secret.as_bytes()).contains(data));
+        let protected = dir.path().join("protected.json");
+        fs::write(
+            &protected,
+            format!(
+                r#"{{"kdf":{{"Scrypt":{{"n":1}}}},"created":"a","modified":"b","data":"{data}"}}"#
+            ),
+        )
+        .unwrap();
+        let e = read_key_file(&protected).unwrap_err().to_string();
+        assert!(e.contains("protected with a password"), "{e}");
+        let e = read_key_file(&dir.path().join("missing"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cannot read"), "{e}");
     }
 }

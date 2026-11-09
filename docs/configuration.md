@@ -32,6 +32,9 @@ sudo systemctl enable --now nestegg.service nestegg-backup.timer nestegg-notify.
 sudo usermod -aG nestegg "$USER"          # log out and in, then: nestegg ui
 ```
 
+The paper key can be saved with `--output paperkey.txt` and is accepted by the
+rescue stick as a file or typed in (see `docs/rescue.md`).
+
 The fingerprint is only needed when the PBS uses its default self-signed
 certificate. It is shown on the PBS dashboard ("Show Fingerprint").
 

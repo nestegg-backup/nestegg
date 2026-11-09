@@ -9,6 +9,11 @@
 #
 # Usage: sudo tests/rescue/run.sh <nestegg-binary> <rescue.iso> [variant]
 # Variants: debian-btrfs-uefi (default), ubuntu-ext4-bios-luks
+# The interactive wizard is driven like a person would (WIZARD=0: the
+# non-interactive `nestegg rescue restore` instead). The encryption key
+# reaches the wizard as a saved paper-key file on the media
+# (debian-btrfs-uefi) or typed in by hand (ubuntu-ext4-bios-luks); a wrong
+# key must be refused before the disk is touched, in both ways.
 # Needs: root, KVM, Docker, qemu-system-x86, OVMF. Touches nothing outside
 # its temporary directory and the containers/VMs it starts. KEEP=1 keeps
 # the work directory for inspection.
@@ -22,8 +27,8 @@ variant="${3:-debian-btrfs-uefi}"
 [[ -e /dev/kvm ]] || { echo "KVM is required"; exit 2; }
 
 case "$variant" in
-  debian-btrfs-uefi) source_variant=debian-btrfs-uefi; builder=debian:trixie; uefi=1; luks=0 ;;
-  ubuntu-ext4-bios-luks) source_variant=ubuntu-ext4-bios; builder=ubuntu:24.04; uefi=0; luks=1 ;;
+  debian-btrfs-uefi) source_variant=debian-btrfs-uefi; builder=debian:trixie; uefi=1; luks=0; key_mode="file" ;;
+  ubuntu-ext4-bios-luks) source_variant=ubuntu-ext4-bios; builder=ubuntu:24.04; uefi=0; luks=1; key_mode="typed" ;;
   *) echo "unknown variant $variant"; exit 2 ;;
 esac
 
@@ -92,22 +97,79 @@ echo "== rescue VM: restore onto an empty disk"
 truncate -s 12G "$work/target.img"
 printf '%s' "$token_secret" > "$work/password"
 printf 'correct horse battery staple' > "$work/luks"
-docker run --rm -v "$work:/work" debian:trixie bash -euo pipefail -c '
+# Key material for the media. The right key is the one of the backup; the
+# wrong one is a valid key of the same format that never saw this backup.
+sed -n 's/.*"data": *"\([^"]*\)".*/\1/p' "$work/nestegg-key.json" > "$work/key-data.txt"
+[[ "$(tr -d '\n' < "$work/key-data.txt" | wc -c)" -eq 44 ]] || { echo "unexpected key file"; exit 1; }
+# Typed the way a person might: quotes, comma and blanks around it.
+printf '  "%s",  \n' "$(cat "$work/key-data.txt")" > "$work/key-typed.txt"
+head -c 32 /dev/urandom | base64 > "$work/wrong-data.txt"
+{
+  echo "nestegg test: a paper key of a different key (never used for a backup)"
+  echo
+  echo "-----BEGIN PROXMOX BACKUP KEY-----"
+  printf '{\n  "kdf": null,\n  "created": "2026-01-01T00:00:00+00:00",\n  "modified": "2026-01-01T00:00:00+00:00",\n  "data": "%s"\n}\n' "$(cat "$work/wrong-data.txt")"
+  echo "-----END PROXMOX BACKUP KEY-----"
+  echo "(QR code)"
+} > "$work/wrong-paperkey.txt"
+# In wizard mode the settings carry no certificate fingerprint, so that the
+# fingerprint question is asked (and Enter must not trust the certificate).
+if [[ "${WIZARD:-1}" == 1 ]]; then
+  grep -v '^fingerprint' "$work/nestegg-rescue.toml" > "$work/settings-nofp.toml"
+else
+  cp "$work/nestegg-rescue.toml" "$work/settings-nofp.toml"
+fi
+# Only the paper key (key_mode "file") is in the top directory, where the
+# wizard finds it by itself. Keys three levels down are not searched; they
+# are reached by path.
+docker run --rm -e KEY_MODE="$key_mode" -v "$work:/work" debian:trixie bash -euo pipefail -c '
   apt-get update -qq && apt-get install -y -qq dosfstools mtools >/dev/null
   mkfs.vfat -C /work/media.img 16384 >/dev/null
-  mcopy -i /work/media.img /work/nestegg-rescue.toml /work/nestegg-key.json /work/password /work/luks ::/
+  mcopy -i /work/media.img /work/settings-nofp.toml ::nestegg-rescue.toml
+  mcopy -i /work/media.img /work/password /work/luks ::/
+  mmd -i /work/media.img ::x ::x/y ::x/y/z
+  mcopy -i /work/media.img /work/nestegg-key.json /work/wrong-paperkey.txt ::x/y/z/
+  if [ "$KEY_MODE" = file ]; then
+    mcopy -i /work/media.img /work/nestegg-paperkey.txt ::/
+  fi
 '
 encrypt_arg=""
 [[ $luks == 1 ]] && encrypt_arg="--encrypt-passphrase-file /media/t/luks"
-if [[ "${WIZARD:-0}" == 1 ]]; then
+if [[ "${WIZARD:-1}" == 1 ]]; then
   # Drive the interactive wizard (`nestegg rescue`) like a person would,
-  # including typical mistakes. First pass: cancelled at the final
+  # including typical mistakes. Before it: a wrong key given to the
+  # non-interactive restore, with permission to erase, must be refused with
+  # the disk untouched. First wizard pass: cancelled at the final
   # confirmation (nothing may change). Second pass: complete restore.
-  connection_defaults() {
+  restore_args="--settings /media/t/nestegg-rescue.toml --fingerprint $fp --password-file /media/t/password --disk /dev/vda --wipe /dev/vda $encrypt_arg"
+  connection_defaults() { # $1 = answer to the certificate question, or "saved"
     for q in "PBS address" "Port" "Datastore" "Namespace" "User or API token" "MAC address"; do
       printf 'expect %s 120\nsend\n' "$q"
     done
-    printf 'expect matches the saved settings 120\n'
+    if [[ $1 == saved ]]; then
+      printf 'expect matches the saved settings 120\n'
+    else
+      printf 'expect Trust this certificate 120\nsend %s\n' "$1"
+    fi
+  }
+  key_from_media() { # the wizard offers the paper key it found; Enter takes it
+    printf 'expect Key files and paper keys found on attached media 60\nexpect nestegg-paperkey.txt 30\nexpect Encryption key 30\nsend\n'
+  }
+  key_typed() {
+    printf 'expect Encryption key 60\nsend type\nexpect Key \\(empty line = back\\) 30\nsendfile %s\nexpect Key accepted 30\n' "$work/key-typed.txt"
+  }
+  right_key() { if [[ $key_mode == file ]]; then key_from_media; else key_typed; fi; }
+  # The wrong key is given the other way round: typed where the right one
+  # is a file, as a file where the right one is typed.
+  wrong_key() {
+    if [[ $key_mode == file ]]; then
+      printf 'expect Encryption key 60\nsend type\nexpect Key \\(empty line = back\\) 30\n'
+      printf 'send abc_defghijkl\nexpect cannot be part of a key 30\n'
+      printf 'send ABCDEFGH\nexpect got 8 characters 30\n'
+      printf 'sendfile %s\nexpect Key accepted 30\n' "$work/wrong-data.txt"
+    else
+      printf 'expect Encryption key 60\nsend /media/t/x/y/z/wrong-paperkey.txt\n'
+    fi
   }
   encryption_answers() { # $1 = 1: also try mismatching passphrases
     if [[ $luks == 1 ]]; then
@@ -122,10 +184,30 @@ if [[ "${WIZARD:-0}" == 1 ]]; then
   }
   {
     echo 'expect root@nestegg-rescue[^#]*# 600'
-    echo 'send mkdir -p /media/t && mount -o ro /dev/vdb /media/t && nestegg rescue; echo WIZARD-EXIT=$?'
+    echo 'send mkdir -p /media/t && mount -o ro /dev/vdb /media/t; echo MOUNT-EXIT=$?'
+    echo 'expect MOUNT-EXIT=0 60'
+    echo '# A wrong key for the non-interactive restore, WITH permission to erase:'
+    echo '# it must be refused before the disk is touched.'
+    echo "send nestegg rescue restore $restore_args --keyfile /media/t/x/y/z/wrong-paperkey.txt; echo WRONGKEY-EXIT=\$?"
+    echo 'expect wrong key 900'
+    echo 'expect WRONGKEY-EXIT=[0-9]+ 60'
+    echo 'send head -c 16777216 /dev/vda | tr -d "\0" | wc -c | sed "s/^/DISK-DIRTY-BYTES=/"'
+    echo 'expect DISK-DIRTY-BYTES=[0-9]+ 120'
+    echo '# The right key as a plain JSON file, dry run: reads the backup, changes nothing.'
+    echo "send nestegg rescue restore $restore_args --keyfile /media/t/x/y/z/nestegg-key.json --dry-run; echo DRYRUN-EXIT=\$?"
+    echo 'expect DRYRUN-EXIT=[0-9]+ 900'
+    echo 'send nestegg rescue; echo WIZARD-EXIT=$?'
     echo 'expect Found settings in /media/t 120'
-    connection_defaults
-    echo '# Mistake: just Enter at the password prompt -> must ask again'
+    echo '# Round 1: Enter at the certificate question must NOT trust the certificate'
+    connection_defaults ''
+    echo 'expect Password or API token secret 120'
+    printf 'sendfile %s\n' "$work/password"
+    echo 'expect Encryption key 60'
+    echo 'send -'
+    echo 'expect Login or listing failed 300'
+    echo 'expect No certificate was trusted 30'
+    echo '# Round 2: trusted explicitly. Mistake: just Enter at the password prompt -> asks again'
+    connection_defaults y
     echo 'expect Password or API token secret 120'
     echo 'send'
     echo 'expect Please enter a value 30'
@@ -133,17 +215,17 @@ if [[ "${WIZARD:-0}" == 1 ]]; then
     echo '# Mistake: wrong secret'
     echo 'send wrong-secret-for-the-test'
     echo '# Mistake: key file that does not exist -> must ask again'
-    echo 'expect Exported encryption key file 60'
+    echo 'expect Encryption key 60'
     echo 'send /nonexistent/nestegg-key.json'
-    echo 'expect Exported encryption key file 30'
-    echo 'send /media/t/nestegg-key.json'
+    echo 'expect Encryption key 30'
+    echo 'send -'
     echo 'expect Login or listing failed 300'
-    echo '# The wizard starts over with the connection'
-    connection_defaults
+    echo '# Round 3: the wizard starts over; the trusted fingerprint is remembered'
+    connection_defaults saved
     echo 'expect Password or API token secret 120'
     printf 'sendfile %s\n' "$work/password"
-    echo 'expect Exported encryption key file 60'
-    echo 'send /media/t/nestegg-key.json'
+    echo '# Mistake: the wrong key. It is refused when the backup is chosen.'
+    wrong_key
     echo '# Mistake: number out of range'
     echo 'expect Which computer 300'
     echo 'send 9'
@@ -152,6 +234,16 @@ if [[ "${WIZARD:-0}" == 1 ]]; then
     echo 'send 1'
     echo 'expect Which backup 300'
     echo 'send'
+    echo 'expect Reading the disk layout 120'
+    echo 'expect (wrong key|does not match provided key) 600'
+    echo 'expect The encryption key does not fit this backup 30'
+    echo 'expect Nothing was changed 30'
+    echo 'expect What now 30'
+    echo '# Pick another key (the default of this menu)'
+    echo 'send'
+    right_key
+    echo 'expect The key fits this backup 600'
+    echo 'expect Step 3/4 60'
     echo 'expect 1\) /dev/vda 120'
     echo 'expect Which disk 60'
     echo 'send'
@@ -164,15 +256,15 @@ if [[ "${WIZARD:-0}" == 1 ]]; then
     echo '# Second pass: everything right'
     echo 'send nestegg rescue; echo WIZARD-EXIT=$?'
     echo 'expect Found settings in /media/t 120'
-    connection_defaults
+    connection_defaults y
     echo 'expect Password or API token secret 120'
     printf 'sendfile %s\n' "$work/password"
-    echo 'expect Exported encryption key file 60'
-    echo 'send'
+    right_key
     echo 'expect Which computer 300'
     echo 'send'
     echo 'expect Which backup 300'
     echo 'send'
+    echo 'expect The key fits this backup 600'
     echo 'expect Which disk 120'
     echo 'send'
     encryption_answers 0
@@ -185,9 +277,11 @@ if [[ "${WIZARD:-0}" == 1 ]]; then
     echo 'send poweroff'
   } > "$work/rescue.script"
 else
-cat > "$work/rescue.script" <<EOF
+  key_arg=/media/t/x/y/z/nestegg-key.json
+  [[ $key_mode == file ]] && key_arg=/media/t/nestegg-paperkey.txt
+  cat > "$work/rescue.script" <<EOF
 expect root@nestegg-rescue[^#]*# 600
-send mkdir -p /media/t && mount -o ro /dev/vdb /media/t && nestegg rescue restore --settings /media/t/nestegg-rescue.toml --password-file /media/t/password --keyfile /media/t/nestegg-key.json --disk /dev/vda --wipe /dev/vda $encrypt_arg; echo RESTORE-EXIT=\$?
+send mkdir -p /media/t && mount -o ro /dev/vdb /media/t && nestegg rescue restore --settings /media/t/nestegg-rescue.toml --password-file /media/t/password --keyfile $key_arg --disk /dev/vda --wipe /dev/vda $encrypt_arg; echo RESTORE-EXIT=\$?
 expect RESTORE-EXIT=[0-9]+ 2400
 send poweroff
 EOF
@@ -200,19 +294,40 @@ qemu 3600 $(firmware rescue) -cdrom "$iso" -boot d \
 qemu_pids+=($!)
 python3 "$here/console.py" "$work/rescue.sock" "$work/rescue-console.log" "$work/rescue.script" || true
 wait "${qemu_pids[-1]}" || true
-if [[ "${WIZARD:-0}" == 1 ]]; then
+if [[ "${WIZARD:-1}" == 1 ]]; then
   rlog="$work/rescue-console.log"
-  check "wizard: empty password input asks again" grep -q 'Please enter a value' "$rlog"
-  check "wizard: missing key file asks again" grep -q 'nonexistent/nestegg-key.json' "$rlog"
-  check "wizard: wrong secret starts over" grep -q 'Login or listing failed' "$rlog"
-  check "wizard: invalid number asks again" grep -q 'Please enter a number between' "$rlog"
-  if [[ $luks == 1 ]]; then
-    check "wizard: different passphrases ask again" grep -q 'passphrases differ' "$rlog"
+  # Output of the non-interactive restore with the wrong key (up to its exit code).
+  wrong_part="$work/wrong-key-part.log"
+  sed -n '/restore --settings/,/WRONGKEY-EXIT=[0-9]/p' "$rlog" > "$wrong_part"
+  check "wrong key (non-interactive): refused because of the key" grep -aq 'wrong key' "$wrong_part"
+  check "wrong key (non-interactive): exit code is an error" grep -aq 'WRONGKEY-EXIT=[1-9]' "$rlog"
+  check "wrong key (non-interactive): disk still untouched" grep -aq 'DISK-DIRTY-BYTES=0' "$rlog"
+  check "right key as JSON file: dry run works" grep -aq 'DRYRUN-EXIT=0' "$rlog"
+  check "wizard: Enter does not trust the certificate" grep -aq 'No certificate was trusted' "$rlog"
+  check "wizard: trusted fingerprint is remembered" grep -aq 'matches the saved settings' "$rlog"
+  check "wizard: empty password input asks again" grep -aq 'Please enter a value' "$rlog"
+  check "wizard: missing key file asks again" grep -aq 'nonexistent/nestegg-key.json' "$rlog"
+  check "wizard: wrong secret starts over" grep -aq 'Login or listing failed' "$rlog"
+  check "wizard: invalid number asks again" grep -aq 'Please enter a number between' "$rlog"
+  check "wizard: wrong key refused with a message" grep -aq 'The encryption key does not fit this backup' "$rlog"
+  check "wizard: right key accepted" grep -aq 'The key fits this backup' "$rlog"
+  # The wrong key is refused before the disk list (Step 3/4) is shown.
+  check "wizard: wrong key refused before the disk step" \
+    awk '/does not fit this backup/ {refused=1} /Step 3\/4/ && !refused {early=1} END {exit !(refused && !early)}' "$rlog"
+  if [[ $key_mode == file ]]; then
+    check "wizard: paper key found on the media" grep -aq 'found on attached media' "$rlog"
+    check "wizard: typed key with a bad character asks again" grep -aq 'cannot be part of a key' "$rlog"
+    check "wizard: typed key of the wrong length asks again" grep -aq 'got 8 characters' "$rlog"
+  else
+    check "wizard: key typed by hand accepted" grep -aq 'Key accepted' "$rlog"
   fi
-  check "wizard: wrong confirmation cancels" grep -q 'Cancelled, nothing was changed' "$rlog"
-  check "wizard: first pass ended without changes (exit 1)" grep -q 'WIZARD-EXIT=1' "$rlog"
-  check "wizard: second pass succeeded" grep -q 'WIZARD-EXIT=0' "$rlog"
-  check "wizard: token secret never shown" bash -c "! grep -qF \"\$(cat '$work/password')\" '$rlog'"
+  if [[ $luks == 1 ]]; then
+    check "wizard: different passphrases ask again" grep -aq 'passphrases differ' "$rlog"
+  fi
+  check "wizard: wrong confirmation cancels" grep -aq 'Cancelled, nothing was changed' "$rlog"
+  check "wizard: first pass ended without changes (exit 1)" grep -aq 'WIZARD-EXIT=1' "$rlog"
+  check "wizard: second pass succeeded" grep -aq 'WIZARD-EXIT=0' "$rlog"
+  check "wizard: token secret never shown" bash -c "! grep -aqF \"\$(cat '$work/password')\" '$rlog'"
 else
   check "rescue restore succeeded" grep -q 'RESTORE-EXIT=0' "$work/rescue-console.log"
 fi

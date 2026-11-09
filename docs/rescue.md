@@ -5,7 +5,8 @@ scratch, the nestegg rescue stick puts the complete system back from the
 Proxmox Backup Server: partitions, files, users, settings, boot loader.
 
 Decision and scope: [decisions/0006](decisions/0006-bare-metal-restore-rescue-stick.md),
-target disk guard: [decisions/0010](decisions/0010-rescue-target-disk-guard.md).
+target disk guard: [decisions/0010](decisions/0010-rescue-target-disk-guard.md),
+paper key and certificate question: [decisions/0019](decisions/0019-rescue-paper-key-and-fingerprint-prompt.md).
 
 ## Before you need it
 
@@ -31,6 +32,12 @@ target disk guard: [decisions/0010](decisions/0010-rescue-target-disk-guard.md).
    The settings file contains the PBS address, datastore, namespace, token
    name and certificate fingerprint, never a password. You also need the
    token secret (password manager).
+
+   The key can also be the **paper key**: `sudo nestegg key paperkey` prints
+   it, `sudo nestegg key paperkey --output paperkey.txt` (or `--format html`)
+   saves it as a file you can keep on the stick. The wizard takes either form
+   (see "The encryption key" below). Keys protected with a password are not
+   supported; nestegg's own keys have none.
 3. **Write the rescue image to a USB stick** (all data on the stick is lost):
 
    ```sh
@@ -51,12 +58,18 @@ target disk guard: [decisions/0010](decisions/0010-rescue-target-disk-guard.md).
 3. Plug in the stick with the key and settings; the wizard finds them. It
    looks at other disks read-only, without replaying journals, so nothing is
    written to them.
-4. Answer the questions: server, token secret, key file, computer, backup,
-   target disk, optional encryption. The disk list shows model, size and
+4. Answer the questions: server, token secret, key, computer, backup,
+   target disk, optional encryption. When the PBS shows a certificate that
+   is not in the saved settings, the wizard prints its fingerprint and asks
+   "Trust this certificate?". Compare it with the PBS dashboard ("Show
+   Fingerprint"); only an explicit `y` trusts it, Enter means no. Answer no
+   only if the PBS has a certificate from a trusted authority. The disk list shows model, size and
    serial number of every disk and marks it `empty`, `NOT EMPTY` or
    `HOLDS DATA OF THE BACKED-UP COMPUTER`, with what was found on it (see
    below). A disk is pre-selected only if exactly one disk is empty and big
    enough; otherwise you have to type its number.
+   The key is checked against the backup you choose before the list of disks
+   appears (see below).
 5. Check the plan and type the disk name (e.g. `nvme0n1`) to start. Only now
    is the disk erased. The plan lists what is currently on the disk. A disk
    that is not empty needs a second confirmation: type `ERASE <name>`
@@ -67,6 +80,59 @@ target disk guard: [decisions/0010](decisions/0010-rescue-target-disk-guard.md).
 The restored system contains a report of what was changed:
 `/var/lib/nestegg/rescue-report.txt`. The previous versions of modified
 configuration files are kept below `/var/lib/nestegg/rescue-backup/`.
+
+### The encryption key
+
+At the question "Encryption key" you can give:
+
+- **A key file or a saved paper key**: the path, or just Enter when the
+  wizard found one on the attached media (it lists them). Both exported key
+  files (`nestegg key export`) and paper keys saved as text or html
+  (`nestegg key paperkey --output …`) work; only the part between `-----BEGIN
+  PROXMOX BACKUP KEY-----` and `-----END PROXMOX BACKUP KEY-----` is read, a
+  header above it and the QR code below it are ignored.
+- **`type`**: type the paper key by hand. Only one line is needed, the
+  `data` line:
+
+  ```text
+  "data": "RVhBTVBMRS1LRVktTk9ULUEtUkVBTC1LRVktMDEyMzQ=",
+  ```
+
+  Type the 44 characters between the quotes. Upper and lower case matter, so
+  do `+`, `/` and the `=` at the end. Quotes, commas and blanks you add are
+  ignored. The text stays visible while you type so you can compare it with
+  the paper; a mistyped letter is not detected by the wizard itself but by
+  the check below. Mind `l` (small L), `I` (capital i) and `1`, and `O` and
+  `0`. The other lines of the paper key (`kdf`, `created`, `modified`,
+  `fingerprint`) are not needed.
+- **`-`**: the backup is not encrypted.
+
+**The key is checked before anything is erased.** After you choose the
+backup, the wizard reads its disk layout with the key. If the key does not
+fit, it shows the message of the client (it names the fingerprint of the key
+the backup was made with and the one you gave), says "Nothing was changed"
+and offers: enter or select another key, choose another backup (an older
+backup may have been made with an older key), try again, or quit. The disk
+list comes only after this check passed. `nestegg rescue restore` does the
+same read and stops before changing anything.
+
+### Keyboard layout
+
+The rescue system starts with a US keyboard layout. On other keyboards
+`+`, `/`, `=`, quotes and special characters sit on other keys, which matters
+for the paper key, the token secret and the disk passphrase. The wizard shows
+what you type for the paper key; passwords are hidden. To use another layout,
+leave the wizard with Ctrl+C, then:
+
+```sh
+sed -i 's/^XKBLAYOUT=.*/XKBLAYOUT="de"/' /etc/default/keyboard   # your layout
+setupcon -k --force
+nestegg rescue
+```
+
+Checked in the rescue system (booted in a VM): after these commands the
+virtual console maps the key `Z` of the US layout to `Y`, as the German
+layout does. Typing on a physical keyboard was not tried.
 
 ### After restoring onto new hardware
 
@@ -99,7 +165,8 @@ nestegg rescue restore --settings /media/usb/nestegg-rescue.toml \
   [--backup-id <other machine>] [--encrypt-passphrase-file /root/pass] [--dry-run]
 ```
 
-`--wipe` must repeat the disk; `--dry-run` only prints the plan. A disk that
+`--keyfile` takes an exported key file or a saved paper key. `--wipe` must
+repeat the disk; `--dry-run` only prints the plan. A disk that
 is not empty is refused unless `--erase-data-disk` is given.
 
 ### When is a disk "not empty"?
@@ -169,7 +236,12 @@ packaging/rescue/build.sh target/release/nestegg target/nestegg-rescue-amd64.iso
 ```
 
 Needs Docker (privileged container with Debian `live-build`) and network
-access. The end-to-end test boots everything in VMs:
+access. The end-to-end test boots everything in VMs and drives the wizard over the
+serial console, including wrong answers. The first variant gives the key as a
+saved paper-key file on the media, the second types it in; both first try a
+wrong key (which must be refused with the target disk untouched) and check
+that Enter does not trust the certificate. `WIZARD=0` tests the
+non-interactive `nestegg rescue restore` instead.
 
 ```sh
 sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso debian-btrfs-uefi
