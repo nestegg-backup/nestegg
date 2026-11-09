@@ -14,7 +14,7 @@ unreachable or asleep, desktop integration, credential storage. Results go
 to `docs/research/` and feed into v0.1 design. Work on v0.1 does not wait
 for this.
 
-## v0.1 – Terminal backup for one machine (implemented, not released)
+## v0.1 – Terminal backup for one machine (implemented and tested in containers, not released)
 
 Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
 
@@ -29,10 +29,13 @@ Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
   packet repeated with growing pauses, "PBS unreachable" reported as its own
   state.
 - Status file with last success, last attempt, next run.
-- Tests: unit tests plus an end-to-end test against a disposable PBS in a VM
-  or container, on clean Ubuntu LTS and Linux Mint images.
+- Tests: unit tests plus an end-to-end test against a disposable PBS in
+  containers, on clean Ubuntu 24.04 and Debian 13 images. There is no
+  official Linux Mint container image; an Ubuntu base with the Linux Mint
+  22.2 repositories passes the same test, a real Mint desktop has not been
+  tested yet.
 
-## v0.2 – Desktop integration (API implemented, UI in progress)
+## v0.2 – Desktop integration (implemented, not released)
 
 - Local web UI (`nestegg ui`): status, run now, history, restore.
   Contract: `api/openapi.yaml`.

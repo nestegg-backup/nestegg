@@ -15,7 +15,7 @@ On the PBS (once per machine, in the PBS web UI or shell):
 On the desktop:
 
 ```sh
-sudo apt install proxmox-backup-client        # or proxmox-backup-client-static
+sudo apt install proxmox-backup-client-static # see "Installing the backup client" below
 sudo apt install ./nestegg_<version>_amd64.deb
 
 sudo nestegg init --server pbs.example.com --datastore backups \
@@ -37,6 +37,76 @@ rescue stick as a file or typed in (see `docs/rescue.md`).
 
 The fingerprint is only needed when the PBS uses its default self-signed
 certificate. It is shown on the PBS dashboard ("Show Fingerprint").
+
+Then make the first backup right away instead of waiting for the timer: see
+"The first backup" below.
+
+## Installing the backup client
+
+nestegg drives the official `proxmox-backup-client`. Ubuntu and Linux Mint do
+not ship it, and Debian only has it in the Proxmox repositories, so `apt
+install proxmox-backup-client` fails on a fresh system with "Unable to locate
+package". Add the Proxmox client repository once:
+
+```sh
+# 1. The key Proxmox signs its packages with
+sudo curl -fsSL -o /usr/share/keyrings/proxmox-archive-keyring.gpg \
+     https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg
+sha256sum /usr/share/keyrings/proxmox-archive-keyring.gpg
+
+# 2. The repository (no subscription needed for the client)
+printf '%s\n' 'Types: deb' 'URIs: http://download.proxmox.com/debian/pbs-client' \
+     'Suites: trixie' 'Components: main' \
+     'Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg' \
+  | sudo tee /etc/apt/sources.list.d/pbs-client.sources
+
+# 3. The client
+sudo apt update
+sudo apt install proxmox-backup-client-static
+proxmox-backup-client version
+```
+
+- Before you go on, compare the checksum printed in step 1 with the one in
+  the Proxmox Backup installation documentation (section "SecureApt"). When
+  this was written both that page and nestegg's own tests had
+  `136673be77aba35dcce385b28737689ad64fd785a797e57897589aed08db6e45`; the
+  Proxmox page is the authority if the key is ever replaced.
+- `Suites: trixie` is right on Ubuntu and Linux Mint too. The package
+  `proxmox-backup-client-static` is one statically linked program without
+  dependencies on the distribution, which is why the Debian 13 build runs on
+  Ubuntu 24.04 and Linux Mint 22. This combination is what the end-to-end
+  tests of this project install (Ubuntu 24.04, Debian 13, and an Ubuntu
+  24.04 base with the Linux Mint 22.2 repositories).
+- On Debian 13 the dynamically linked `proxmox-backup-client` from the same
+  repository works as well; the nestegg package accepts either.
+- Installing the nestegg package first is harmless: it only recommends the
+  client, and `sudo nestegg check` says so when the client is missing.
+
+## The first backup
+
+`nestegg-backup.timer` checks once an hour whether a backup is due, so after
+the setup the first backup would start by itself within the hour. Start it
+now and watch it, so that problems show while you are still at the computer:
+
+```sh
+sudo nestegg backup            # or "Back up now" in the web UI (nestegg ui)
+nestegg status                 # should say that the last backup worked
+sudo nestegg key verify /media/usb/nestegg-key.json   # your copy opens that backup
+```
+
+- The first backup uploads everything and can take hours; later ones only
+  upload what changed. The computer can be used meanwhile.
+- After the upload nestegg reads the snapshot back from the server and
+  compares it (decision 0015). `nestegg status` shows "incomplete" with the
+  reason if something that is configured could not be backed up, for example
+  the full system backup on a file system the rescue stick cannot recreate.
+- Try one restore before you rely on it: `nestegg ui`, "Restore files", pick
+  a small file and restore it into a new folder. With a full system backup
+  also write the rescue stick once and boot it up to the point where it
+  lists the backup (`docs/rescue.md`); nothing is changed before you confirm
+  the final plan.
+- `sudo nestegg notify --test` shows whether warnings about failed or
+  missing backups would reach you (section "Notifications").
 
 ## `/etc/nestegg/config.toml`
 

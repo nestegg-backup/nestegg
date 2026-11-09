@@ -62,9 +62,10 @@ directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
 1. Acquire `/run/nestegg/run.lock` (no overlapping runs).
 2. Check sources exist (missing configured sources fail the run instead of
    silently producing an incomplete backup).
-3. PBS availability: `GET https://<pbs>:8007/api2/json/ping` (no
-   authentication). If unreachable and Wake-on-LAN is configured, send the
-   magic packet and poll until `wake.timeout`. Still unreachable → state
+3. PBS availability: a TCP connection to the PBS port (no credentials are
+   sent). If unreachable and Wake-on-LAN is configured, send the magic
+   packet, repeat it with growing pauses and poll until
+   `wake.timeout_seconds`. Still unreachable → state
    `pbs_unreachable` (distinct from failure); the timer retries next time.
    A packet that cannot be sent (no network) is a warning, not an error:
    the run keeps retrying it while it polls and ends the same way
@@ -76,10 +77,10 @@ directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
    (`home.pxar:/home`, `etc.pxar:/etc`, …, `inventory.pxar:…`) and the
    metadata blob `nestegg-meta.conf` (sources, archive → source path,
    incomplete reasons; written to `/run/nestegg/tmp/`),
-   `--backup-type host --backup-id <id> [--ns <ns>]`, excludes, optional
-   `--keyfile`, `--change-detection-mode`, rate limit. Secrets come from
-   systemd credentials or `*_FILE` environment variables, never from
-   arguments.
+   `--backup-type host --backup-id <id> [--ns <ns>]`, excludes,
+   `--change-detection-mode`, rate limit. The encryption key (`--keyfd`) and the
+   token secret (`PBS_PASSWORD_FD`) are handed over on file descriptors; no
+   secret is ever a command-line argument or written to a log.
 6. Read the snapshot back: all archives listed, metadata blob and
    inventory restored and identical; otherwise `verification_failed`. Then
    record the snapshots the server's own verification marked as failed
@@ -107,7 +108,8 @@ directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
 
 - API contract between daemon and UI: [`api/openapi.yaml`](../api/openapi.yaml).
   It is the single source of truth; the UI never talks to the PBS directly.
-- Configuration reference: `docs/configuration.md` (follows with v0.1).
+- Configuration reference and setup guide: [`docs/configuration.md`](configuration.md);
+  rescue stick: [`docs/rescue.md`](rescue.md).
 
 ## Repository layout
 
