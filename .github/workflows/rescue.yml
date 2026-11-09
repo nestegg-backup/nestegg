@@ -14,6 +14,9 @@ on:
     paths:
       - "crates/nestegg/src/rescue/**"
       - "crates/nestegg/src/layout.rs"
+      # The rescue path reads snapshots and checks keys through these.
+      - "crates/nestegg/src/client.rs"
+      - "crates/nestegg/src/keyproof.rs"
       - "packaging/rescue/**"
       - "tests/rescue/**"
       # tests/rescue/run.sh starts the PBS with these.
