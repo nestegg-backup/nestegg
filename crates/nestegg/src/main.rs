@@ -541,6 +541,10 @@ fn set_password(paths: &Paths, allow_plain: bool, overview: bool) -> Result<u8> 
         Storage::SystemdCreds => println!("Stored encrypted with systemd-creds."),
         Storage::PlainFile => println!("Stored as root-only file."),
     }
+    // New credentials may cure a failing backup: let the timer retry at once.
+    if let Err(e) = Store::new(paths).clear_failures() {
+        eprintln!("warning: {e:#}");
+    }
     Ok(0)
 }
 
@@ -613,6 +617,7 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             let storage = secrets_store.store(secrets::ENCRYPTION_KEY, &key, allow_plain)?;
             state.key_fingerprint = Some(fingerprint.clone());
             state.key_digest = Some(secrets::digest(&key));
+            state.consecutive_failures = 0;
             store.save_state(&state)?;
             println!("Encryption key created (fingerprint {fingerprint}).");
             if storage == Storage::SystemdCreds {
@@ -685,6 +690,7 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             state.key_digest = Some(digest.clone());
             state.key_last_exported_digest = Some(digest.clone());
             state.key_exported_digest = counts_as_exported.then_some(digest);
+            state.consecutive_failures = 0;
             store.save_state(&state)?;
             println!(
                 "Encryption key imported (fingerprint {}) and stored {}.",
@@ -992,6 +998,8 @@ fn confirm_exported(
     state.key_digest = Some(digest.clone());
     state.key_last_exported_digest = Some(digest.clone());
     state.key_exported_digest = Some(digest);
+    // Backups were failing for want of this confirmation: retry at once.
+    state.consecutive_failures = 0;
     store.save_state(&state)?;
     println!("Confirmed: your copy is the stored key. Backups can run now.");
     println!("Check it again at any time: sudo nestegg key verify <copy>");

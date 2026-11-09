@@ -213,9 +213,16 @@ Notes:
 - **Schedule:** the timer checks hourly; a backup runs when the last success
   is older than `interval_hours`. If the PBS is unreachable, the run ends
   with state `pbs_unreachable` and the next hourly check tries again.
+  A failed backup is retried at the next check; after two or more failures
+  in a row the timer waits 2, 4, 8, 16 hours (at most `interval_hours`)
+  before it tries again, so a problem that does not go away by itself does
+  not wake the server every hour. Changing the configuration, storing
+  credentials or a key, and every manual start (`sudo nestegg backup`, "Back
+  up now") end that pause (decision 0021).
 - **Wake-on-LAN:** with `[wake]` (and `enabled = true`, the default), a
   run that finds the PBS down sends the
-  magic packet, repeats it every minute and waits up to `timeout_seconds`.
+  magic packet, repeats it after 10, 20 and 40 seconds and then every minute,
+  and waits up to `timeout_seconds`.
   If the packet cannot be sent at all (for example a laptop that is offline
   or still reconnecting after sleep), the run logs a warning, keeps trying
   until the timeout and then also ends as `pbs_unreachable`, not as a

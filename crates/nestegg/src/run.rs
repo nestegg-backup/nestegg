@@ -273,6 +273,26 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
         );
         return Ok(RunExit::NotDue);
     }
+    // After failures in a row the timer pauses longer and longer; manual
+    // runs and a changed configuration are not held back.
+    if let (Ok(cfg), Trigger::Timer, false) = (&config, options.trigger, options.force) {
+        let config_changed = fs::metadata(&paths.config_file)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(chrono::DateTime::<Utc>::from);
+        if let Some(not_before) =
+            crate::state::retry_not_before(&state, cfg.schedule.interval_hours, config_changed)
+            && Utc::now() < not_before
+        {
+            eprintln!(
+                "not retrying yet: {} failed runs in a row, next automatic attempt after {} \
+                 (start one now with `nestegg backup`)",
+                state.consecutive_failures,
+                crate::state::format_time(not_before)
+            );
+            return Ok(RunExit::NotDue);
+        }
+    }
 
     let mut run = Run::new(options.trigger, Utc::now());
     if let Some(id) = &options.run_id

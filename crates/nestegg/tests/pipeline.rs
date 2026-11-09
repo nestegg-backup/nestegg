@@ -1046,6 +1046,66 @@ fn key_import_stores_the_key_without_pcr_binding_and_needs_proof_for_a_local_fil
 }
 
 #[test]
+fn repeated_failures_pause_the_timer_but_not_manual_runs() {
+    let env = Env::new();
+    let failing = |args: &[&str]| {
+        env.command(args)
+            .env("FAKE_FAIL_AUTH", "1")
+            .output()
+            .unwrap()
+    };
+    let attempts = || env.fake_log().matches("ARGS backup").count();
+    let timer = ["run", "--trigger", "timer"];
+
+    // Two failures in a row: both are real attempts.
+    assert_eq!(code(&failing(&timer)), 1);
+    assert_eq!(code(&failing(&timer)), 1);
+    assert_eq!(attempts(), 2);
+    assert_eq!(env.state()["consecutive_failures"], 2);
+
+    // The next timer check does not try again yet and leaves no record.
+    let out = failing(&timer);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not retrying yet: 2 failed runs in a row"),
+        "{stderr}"
+    );
+    assert_eq!(attempts(), 2);
+    assert_eq!(env.state()["last_run"]["state"], "failed");
+
+    // Storing the credentials again (somebody fixed it) ends the pause.
+    let mut set = env.command(&["credentials", "set-password", "--allow-plain"]);
+    set.env("NESTEGG_ALLOW_NON_ROOT", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = set.spawn().unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"new-secret\n")
+            .unwrap();
+    }
+    assert!(child.wait_with_output().unwrap().status.success());
+    assert_eq!(env.state()["consecutive_failures"], 0);
+    assert_eq!(code(&failing(&timer)), 1);
+    assert_eq!(code(&failing(&timer)), 1);
+    assert_eq!(attempts(), 4);
+
+    // Paused again; a manual run is never held back, and a success clears
+    // the count.
+    assert_eq!(code(&failing(&timer)), 0);
+    assert_eq!(attempts(), 4);
+    assert_eq!(code(&env.run(&["run", "--trigger", "manual"])), 0);
+    assert_eq!(attempts(), 5);
+    assert_eq!(env.state()["consecutive_failures"], 0);
+}
+
+#[test]
 fn key_export_then_import_of_the_same_file_does_not_confirm_the_key() {
     let env = Env::new();
     env.set_state("key_fingerprint", serde_json::json!("aa:01"));

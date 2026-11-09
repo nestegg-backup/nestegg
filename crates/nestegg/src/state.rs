@@ -216,6 +216,12 @@ pub struct State {
     /// verification marked as failed, as seen at the end of the last run.
     #[serde(default)]
     pub server_verify_failed: Vec<String>,
+    /// Failed runs in a row since the last success. Runs that ended because
+    /// the server was unreachable or that were cancelled do not count and do
+    /// not reset it. Drives the growing pause between automatic retries
+    /// ([`retry_not_before`]).
+    #[serde(default)]
+    pub consecutive_failures: u32,
 }
 
 impl State {
@@ -280,6 +286,43 @@ pub fn is_due(state: &State, interval_hours: u32, now: DateTime<Utc>) -> bool {
             now - finished >= Duration::hours(i64::from(interval_hours)) - Duration::minutes(30)
         }
     }
+}
+
+/// Tolerance for the hourly timer with its random delay.
+const TIMER_SLACK_MINUTES: i64 = 30;
+
+/// After two or more failed runs in a row the timer does not try again every
+/// hour: the pause doubles (2, 4, 8, 16 hours) up to the backup interval, so
+/// a problem that does not go away by itself does not wake the backup
+/// server 24 times a day. Returns the earliest time for the next automatic
+/// attempt, or `None` when no pause applies.
+///
+/// `config_changed`: when the configuration file was last written. A change
+/// after the failure (somebody is fixing it) ends the pause; so do the
+/// commands that store credentials or keys ([`Store::clear_failures`]) and
+/// every manually started run.
+pub fn retry_not_before(
+    state: &State,
+    interval_hours: u32,
+    config_changed: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let last = state
+        .last_run
+        .as_ref()
+        .filter(|run| run.state == RunState::Failed)?;
+    if state.consecutive_failures < 2 {
+        return None;
+    }
+    let failed_at = last.finished_at.unwrap_or(last.started_at);
+    // The failed run read the configuration when it started. Run times are
+    // stored in whole seconds, so the file time is cut to seconds as well:
+    // a file written in the second the run started was read by that run.
+    if config_changed.is_some_and(|changed| changed.timestamp() > last.started_at.timestamp()) {
+        return None;
+    }
+    let doubled = 1u32 << (state.consecutive_failures - 1).min(16);
+    let hours = doubled.min(interval_hours.max(1));
+    Some(failed_at + Duration::hours(i64::from(hours)) - Duration::minutes(TIMER_SLACK_MINUTES))
 }
 
 pub fn next_due(state: &State, interval_hours: u32, now: DateTime<Utc>) -> DateTime<Utc> {
@@ -375,11 +418,30 @@ impl Store {
         write_json_atomic(&dir.join(format!("{}.json", run.id)), run)?;
         let mut state = self.load_state()?;
         state.last_run = Some(run.clone());
-        if run.state == RunState::Succeeded {
-            state.last_success = Some(run.clone());
+        match run.state {
+            RunState::Succeeded => {
+                state.last_success = Some(run.clone());
+                state.consecutive_failures = 0;
+            }
+            RunState::Failed => {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            }
+            _ => {}
         }
         self.save_state(&state)?;
         self.prune(keep)?;
+        Ok(())
+    }
+
+    /// Forget the failures in a row: something that can cure them was just
+    /// changed (credentials stored, key created, imported or confirmed), so
+    /// the next timer check tries again at once.
+    pub fn clear_failures(&self) -> Result<()> {
+        let mut state = self.load_state()?;
+        if state.consecutive_failures != 0 {
+            state.consecutive_failures = 0;
+            self.save_state(&state)?;
+        }
         Ok(())
     }
 
@@ -622,6 +684,85 @@ mod tests {
         assert!(!is_due(&state, 12, t(12)));
         assert!(is_due(&state, 11, t(12)));
         assert_eq!(next_due(&state, 24, t(12)), t(1) + Duration::hours(24));
+    }
+
+    #[test]
+    fn retries_pause_longer_after_each_failure_in_a_row() {
+        let mut state = State::default();
+        let failed_at = t(10);
+        state.last_run = Some(finished(RunState::Failed, failed_at));
+        let pause = |state: &State| {
+            retry_not_before(state, 24, None).map(|at| (at - failed_at).num_minutes())
+        };
+        // The first failure is retried at the next hourly check as before.
+        state.consecutive_failures = 1;
+        assert_eq!(pause(&state), None);
+        // Then 2, 4, 8, 16 hours (minus the timer tolerance), capped at the
+        // backup interval.
+        for (failures, hours) in [(2, 2), (3, 4), (4, 8), (5, 16), (6, 24), (40, 24)] {
+            state.consecutive_failures = failures;
+            assert_eq!(pause(&state), Some(hours * 60 - 30), "{failures} failures");
+        }
+        state.consecutive_failures = 4;
+        assert_eq!(
+            retry_not_before(&state, 6, None).map(|at| (at - failed_at).num_minutes()),
+            Some(6 * 60 - 30),
+            "never longer than the interval"
+        );
+        // A configuration change after the failed run started ends the
+        // pause, one before it does not; the second the run started in
+        // counts as "before" (run times have no fractions).
+        let started = state.last_run.as_ref().unwrap().started_at;
+        assert_eq!(retry_not_before(&state, 24, Some(t(11))), None);
+        assert_eq!(
+            retry_not_before(&state, 24, Some(started + Duration::seconds(1))),
+            None
+        );
+        assert!(retry_not_before(&state, 24, Some(t(9))).is_some());
+        assert!(
+            retry_not_before(&state, 24, Some(started + Duration::milliseconds(900))).is_some()
+        );
+        // An unreachable server or a cancelled run is not a failure.
+        state.last_run = Some(finished(RunState::PbsUnreachable, t(11)));
+        assert_eq!(retry_not_before(&state, 24, None), None);
+    }
+
+    #[test]
+    fn store_counts_failures_in_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: dir.path().join("config.toml"),
+            credentials_dir: dir.path().join("cred"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+            systemctl: PathBuf::from("systemctl"),
+        };
+        let store = Store::new(&paths);
+        let count = || store.load_state().unwrap().consecutive_failures;
+        store
+            .record_finished(&finished(RunState::Failed, t(1)), 50)
+            .unwrap();
+        store
+            .record_finished(&finished(RunState::Failed, t(2)), 50)
+            .unwrap();
+        assert_eq!(count(), 2);
+        // Neither a failure nor a cure.
+        store
+            .record_finished(&finished(RunState::PbsUnreachable, t(3)), 50)
+            .unwrap();
+        store
+            .record_finished(&finished(RunState::Cancelled, t(4)), 50)
+            .unwrap();
+        assert_eq!(count(), 2);
+        store.clear_failures().unwrap();
+        assert_eq!(count(), 0);
+        store
+            .record_finished(&finished(RunState::Failed, t(5)), 50)
+            .unwrap();
+        store
+            .record_finished(&finished(RunState::Succeeded, t(6)), 50)
+            .unwrap();
+        assert_eq!(count(), 0);
     }
 
     #[test]
