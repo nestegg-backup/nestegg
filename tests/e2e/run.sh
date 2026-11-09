@@ -406,9 +406,10 @@ check "forged notes do not allow restoring etc.pxar" \
   -d "{\"snapshot_time\":\"$forged_time\",\"archive\":\"etc.pxar\",\"paths\":[],\"target_dir\":\"/home/alice/forged\"}" \
   http://localhost/api/v1/restores
 
-# A snapshot without metadata blob, as older versions made them.
+# A snapshot without metadata blob, as older versions made them (made with
+# the current key: nestegg-key-3.json since the last `key create` above).
 as_backup_token backup home.pxar:/home --backup-type host --backup-id e2e-desktop \
-  --keyfile /root/nestegg-key-2.json >/dev/null 2>&1
+  --keyfile /root/nestegg-key-3.json >/dev/null 2>&1
 raw_snapshot="$(on_client nestegg snapshots --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
 raw_time="${raw_snapshot##*/}"
 check "snapshot without metadata blob created" \
