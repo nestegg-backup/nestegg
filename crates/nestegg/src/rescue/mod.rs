@@ -9,6 +9,7 @@
 pub mod cli;
 pub mod exec;
 pub mod fixup;
+pub mod guard;
 pub mod plan;
 
 use std::fs;
@@ -140,8 +141,9 @@ impl Session {
         Ok(snaps.into_iter().filter(has_system_archive).collect())
     }
 
-    /// Read `layout.json` and the package list of a snapshot.
-    pub fn inventory(&self, snapshot: &str) -> Result<(Layout, Option<String>)> {
+    /// Read `layout.json`, the package list and the storage records of a
+    /// snapshot.
+    pub fn inventory(&self, snapshot: &str) -> Result<Inventory> {
         let base = work_dir().join("inventory");
         let _ = fs::remove_dir_all(&base);
         let mut sink = std::io::sink();
@@ -162,8 +164,37 @@ impl Session {
                 .context("this snapshot has no disk layout (made by an older nestegg)")?,
         )
         .context("invalid layout.json")?;
-        let selections = fs::read_to_string(base.join("dpkg-selections.txt")).ok();
-        Ok((layout, selections))
+        let read = |name: &str| fs::read_to_string(base.join(name)).ok();
+        Ok(Inventory {
+            layout,
+            selections: read("dpkg-selections.txt"),
+            fstab: read("fstab"),
+            crypttab: read("crypttab"),
+            lsblk: read("lsblk.json"),
+        })
+    }
+}
+
+/// What the rescue system reads from a snapshot's `inventory.pxar`.
+pub struct Inventory {
+    pub layout: Layout,
+    /// `dpkg --get-selections` of the backed-up system.
+    pub selections: Option<String>,
+    /// `/etc/fstab`, `/etc/crypttab` and `lsblk --json` of the backed-up
+    /// system: used to recognise its surviving disks.
+    pub fstab: Option<String>,
+    pub crypttab: Option<String>,
+    pub lsblk: Option<String>,
+}
+
+impl Inventory {
+    pub fn recorded_ids(&self) -> Vec<guard::Recorded> {
+        guard::recorded_ids(
+            &self.layout,
+            self.fstab.as_deref(),
+            self.crypttab.as_deref(),
+            self.lsblk.as_deref(),
+        )
     }
 }
 
@@ -181,9 +212,13 @@ pub struct Disk {
     pub path: String,
     pub size_bytes: u64,
     pub model: String,
+    pub serial: String,
     pub transport: String,
     /// Holds the running rescue system or something mounted.
     pub in_use: bool,
+    /// The disk itself and every device on it (partitions, assembled RAID,
+    /// open LUKS mappings, ...), each once.
+    pub items: Vec<guard::BlockItem>,
 }
 
 pub fn parse_disks(lsblk_json: &str, busy: &[String]) -> Result<Vec<Disk>> {
@@ -209,8 +244,21 @@ pub fn parse_disks(lsblk_json: &str, busy: &[String]) -> Result<Vec<Disk>> {
             continue;
         }
         let mut in_use = busy.iter().any(|b| b == &path);
+        let mut items: Vec<guard::BlockItem> = Vec::new();
         let mut stack: Vec<&serde_json::Value> = vec![d];
         while let Some(n) = stack.pop() {
+            let s = |k: &str| n[k].as_str().unwrap_or_default().trim().to_string();
+            let item_path = s("path");
+            if !items.iter().any(|i| i.path == item_path) {
+                items.push(guard::BlockItem {
+                    path: item_path,
+                    kind: s("type"),
+                    fstype: s("fstype"),
+                    uuid: s("uuid"),
+                    partuuid: s("partuuid"),
+                    label: s("label"),
+                });
+            }
             if let Some(points) = n["mountpoints"].as_array()
                 && points
                     .iter()
@@ -219,23 +267,33 @@ pub fn parse_disks(lsblk_json: &str, busy: &[String]) -> Result<Vec<Disk>> {
                 in_use = true;
             }
             if let Some(children) = n["children"].as_array() {
-                stack.extend(children.iter());
+                // Reversed so that partitions come out in disk order.
+                stack.extend(children.iter().rev());
             }
         }
         out.push(Disk {
             path,
             size_bytes: size,
             model: d["model"].as_str().unwrap_or("").trim().to_string(),
+            serial: d["serial"].as_str().unwrap_or("").trim().to_string(),
             transport: d["tran"].as_str().unwrap_or("").to_string(),
             in_use,
+            items,
         });
     }
     Ok(out)
 }
 
 pub fn list_disks() -> Result<Vec<Disk>> {
+    // NAME must be among the columns: without it lsblk prints a flat list
+    // instead of a tree, and partitions would not appear below their disk.
     let out = std::process::Command::new("lsblk")
-        .args(["-J", "-b", "-o", "PATH,TYPE,SIZE,MODEL,TRAN,RO,MOUNTPOINTS"])
+        .args([
+            "-J",
+            "-b",
+            "-o",
+            "NAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,RO,MOUNTPOINTS,FSTYPE,UUID,PARTUUID,LABEL",
+        ])
         .output()
         .context("cannot run lsblk")?;
     if !out.status.success() {
@@ -286,20 +344,34 @@ pub fn fetch_fingerprint(server: &str, port: u16) -> Result<String> {
     Ok(fp)
 }
 
+/// Key files and settings found on attached media.
+#[derive(Default)]
+pub struct MediaScan {
+    pub keys: Vec<PathBuf>,
+    pub settings: Option<(PathBuf, Settings)>,
+    /// Devices (e.g. `/dev/sdb1`) on which a key or settings file was found;
+    /// such a disk is never pre-selected as restore target.
+    pub devices: Vec<String>,
+}
+
 /// Look for exported key files and settings on attached partitions. A
 /// partition that is not mounted is mounted read-only WITHOUT journal
 /// replay (so nothing is written to it), searched, the files found are
 /// copied into the work directory, and it is unmounted again (so the disk
 /// stays selectable as restore target).
-pub fn scan_media() -> (Vec<PathBuf>, Option<(PathBuf, Settings)>) {
-    let mut keys = Vec::new();
-    let mut settings = None;
+pub fn scan_media() -> MediaScan {
+    let mut scan = MediaScan::default();
     let Ok(out) = std::process::Command::new("lsblk")
         .args(["-J", "-l", "-o", "PATH,KNAME,TYPE,FSTYPE,MOUNTPOINTS"])
         .output()
     else {
-        return (keys, settings);
+        return scan;
     };
+    let MediaScan {
+        keys,
+        settings,
+        devices,
+    } = &mut scan;
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
     for d in v["blockdevices"].as_array().cloned().unwrap_or_default() {
         let fstype = d["fstype"].as_str().unwrap_or("");
@@ -314,8 +386,13 @@ pub fn scan_media() -> (Vec<PathBuf>, Option<(PathBuf, Settings)>) {
                     .collect()
             })
             .unwrap_or_default();
+        let dev = d["path"].as_str().unwrap_or("").to_string();
+        let before = (keys.len(), settings.is_some());
         if let Some(m) = mounted.first() {
-            search_media(Path::new(m), None, &mut keys, &mut settings);
+            search_media(Path::new(m), None, keys, settings);
+            if (keys.len(), settings.is_some()) != before {
+                devices.push(dev);
+            }
             continue;
         }
         let kname = d["kname"].as_str().unwrap_or("x");
@@ -325,19 +402,22 @@ pub fn scan_media() -> (Vec<PathBuf>, Option<(PathBuf, Settings)>) {
         }
         let ok = std::process::Command::new("mount")
             .args(["-o", options])
-            .arg(d["path"].as_str().unwrap_or(""))
+            .arg(&dev)
             .arg(&point)
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|s| s.success());
         if ok {
             let copies = work_dir().join("found").join(kname);
-            search_media(&point, Some(&copies), &mut keys, &mut settings);
+            search_media(&point, Some(&copies), keys, settings);
             let _ = std::process::Command::new("umount").arg(&point).status();
+            if (keys.len(), settings.is_some()) != before {
+                devices.push(dev);
+            }
         }
         let _ = fs::remove_dir(&point);
     }
-    (keys, settings)
+    scan
 }
 
 /// Read-only mount options that also skip journal/log replay, or `None` for
@@ -486,13 +566,15 @@ pub fn ask_secret(prompt: &str) -> Result<Secret> {
     Ok(Secret::new(v.into_bytes()))
 }
 
-/// Let the user pick one entry (1-based numbers). `default` is 0-based.
-pub fn choose(prompt: &str, items: &[String], default: usize) -> Result<usize> {
+/// Let the user pick one entry (1-based numbers). `default` is 0-based;
+/// without one the user has to type a number.
+pub fn choose(prompt: &str, items: &[String], default: Option<usize>) -> Result<usize> {
     for (i, item) in items.iter().enumerate() {
         eprintln!("  {:>2}) {item}", i + 1);
     }
+    let default = default.map(|d| (d + 1).to_string());
     loop {
-        let v = ask(prompt, Some(&(default + 1).to_string()))?;
+        let v = ask(prompt, default.as_deref())?;
         match v.parse::<usize>() {
             Ok(n) if n >= 1 && n <= items.len() => return Ok(n - 1),
             _ => eprintln!("Please enter a number between 1 and {}.", items.len()),
@@ -540,6 +622,27 @@ mod tests {
         assert!(d[0].in_use);
         assert!(!d[1].in_use);
         assert_eq!(d[1].model, "Samsung SSD 980");
+        assert_eq!(d[0].items.len(), 2);
+        assert_eq!(d[1].items.len(), 1);
+    }
+
+    #[test]
+    fn disk_items_with_signatures() {
+        let json = r#"{"blockdevices":[
+ {"path":"/dev/sdb","type":"disk","size":4000787030016,"model":"WDC WD40EFRX","serial":"WD-0001","tran":"sata","ro":false,"mountpoints":[null],"fstype":null,"uuid":null,"partuuid":null,"label":null,
+  "children":[
+   {"path":"/dev/sdb1","type":"part","size":1,"mountpoints":[null],"fstype":"linux_raid_member","uuid":"r1","partuuid":"p1","label":"desktop:0",
+    "children":[{"path":"/dev/md127","type":"raid1","size":1,"mountpoints":[null],"fstype":"ext4","uuid":"e1","label":null}]},
+   {"path":"/dev/sdb2","type":"part","size":1,"mountpoints":[null],"fstype":"crypto_LUKS","uuid":"l1","partuuid":"p2","label":null}]}
+]}"#;
+        let d = parse_disks(json, &[]).unwrap();
+        assert_eq!(d[0].serial, "WD-0001");
+        let paths: Vec<&str> = d[0].items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["/dev/sdb", "/dev/sdb1", "/dev/md127", "/dev/sdb2"]);
+        assert_eq!(d[0].items[1].fstype, "linux_raid_member");
+        assert_eq!(d[0].items[1].partuuid, "p1");
+        assert_eq!(d[0].items[3].uuid, "l1");
+        assert!(!d[0].in_use);
     }
 
     #[test]

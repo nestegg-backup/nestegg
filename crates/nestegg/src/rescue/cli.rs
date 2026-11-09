@@ -9,10 +9,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
 use super::exec::{self, Job, Runner};
+use super::guard;
 use super::plan::{Target, human, make_plan};
 use super::{
-    Disk, Session, Settings, ask, ask_secret, ask_yes, booted_uefi, choose, fetch_fingerprint,
-    list_disks, scan_media, work_dir,
+    Disk, Inventory, Session, Settings, ask, ask_secret, ask_yes, booted_uefi, choose,
+    fetch_fingerprint, list_disks, scan_media, work_dir,
 };
 use crate::secrets::Secret;
 
@@ -72,8 +73,9 @@ pub struct RestoreArgs {
     /// Only show the plan, change nothing.
     #[arg(long)]
     pub dry_run: bool,
-    /// Allow erasing a disk that holds a data disk of the backed-up computer
-    /// (refused otherwise).
+    /// Allow erasing a disk that is not empty: it carries a file system,
+    /// RAID/LVM/ZFS/LUKS signature or partitions, e.g. a data disk of the
+    /// backed-up computer (refused otherwise).
     #[arg(long)]
     pub erase_data_disk: bool,
 }
@@ -84,7 +86,8 @@ pub fn run(cmd: Option<RescueCmd>) -> Result<u8> {
         RescueCmd::Restore(args) => restore(*args),
         RescueCmd::Disks => {
             for d in list_disks()? {
-                println!("{}", disk_line(&d));
+                let a = guard::assess(&d, &[], &[]);
+                println!("{}", disk_entry(&d, &a, None, ""));
             }
             Ok(0)
         }
@@ -105,15 +108,40 @@ pub fn run(cmd: Option<RescueCmd>) -> Result<u8> {
     }
 }
 
-fn disk_line(d: &Disk) -> String {
-    format!(
-        "{:<16} {:>10}  {:<6} {}{}",
+/// One entry of the disk list: path, size, model, serial, a short verdict
+/// and, for a disk that is not empty, what was found on it.
+fn disk_entry(d: &Disk, a: &guard::Assessment, fits: Option<bool>, backup_time: &str) -> String {
+    let mut marks = Vec::new();
+    if d.in_use {
+        marks.push("in use");
+    }
+    if a.of_backed_up_computer() {
+        marks.push("HOLDS DATA OF THE BACKED-UP COMPUTER");
+    } else if a.holds_data() {
+        marks.push("NOT EMPTY");
+    } else {
+        marks.push("empty");
+    }
+    if fits == Some(false) {
+        marks.push("too small");
+    }
+    let mut s = format!(
+        "{:<16} {:>10}  {:<6} {}{}  [{}]",
         d.path,
         human(d.size_bytes),
         d.transport,
         d.model,
-        if d.in_use { "  (in use)" } else { "" }
-    )
+        if d.serial.is_empty() {
+            String::new()
+        } else {
+            format!("  serial {}", d.serial)
+        },
+        marks.join(", ")
+    );
+    for l in a.lines(backup_time) {
+        s.push_str(&format!("\n        - {l}"));
+    }
+    s
 }
 
 fn require_root() -> Result<()> {
@@ -205,6 +233,10 @@ fn restore(a: RestoreArgs) -> Result<u8> {
         a.snapshot.clone()
     };
     let archive_bytes = system_archive_bytes(&snaps, &snapshot);
+    let backup_time = snaps
+        .iter()
+        .find(|s| s.snapshot == snapshot)
+        .map_or(snapshot.clone(), |s| s.time.clone());
     let disks = list_disks()?;
     let disk = disks
         .iter()
@@ -216,18 +248,26 @@ fn restore(a: RestoreArgs) -> Result<u8> {
             disk.path
         );
     }
+    eprintln!("Reading the disk layout of {snapshot} ...");
+    let inventory = session.inventory(&snapshot)?;
+    let assessment = guard::assess(disk, &inventory.recorded_ids(), &[]);
     run_restore(
         &session,
         &snapshot,
+        &backup_time,
         archive_bytes,
+        &inventory,
         disk,
+        &assessment,
         luks.as_ref(),
         a.dry_run,
-        &mut |disk, data_disk| {
-            if data_disk && !a.erase_data_disk {
+        &mut |disk, found| {
+            if found.holds_data() && !a.erase_data_disk {
                 bail!(
-                    "{disk} holds a data disk of the backed-up computer; nothing was changed. \
-                     Use --erase-data-disk if it really should be erased."
+                    "{} is not empty ({}); nothing was changed. \
+                     Use --erase-data-disk if it really should be erased.",
+                    disk.path,
+                    found.lines(&backup_time).join("; ")
                 );
             }
             Ok(true)
@@ -253,19 +293,32 @@ fn system_archive_bytes(snaps: &[crate::client::SnapshotInfo], snapshot: &str) -
         .map(|(_, b)| *b)
 }
 
+fn target(disk: &Disk, uefi: bool, archive_bytes: Option<u64>) -> Target {
+    Target {
+        disk: disk.path.clone(),
+        size_bytes: disk.size_bytes,
+        uefi,
+        archive_bytes,
+    }
+}
+
 /// Shared by the wizard and the non-interactive command.
+#[allow(clippy::too_many_arguments)]
 fn run_restore(
     session: &Session,
     snapshot: &str,
+    backup_time: &str,
     archive_bytes: Option<u64>,
+    inventory: &Inventory,
     disk: &Disk,
+    assessment: &guard::Assessment,
     luks: Option<&Secret>,
     dry_run: bool,
-    // (disk, it holds a data disk of the backed-up computer) → go ahead?
-    confirm: &mut dyn FnMut(&str, bool) -> Result<bool>,
+    // (disk, what would be destroyed on it) → go ahead?
+    confirm: &mut dyn FnMut(&Disk, &guard::Assessment) -> Result<bool>,
 ) -> Result<u8> {
-    eprintln!("Reading the disk layout of {snapshot} ...");
-    let (layout, selections) = session.inventory(snapshot)?;
+    let layout = &inventory.layout;
+    let selections = &inventory.selections;
     eprintln!(
         "Backed-up system: {} ({}), {} boot, {}",
         if layout.os_name.is_empty() {
@@ -278,42 +331,35 @@ fn run_restore(
         human(layout.used_bytes())
     );
     let plan = make_plan(
-        &layout,
-        &Target {
-            disk: disk.path.clone(),
-            size_bytes: disk.size_bytes,
-            uefi: booted_uefi(),
-            archive_bytes,
-        },
+        layout,
+        &target(disk, booted_uefi(), archive_bytes),
         luks.is_some(),
     )?;
     let mut warnings = exec::preflight(&plan, selections.as_deref())?;
     exec::check_disk_free(&plan.disk)?;
-    let (contents, uuids) = exec::disk_contents(&plan.disk);
-    // A file system of the backed-up computer that is NOT part of the
-    // system (a data disk) must never be overwritten by accident.
-    // Encrypted data disks show only their LUKS UUID while locked.
-    let mut data_disk = false;
-    for m in &layout.mounts {
-        if layout.role(m) == crate::layout::MountRole::Other
-            && [&m.uuid, &m.crypt_uuid]
-                .into_iter()
-                .flatten()
-                .any(|u| uuids.contains(u))
-        {
-            data_disk = true;
-            warnings.push(format!(
-                "THIS DISK HOLDS {} OF THE BACKED-UP COMPUTER (a data disk that is not part of \
-                 the system backup). Restoring erases it.",
-                m.point
-            ));
-        }
+    let contents = exec::disk_contents(&plan.disk);
+    // Something of the backed-up computer (a surviving /home or data disk,
+    // a RAID member, ...) must never be overwritten by accident.
+    for f in assessment.findings.iter().filter(|f| {
+        matches!(
+            f.scope,
+            Some(guard::Scope::Data) | Some(guard::Scope::System)
+        )
+    }) {
+        warnings.push(format!(
+            "THIS DISK HOLDS {} OF THE BACKED-UP COMPUTER ({}). Restoring erases it.",
+            f.recorded.join(", "),
+            f.device
+        ));
     }
     eprintln!();
     eprintln!("{}", plan.describe());
     if !contents.trim().is_empty() {
         eprintln!("Current content of {} (will be erased):", plan.disk);
         eprintln!("{}", contents.trim_end());
+    }
+    if assessment.holds_data() {
+        eprintln!("{}", guard::warning(disk, assessment, backup_time));
     }
     for w in &warnings {
         eprintln!("Warning: {w}");
@@ -322,7 +368,7 @@ fn run_restore(
         eprintln!("Dry run: nothing was changed.");
         return Ok(0);
     }
-    if !confirm(&plan.disk, data_disk)? {
+    if !confirm(disk, assessment)? {
         eprintln!("Cancelled, nothing was changed.");
         return Ok(1);
     }
@@ -333,7 +379,7 @@ fn run_restore(
     let client = session.client();
     let job = Job {
         plan: &plan,
-        layout: &layout,
+        layout,
         client: &client,
         snapshot,
         luks_passphrase: luks,
@@ -390,8 +436,9 @@ fn wizard() -> Result<u8> {
     show_network();
     eprintln!();
 
-    let (keys, found) = scan_media();
-    let mut settings = match found {
+    let media = scan_media();
+    let keys = media.keys.clone();
+    let mut settings = match media.settings.clone() {
         Some((path, s)) => {
             eprintln!("Found settings in {}.", path.display());
             s
@@ -477,7 +524,7 @@ fn wizard() -> Result<u8> {
             .as_ref()
             .and_then(|id| machines.iter().position(|m| m == id))
             .unwrap_or(0);
-        let i = choose("Which computer", &machines, default)?;
+        let i = choose("Which computer", &machines, Some(default))?;
         break (session, machines[i].clone());
     };
 
@@ -505,9 +552,13 @@ fn wizard() -> Result<u8> {
         })
         .collect();
     eprintln!("Backups of {backup_id} (newest first):");
-    let i = choose("Which backup", &items, 0)?;
+    let i = choose("Which backup", &items, Some(0))?;
     let snapshot = snaps[i].snapshot.clone();
+    let backup_time = snaps[i].time.clone();
     let archive_bytes = system_archive_bytes(&snaps, &snapshot);
+    eprintln!("Reading the disk layout of {snapshot} ...");
+    let inventory = session.inventory(&snapshot)?;
+    let recorded = inventory.recorded_ids();
 
     eprintln!();
     eprintln!("Step 3/4: target disk (it will be ERASED)");
@@ -515,9 +566,44 @@ fn wizard() -> Result<u8> {
     if disks.is_empty() {
         bail!("no usable disk found (the disk of the rescue stick is not offered)");
     }
-    let items: Vec<String> = disks.iter().map(disk_line).collect();
-    let d = choose("Which disk", &items, 0)?;
-    let disk = disks[d].clone();
+    let uefi = booted_uefi();
+    let rated: Vec<(guard::Assessment, bool)> = disks
+        .iter()
+        .map(|d| {
+            let fits = make_plan(&inventory.layout, &target(d, uefi, archive_bytes), false).is_ok();
+            (guard::assess(d, &recorded, &media.devices), fits)
+        })
+        .collect();
+    let items: Vec<String> = disks
+        .iter()
+        .zip(&rated)
+        .map(|(d, (a, fits))| disk_entry(d, a, Some(*fits), &backup_time))
+        .collect();
+    let default = guard::preselect(
+        &rated
+            .iter()
+            .map(|(a, fits)| guard::DiskChoice {
+                holds_data: a.holds_data(),
+                fits: *fits,
+            })
+            .collect::<Vec<_>>(),
+    );
+    if default.is_none() {
+        eprintln!("No disk is pre-selected: check the list and type the number of the disk.");
+    }
+    let (disk, assessment) = loop {
+        let d = choose("Which disk", &items, default)?;
+        let (a, _) = &rated[d];
+        if !a.holds_data() {
+            break (disks[d].clone(), a.clone());
+        }
+        eprintln!();
+        eprintln!("{}", guard::warning(&disks[d], a, &backup_time));
+        if ask_yes("Use this disk anyway?", false)? {
+            break (disks[d].clone(), a.clone());
+        }
+        eprintln!();
+    };
 
     eprintln!();
     eprintln!("Step 4/4: encryption");
@@ -540,16 +626,35 @@ fn wizard() -> Result<u8> {
     let code = run_restore(
         &session,
         &snapshot,
+        &backup_time,
         archive_bytes,
+        &inventory,
         &disk,
+        &assessment,
         luks.as_ref(),
         false,
-        &mut |_, _| {
+        &mut |disk, a| {
             let typed = ask(
                 &format!("Type '{name}' to erase {} and start the restore", disk.path),
                 Some(""),
             )?;
-            Ok(typed == name)
+            if typed != name {
+                return Ok(false);
+            }
+            if !a.holds_data() {
+                return Ok(true);
+            }
+            // Second, explicit confirmation for a disk that is not empty.
+            let phrase = guard::erase_phrase(disk);
+            let typed = ask(
+                &format!(
+                    "{} ({}) is NOT empty, see the list above. Type '{phrase}' to erase it anyway",
+                    disk.path,
+                    guard::identity(disk)
+                ),
+                Some(""),
+            )?;
+            Ok(typed == phrase)
         },
     )?;
     if code == 0 && ask_yes("Remove the rescue stick and restart now?", true)? {

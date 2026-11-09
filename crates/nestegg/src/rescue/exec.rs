@@ -285,27 +285,14 @@ pub fn check_disk_free(disk: &str) -> Result<()> {
     Ok(())
 }
 
-/// What is on the disk now (shown before the confirmation), and the UUIDs
-/// of its file systems.
-pub fn disk_contents(disk: &str) -> (String, Vec<String>) {
-    let out = std::process::Command::new("lsblk")
+/// What is on the disk now (shown before the confirmation). Whether it
+/// holds data is decided by `guard::assess`.
+pub fn disk_contents(disk: &str) -> String {
+    std::process::Command::new("lsblk")
         .args(["-n", "-o", "NAME,SIZE,FSTYPE,LABEL", disk])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    let uuids = std::process::Command::new("lsblk")
-        .args(["-n", "-l", "-o", "UUID", disk])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    (out, uuids)
+        .unwrap_or_default()
 }
 
 fn wait_for(path: &str) -> Result<()> {

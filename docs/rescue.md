@@ -4,7 +4,8 @@ When the system disk has died, or a computer has to be set up again from
 scratch, the nestegg rescue stick puts the complete system back from the
 Proxmox Backup Server: partitions, files, users, settings, boot loader.
 
-Decision and scope: [decisions/0006](decisions/0006-bare-metal-restore-rescue-stick.md).
+Decision and scope: [decisions/0006](decisions/0006-bare-metal-restore-rescue-stick.md),
+target disk guard: [decisions/0007](decisions/0007-rescue-target-disk-guard.md).
 
 ## Before you need it
 
@@ -43,11 +44,16 @@ Decision and scope: [decisions/0006](decisions/0006-bare-metal-restore-rescue-st
    looks at other disks read-only, without replaying journals, so nothing is
    written to them.
 4. Answer the questions: server, token secret, key file, computer, backup,
-   target disk, optional encryption.
+   target disk, optional encryption. The disk list shows model, size and
+   serial number of every disk and marks it `empty`, `NOT EMPTY` or
+   `HOLDS DATA OF THE BACKED-UP COMPUTER`, with what was found on it (see
+   below). A disk is pre-selected only if exactly one disk is empty and big
+   enough; otherwise you have to type its number.
 5. Check the plan and type the disk name (e.g. `nvme0n1`) to start. Only now
-   is the disk erased. The plan lists what is currently on the disk and
-   warns loudly if it is a data disk of the backed-up computer. Disks that
-   are mounted or in use by LVM, encryption or RAID are refused.
+   is the disk erased. The plan lists what is currently on the disk. A disk
+   that is not empty needs a second confirmation: type `ERASE <name>`
+   (e.g. `ERASE sdb`). Disks that are mounted or in use by active LVM or
+   encryption are refused.
 6. Remove the stick and restart.
 
 The restored system contains a report of what was changed:
@@ -86,8 +92,27 @@ nestegg rescue restore --settings /media/usb/nestegg-rescue.toml \
 ```
 
 `--wipe` must repeat the disk; `--dry-run` only prints the plan. A disk that
-holds a data disk of the backed-up computer (recognised by its file system or
-LUKS UUID) is refused unless `--erase-data-disk` is given.
+is not empty is refused unless `--erase-data-disk` is given.
+
+### When is a disk "not empty"?
+
+A disk counts as not empty when it, or a partition on it, carries any
+signature that `lsblk`/`blkid` recognise (a file system such as ext4, ntfs
+or vfat, swap, a software RAID member, a ZFS pool member, an LVM physical
+volume, a LUKS or BitLocker container), or when it has partitions without a
+recognisable signature (unknown or encrypted content). A partition table
+without partitions counts as empty.
+
+It is additionally marked as holding data **of the backed-up computer** when
+one of its file system, LUKS or partition UUIDs appears in the snapshot's
+inventory: `layout.json` (mounted file systems and swap), `fstab` and
+`crypttab` (also unmounted or `noauto` entries) and the `lsblk` listing
+(RAID and ZFS members, ntfs-3g disks, ...). The message says what it was,
+e.g. that it held `/home` (it comes back from the backup, but everything
+written after the backup is lost) or a data disk that is not part of the
+system backup at all. The stick with the key or settings file is marked as
+well. Software RAID arrays are not assembled by the rescue system; their
+members are recognised by their signature only.
 
 ## What the restore does
 
