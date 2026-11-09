@@ -19,23 +19,28 @@ if [ "$1" = "configure" ]; then
     # They are enabled again only while the configuration still exists.
     marker=/var/lib/nestegg/enabled-units
     if [ -f "$marker" ]; then
-        if [ -e /etc/nestegg/config.toml ]; then
-            reenabled=""
-            while read -r unit; do
-                case "$unit" in
-                    nestegg.service|nestegg-backup.timer|nestegg-notify.timer) ;;
-                    *) continue ;;
-                esac
-                # Without a running systemd (chroot, image build): enable only.
-                now=""
-                [ "$running" = yes ] && now=--now
-                if systemctl enable $now "$unit" >/dev/null 2>&1; then
-                    reenabled="$reenabled $unit"
-                fi
-            done < "$marker"
-            if [ -n "$reenabled" ]; then
-                echo "nestegg: enabled again as before removal:$reenabled"
+        configured=no
+        [ -e /etc/nestegg/config.toml ] && configured=yes
+        reenabled=""
+        while read -r unit; do
+            case "$unit" in
+                # The health check needs no configuration: without this, a
+                # remove and reinstall before `nestegg init` would leave it
+                # off for good (the one-time marker below is already set).
+                nestegg-notify.timer) ;;
+                nestegg.service|nestegg-backup.timer)
+                    [ "$configured" = yes ] || continue ;;
+                *) continue ;;
+            esac
+            # Without a running systemd (chroot, image build): enable only.
+            now=""
+            [ "$running" = yes ] && now=--now
+            if systemctl enable $now "$unit" >/dev/null 2>&1; then
+                reenabled="$reenabled $unit"
             fi
+        done < "$marker"
+        if [ -n "$reenabled" ]; then
+            echo "nestegg: enabled again as before removal:$reenabled"
         fi
         rm -f "$marker"
     fi

@@ -112,8 +112,9 @@ prints what would be sent and changes nothing.
 
 ## Consequences
 
-- A failed backup reaches the desktop and the hook within seconds; a quiet
-  stop of backups (timer off, server away for days, nothing ever succeeded)
+- A failed backup usually reaches the desktop and the hook within seconds
+  (if a check is already running at that moment, the next hourly check
+  reports it); a quiet stop of backups (timer off, server away for days, nothing ever succeeded)
   within an hour of passing the threshold.
 - A server that is switched off most of the week is not noisy: only
   `overdue` counts, once per day (or per week with automatic backups off).
@@ -125,7 +126,26 @@ prints what would be sent and changes nothing.
   nothing is lost: the problem stays visible in `nestegg status` and the
   web UI.
 - Texts exist in English and German only; another language falls back to
-  English.
+  English. Error texts and the reasons for an incomplete backup are quoted
+  as recorded, in English.
+- The desktop body is escaped (`&`, `<`, `>`): notification services render
+  it as markup, and an error text can contain text from the backup server
+  or a file name. The hook gets the plain text.
+- A state file that cannot be read (damaged, or written by a newer version)
+  is reported as `failing` like an unusable configuration file; backups
+  fail on the same file, and nothing else would report it.
+- "Set up but never backed up" counts from the first check that saw it (or
+  the date of the configuration file, whichever is earlier), so changing a
+  setting does not restart the wait.
+- The same error with other numbers in its text (a size, a duration) is the
+  same problem, not a new one.
+- With two problems at once, the end of one of them is not announced while
+  the other lasts; "backups work again" is sent when nothing is left.
+- Regular users are those from `UID_MIN` (`/etc/login.defs`) up to the end
+  of the systemd-homed range (60513).
+- After `apt remove` and a new installation the timer is enabled again if
+  it was enabled before, also without a configuration (unlike the backup
+  timer, it needs none).
 
 ## Alternatives rejected
 

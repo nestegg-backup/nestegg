@@ -257,6 +257,7 @@ check "test message reaches the desktop of the logged-in user" contains "$out" '
 check "test message reaches the hook" contains "$out" 'command: ran successfully'
 check "hook got the test event" test "$(count_events test)" = 1
 check "notify-send runs as alice with her groups" bash -c "docker exec $client grep -Eq '^uid=$alice_uid gid=$alice_gid groups=.*\\b$nestegg_gid\\b' /tmp/notify-send.log"
+check "notify-send does not keep root's group" bash -c "! docker exec $client grep -Eq '^uid=.* groups=(.* )?0( |\$)' /tmp/notify-send.log"
 check "notify-send gets alice's session bus" on_client grep -qx "bus=unix:path=/run/user/$alice_uid/bus" /tmp/notify-send.log
 check "notify-send gets alice's runtime directory" on_client grep -qx "xdg=/run/user/$alice_uid" /tmp/notify-send.log
 check "notify-send is told the app name" on_client grep -qx 'arg=--app-name=nestegg' /tmp/notify-send.log

@@ -41,8 +41,27 @@ const RECOVERY_KEEP: Duration = Duration::days(3);
 const REPEAT_MARGIN: Duration = Duration::minutes(30);
 /// Longest piece of an error text or reason that goes into a message.
 const MAX_DETAIL: usize = 300;
-/// Regular (non-system) accounts, as in `sd-login`/`UID_MIN..` of systemd.
-const REGULAR_UIDS: std::ops::Range<u32> = 1000..60000;
+/// Regular (non-system) accounts: from `UID_MIN` of `/etc/login.defs`
+/// (default 1000) up to the end of the systemd-homed range. Above that come
+/// container, dynamic-service and `nobody` ids.
+const DEFAULT_UID_MIN: u32 = 1000;
+const REGULAR_UID_MAX: u32 = 60513;
+
+/// `UID_MIN` from the text of `/etc/login.defs`.
+pub fn parse_uid_min(login_defs: &str) -> Option<u32> {
+    login_defs.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next()? == "UID_MIN").then(|| words.next()?.parse().ok())?
+    })
+}
+
+pub fn regular_uids() -> std::ops::RangeInclusive<u32> {
+    let min = fs::read_to_string("/etc/login.defs")
+        .ok()
+        .and_then(|text| parse_uid_min(&text))
+        .unwrap_or(DEFAULT_UID_MIN);
+    min..=REGULAR_UID_MAX
+}
 
 // ---------------------------------------------------------------------------
 // Events and conditions
@@ -134,10 +153,15 @@ pub enum Evaluation {
 }
 
 /// Derive the current problems from the status.
+///
+/// `unbacked_since`: since when this computer is known to be set up without
+/// a successful backup (the earlier of the configuration file's date and the
+/// first check that saw it; a later change of the settings must not restart
+/// the wait).
 pub fn evaluate(
     status: &Status,
     timer_enabled: bool,
-    config_modified: Option<DateTime<Utc>>,
+    unbacked_since: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Evaluation {
     match status.health {
@@ -168,17 +192,24 @@ pub fn evaluate(
             .and_then(|e| serde_json::to_value(e.kind).ok())
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
-        let mut c = Condition::new(
-            Event::Failing,
-            format!("{kind}|{}", error.as_deref().unwrap_or("")),
-        );
+        // Digits are levelled out: an error text with a counter, a size or
+        // a time in it is the same problem at every retry, not a new one.
+        let mut stable = String::new();
+        for ch in error.as_deref().unwrap_or("").chars() {
+            if !ch.is_ascii_digit() {
+                stable.push(ch);
+            } else if !stable.ends_with('#') {
+                stable.push('#');
+            }
+        }
+        let mut c = Condition::new(Event::Failing, format!("{kind}|{stable}"));
         c.error = error;
         c.age_hours = age_hours;
         conditions.push(c);
     } else {
         let overdue_limit = Duration::hours(i64::from(status.overdue_after_hours));
         let never_and_old = status.health == Health::Never
-            && config_modified.is_some_and(|since| now - since > overdue_limit);
+            && unbacked_since.is_some_and(|since| now - since > overdue_limit);
         if status.health == Health::Overdue || never_and_old {
             let mut c = Condition::new(
                 Event::Overdue,
@@ -228,6 +259,14 @@ pub fn evaluate(
 pub fn config_problem(error: &str) -> Condition {
     let mut c = Condition::new(Event::Failing, format!("config|{error}"));
     c.error = Some(error.to_string());
+    c
+}
+
+/// The state of nestegg cannot be read (damaged `state.json`, or one written
+/// by a newer version): backups fail on it too, so nobody would hear of it.
+pub fn state_problem(error: &str) -> Condition {
+    let mut c = Condition::new(Event::Failing, format!("state|{error}"));
+    c.error = Some(format!("the backup status cannot be read ({error})"));
     c
 }
 
@@ -339,7 +378,7 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>) -> Messa
             let error = c
                 .error
                 .as_deref()
-                .map(shorten)
+                .map(|e| shorten(e).trim_end_matches('.').to_string())
                 .unwrap_or_else(|| tr(lang, "no reason was recorded", "ohne genannten Grund"));
             (
                 tr(lang, "Backup failed", "Datensicherung fehlgeschlagen"),
@@ -506,8 +545,8 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>) -> Messa
                 lang,
                 "If you can read this, notifications from nestegg reach you. \
                  Your backups: \"nestegg ui\".",
-                "Wenn Sie das lesen, erreichen Sie die Meldungen von nestegg. \
-                 Ihre Sicherungen: \"nestegg ui\".",
+                "Wenn du das liest, erreichen dich die Meldungen von nestegg. \
+                 Deine Sicherungen: \"nestegg ui\".",
             ),
         ),
     };
@@ -558,6 +597,9 @@ pub struct NotifyState {
     pub active: BTreeMap<Event, Active>,
     #[serde(default)]
     pub recovery: Option<PendingRecovery>,
+    /// First check that found nestegg set up without any successful backup.
+    #[serde(default, with = "crate::state::rfc3339_opt")]
+    pub unbacked_since: Option<DateTime<Utc>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +670,11 @@ pub fn apply(
         let announce = match state.active.get_mut(&c.kind) {
             Some(entry) if entry.condition.key == c.key => {
                 entry.condition = c.clone();
+                // A clock that was ahead and has been corrected must not
+                // silence the repeats until it catches up.
+                if entry.announced_at > now {
+                    entry.announced_at = now;
+                }
                 if now - entry.announced_at >= c.repeat_after() - REPEAT_MARGIN {
                     entry.seq += 1;
                     entry.announced_at = now;
@@ -796,9 +843,14 @@ pub fn runtime_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/run/user"))
 }
 
-/// Regular users that have a session bus below `root` (`<root>/<uid>/bus`).
+/// Users in the uid range `regular` that have a session bus below `root`
+/// (`<root>/<uid>/bus`).
 /// `user_name` maps a uid to an account name (`None`: no such account).
-pub fn find_sessions(root: &Path, user_name: impl Fn(u32) -> Option<String>) -> Vec<Session> {
+pub fn find_sessions(
+    root: &Path,
+    regular: std::ops::RangeInclusive<u32>,
+    user_name: impl Fn(u32) -> Option<String>,
+) -> Vec<Session> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
     };
@@ -806,7 +858,7 @@ pub fn find_sessions(root: &Path, user_name: impl Fn(u32) -> Option<String>) -> 
         .flatten()
         .filter_map(|entry| {
             let uid: u32 = entry.file_name().to_str()?.parse().ok()?;
-            if !REGULAR_UIDS.contains(&uid) {
+            if !regular.contains(&uid) {
                 return None;
             }
             let bus = fs::symlink_metadata(entry.path().join("bus")).ok()?;
@@ -909,6 +961,15 @@ fn run_with_timeout(mut cmd: Command, input: &[u8], timeout: StdDuration) -> Res
     })
 }
 
+/// Notification servers render the body as markup (bold, clickable links).
+/// Error texts come from the backup server and from file names, so they are
+/// shown literally. The hook gets the plain text.
+pub fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 impl SystemChannels<'_> {
     /// `notify-send` for `session`, run with that user's identity and session
     /// bus.
@@ -944,7 +1005,7 @@ impl SystemChannels<'_> {
             })
             .arg("--")
             .arg(&message.title)
-            .arg(&message.body);
+            .arg(escape_markup(&message.body));
         identity.apply(&mut cmd);
         Ok(cmd)
     }
@@ -955,7 +1016,7 @@ impl Channels for SystemChannels<'_> {
         if !self.config.desktop {
             return Vec::new();
         }
-        find_sessions(&self.runtime_root, system_user_name)
+        find_sessions(&self.runtime_root, regular_uids(), system_user_name)
     }
 
     fn command_enabled(&self) -> bool {
@@ -1114,15 +1175,30 @@ pub fn run(paths: &Paths, options: &Options) -> Result<()> {
             .and_then(|text| lenient_notify_config(&text))
             .unwrap_or_default(),
     };
+    // The lock comes first: a check that waits for another one (a slow hook)
+    // must judge the situation as it is when its turn comes.
+    let _lock = if options.dry_run || options.test {
+        None
+    } else {
+        Some(lock(paths)?)
+    };
     let timer = status::timer_enabled(paths);
     let now = Utc::now();
-    let status = status::build(paths, config.as_ref(), timer)?;
+    // An unreadable state must not silence the check: backups fail on the
+    // same file, and this is the only place that would tell anyone.
+    let (status, state_error) = match status::build(paths, config.as_ref(), timer) {
+        Ok(status) => (Some(status), None),
+        Err(e) => {
+            eprintln!("warning: {e:#}");
+            (None, Some(format!("{e:#}")))
+        }
+    };
     let context = Context {
         lang: system_lang(),
         hostname: crate::config::hostname(),
         last_success: status
-            .last_success
             .as_ref()
+            .and_then(|s| s.last_success.as_ref())
             .map(|run| run.finished_at.unwrap_or(run.started_at)),
     };
     let channels = SystemChannels {
@@ -1135,16 +1211,42 @@ pub fn run(paths: &Paths, options: &Options) -> Result<()> {
         return send_test(channels, options.dry_run);
     }
 
+    let mut state = load_state(paths);
+    // Since when the computer has been set up without a successful backup.
+    let never = status.as_ref().is_some_and(|s| s.health == Health::Never);
+    if never {
+        state.unbacked_since.get_or_insert(now);
+    } else if status.as_ref().is_some_and(|s| s.last_success.is_some()) {
+        state.unbacked_since = None;
+    }
     let modified = fs::metadata(&paths.config_file)
         .and_then(|m| m.modified())
         .ok()
         .map(DateTime::<Utc>::from);
+    let unbacked_since = match (modified, state.unbacked_since) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let save = |state: &NotifyState| {
+        if options.dry_run {
+            return;
+        }
+        // A full disk must not turn every check into a repeat of everything
+        // or stop the messages; the record is written again next time.
+        if let Err(e) = write_json_atomic(&paths.notify_state_file(), state) {
+            eprintln!("warning: cannot save the notification record: {e:#}");
+        }
+    };
     let (conditions, settled) = if let Some(error) = &config_error {
         (vec![config_problem(error)], true)
+    } else if let Some(error) = &state_error {
+        (vec![state_problem(error)], true)
     } else {
-        match evaluate(&status, timer, modified, now) {
+        let status = status.as_ref().expect("status or state_error is set");
+        match evaluate(status, timer, unbacked_since, now) {
             Evaluation::Skip(why) => {
                 println!("nothing to check: {why}");
+                save(&state);
                 return Ok(());
             }
             Evaluation::Checked {
@@ -1157,18 +1259,13 @@ pub fn run(paths: &Paths, options: &Options) -> Result<()> {
     // confirmed either way, so the record stays as it is.
     if conditions.is_empty() && !settled {
         println!("nothing new: the last run ended without a result (server unreachable?)");
+        save(&state);
         return Ok(());
     }
     // A failure that is not the last run any more (the last run was
     // cancelled, for example) stays open.
     let carry_failing = !settled;
 
-    let _lock = if options.dry_run {
-        None
-    } else {
-        Some(lock(paths)?)
-    };
-    let mut state = load_state(paths);
     let lines = if options.dry_run {
         let mut dry = DryChannels {
             inner: channels,
@@ -1194,7 +1291,7 @@ pub fn run(paths: &Paths, options: &Options) -> Result<()> {
             context.lang,
             &mut channels,
         );
-        write_json_atomic(&paths.notify_state_file(), &state)?;
+        save(&state);
         lines
     };
     if lines.is_empty() {
@@ -1937,6 +2034,85 @@ mod tests {
         );
     }
 
+    // --- fixes after review ---------------------------------------------------
+
+    #[test]
+    fn an_error_text_with_changing_numbers_is_the_same_problem() {
+        let mut bad = run_with(RunState::Failed, hours(-1));
+        bad.error = Some(RunError {
+            kind: ErrorKind::ClientFailed,
+            message: "upload failed after 132 s at 4711 MiB".into(),
+        });
+        let first = status(Health::Failing, Some(bad.clone()), None, &[]);
+        bad.error.as_mut().unwrap().message = "upload failed after 97 s at 12 MiB".into();
+        let second = status(Health::Failing, Some(bad.clone()), None, &[]);
+        let key = |s: &Status| checked(evaluate(s, true, None, t0())).0[0].key.clone();
+        assert_eq!(key(&first), key(&second));
+        // The message itself keeps the numbers.
+        let (list, _) = checked(evaluate(&second, true, None, t0()));
+        assert_eq!(
+            list[0].error.as_deref(),
+            Some("upload failed after 97 s at 12 MiB")
+        );
+        bad.error.as_mut().unwrap().message = "authentication failed".into();
+        let other = status(Health::Failing, Some(bad), None, &[]);
+        assert_ne!(key(&first), key(&other));
+    }
+
+    #[test]
+    fn a_clock_that_was_ahead_does_not_silence_the_repeats() {
+        let mut state = NotifyState::default();
+        let mut ch = Fake::new(&[(1000, "alice")], true);
+        let problem = [failing("disk full")];
+        // Announced while the clock was a year ahead.
+        step(&mut state, &problem, hours(24 * 365), &mut ch);
+        assert_eq!(ch.hook, [Event::Failing]);
+        // Clock corrected: nothing now, but a day later the repeat comes.
+        step(&mut state, &problem, hours(0), &mut ch);
+        assert!(ch.hook.is_empty());
+        step(&mut state, &problem, hours(25), &mut ch);
+        assert_eq!(ch.hook, [Event::Failing]);
+    }
+
+    #[test]
+    fn the_desktop_body_is_shown_literally() {
+        assert_eq!(
+            escape_markup(r#"upload <a href="http://x.example">click</a> & <b>x</b>"#),
+            "upload &lt;a href=\"http://x.example\"&gt;click&lt;/a&gt; &amp; &lt;b&gt;x&lt;/b&gt;"
+        );
+        assert_eq!(escape_markup("plain text"), "plain text");
+    }
+
+    #[test]
+    fn an_error_that_ends_with_a_full_stop_gets_no_second_one() {
+        let message = compose(Lang::En, Event::Failing, Some(&failing("no space left.")));
+        assert!(
+            message.body.contains("no space left. Details"),
+            "{}",
+            message.body
+        );
+        assert!(!message.body.contains(".."), "{}", message.body);
+    }
+
+    #[test]
+    fn uid_min_is_read_from_login_defs() {
+        let text = "# comment\nUID_MAX\t\t60000\nUID_MIN\t\t\t 500\nSYS_UID_MIN 100\n";
+        assert_eq!(parse_uid_min(text), Some(500));
+        assert_eq!(parse_uid_min("#UID_MIN 1\n"), None);
+        assert_eq!(parse_uid_min("UID_MIN x\n"), None);
+        // The systemd-homed range counts as regular, `nobody` does not.
+        let range = DEFAULT_UID_MIN..=REGULAR_UID_MAX;
+        assert!(range.contains(&60100) && !range.contains(&65534));
+    }
+
+    #[test]
+    fn an_unreadable_state_is_reported_as_a_failure() {
+        let c = state_problem("cannot parse state.json: expected value");
+        assert_eq!(c.kind, Event::Failing);
+        let body = compose(Lang::De, Event::Failing, Some(&c)).body;
+        assert!(body.contains("cannot parse state.json"), "{body}");
+    }
+
     // --- sessions and processes ---------------------------------------------------
 
     #[test]
@@ -1944,7 +2120,7 @@ mod tests {
         use std::os::unix::net::UnixListener;
         let dir = tempfile::tempdir().unwrap();
         let mut keep = Vec::new();
-        for uid in ["1000", "1001", "999", "60001", "0"] {
+        for uid in ["1000", "1001", "999", "60100", "61184", "65534", "0"] {
             let user_dir = dir.path().join(uid);
             fs::create_dir(&user_dir).unwrap();
             keep.push(UnixListener::bind(user_dir.join("bus")).unwrap());
@@ -1961,10 +2137,11 @@ mod tests {
         let names = |uid: u32| match uid {
             1000 => Some("alice".to_string()),
             1001 => Some("bob".to_string()),
-            999 | 60001 | 0 | 1002 | 1003 => Some("system".to_string()),
+            60100 => Some("carol".to_string()),
+            999 | 61184 | 65534 | 0 | 1002 | 1003 => Some("system".to_string()),
             _ => None,
         };
-        let found = find_sessions(dir.path(), names);
+        let found = find_sessions(dir.path(), DEFAULT_UID_MIN..=REGULAR_UID_MAX, names);
         assert_eq!(
             found,
             [
@@ -1975,10 +2152,21 @@ mod tests {
                 Session {
                     uid: 1001,
                     name: "bob".into()
+                },
+                Session {
+                    uid: 60100,
+                    name: "carol".into()
                 }
             ]
         );
-        assert!(find_sessions(&dir.path().join("missing"), |_| None).is_empty());
+        assert!(
+            find_sessions(
+                &dir.path().join("missing"),
+                DEFAULT_UID_MIN..=REGULAR_UID_MAX,
+                |_| None
+            )
+            .is_empty()
+        );
     }
 
     #[test]

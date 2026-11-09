@@ -460,7 +460,9 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
         );
     }
     println!("  3. sudo nestegg check");
-    println!("  4. sudo systemctl enable --now nestegg.service nestegg-backup.timer");
+    println!(
+        "  4. sudo systemctl enable --now nestegg.service nestegg-backup.timer nestegg-notify.timer"
+    );
     println!(
         "  5. sudo usermod -aG nestegg $USER             # then log out and in for `nestegg ui`"
     );

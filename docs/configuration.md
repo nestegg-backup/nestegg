@@ -28,7 +28,7 @@ sudo nestegg key paperkey --format html --output key.html   # print it, then del
 sudo nestegg key confirm-exported --paper-code <code on the paper>
                                           # - or: --file /media/usb/nestegg-key.json
 sudo nestegg check
-sudo systemctl enable --now nestegg.service nestegg-backup.timer
+sudo systemctl enable --now nestegg.service nestegg-backup.timer nestegg-notify.timer
 sudo usermod -aG nestegg "$USER"          # log out and in, then: nestegg ui
 ```
 
@@ -197,7 +197,8 @@ machine's own backups are visible.
 
 Nobody should have to open a dashboard to learn that backups stopped.
 `nestegg-notify.timer` runs `nestegg notify` every hour (and the backup unit
-runs it right after each backup, so a failure is reported within seconds).
+runs it right after each backup, so a failure is usually reported within
+seconds).
 The package enables the timer; it does nothing while nestegg is not set up.
 Switch it off with `sudo systemctl disable --now nestegg-notify.timer`.
 
