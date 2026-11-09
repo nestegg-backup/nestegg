@@ -169,7 +169,8 @@ const HOW_TO: [&str; 3] = [
     "To restore, save everything between the BEGIN and END lines below as a text file \
      (or scan the QR code and save its text), for example as key.json.",
     "Then give that file to the restore: `nestegg restore ... --keyfile key.json`, \
-     or to the rescue stick when it asks for the key.",
+     or to the rescue stick when it asks for the key. The rescue stick also lets you \
+     type the \"data\" line by hand.",
     "Keep this sheet away from this computer. The check code proves you hold it: \
      `nestegg key confirm-exported --paper-code <code>`.",
 ];

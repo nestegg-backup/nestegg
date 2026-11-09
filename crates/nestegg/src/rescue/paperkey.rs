@@ -467,7 +467,9 @@ mod tests {
     fn typed_errors_are_specific() {
         let e = from_typed(&DATA[..30]).unwrap_err().to_string();
         assert!(e.contains("got 30 characters") && e.contains("44"), "{e}");
-        let e = from_typed(&DATA.replace('+', "_")).unwrap_err().to_string();
+        let mut bad = DATA.to_string();
+        bad.replace_range(30..31, "_");
+        let e = from_typed(&bad).unwrap_err().to_string();
         assert!(
             e.contains("character 31") && e.contains("keyboard layout"),
             "{e}"
@@ -478,7 +480,7 @@ mod tests {
             "{e}"
         );
         // `=` only at the end
-        assert!(from_typed(&DATA.replace('A', "=")).is_err());
+        assert!(from_typed(&format!("{}={}", &DATA[..10], &DATA[11..])).is_err());
         // right length, wrong padding: does not decode to 32 bytes
         assert!(from_typed(&format!("{}==", &DATA[..42])).is_err());
         assert!(from_typed("").is_err());
