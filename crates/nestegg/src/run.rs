@@ -389,8 +389,10 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             rep.fail(
                 RunState::Failed,
                 config_error(
-                    "the encryption key has not been exported yet; run `nestegg key paperkey` or \
-                     `nestegg key export <file>`, store it safely, then `nestegg key confirm-exported`",
+                    "the encryption key has not been exported yet; run `nestegg key paperkey --output \
+                     key.html` (and print it) or `nestegg key export <file>` (and move it to a USB \
+                     stick), then prove it with `nestegg key confirm-exported --file <copy>` or \
+                     `--paper-code <code>`",
                 ),
             );
             return Ok(());

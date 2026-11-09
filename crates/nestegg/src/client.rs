@@ -652,6 +652,42 @@ impl<'a> Client<'a> {
         self.restore_with_args(request, &[], log)
     }
 
+    /// Prove that `key` opens `snapshot`: restore its manifest (`index.json`)
+    /// with that key. The client checks the manifest's signature with the
+    /// key, so this only works with the key the snapshot was made with.
+    /// `Ok(false)`: the snapshot is not signed or encrypted, so it proves
+    /// nothing about a key.
+    pub fn open_snapshot_with_key(&self, snapshot: &str, key: &Secret) -> Result<bool> {
+        let files = self.snapshot_files(snapshot)?;
+        let signed = serde_json::from_str::<Value>(&files)
+            .ok()
+            .and_then(|v| {
+                v.as_array().map(|list| {
+                    list.iter()
+                        .any(|f| f["crypt-mode"].as_str().is_some_and(|m| m != "none"))
+                })
+            })
+            .unwrap_or(false);
+        if !signed {
+            return Ok(false);
+        }
+        let mut fds = FdPassing::new();
+        let mut cmd = self.command(&mut fds)?;
+        // Target "-" writes the manifest to stdout.
+        cmd.args(["restore", snapshot, "index.json", "-"]);
+        fds.add(key, KEY_FD)?;
+        cmd.args(["--keyfd", &KEY_FD.to_string()]);
+        self.add_namespace(&mut cmd);
+        fds.apply(&mut cmd);
+        let output = cmd.output().context("cannot run proxmox-backup-client")?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        serde_json::from_slice::<Value>(&output.stdout)
+            .context("the client did not return the manifest of the snapshot")?;
+        Ok(true)
+    }
+
     /// Restore into a directory that already exists and may contain
     /// (empty) mount points, as the rescue system does for a whole system.
     pub fn restore_into_existing(

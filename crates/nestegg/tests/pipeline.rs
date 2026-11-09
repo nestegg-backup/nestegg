@@ -44,6 +44,27 @@ case "$1" in
     if [ "$2" = "list" ]; then
       echo '[{"backup-type":"host","backup-id":"test","backup-time":1794000000,"files":[{"filename":"home.pxar.didx","crypt-mode":"encrypt"}],"size":2048,"protected":false}]'
     fi
+    if [ "$2" = "files" ] && [ -f "$FAKE_FILES_FILE" ]; then
+      cat "$FAKE_FILES_FILE"
+    fi
+    exit 0
+    ;;
+  restore)
+    # `restore <snapshot> index.json - --keyfd N`: only the key the
+    # snapshot was made with ("c2Vj..." in its data) opens the manifest.
+    keyfd=""
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "--keyfd" ]; then keyfd="$a"; fi
+      prev="$a"
+    done
+    key=""
+    if [ -n "$keyfd" ]; then key=$(cat <&"$keyfd"); fi
+    echo "RESTORE-KEY $key" >> "$FAKE_LOG"
+    case "$key" in
+      *c2VjcmV0LWtleS1kYXRh*) echo '{"backup-type":"host","backup-id":"test"}' ;;
+      *) echo "Error: unable to verify signature of the manifest" >&2; exit 255 ;;
+    esac
     exit 0
     ;;
   version)
@@ -65,6 +86,15 @@ case "$1" in
         *) kdf=none ;;
       esac
       echo "{\"path\":\"$3\",\"kdf\":\"$kdf\",\"fingerprint\":\"$fp\",\"hint\":null}"
+    fi
+    # `key paperkey <file> --output-format text|html`: the key pretty
+    # printed (one member per line) between the markers, then a "QR code".
+    if [ "$2" = "paperkey" ]; then
+      block=$(printf '%s' "$(cat "$3")" | sed 's/,"/,\n"/g')
+      case "$*" in
+        *html*) printf '<html>\n<body>\n<p>\n-----BEGIN PROXMOX BACKUP KEY-----\n%s\n-----END PROXMOX BACKUP KEY-----\n</p>\n<img src="qr">\n</body>\n</html>\n' "$block" ;;
+        *) printf -- '-----BEGIN PROXMOX BACKUP KEY-----\n%s\n-----END PROXMOX BACKUP KEY-----\nQR-CODE\n' "$block" ;;
+      esac
     fi
     exit 0
     ;;
@@ -112,6 +142,10 @@ case "$1" in
 esac
 "#;
 
+/// The key of the test environment. `data` is what makes it a key; `fp`
+/// is what the fake client reports as fingerprint.
+const KEY_JSON: &str = r#"{"kdf":null,"data":"c2VjcmV0LWtleS1kYXRh","fp":"aa:01"}"#;
+
 struct Env {
     dir: tempfile::TempDir,
     pbs: Option<TcpListener>,
@@ -138,7 +172,7 @@ impl Env {
         fs::set_permissions(&creds, fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(root.join("cred"), fs::Permissions::from_mode(0o700)).unwrap();
         write_secret(&root.join("cred/password"), "token-secret\n");
-        write_secret(&root.join("cred/encryption-key"), "{\"kdf\":null}");
+        write_secret(&root.join("cred/encryption-key"), KEY_JSON);
         let pbs = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = pbs.local_addr().unwrap().port();
         let env = Env {
@@ -213,6 +247,7 @@ inventory = false
             .env("NESTEGG_RUNTIME_DIR", root.join("run"))
             .env("NESTEGG_PBS_CLIENT", root.join("fake-client"))
             .env("FAKE_LOG", root.join("fake.log"))
+            .env("FAKE_FILES_FILE", root.join("snapshot-files.json"))
             .env("NESTEGG_SYSTEMD_CREDS", root.join("fake-systemd-creds"))
             .env("FAKE_CREDS_LOG", root.join("creds.log"))
             .env("NESTEGG_SYSTEMCTL", root.join("fake-systemctl"))
@@ -262,7 +297,10 @@ fn successful_run_records_state_and_passes_secrets_via_fds() {
 
     let log = env.fake_log();
     assert!(log.contains("PW token-secret\n"), "password via fd: {log}");
-    assert!(log.contains("KEY {\"kdf\":null}"), "key via fd: {log}");
+    assert!(
+        log.contains(&format!("KEY {KEY_JSON}")),
+        "key via fd: {log}"
+    );
     assert!(
         !log.contains("LEAK"),
         "plain PBS_PASSWORD must be removed: {log}"
@@ -543,44 +581,263 @@ fn promised_run_that_cannot_get_the_lock_is_recorded_as_cancelled() {
 }
 
 #[test]
-fn confirmation_requires_exporting_the_current_key() {
+fn confirmation_needs_proof_of_the_current_key() {
     let env = Env::new();
     env.set_key_exported(false);
-    let key_cmd = |args: &[&str]| {
-        env.command(args)
-            .env("NESTEGG_ALLOW_NON_ROOT", "1")
-            .env_remove("SUDO_UID")
-            .output()
-            .unwrap()
-    };
+    let key_cmd = |args: &[&str]| env.root_cmd(args);
+    let stderr = |out: &Output| String::from_utf8_lossy(&out.stderr).into_owned();
+    let confirmed = || env.state()["key_exported_digest"].is_string();
+
+    // No proof: a bare confirmation is refused, with the syntax to use.
     let out = key_cmd(&["key", "confirm-exported"]);
-    assert_eq!(code(&out), 1, "confirm without export must fail");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not been exported"));
+    assert_eq!(code(&out), 1, "confirm without proof must fail");
+    assert!(stderr(&out).contains("proof needed"), "{}", stderr(&out));
+    assert!(!confirmed());
+
+    // Export writes the file, reads it back and warns about its location.
     let export = env.root().join("exported-key.json");
-    assert_eq!(
-        code(&key_cmd(&["key", "export", export.to_str().unwrap()])),
-        0
-    );
+    let out = key_cmd(&["key", "export", export.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("read back"));
     assert_eq!(
         fs::metadata(&export).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    // Key replaced after the export: confirming must fail.
-    write_secret(&env.root().join("cred/encryption-key"), "{\"other\":2}");
-    assert_eq!(code(&key_cmd(&["key", "confirm-exported"])), 1);
-    // Export the new key, then confirm works and backups run.
-    let export2 = env.root().join("exported-key-2.json");
-    assert_eq!(
-        code(&key_cmd(&["key", "export", export2.to_str().unwrap()])),
-        0
+    // Exporting alone confirms nothing.
+    assert_eq!(code(&env.run(&["run"])), 1);
+    assert!(!confirmed());
+
+    // A file with another key is refused, nothing recorded.
+    let other = env.write_user_file(
+        "other.json",
+        r#"{"kdf":null,"data":"b3RoZXI=","fp":"bb:02"}"#,
     );
-    assert_eq!(code(&key_cmd(&["key", "confirm-exported"])), 0);
+    let out = key_cmd(&["key", "confirm-exported", "--file", &other]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("does not contain the key"));
+    // Not a key at all.
+    let junk = env.write_user_file("junk.txt", "hello");
+    let out = key_cmd(&["key", "confirm-exported", "--file", &junk]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("no key found"), "{}", stderr(&out));
+    // A wrong or malformed check code is refused.
+    for bad in ["0000-0000", "nonsense"] {
+        let out = key_cmd(&["key", "confirm-exported", "--paper-code", bad]);
+        assert_eq!(code(&out), 1, "{bad}");
+    }
+    assert!(!confirmed());
+
+    // The right file lies on this computer's disk (a temp directory, never
+    // a removable medium), and there is no terminal: it needs the statement.
+    let export = export.to_str().unwrap();
+    let out = key_cmd(&["key", "confirm-exported", "--file", export]);
+    assert_eq!(code(&out), 1);
+    assert!(
+        stderr(&out).contains("--accept-local-copy"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!confirmed());
+    let out = key_cmd(&[
+        "key",
+        "confirm-exported",
+        "--file",
+        export,
+        "--accept-local-copy",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(confirmed());
     assert_eq!(code(&env.run(&["run"])), 0);
     // Export refuses to overwrite.
-    assert_eq!(
-        code(&key_cmd(&["key", "export", export2.to_str().unwrap()])),
-        1
+    assert_eq!(code(&key_cmd(&["key", "export", export])), 1);
+
+    // Key replaced afterwards: the old confirmation and the old copy are void.
+    write_secret(
+        &env.root().join("cred/encryption-key"),
+        r#"{"kdf":null,"data":"bmV3LWtleQ==","fp":"cc:03"}"#,
     );
+    assert_eq!(code(&env.run(&["run"])), 1);
+    let out = key_cmd(&[
+        "key",
+        "confirm-exported",
+        "--file",
+        export,
+        "--accept-local-copy",
+    ]);
+    assert_eq!(code(&out), 1, "the old copy must not confirm the new key");
+    assert!(stderr(&out).contains("does not contain the key"));
+}
+
+#[test]
+fn paper_key_has_our_header_outside_the_key_block_and_its_code_proves_the_sheet() {
+    let env = Env::new();
+    env.set_key_exported(false);
+    let code_of = nestegg::keyproof::KeyMaterial::from_key_json(KEY_JSON)
+        .unwrap()
+        .check_code();
+
+    // Text, piped (stdout is not a terminal): allowed.
+    let out = env.root_cmd(&["key", "paperkey"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let begin = text.find("-----BEGIN PROXMOX BACKUP KEY-----").unwrap();
+    let header = &text[..begin];
+    assert!(header.contains("nestegg paper key"));
+    assert!(
+        header
+            .lines()
+            .any(|l| l.starts_with("Check code:") && l.ends_with(&code_of)),
+        "{header}"
+    );
+    assert!(
+        header
+            .lines()
+            .any(|l| l.starts_with("Key fingerprint:") && l.ends_with("aa:01")),
+        "{header}"
+    );
+    assert!(header.contains("127.0.0.1:"), "{header}");
+    assert!(header.contains("backups"), "datastore: {header}");
+    assert!(header.contains("test"), "backup id: {header}");
+    assert!(
+        text.ends_with("QR-CODE\n"),
+        "client output stays unmodified"
+    );
+    assert_eq!(
+        nestegg::keyproof::KeyMaterial::from_copy(text.as_bytes()).unwrap(),
+        nestegg::keyproof::KeyMaterial::from_key_json(KEY_JSON).unwrap()
+    );
+
+    // To a file, in both formats; the check code is not echoed.
+    let txt = env.root().join("key.txt");
+    let html = env.root().join("key.html");
+    let out = env.root_cmd(&["key", "paperkey", "--output", txt.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(&code_of));
+    let out = env.root_cmd(&[
+        "key",
+        "paperkey",
+        "--format",
+        "html",
+        "--output",
+        html.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let html_text = fs::read_to_string(&html).unwrap();
+    assert!(html_text.find("nestegg paper key").unwrap() > html_text.find("<body>").unwrap());
+    assert!(
+        html_text.find("nestegg paper key").unwrap() < html_text.find("BEGIN PROXMOX").unwrap()
+    );
+    assert!(html_text.contains(&code_of));
+
+    // Saved paper keys are proof, as files and by their code.
+    for file in [&txt, &html] {
+        let out = env.root_cmd(&["key", "verify", file.to_str().unwrap()]);
+        assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stdout));
+    }
+    let wrong = if code_of == "0000-0000" {
+        "1111-1111"
+    } else {
+        "0000-0000"
+    };
+    let out = env.root_cmd(&["key", "confirm-exported", "--paper-code", wrong]);
+    assert_eq!(code(&out), 1);
+    assert!(env.state()["key_exported_digest"].is_null());
+    assert_eq!(code(&env.run(&["run"])), 1);
+    // Lower case and a missing hyphen are fine.
+    let typed = code_of.replace('-', "").to_lowercase();
+    let out = env.root_cmd(&["key", "confirm-exported", "--paper-code", &typed]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(code(&env.run(&["run"])), 0);
+
+    // A saved paper key also confirms (on this disk: needs the statement).
+    env.set_key_exported(false);
+    let out = env.root_cmd(&[
+        "key",
+        "confirm-exported",
+        "--file",
+        html.to_str().unwrap(),
+        "--accept-local-copy",
+    ]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(code(&env.run(&["run"])), 0);
+}
+
+#[test]
+fn key_verify_compares_the_copy_and_opens_the_newest_snapshot() {
+    let env = Env::new();
+    let good = env.write_user_file("copy.json", KEY_JSON);
+    let other = env.write_user_file("other.json", r#"{"kdf":null,"data":"b3RoZXI="}"#);
+    let verify = |file: &str| env.root_cmd(&["key", "verify", file]);
+    let text = |out: &Output| String::from_utf8_lossy(&out.stdout).into_owned();
+
+    // The PBS answers, the newest snapshot is encrypted and the fake client
+    // opens its manifest with the right key only.
+    env.set_files(r#"[{"filename":"index.json.blob","crypt-mode":"sign-only"}]"#);
+    let out = verify(&good);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(
+        text(&out).contains("matches the stored key:  yes"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("opens the newest backup: yes (host/test/"),
+        "{}",
+        text(&out)
+    );
+    let log = env.fake_log();
+    assert!(log.contains("restore host/test/"), "{log}");
+    assert!(log.contains("index.json -"), "{log}");
+    assert!(log.contains(&format!("RESTORE-KEY {KEY_JSON}")), "{log}");
+
+    // A different key: no match, and the backup is not even tried.
+    let before = env.fake_log().matches("ARGS restore").count();
+    let out = verify(&other);
+    assert_eq!(code(&out), 1);
+    assert!(text(&out).contains("NO"), "{}", text(&out));
+    assert_eq!(env.fake_log().matches("ARGS restore").count(), before);
+    // Not a key at all.
+    let junk = env.write_user_file("junk.txt", "hello");
+    assert_eq!(code(&verify(&junk)), 1);
+
+    // The stored key matches the copy, but the client cannot open the
+    // snapshot with it (key replaced after the backup).
+    write_secret(
+        &env.root().join("cred/encryption-key"),
+        r#"{"kdf":null,"data":"bmV3LWtleQ=="}"#,
+    );
+    let replaced = env.write_user_file("replaced.json", r#"{"kdf":null,"data":"bmV3LWtleQ=="}"#);
+    let out = verify(&replaced);
+    assert_eq!(code(&out), 1, "{}", text(&out));
+    assert!(text(&out).contains("matches the stored key:  yes"));
+    assert!(
+        text(&out).contains("opens the newest backup: NO"),
+        "{}",
+        text(&out)
+    );
+    write_secret(&env.root().join("cred/encryption-key"), KEY_JSON);
+
+    // Nothing to test against: unencrypted snapshot.
+    env.set_files(r#"[{"filename":"index.json.blob","crypt-mode":"none"}]"#);
+    let out = verify(&good);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("not checked"), "{}", text(&out));
+}
+
+#[test]
+fn key_verify_without_server_checks_the_copy_only() {
+    let mut env = Env::new();
+    let good = env.write_user_file("copy.json", KEY_JSON);
+    env.close_pbs();
+    let out = env.root_cmd(&["key", "verify", &good]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(code(&out), 0, "{stdout}");
+    assert!(stdout.contains("matches the stored key:  yes"), "{stdout}");
+    assert!(
+        stdout.contains("not checked - the PBS does not answer"),
+        "{stdout}"
+    );
+    assert!(!env.fake_log().contains("ARGS restore"));
 }
 
 impl Env {
@@ -597,6 +854,11 @@ impl Env {
         let path = self.root().join(name);
         fs::write(&path, content).unwrap();
         path.to_str().unwrap().to_string()
+    }
+
+    /// What the fake client prints for `snapshot files`.
+    fn set_files(&self, json: &str) {
+        fs::write(self.root().join("snapshot-files.json"), json).unwrap();
     }
 
     fn set_state(&self, key: &str, value: serde_json::Value) {

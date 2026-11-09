@@ -72,7 +72,13 @@ on_client nestegg init --server pbs.e2e.test --datastore store1 --namespace desk
 docker exec -i "$client" nestegg credentials set-password <<<"$token_secret" >/dev/null
 on_client nestegg key create >/dev/null
 on_client nestegg key export /root/key.json >/dev/null
-on_client nestegg key confirm-exported >/dev/null
+# The old package may still confirm without proof (no --file option); call
+# each package with the syntax it understands.
+if on_client nestegg key confirm-exported --help | grep -q -- '--file'; then
+  on_client nestegg key confirm-exported --file /root/key.json --accept-local-copy >/dev/null
+else
+  on_client nestegg key confirm-exported >/dev/null
+fi
 check "services enable" on_client systemctl enable --now nestegg.service nestegg-backup.timer
 check "timer unit run succeeds (old)" on_client systemctl start nestegg-backup.service
 check "unit result success (old)" test "$(on_client systemctl show -p Result --value nestegg-backup.service)" == success
@@ -103,6 +109,8 @@ check "earlier run in nestegg history" bash -c "docker exec $client nestegg hist
 check "earlier run is the last success in nestegg status" bash -c "docker exec $client nestegg status --json | grep -q '\"id\": \"$old_run\"'"
 check "earlier run listed by the API" bash -c "docker exec $client curl -sf --unix-socket /run/nestegg/api.sock http://localhost/api/v1/runs | grep -q '\"$old_run\"'"
 check "check passes after the upgrade" on_client nestegg check
+check "a key confirmed before the upgrade stays confirmed" bash -c "docker exec $client nestegg key show | grep -Eq 'exported: +yes'"
+check "the exported key file still verifies after the upgrade" bash -c "docker exec $client nestegg key verify /root/key.json | grep -q 'opens the newest backup: yes'"
 
 echo "== timer backup and restore with the new version"
 # The timer only backs up when the last success is older than the interval:

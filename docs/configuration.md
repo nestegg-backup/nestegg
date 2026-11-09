@@ -23,8 +23,10 @@ sudo nestegg init --server pbs.example.com --datastore backups \
      [--fingerprint <SHA-256>] [--wake-mac 00:00:5e:00:53:01]
 sudo nestegg credentials set-password     # paste the token secret
 sudo nestegg key create                   # reinstalling? keep the old key: sudo nestegg key import <file>
-sudo nestegg key paperkey                 # print it - or: sudo nestegg key export /media/usb/nestegg-key.json
-sudo nestegg key confirm-exported
+sudo nestegg key paperkey --format html --output key.html   # print it, then delete the file
+                                          # - or: sudo nestegg key export /media/usb/nestegg-key.json
+sudo nestegg key confirm-exported --paper-code <code on the paper>
+                                          # - or: --file /media/usb/nestegg-key.json
 sudo nestegg check
 sudo systemctl enable --now nestegg.service nestegg-backup.timer
 sudo usermod -aG nestegg "$USER"          # log out and in, then: nestegg ui
@@ -196,7 +198,52 @@ sudo nestegg key import /media/usb/nestegg-key.json
 
 **The encryption key is the only way to read encrypted backups.** If it only
 exists on this computer and the disk fails, the backups are lost. That is why
-backups refuse to run until `nestegg key confirm-exported` was executed.
+backups refuse to run until `nestegg key confirm-exported` was executed with
+proof that a copy exists (below). The reasoning is in
+[decisions/0018](decisions/0018-key-export-must-be-proven.md).
+
+### Exporting and proving the key
+
+Two ways to keep a copy; use at least one, better both:
+
+- **Paper key:** `sudo nestegg key paperkey --format html --output key.html`,
+  print the file, delete it. The sheet shows the computer, date, server,
+  datastore, the key fingerprint, a **check code** (`XXXX-XXXX`) and how to
+  restore with it, then the key and a QR code. Without `--output` the command
+  refuses to write into a terminal; piping to a printer
+  (`nestegg key paperkey | lpr`) works. The check code appears on the sheet
+  only, no command prints it.
+- **Key file:** `sudo nestegg key export /media/usb/nestegg-key.json`. The
+  file is read back and compared with the key. If it lies on a disk of this
+  computer you get a warning: that copy is lost together with the disk and
+  useless inside its own backup (which is encrypted with this key). Move it to
+  a USB stick or a password manager.
+
+Then prove it. `confirm-exported` needs exactly one of:
+
+```sh
+sudo nestegg key confirm-exported --paper-code 1A2B-3C4D    # from the sheet
+sudo nestegg key confirm-exported --file /media/usb/nestegg-key.json
+```
+
+`--file` takes the key file or a saved paper key (text or HTML); the key
+material is compared, not the bytes. A file on a disk of this computer is
+only accepted after you state that another copy exists outside it: type `yes`
+when asked, or pass `--accept-local-copy` without a terminal. A file on
+removable media needs neither. With a terminal and no option the command asks
+what you have. A wrong file or code is an error and nothing is recorded.
+Keys confirmed by an earlier version stay confirmed.
+
+Check a copy again at any time, for example after a year:
+
+```sh
+sudo nestegg key verify /media/usb/nestegg-key.json
+```
+
+It compares the copy with the stored key and, when the PBS answers and a
+snapshot exists, opens the newest snapshot with the copy. Exit code 1 if the
+copy does not match or does not open the backup; a PBS that is asleep or no
+snapshot yet is reported as "not checked".
 
 ### When the stored secrets cannot be decrypted
 
@@ -288,7 +335,8 @@ Restores always go into a new directory and never overwrite files.
 
 The key confirmation (`nestegg key confirm-exported`) is bound to the exact
 key that is stored. Replacing the key (`nestegg key create --force`) blocks
-backups again until the new key has been exported and confirmed.
+backups again until a copy of the new key has been proven (a copy of the old
+key or an old paper key is refused).
 
 Because
 backups are normal PBS snapshots, they can also be restored with plain

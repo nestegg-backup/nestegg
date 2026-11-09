@@ -74,10 +74,42 @@ docker exec -i "$client" nestegg credentials set-password --allow-plain <<<"$tok
 on_client nestegg key create --allow-plain >/dev/null
 check "backup refused while key not exported" \
   fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
-on_client nestegg key export /root/nestegg-key.json >/dev/null
+export_out="$(on_client nestegg key export /root/nestegg-key.json 2>&1)"
+check "export reads the file back" grep -q 'read back' <<<"$export_out"
+check "export on the internal disk warns" grep -q 'lost together with this disk' <<<"$export_out"
+check "export alone does not unlock backups" \
+  fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
+check "confirm without proof is refused" \
+  fails_with 1 'proof needed' on_client nestegg key confirm-exported
+# A real second key: a different file must never confirm the stored key.
+on_client proxmox-backup-client key create --kdf none /root/other-key.json >/dev/null
+check "confirm with the file of another key is refused" \
+  fails_with 1 'does not contain the key' \
+  on_client nestegg key confirm-exported --file /root/other-key.json --accept-local-copy
+check "confirm with a file that is no key is refused" \
+  fails_with 1 'no key found' on_client nestegg key confirm-exported --file /etc/hostname --accept-local-copy
+check "right file on the internal disk needs --accept-local-copy" \
+  fails_with 1 'accept-local-copy' on_client nestegg key confirm-exported --file /root/nestegg-key.json
+check "paper key to a terminal is refused" \
+  fails_with 1 'not a copy of the key' docker exec -t "$client" nestegg key paperkey
+paper_out="$(on_client nestegg key paperkey --output /root/paper.txt)"
+on_client nestegg key paperkey --format html --output /root/paper.html >/dev/null
 check "paper key contains a QR code" \
   bash -c "docker exec $client nestegg key paperkey | grep -q 'BEGIN PROXMOX BACKUP KEY\|-----BEGIN'"
-on_client nestegg key confirm-exported >/dev/null
+paper_code="$(on_client sed -n 's/^Check code: *//p' /root/paper.txt)"
+check "paper key header has a check code" bash -c "[[ '$paper_code' =~ ^[0-9A-F]{4}-[0-9A-F]{4}$ ]]"
+check "paper key header names the server and datastore" bash -c "docker exec $client head -20 /root/paper.txt | grep -q 'pbs.e2e.test:8007' && docker exec $client head -20 /root/paper.txt | grep -q store1"
+check "paper key keeps the client's key block" bash -c "docker exec $client grep -q -- '-----BEGIN PROXMOX BACKUP KEY-----' /root/paper.txt && docker exec $client grep -q -- '-----END PROXMOX BACKUP KEY-----' /root/paper.html"
+check "the check code is not shown when the file is written" bash -c "! grep -q '$paper_code' <<<'$paper_out'"
+check "paper key is not enough by itself" \
+  fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
+check "wrong paper code is refused" \
+  fails_with 1 'does not belong to the key' on_client nestegg key confirm-exported --paper-code 0000-0000
+check "malformed paper code is refused" \
+  fails_with 1 'not a check code' on_client nestegg key confirm-exported --paper-code nonsense
+check "nothing was recorded by the failed attempts" \
+  fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
+check "paper code of the printed key confirms" on_client nestegg key confirm-exported --paper-code "$paper_code"
 check "config contains no secret" exits_with 1 on_client grep -qF "$token_secret" /etc/nestegg/config.toml
 on_client nestegg check || true
 
@@ -112,6 +144,13 @@ check "pattern restore limits files" bash -c "docker exec $client test -e /root/
 check "restore with plain client and exported key" docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$client" \
   bash -c "proxmox-backup-client restore '$snapshot' etc.pxar /root/restore-etc --ns desktops --keyfile /root/nestegg-key.json --repository admin@pbs@pbs.e2e.test:store1 >/dev/null 2>&1 && test -e /root/restore-etc/hostname"
 
+echo "== key verify"
+check "verify: the exported file opens the newest backup" bash -c "docker exec $client nestegg key verify /root/nestegg-key.json | grep -q 'opens the newest backup: yes'"
+check "verify: a saved paper key (HTML) opens it too" on_client nestegg key verify /root/paper.html
+check "verify: a saved paper key (text) opens it too" on_client nestegg key verify /root/paper.txt
+check "verify: another key fails" fails_with 1 'matches the stored key:  NO' on_client nestegg key verify /root/other-key.json
+check "verify: a file that is no key fails" fails_with 1 'matches the stored key:  NO' on_client nestegg key verify /etc/hostname
+
 echo "== review findings: export, restore as user, key handling"
 alice_uid="$(on_client id -u alice)"
 alice_gid="$(on_client id -g alice)"
@@ -121,7 +160,7 @@ check "export refuses a planted symlink" \
   fails_with 1 'File exists' as_sudo_alice nestegg key export /home/alice/evil-key.json
 check "symlink target untouched" bash -c "[[ \$(docker exec $client cat /root/victim) == keep ]]"
 as_sudo_alice nestegg key export /home/alice/key-copy.json >/dev/null
-check "confirm after export of the same key works" on_client nestegg key confirm-exported
+check "confirm with the exported file works" on_client nestegg key confirm-exported --file /home/alice/key-copy.json --accept-local-copy
 check "export as sudo user: owned by user, mode 600" bash -c "[[ \$(docker exec $client stat -c '%U %a' /home/alice/key-copy.json) == 'alice 600' ]]"
 check "export cannot write where the user may not" \
   fails_with 1 'Permission denied' as_sudo_alice nestegg key export /etc/nestegg-key.json
@@ -169,12 +208,31 @@ on_client nestegg key create --force --allow-plain >/dev/null
 check "new key blocks backups until exported" \
   fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
 check "status shows key not exported" bash -c "docker exec $client nestegg status | grep -q 'KEY NOT EXPORTED'"
-check "confirm before exporting the new key is refused" \
-  fails_with 1 'the current key has not been exported yet' on_client nestegg key confirm-exported
+check "the old key's file does not confirm the new key" \
+  fails_with 1 'does not contain the key' \
+  on_client nestegg key confirm-exported --file /root/nestegg-key.json --accept-local-copy
+check "the old paper key does not confirm the new key" \
+  fails_with 1 'does not belong to the key' on_client nestegg key confirm-exported --paper-code "$paper_code"
 on_client nestegg key export /root/nestegg-key-2.json >/dev/null
-on_client nestegg key confirm-exported >/dev/null
+# With a terminal the user is asked; `script` gives the command one.
+check "interactive: anything but yes refuses" bash -c "! printf 'no\n' | docker exec -i $client script -qec 'nestegg key confirm-exported --file /root/nestegg-key-2.json' /dev/null >/dev/null 2>&1"
+check "still not confirmed after answering no" \
+  fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
+check "interactive: yes confirms a copy on the internal disk" bash -c "printf 'yes\n' | docker exec -i $client script -qec 'nestegg key confirm-exported --file /root/nestegg-key-2.json' /dev/null >/dev/null 2>&1"
+check "verify: the newest snapshot is unencrypted, so it proves nothing" \
+  fails_with 0 'opens the newest backup: not checked - .*not encrypted' on_client nestegg key verify /root/nestegg-key-2.json
+check "verify: the old key is no longer the stored key" \
+  fails_with 1 'matches the stored key:  NO' on_client nestegg key verify /root/nestegg-key.json
 check "backup runs again after confirming the new key" on_client nestegg backup
+check "verify: the new key opens the new snapshot" bash -c "docker exec $client nestegg key verify /root/nestegg-key-2.json | grep -q 'opens the newest backup: yes'"
 check "old snapshot restores with old exported key" on_client nestegg restore "$snapshot" etc.pxar /root/restore-oldkey --keyfile /root/nestegg-key.json
+
+echo "== key verify: key replaced after the last backup"
+on_client nestegg key create --force --allow-plain >/dev/null
+on_client nestegg key export /root/nestegg-key-3.json >/dev/null
+check "verify: the copy matches the new key but not the newest snapshot" \
+  fails_with 1 'opens the newest backup: NO' on_client nestegg key verify /root/nestegg-key-3.json
+on_client nestegg key confirm-exported --file /root/nestegg-key-3.json --accept-local-copy >/dev/null
 
 echo "== second backup and timer behaviour"
 check "manual second backup succeeds" on_client nestegg run --trigger manual

@@ -208,7 +208,8 @@ pub struct State {
     #[serde(default)]
     pub key_exported_digest: Option<String>,
     /// SHA-256 of the key that `key export` / `key paperkey` last wrote out.
-    /// `key confirm-exported` only accepts the current key if it matches.
+    /// Informational: `key confirm-exported` needs proof of a copy instead
+    /// (decision 0018).
     #[serde(default)]
     pub key_last_exported_digest: Option<String>,
     /// Snapshots of this machine (`host/<id>/<time>`) that the server's own

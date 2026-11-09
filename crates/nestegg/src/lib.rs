@@ -9,6 +9,7 @@ pub mod config;
 pub mod daemon;
 pub mod identity;
 pub mod inventory;
+pub mod keyproof;
 pub mod layout;
 pub mod mounts;
 pub mod rescue;

@@ -186,10 +186,12 @@ enum KeyCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Print a paper key (QR code) for safe offline storage.
+    /// Write a paper key (QR code, check code) for safe offline storage.
+    /// Print it, or pipe it to a printer; a terminal needs --output.
     Paperkey {
         #[arg(long, value_enum, default_value_t = PaperFormat::Text)]
         format: PaperFormat,
+        /// Write to this file (e.g. key.html) instead of stdout.
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -206,11 +208,34 @@ enum KeyCmd {
         force: bool,
     },
     /// Write the key file to a location of your choice (e.g. a USB stick).
+    /// The file is read back and compared with the key.
     Export { file: PathBuf },
-    /// Confirm that the key is stored safely outside this computer.
-    ConfirmExported,
+    /// Confirm that the key is stored safely outside this computer. Needs
+    /// proof: a copy of the key or the check code of the paper key.
+    ConfirmExported(ConfirmArgs),
+    /// Check that a copy of the key still matches the stored key and opens
+    /// the newest backup.
+    Verify {
+        /// A key file or a saved paper key (text or HTML).
+        file: PathBuf,
+    },
     /// Show key fingerprint and export status.
     Show,
+}
+
+#[derive(clap::Args)]
+struct ConfirmArgs {
+    /// A copy of the key: the file written by `key export`, or a saved
+    /// paper key (text or HTML). Compared with the stored key.
+    #[arg(long, conflicts_with = "paper_code")]
+    file: Option<PathBuf>,
+    /// The check code printed at the top of the paper key (XXXX-XXXX).
+    #[arg(long, value_name = "XXXX-XXXX")]
+    paper_code: Option<String>,
+    /// The copy given with --file lies on a disk of this computer; state
+    /// without a terminal that another copy exists outside this computer.
+    #[arg(long, requires = "file")]
+    accept_local_copy: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -409,9 +434,11 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
             "  2. sudo nestegg key create                    # or, to keep an exported key: sudo nestegg key import <file>"
         );
         println!(
-            "     sudo nestegg key paperkey                  # print it, or: sudo nestegg key export <file>"
+            "     sudo nestegg key paperkey --output key.html   # print it - or: sudo nestegg key export <file> (USB stick)"
         );
-        println!("     sudo nestegg key confirm-exported");
+        println!(
+            "     sudo nestegg key confirm-exported --file <copy>   # or: --paper-code <code on the paper key>"
+        );
     }
     println!("  3. sudo nestegg check");
     println!("  4. sudo systemctl enable --now nestegg.service nestegg-backup.timer");
@@ -529,7 +556,6 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
     let _lock = match &cmd {
         KeyCmd::Create { .. }
         | KeyCmd::Import { .. }
-        | KeyCmd::ConfirmExported
         | KeyCmd::Export { .. }
         | KeyCmd::Paperkey { .. } => Some(
             nestegg::run::RunLock::try_acquire(paths)?
@@ -572,9 +598,13 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                 println!("It is stored encrypted on this computer and is lost if this disk fails.");
             }
             println!(
-                "Export it now: sudo nestegg key paperkey   or   sudo nestegg key export <file>"
+                "Export it now: sudo nestegg key paperkey --output key.html   (then print it)\n\
+                 \x20         or: sudo nestegg key export <file>                 (then move it to a USB stick)"
             );
-            println!("Then confirm:  sudo nestegg key confirm-exported");
+            println!(
+                "Then prove you hold a copy: sudo nestegg key confirm-exported --file <copy>\n\
+                 \x20                      or: sudo nestegg key confirm-exported --paper-code <code on the paper key>"
+            );
         }
         KeyCmd::Import {
             file,
@@ -635,18 +665,48 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             println!("It counts as exported, because you already have the file. Keep it safe.");
         }
         KeyCmd::Paperkey { format, output } => {
+            if !nestegg::keyproof::paperkey_stdout_allowed(output.is_some(), stdout_is_terminal()) {
+                bail!(
+                    "a paper key scrolling past in a terminal is not a copy of the key. Write it \
+                     to a file and print that: nestegg key paperkey --format html --output key.html \
+                     (or pipe it to a printer: nestegg key paperkey | lpr)"
+                );
+            }
+            let cfg = Config::load(&paths.config_file)?;
             let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;
+            let material = nestegg::keyproof::KeyMaterial::from_key_json(&String::from_utf8_lossy(
+                key.as_bytes(),
+            ))
+            .context("the stored encryption key is damaged")?;
             let tmp = temp_key(paths)?;
+            let fingerprint = client::local::key_fingerprint(&tmp.0)?;
             let fmt = match format {
                 PaperFormat::Text => "text",
                 PaperFormat::Html => "html",
             };
-            let data = client::local::paperkey(&tmp.0, fmt)?;
+            let raw = client::local::paperkey(&tmp.0, fmt)?;
+            let header = nestegg::keyproof::PaperHeader {
+                backup_id: cfg.effective_backup_id(),
+                hostname: config::hostname(),
+                date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                server: format!("{}:{}", cfg.pbs.server, cfg.pbs.port),
+                datastore: cfg.pbs.datastore.clone(),
+                fingerprint,
+                check_code: material.check_code(),
+            };
+            let data = match format {
+                PaperFormat::Text => nestegg::keyproof::compose_text(&header, &raw),
+                PaperFormat::Html => nestegg::keyproof::compose_html(&header, &raw)?,
+            };
             match output {
                 Some(file) => {
                     write_user_file(&file, &data)?;
+                    // The check code stays on the paper: it is not shown here.
                     println!(
-                        "Paper key written to {}. Print it and store it safely.",
+                        "Paper key written to {}. Print it and keep the paper away from this \
+                         computer, then delete the file.\n\
+                         Then prove you hold it: sudo nestegg key confirm-exported --paper-code \
+                         <check code at the top of the paper>",
                         file.display()
                     );
                 }
@@ -657,30 +717,50 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
         KeyCmd::Export { file } => {
             let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;
             write_user_file(&file, key.as_bytes())?;
-            record_export(&store, &key)?;
-            println!(
-                "Key written to {}. Move it to a safe place outside this computer.",
-                file.display()
-            );
-        }
-        KeyCmd::ConfirmExported => {
-            if !secrets_store.exists(secrets::ENCRYPTION_KEY) {
-                bail!("no encryption key exists yet");
-            }
-            // Only confirm the key that was actually written out.
-            let digest = secrets::digest(&secrets_store.load(secrets::ENCRYPTION_KEY)?);
-            let mut state = store.load_state()?;
-            if state.key_last_exported_digest.as_deref() != Some(digest.as_str()) {
+            // Read the file back with the invoking user's rights: what is
+            // on disk must be the key, or the "copy" is worthless.
+            let path = absolute_user_path(&file)?;
+            let sudo = nestegg::identity::UserIdentity::from_sudo()?;
+            let back =
+                nestegg::restore::read_user_key(&path, sudo.as_ref()).with_context(|| {
+                    format!("{} was written but cannot be read back", path.display())
+                })?;
+            if back.as_bytes() != key.as_bytes() {
                 bail!(
-                    "the current key has not been exported yet; run `nestegg key paperkey` or \
-                     `nestegg key export <file>` first"
+                    "{} was written, but reading it back gave different content. Do not rely on \
+                     this file; delete it and export again to another location.",
+                    path.display()
                 );
             }
-            state.key_digest = Some(digest.clone());
-            state.key_exported_digest = Some(digest);
-            store.save_state(&state)?;
-            println!("Noted. Backups can run now.");
+            record_export(&store, &key)?;
+            println!(
+                "Key written to {} and read back: the file matches the stored key.",
+                path.display()
+            );
+            match nestegg::keyproof::locate(&path) {
+                nestegg::keyproof::Location::Removable => println!(
+                    "It is on a removable medium. Keep that medium somewhere safe, away from \
+                     this computer."
+                ),
+                other => {
+                    println!();
+                    println!("WARNING: this copy is not safe yet.");
+                    if let nestegg::keyproof::Location::Unknown(why) = &other {
+                        println!("It could not be determined where the file lies ({why}).");
+                    } else {
+                        println!("The file is on a disk that belongs to this computer.");
+                    }
+                    println!(
+                        "It is lost together with this disk, and it is useless inside the \
+                         backup, because the backup is encrypted with this very key.\n\
+                         Move it to a USB stick or into a password manager, then run:\n\
+                         \x20 sudo nestegg key confirm-exported --file <the copy>"
+                    );
+                }
+            }
         }
+        KeyCmd::ConfirmExported(args) => confirm_exported(paths, &store, &secrets_store, args)?,
+        KeyCmd::Verify { file } => return key_verify(paths, &secrets_store, &file),
         KeyCmd::Show => {
             let state = store.load_state()?;
             println!(
@@ -702,6 +782,226 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
         }
     }
     Ok(0)
+}
+
+fn stdin_is_terminal() -> bool {
+    nix::unistd::isatty(std::io::stdin()).unwrap_or(false)
+}
+
+fn stdout_is_terminal() -> bool {
+    nix::unistd::isatty(std::io::stdout()).unwrap_or(false)
+}
+
+/// Ask one question on the terminal; the prompt goes to stderr.
+fn prompt_line(question: &str) -> Result<String> {
+    eprint!("{question}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+/// The stored key as key material, for comparisons.
+fn stored_key_material(
+    secrets_store: &SecretStore,
+) -> Result<(Secret, nestegg::keyproof::KeyMaterial)> {
+    if !secrets_store.exists(secrets::ENCRYPTION_KEY) {
+        bail!("no encryption key exists yet");
+    }
+    let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;
+    let material =
+        nestegg::keyproof::KeyMaterial::from_key_json(&String::from_utf8_lossy(key.as_bytes()))
+            .context("the stored encryption key is damaged")?;
+    Ok((key, material))
+}
+
+/// Read a copy of the key (key file or saved paper key) with the invoking
+/// user's rights. Returns the path, the key JSON and its material.
+fn read_key_copy(file: &Path) -> Result<(PathBuf, String, nestegg::keyproof::KeyMaterial)> {
+    let path = absolute_user_path(file)?;
+    let sudo = nestegg::identity::UserIdentity::from_sudo()?;
+    let bytes = nestegg::restore::read_user_key(&path, sudo.as_ref())?;
+    let json = nestegg::keyproof::key_json_of_copy(bytes.as_bytes())
+        .with_context(|| format!("{}", path.display()))?;
+    let material = nestegg::keyproof::KeyMaterial::from_key_json(&json)
+        .with_context(|| format!("{}", path.display()))?;
+    Ok((path, json, material))
+}
+
+/// `nestegg key confirm-exported`: record that the key is safe outside this
+/// computer, but only against proof (see docs/decisions/0018).
+fn confirm_exported(
+    paths: &Paths,
+    store: &Store,
+    secrets_store: &SecretStore,
+    args: ConfirmArgs,
+) -> Result<()> {
+    use nestegg::keyproof::{self, LocalCopy};
+    let (key, stored) = stored_key_material(secrets_store)?;
+    let terminal = stdin_is_terminal();
+    let (file, code) = match (args.file, args.paper_code) {
+        (Some(file), _) => (Some(file), None),
+        (None, Some(code)) => (None, Some(code)),
+        (None, None) if terminal => {
+            eprintln!("The backups are worthless without this key. How do you hold a copy of it");
+            eprintln!("outside this computer?");
+            eprintln!("  1) as a file (from `key export`, or a saved paper key)");
+            eprintln!("  2) as a printed paper key");
+            match prompt_line("Choose 1 or 2: ")?.as_str() {
+                "1" => (Some(prompt_line("Path of the file: ")?.into()), None),
+                "2" => (
+                    None,
+                    Some(prompt_line("Check code at the top of the paper key: ")?),
+                ),
+                _ => bail!("no proof given; nothing was recorded"),
+            }
+        }
+        (None, None) => bail!(
+            "proof needed: give a copy of the key with --file <path> (the exported file or a saved \
+             paper key), or the check code of the paper key with --paper-code <XXXX-XXXX>"
+        ),
+    };
+    if let Some(file) = file {
+        let (path, _, copy) = read_key_copy(&file)?;
+        if copy != stored {
+            bail!(
+                "{} does not contain the key stored on this computer; nothing was recorded. \
+                 Export the current key again.",
+                path.display()
+            );
+        }
+        let location = keyproof::locate(&path);
+        match keyproof::decide_local_copy(&location, args.accept_local_copy, terminal) {
+            LocalCopy::Accept => {}
+            LocalCopy::Ask => {
+                eprintln!("The file matches the key, but it lies on a disk of this computer.");
+                eprintln!("If this disk fails or is stolen, that copy is gone with it, and the");
+                eprintln!("backup cannot help: it is encrypted with this very key.");
+                let answer = prompt_line(
+                    "Type yes if another copy exists outside this computer (USB stick, \
+                     password manager, paper): ",
+                )?;
+                if answer != "yes" {
+                    bail!("not confirmed; nothing was recorded");
+                }
+            }
+            LocalCopy::Refuse => bail!(
+                "{} lies on a disk of this computer ({}). A copy that is lost together with \
+                 the computer is no protection. Move it to a USB stick or a password manager and \
+                 give that file, or, if another copy exists outside this computer, add \
+                 --accept-local-copy. Nothing was recorded.",
+                path.display(),
+                match &location {
+                    keyproof::Location::Unknown(why) => why.as_str(),
+                    _ => "internal disk",
+                }
+            ),
+        }
+    } else if let Some(code) = code {
+        let given = keyproof::normalize_check_code(&code).context(
+            "that is not a check code; it looks like ABCD-0123 and is printed at the top of \
+             the paper key",
+        )?;
+        if given != stored.check_code() {
+            bail!(
+                "this check code does not belong to the key stored on this computer; nothing was \
+                 recorded. Print a new paper key and use its code."
+            );
+        }
+    }
+    // Key changes and backup runs exclude each other. Take the lock only
+    // now, so that waiting for the user does not block the backup timer.
+    let _lock = nestegg::run::RunLock::try_acquire(paths)?
+        .context("a backup is running; try again when it has finished")?;
+    let digest = secrets::digest(&key);
+    if secrets::digest(&secrets_store.load(secrets::ENCRYPTION_KEY)?) != digest {
+        bail!("the stored key changed while waiting; nothing was recorded");
+    }
+    let mut state = store.load_state()?;
+    state.key_digest = Some(digest.clone());
+    state.key_last_exported_digest = Some(digest.clone());
+    state.key_exported_digest = Some(digest);
+    store.save_state(&state)?;
+    println!("Confirmed: your copy is the stored key. Backups can run now.");
+    println!("Check it again at any time: sudo nestegg key verify <copy>");
+    Ok(())
+}
+
+/// `nestegg key verify`: does this copy still match the stored key, and does
+/// it open the newest snapshot of this computer? Exit code 1 if not.
+fn key_verify(paths: &Paths, secrets_store: &SecretStore, file: &Path) -> Result<u8> {
+    let (_, stored) = stored_key_material(secrets_store)?;
+    let (path, json, copy) = match read_key_copy(file) {
+        Ok(read) => read,
+        Err(e) => {
+            println!("Copy matches the stored key:  NO - {e:#}");
+            println!("Copy opens the newest backup: not tried");
+            return Ok(1);
+        }
+    };
+    if copy != stored {
+        println!(
+            "Copy matches the stored key:  NO - {} is a key, but not the one stored on this \
+             computer",
+            path.display()
+        );
+        println!("Copy opens the newest backup: not tried");
+        return Ok(1);
+    }
+    println!("Copy matches the stored key:  yes");
+    let opened = verify_opens_newest(paths, json);
+    match &opened {
+        Ok(text) => println!("Copy opens the newest backup: {text}"),
+        Err((fatal, text)) => println!(
+            "Copy opens the newest backup: {}{text}",
+            if *fatal { "NO - " } else { "not checked - " }
+        ),
+    }
+    Ok(if matches!(opened, Err((true, _))) {
+        1
+    } else {
+        0
+    })
+}
+
+/// Err((true, ..)): the check ran and failed; Err((false, ..)): it could not
+/// be tried (nothing wrong with the copy).
+fn verify_opens_newest(paths: &Paths, json: String) -> Result<String, (bool, String)> {
+    let cfg = Config::load(&paths.config_file).map_err(|e| (false, format!("{e:#}")))?;
+    if !cfg.backup.encryption {
+        return Err((
+            false,
+            "encryption is switched off in the configuration".into(),
+        ));
+    }
+    if !nestegg::wake::is_reachable(&cfg, std::time::Duration::from_secs(5)) {
+        return Err((
+            false,
+            "the PBS does not answer; run this again when it is reachable".into(),
+        ));
+    }
+    let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
+    let snapshots = client
+        .list_snapshots(&cfg.effective_backup_id())
+        .map_err(|e| (true, format!("cannot list the snapshots: {e:#}")))?;
+    let Some(newest) = snapshots.first() else {
+        return Err((false, "there is no snapshot of this computer yet".into()));
+    };
+    match client.open_snapshot_with_key(&newest.snapshot, &Secret::new(json.into_bytes())) {
+        Ok(true) => Ok(format!("yes ({})", newest.snapshot)),
+        Ok(false) => Err((
+            false,
+            format!("the newest snapshot {} is not encrypted", newest.snapshot),
+        )),
+        Err(e) => Err((
+            true,
+            format!(
+                "{e:#}\n  (snapshot {}; if the key was replaced after that backup, run a \
+                 backup first)",
+                newest.snapshot
+            ),
+        )),
+    }
 }
 
 /// Remember which key was exported (paper key or file), under the run lock.

@@ -64,7 +64,7 @@ check "credential file is not plain text" bash -c "! docker exec $client grep -q
 on_client nestegg key create >/dev/null
 check "key stored with systemd-creds" on_client test -f /etc/nestegg/credentials/encryption-key.cred
 on_client nestegg key export /root/key.json >/dev/null
-on_client nestegg key confirm-exported >/dev/null
+on_client nestegg key confirm-exported --file /root/key.json --accept-local-copy >/dev/null
 on_client usermod -aG nestegg alice
 check "services enable" on_client systemctl enable --now nestegg.service nestegg-backup.timer
 sleep 1

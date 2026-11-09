@@ -13,12 +13,20 @@ target disk guard: [decisions/0010](decisions/0010-rescue-target-disk-guard.md).
    `system = true` in `[backup]` (see `nestegg config`). Older
    configurations: add it and run one backup.
 2. **Keep the key and the settings outside the computer**, e.g. on a second
-   USB stick:
+   USB stick, and prove to nestegg that the copy is the key:
 
    ```sh
    sudo nestegg key export /media/usb/nestegg-key.json
+   sudo nestegg key confirm-exported --file /media/usb/nestegg-key.json
    sudo nestegg rescue export-settings /media/usb/nestegg-rescue.toml
    ```
+
+   A printed paper key (`sudo nestegg key paperkey --format html --output
+   key.html`) is the second copy to keep at home; its check code
+   (`XXXX-XXXX`, top of the sheet) is what `confirm-exported --paper-code`
+   asks for. Check the copies from time to time with
+   `sudo nestegg key verify <copy>`. See
+   [configuration](configuration.md#exporting-and-proving-the-key).
 
    The settings file contains the PBS address, datastore, namespace, token
    name and certificate fingerprint, never a password. You also need the

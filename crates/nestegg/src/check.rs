@@ -92,7 +92,9 @@ pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
             if exported {
                 String::new()
             } else {
-                "run `nestegg key confirm-exported` after exporting".into()
+                "export the key, then run `nestegg key confirm-exported --file <copy>` \
+                 (or `--paper-code <code>`)"
+                    .into()
             },
         );
     }
