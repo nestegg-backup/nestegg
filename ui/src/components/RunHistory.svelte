@@ -8,7 +8,7 @@
 <script lang="ts">
   import Dot from "./Dot.svelte";
   import { api } from "../lib/api";
-  import { errorKind, type RunRow } from "../lib/derive";
+  import { errorKind, isIncomplete, otherWarnings, type RunRow } from "../lib/derive";
   import { f, t } from "../lib/locale";
   import type { Run } from "../lib/types";
 
@@ -40,7 +40,8 @@
     const r = row.run;
     switch (r.state) {
       case "succeeded":
-        if (r.warnings?.length) return t.runs.succeededWarnings(r.warnings.length);
+        if (isIncomplete(r)) return t.runs.succeededIncomplete;
+        if (otherWarnings(r).length) return t.runs.succeededWarnings(otherWarnings(r).length);
         return r.trigger === "timer" ? t.runs.succeeded : t.runs.succeededManual;
       case "failed":
         return t.runs.failed(t.reason[errorKind(r) ?? "internal"]);
@@ -54,7 +55,7 @@
   function tone(r: Run) {
     if (r.state === "failed") return "bad";
     if (r.state === "pbs_unreachable") return "pbs";
-    if (r.state === "succeeded" && r.warnings?.length) return "warn";
+    if (r.state === "succeeded" && (isIncomplete(r) || otherWarnings(r).length)) return "warn";
     return "neutral";
   }
 
@@ -123,8 +124,15 @@
         {#if open}
           <tr class="logrow" id={slug(r.id)}>
             <td colspan={cols}><div class="logwrap">
-              {#if r.warnings?.length}
-                <p class="explain"><strong>{t.runs.warnings}:</strong> {r.warnings.join(" · ")}</p>
+              {#if isIncomplete(r)}
+                <div class="explain">
+                  <strong>{t.runs.incompleteReasons}:</strong>
+                  <ul class="reasons">{#each r.incomplete ?? [] as reason (reason)}<li>{reason}</li>{/each}</ul>
+                  <span class="faint">{t.self.incompleteNote}</span>
+                </div>
+              {/if}
+              {#if otherWarnings(r).length}
+                <p class="explain"><strong>{t.runs.warnings}:</strong> {otherWarnings(r).join(" · ")}</p>
               {/if}
               {#if remote}
                 <!-- svelte-ignore a11y_no_noninteractive_tabindex (scrollable log must be reachable by keyboard) -->
@@ -172,6 +180,8 @@
   .explain { margin: 8px 0 0; color: var(--muted); font-size: 13px; max-width: 72ch; }
   .explain:first-child { margin-top: 0; }
   .explain strong { font-weight: 500; color: var(--text); }
+  .reasons { margin: 4px 0 4px; padding-left: 18px; list-style: disc; }
+  .reasons li { margin-top: 2px; }
   .more { margin-top: 10px; }
 
   @media (max-width: 760px) {

@@ -22,9 +22,14 @@ describe("mock API", () => {
       pbs_unreachable: "ok",
       key_not_exported: "never",
       credentials_unreadable: "failing",
+      incomplete: "incomplete",
+      verification_failed: "failing",
+      damaged: "ok",
+      no_key: "never",
+      cancelled: "ok",
     };
     expect(s.health).toBe(expected[sc]);
-    expect(s.encryption.key_exported).toBe(sc !== "key_not_exported" && sc !== "unconfigured");
+    expect(s.encryption.key_exported).toBe(sc !== "key_not_exported" && sc !== "unconfigured" && sc !== "no_key");
   });
 
   it("a started run goes through all phases and succeeds", () => {

@@ -10,6 +10,13 @@
   const now = $derived(runStep(run.state));
   const elapsed = $derived(Math.max(0, (app.now.getTime() - new Date(run.started_at).getTime()) / 1000));
 
+  // Archives finished so far against the size of the last backup: coarse (it moves after each archive), but honest.
+  const bar = $derived(
+    now === 2 && run.expected_bytes && run.processed_bytes != null && run.expected_bytes > 0
+      ? { value: Math.min(run.processed_bytes, run.expected_bytes), max: run.expected_bytes }
+      : null,
+  );
+
   const steps = $derived([
     {
       title: wakeOnLan ? t.self.stepWake : t.self.stepReach,
@@ -47,6 +54,10 @@
       <div>
         {s.title}
         {#if s.sub}<div class="sub">{s.sub}</div>{/if}
+        {#if i === 2 && bar}
+          <progress class="bar" max={bar.max} value={bar.value} aria-label={t.self.stepUploadProgress(f.size(bar.value), f.size(bar.max))}></progress>
+          <div class="sub">{t.self.stepUploadProgress(f.size(bar.value), f.size(bar.max))}</div>
+        {/if}
       </div>
     </li>
   {/each}
@@ -66,6 +77,7 @@
   .step.now .n { box-shadow: inset 0 0 0 2px var(--accent-text); }
   .step.done { color: var(--muted); }
   .step.done .n { background: var(--tick); box-shadow: none; color: var(--on-tick); }
+  .bar { display: block; width: 100%; max-width: 360px; height: 6px; margin-top: 6px; accent-color: var(--accent); }
   .sub { font-size: var(--fs-s); color: var(--muted); margin-top: 1px; font-weight: 400; }
   .hint { margin-top: 14px; }
 </style>

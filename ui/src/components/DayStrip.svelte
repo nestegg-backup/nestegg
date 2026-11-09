@@ -5,7 +5,7 @@
   let { cells }: { cells: DayCell[] } = $props();
 
   const label = (k: DayKind) => t.strip[k];
-  const order: DayKind[] = ["ok", "none", "run", "pbs", "fail"];
+  const order: DayKind[] = ["ok", "incomplete", "none", "run", "pbs", "fail", "damaged"];
   const used = $derived(order.filter((k) => cells.some((c) => c.kind === k)));
 </script>
 
@@ -38,6 +38,8 @@
   .cells .k-none { background: none; box-shadow: inset 0 0 0 1px var(--field-border); color: var(--muted); }
   .cells .k-pbs { background: var(--pbs); color: var(--on-pbs); }
   .cells .k-fail { background: var(--bad-fill); color: var(--on-bad-fill); }
+  .cells .k-incomplete { background: var(--warn); color: var(--on-warn); }
+  .cells .k-damaged { background: none; box-shadow: inset 0 0 0 2px var(--bad); color: var(--text); }
   .cells .k-run { background: none; box-shadow: inset 0 0 0 2px var(--accent-text); color: var(--text); }
   .cells li.today { outline: 2px solid var(--text); outline-offset: 2px; }
   .cells li.today .w { color: var(--text); }
@@ -48,6 +50,8 @@
   .legend .k-none { background: none; box-shadow: inset 0 0 0 1px var(--field-border); }
   .legend .k-pbs { background: var(--pbs); }
   .legend .k-fail { background: var(--bad-fill); }
+  .legend .k-incomplete { background: var(--warn); }
+  .legend .k-damaged { background: none; box-shadow: inset 0 0 0 2px var(--bad); }
   .legend .k-run { background: none; box-shadow: inset 0 0 0 2px var(--accent-text); }
 
   @media (max-width: 760px) {

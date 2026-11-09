@@ -79,6 +79,7 @@ describe.each([
     need("on-tick", ["tick"], 4.5); // day number in a backed-up day
     need("on-bad-fill", ["bad-fill"], 4.5); // day number in a failed day
     need("on-pbs", ["pbs"], 4.5); // day number in a "server not reachable" day
+    need("on-warn", ["warn"], 4.5); // day number in a "backed up, incomplete" day
   });
 
   it("non-text marks, field borders and switches reach 3:1", () => {
@@ -86,6 +87,8 @@ describe.each([
     need("field-border", ["win", "box", "field"], 3);
     need("bad-fill", ["win"], 3);
     need("pbs", ["win", "side"], 3);
+    need("warn", ["win"], 3); // filled day mark: incomplete
+    need("bad", ["win"], 3); // ring around a day with a damaged backup
     need("bad", ["side", "sel"], 3);
     need("warn", ["side", "sel"], 3);
     // A switch shows its state by the knob: white knob on the accent fill

@@ -4,7 +4,7 @@
   import { app } from "../../lib/store.svelte";
   import { restore } from "../../lib/restore.svelte";
   import { href } from "../../lib/router.svelte";
-  import { restorableArchives } from "../../lib/derive";
+  import { isDamaged, restorableArchives } from "../../lib/derive";
   import { f, t } from "../../lib/locale";
   import type { Snapshot, Status } from "../../lib/types";
 
@@ -25,6 +25,8 @@
     }
     return groups;
   });
+  const failed = $derived(status.server_verify_failed ?? []);
+  const damaged = (s: Snapshot) => isDamaged(s, failed);
   const current = $derived(restore.snapshot(list));
   const showOlder = $derived(restore.showOlder || (!!current && older.includes(current)));
 
@@ -32,7 +34,8 @@
   // that is what step 2 shows first, and it tells whether browsing works at all.
   $effect(() => {
     if (snaps.state !== "ok" || !list.length) return;
-    if (!current) restore.pick(list[0]!.time);
+    // The newest snapshot that is not marked as damaged.
+    if (!current) restore.pick((list.find((x) => !isDamaged(x, failed)) ?? list[0]!).time);
     const s = restore.snapshot(list);
     if (s) untrack(() => void restore.prepare(s, app.config.value));
   });
@@ -49,7 +52,7 @@
   <label class="choice">
     <input type="radio" name="snap" value={s.time} checked={restore.snapshotTime === s.time} onchange={() => restore.pick(s.time)} />
     <span>{f.dayLongYear(s.time)}</span>
-    <span class="side">{f.time(s.time)}</span>
+    <span class="side">{#if damaged(s)}<span class="dmg">{t.restore.damaged}</span>{/if}{f.time(s.time)}</span>
   </label>
 {/snippet}
 
@@ -93,6 +96,7 @@
       </button>
     </p>
   {/if}
+  {#if current && damaged(current)}<p class="hint bad" role="status">{t.restore.damagedSnapshot}</p>{/if}
   <div class="selbar">
     <span class="muted">{current ? f.dayLong(current.time) : ""}</span>
     <a class="btn primary" href={href({ view: "restore", step: "2" })} aria-disabled={current ? undefined : "true"}>{t.restore.showFiles}</a>
@@ -115,4 +119,5 @@
   .choice input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
   .side { color: var(--muted); font-size: var(--fs-s); text-align: right; }
   .older { margin-top: 12px; }
+  .dmg { color: var(--bad); font-weight: 500; margin-right: 12px; }
 </style>

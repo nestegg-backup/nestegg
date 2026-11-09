@@ -9,6 +9,8 @@ import type {
   DirEntry,
   HealthInfo,
   MachinesResponse,
+  PbsCheckResult,
+  PbsInfo,
   Restore,
   RestoreRequest,
   Run,
@@ -91,6 +93,11 @@ export const api = {
   runs: (limit = 200) => request<{ runs: Run[] }>(`runs?limit=${limit}`).then((r) => r.runs),
   run: (id: string) => request<RunDetail>(`runs/${q(id)}`),
   startRun: () => request<Run>("runs", { method: "POST" }),
+  /** Ask the daemon to stop a running backup. Rejects with kind `conflict` (`cannot_cancel`) or `not_found`. */
+  cancelRun: (id: string) => request<{ cancelling?: boolean }>(`runs/${q(id)}/cancel`, { method: "POST" }),
+  pbs: () => request<PbsInfo>("pbs"),
+  /** Runs the checks of `nestegg check`; with `wake` the PBS is woken first if it sleeps (can take minutes). */
+  checkPbs: (wake: boolean) => request<PbsCheckResult>(`pbs/check${wake ? "?wake=true" : ""}`, { method: "POST" }),
   snapshots: () => request<{ snapshots: Snapshot[] }>("snapshots").then((r) => r.snapshots),
   browse: (time: string, archive: string, path: string) =>
     request<{ entries: DirEntry[] }>(`snapshots/${q(time)}/browse?archive=${q(archive)}&path=${q(path)}`).then(
@@ -106,7 +113,7 @@ export const api = {
    */
   updateConfig: (change: SettingsChange) =>
     request<ConfigView>("config", { method: "PATCH", body: JSON.stringify(change) }),
-  // Proposed endpoints (API-REQUESTS.md). A 404 means "not offered by this daemon".
+  // Older daemons do not offer these; a 404 means "not offered by this daemon" (see `optional`).
   machines: () => request<MachinesResponse>("machines"),
   session: () => request<SessionInfo>("session"),
 };

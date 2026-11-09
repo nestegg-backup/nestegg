@@ -1,15 +1,15 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import Cmd from "./Cmd.svelte";
+  import CancelRun from "./CancelRun.svelte";
   import DayStrip from "./DayStrip.svelte";
   import Dot from "./Dot.svelte";
-  import KeyNotice from "./KeyNotice.svelte";
   import LoadError from "./LoadError.svelte";
   import RunHistory from "./RunHistory.svelte";
   import RunProgress from "./RunProgress.svelte";
+  import SetupGuide from "./SetupGuide.svelte";
   import { app } from "../lib/store.svelte";
   import { href } from "../lib/router.svelte";
-  import { historyRows, restoreOffer, selfStrip, selfTone, serverBackups } from "../lib/derive";
+  import { damagedTimes, historyRows, restoreOffer, scheduleHours, selfStrip, selfTone, serverBackups, setupGuide } from "../lib/derive";
   import { selfSummary } from "../lib/text";
   import { f, t } from "../lib/locale";
   import type { Status } from "../lib/types";
@@ -19,7 +19,12 @@
   const server = $derived(serverBackups(app.snapshots));
   const summary = $derived(selfSummary(status, t, f, app.now, server));
   const tone = $derived(selfTone(summary.kind));
-  const cells = $derived(selfStrip(app.runs.value, status.current_run, app.snapshots.list, app.now, f));
+  const cells = $derived(selfStrip(app.runs.value, status.current_run, app.snapshots.list, app.now, f, status.server_verify_failed ?? []));
+  const guide = $derived(setupGuide(status));
+  const incompleteReasons = $derived(summary.kind === "incomplete" ? (status.last_success?.incomplete ?? []) : []);
+  const damaged = $derived(damagedTimes(status.server_verify_failed, app.snapshots.list));
+  const hours = $derived(scheduleHours(app.config.value, status));
+  const verified = $derived(status.last_success?.verified === true);
   const rows = $derived(historyRows(app.runs.value, f));
   const running = $derived(summary.kind === "running" && !!status.current_run);
   const canRun = $derived(summary.kind !== "unconfigured" && summary.kind !== "key_missing" && summary.kind !== "running");
@@ -44,14 +49,12 @@
     {:else}
       <h2 class="lead" class:bad={tone === "bad"}>{#if tone === "bad" || tone === "warn"}<Dot {tone} />{/if}{summary.lead}</h2>
       <p class="lead-text">{summary.text}</p>
-      {#if summary.kind === "unconfigured"}
-        <Cmd command="nestegg init --help" />
-      {/if}
       {#if offer === "empty" && status.last_success}
         <!-- The local history knows a backup, the server has none: say so instead of a dead end. -->
         <p class="hint" role="status">{t.restore.noSnapshots}</p>
       {/if}
     {/if}
+    {#if running}<CancelRun />{/if}
     {#if app.startError}
       <p class="hint" class:bad={app.startError.kind !== "conflict"} role="status">
         {app.startError.kind === "conflict" ? t.self.runConflict : t.self.runStartFailed(app.startError.message)}
@@ -78,8 +81,29 @@
   {/if}
 </div>
 
-{#if summary.kind === "key_missing"}
-  <KeyNotice />
+{#if guide}
+  <SetupGuide {guide} />
+{/if}
+
+{#if incompleteReasons.length}
+  <section class="reasons notice-box" aria-labelledby="h-incomplete">
+    <h2 id="h-incomplete"><Dot tone="warn" />{t.self.incompleteTitle}</h2>
+    <ul>
+      {#each incompleteReasons as reason (reason)}<li>{reason}</li>{/each}
+    </ul>
+    <p class="hint">{t.self.incompleteNote}</p>
+  </section>
+{/if}
+
+{#if damaged.length && summary.kind !== "unconfigured"}
+  <section class="damaged notice-box" aria-labelledby="h-damaged">
+    <h2 id="h-damaged"><Dot tone="bad" />{t.self.damagedTitle}</h2>
+    <p>{t.self.damagedText(damaged.length)}</p>
+    <ul>
+      {#each damaged as time (time)}<li>{t.self.damagedDay(f.dayLongYear(time), f.time(time))}</li>{/each}
+    </ul>
+    <p>{t.self.damagedMore}</p>
+  </section>
 {/if}
 
 {#if summary.kind !== "unconfigured"}
@@ -137,6 +161,10 @@
             {/if}
           </dd>
         {/if}
+        {#if hours != null}
+          <dt>{t.self.factInterval}</dt>
+          <dd>{t.settings.everyHours(hours)}</dd>
+        {/if}
         <dt>{t.self.factNext}</dt>
         <dd>
           {#if !status.schedule.enabled}
@@ -149,6 +177,10 @@
             <span class="muted">{t.other.unknown}</span>
           {/if}
         </dd>
+        {#if verified}
+          <dt>{t.self.factVerified}</dt>
+          <dd>{t.self.verifiedYes}</dd>
+        {/if}
         <dt>{t.self.factEncryption}</dt>
         <dd>
           {#if !status.encryption.enabled}
@@ -166,4 +198,9 @@
 
 <style>
   .warn-text { color: var(--warn); }
+  .reasons, .damaged { margin-top: 22px; max-width: 720px; padding: 14px 16px 16px; }
+  .reasons h2, .damaged h2 { font-size: var(--fs-m); font-weight: 600; display: flex; align-items: center; gap: 10px; }
+  .reasons ul, .damaged ul { margin-top: 8px; padding-left: 18px; list-style: disc; }
+  .reasons li, .damaged li { margin-top: 3px; max-width: 66ch; overflow-wrap: anywhere; }
+  .damaged p { color: var(--muted); margin-top: 8px; max-width: 66ch; }
 </style>

@@ -17,8 +17,7 @@
   const folder = $derived(node.type === "archive" || node.type === "directory");
   const inherited = $derived(restore.inherited(node));
   const checked = $derived(inherited || restore.isSelected(node));
-  const locked = $derived(restore.lockedArchive());
-  const disabled = $derived(inherited || (locked !== null && locked !== node.archive));
+  const disabled = $derived(inherited);
   const id = $derived(`n-${node.archive}-${node.path}`.replace(/[^A-Za-z0-9_-]/g, (c) => `_${c.charCodeAt(0).toString(16)}`));
 </script>
 

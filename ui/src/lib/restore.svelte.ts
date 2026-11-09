@@ -3,7 +3,7 @@
 
 import { api, ApiFailure } from "./api";
 import { isInventoryArchive, restorableArchives } from "./derive";
-import type { ConfigView, DirEntry, Restore, Snapshot } from "./types";
+import type { ConfigView, DirEntry, Restore, RestoreRequest, Snapshot } from "./types";
 
 export interface TreeNode {
   archive: string;
@@ -43,6 +43,31 @@ export function displayPath(sel: Selection, config: ConfigView | null): string {
   if (!source) return sel.path === "/" ? sel.archive : `${sel.archive}:${sel.path}`;
   if (sel.path === "/") return source;
   return `${source.replace(/\/$/, "")}${sel.path}`;
+}
+
+/** Archives in the selection, in the order they were first selected. */
+export function selectedArchives(selection: Selection[]): string[] {
+  return [...new Set(selection.map((s) => s.archive))];
+}
+
+/** Subfolder an archive gets when several are restored at once (`home.pxar` -> `home`). */
+export function archiveFolder(archive: string): string {
+  return archive.replace(/\.pxar$/, "");
+}
+
+/**
+ * The restore request for a selection. One archive keeps the plain form
+ * (`archive` + `paths`, understood by every daemon); several archives use
+ * `archives`, and the daemon puts each into its own subfolder. An empty list
+ * of paths restores a whole archive (when its root is selected).
+ */
+export function restoreRequest(selection: Selection[], snapshotTime: string, targetDir: string): RestoreRequest {
+  const groups = selectedArchives(selection).map((archive) => {
+    const mine = selection.filter((s) => s.archive === archive);
+    return { archive, paths: mine.some((s) => s.path === "/") ? [] : mine.map((s) => s.path) };
+  });
+  if (groups.length === 1) return { snapshot_time: snapshotTime, archive: groups[0]!.archive, paths: groups[0]!.paths, target_dir: targetDir };
+  return { snapshot_time: snapshotTime, archives: groups, target_dir: targetDir };
 }
 
 export function folderNameFor(snapshotTime: string): string {
@@ -176,11 +201,6 @@ class RestoreState {
     return this.selection.some((s) => s.archive === node.archive && s.path === node.path);
   }
 
-  /** One restore request covers one archive (see API-REQUESTS.md). */
-  lockedArchive(): string | null {
-    return this.selection[0]?.archive ?? null;
-  }
-
   setSelected(node: TreeNode, on: boolean) {
     if (on) {
       this.selection = [
@@ -203,18 +223,11 @@ class RestoreState {
   }
 
   async start(home: string | null): Promise<boolean> {
-    const archive = this.lockedArchive();
-    if (!archive || !this.snapshotTime) return false;
+    if (!this.selection.length || !this.snapshotTime) return false;
     this.starting = true;
     this.startError = null;
-    const paths = this.selection.some((s) => s.path === "/") ? [] : this.selection.map((s) => s.path);
     try {
-      this.job = await api.startRestore({
-        snapshot_time: this.snapshotTime,
-        archive,
-        paths,
-        target_dir: this.targetDir(home),
-      });
+      this.job = await api.startRestore(restoreRequest(this.selection, this.snapshotTime, this.targetDir(home)));
       this.jobSelection = [...this.selection];
       this.watch();
       return true;

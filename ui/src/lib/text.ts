@@ -2,9 +2,14 @@
 // can be tested with both languages.
 
 import type { Messages } from "../i18n";
-import { ageOf, errorKind, machineKind, runEnd, selfKind, type MachineKind, type SelfKind, type ServerBackups } from "./derive";
+import { ageOf, errorKind, machineKind, runEnd, selfKind, setupGuide, type MachineKind, type SelfKind, type ServerBackups } from "./derive";
 import type { Formatter } from "./format";
-import type { Machine, Status } from "./types";
+import type { Machine, Run, Status } from "./types";
+
+/** The newest run was cancelled and no success came after it. */
+function cancelledAfter(last: Run | null, success: Run | null): Run | null {
+  return last && last.state === "cancelled" && (!success || last.started_at > success.started_at) ? last : null;
+}
 
 export interface Summary {
   kind: SelfKind;
@@ -34,6 +39,8 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
     case "running":
       return { kind, lead: t.self.runningLead, text: t.self.runningText };
     case "key_missing":
+      // No key at all is a different step than a key whose copy is not confirmed yet.
+      if (setupGuide(s)?.current === "key_create") return { kind, lead: t.self.keyCreateLead, text: t.self.keyCreateText };
       return { kind, lead: t.self.keyLead, text: successAt ? `${t.self.keyText} ${lastSuccessText}` : t.self.keyText };
     case "failing": {
       // The contract allows health=failing without run details; then the text stays undated.
@@ -49,17 +56,35 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       const age = ageOf(success ? runEnd(success) : (successAt ?? last?.started_at ?? now.toISOString()), now);
       const parts = [lastSuccessText];
       if (last?.state === "pbs_unreachable") parts.push(t.self.overduePbs);
+      const cancelled = cancelledAfter(last, success);
+      if (cancelled) parts.push(t.self.lastCancelled(m(cancelled.started_at)));
       // Every promise of an automatic retry depends on the schedule being switched on.
       if (!s.schedule.enabled) parts.push(t.self.scheduleOff);
       else parts.push(last?.state === "pbs_unreachable" ? t.self.autoRetry : t.self.overdueCatchUp);
       return { kind, lead: t.self.overdueLead(age.days, age.hours), text: parts.join(" ") };
+    }
+    case "incomplete": {
+      const parts = [t.self.incompleteText];
+      const cancelled = cancelledAfter(last, success);
+      if (cancelled) parts.push(t.self.lastCancelled(m(cancelled.started_at)));
+      if (!s.schedule.enabled) parts.push(t.self.scheduleOff);
+      else if (s.schedule.next_run) {
+        parts.push(new Date(s.schedule.next_run) <= now ? t.self.nextRunDue : t.self.nextRun(m(s.schedule.next_run)));
+      }
+      return {
+        kind,
+        lead: successAt ? t.self.incompleteLead(m(successAt)) : t.self.incompleteLeadUndated,
+        text: parts.join(" "),
+      };
     }
     case "never": {
       const parts: string[] = [];
       // No backup from this installation, but older ones on the server (e.g. after a reinstall).
       const earlier = server && server.count > 0 && server.latest ? server : null;
       if (earlier) parts.push(t.self.neverServer(earlier.count, m(earlier.latest!)));
-      if (last && last.state !== "succeeded") {
+      if (last && last.state === "cancelled") {
+        parts.push(t.self.neverCancelled(m(last.started_at)));
+      } else if (last && last.state !== "succeeded") {
         parts.push(t.self.neverAttempt(m(last.started_at)));
         const ek = errorKind(last);
         if (ek) parts.push(t.explain[ek]);
@@ -74,6 +99,8 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       const pbsAfterSuccess =
         !!last && last.state === "pbs_unreachable" && (!success || last.started_at > success.started_at);
       if (pbsAfterSuccess) parts.push(t.self.lastAttemptPbs(m(last.started_at)));
+      const cancelled = cancelledAfter(last, success);
+      if (cancelled) parts.push(t.self.lastCancelled(m(cancelled.started_at)));
       if (!s.schedule.enabled) parts.push(t.self.scheduleOff);
       else if (pbsAfterSuccess) parts.push(t.self.autoRetry);
       else if (s.schedule.next_run) {
@@ -99,7 +126,9 @@ export function selfRowText(s: Status, t: Messages, f: Formatter, now: Date, ser
     case "running":
       return t.row.running;
     case "key_missing":
-      return t.row.keyMissing;
+      return setupGuide(s)?.current === "key_create" ? t.row.keyCreate : t.row.keyMissing;
+    case "incomplete":
+      return successAt ? t.row.incomplete(f.moment(successAt, now), f.dayMonth(successAt)) : t.row.incompleteUndated;
     case "failing": {
       const failed = s.last_run && s.last_run.state === "failed" ? s.last_run : null;
       return failed ? t.row.failing(f.dayMonth(failed.started_at)) : t.row.failingUndated;

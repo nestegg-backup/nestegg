@@ -15,5 +15,7 @@
   .k-none { height: 3px; }
   .k-pbs { background: var(--pbs); }
   .k-fail { background: var(--bad); }
+  .k-incomplete { background: var(--warn); }
+  .k-damaged { background: none; box-shadow: inset 0 0 0 1px var(--bad); }
   .k-run { background: var(--accent-text); }
 </style>

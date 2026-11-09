@@ -1,6 +1,6 @@
 <script lang="ts">
   import { app } from "../../lib/store.svelte";
-  import { displayPath, folderNameFor, folderProblem, restore } from "../../lib/restore.svelte";
+  import { archiveFolder, displayPath, folderNameFor, folderProblem, restore, selectedArchives } from "../../lib/restore.svelte";
   import { href, router } from "../../lib/router.svelte";
   import { isInventoryArchive } from "../../lib/derive";
   import { f, t } from "../../lib/locale";
@@ -37,6 +37,7 @@
       : null,
   );
   const total = $derived(restore.totalSize());
+  const areas = $derived(selectedArchives(restore.selection));
 
   function label(sel: (typeof restore.selection)[number]) {
     return isInventoryArchive(sel.archive) && sel.path === "/" ? t.restore.inventory : displayPath(sel, app.config.value);
@@ -100,7 +101,13 @@
       {#if total != null}
         <div><dt>{t.restore.sumSize}</dt><dd>{f.size(total)}</dd></div>
       {/if}
-      <div><dt>{t.restore.sumTarget}</dt><dd><code>{restore.targetDir(home) || "–"}</code></dd></div>
+      <div>
+        <dt>{t.restore.sumTarget}</dt>
+        <dd>
+          <code>{restore.targetDir(home) || "–"}</code>
+          {#if areas.length > 1}<p class="hint">{t.restore.manyAreas(areas.map(archiveFolder).join(", "))}</p>{/if}
+        </dd>
+      </div>
     </dl>
   </section>
 

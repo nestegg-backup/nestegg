@@ -4,9 +4,10 @@
   import LoadError from "./LoadError.svelte";
   import Switch from "./Switch.svelte";
   import { app } from "../lib/store.svelte";
+  import { href } from "../lib/router.svelte";
   import { statusBar } from "../lib/statusbar.svelte";
   import { ApiFailure } from "../lib/api";
-  import { intervalHours } from "../lib/derive";
+  import { scheduleHours } from "../lib/derive";
   import { DEFAULT_LIMITS, settingsProblem } from "../lib/settings";
   import { intervalOptions, overdueFor, parseHours, problemText, saveFailure } from "../lib/settingsForm";
   import { f, t } from "../lib/locale";
@@ -27,7 +28,7 @@
   const can = (k: SettingKey) => editable.has(k) && !app.offline;
   const limits = $derived(c?.limits ?? DEFAULT_LIMITS);
 
-  const interval = $derived(c?.interval_hours ?? intervalHours(c?.schedule ?? status.schedule.calendar) ?? status.schedule.interval_hours ?? null);
+  const interval = $derived(scheduleHours(c, status));
   const overdue = $derived(c?.overdue_after_hours ?? status.overdue_after_hours ?? null);
   const automatic = $derived(c?.automatic_backups ?? status.schedule.enabled);
   const wol = $derived(c?.wake_on_lan ?? !!status.pbs.wake_on_lan);
@@ -206,7 +207,7 @@
 <div class="intro">
   {#if unconfigured}
     <p class="lead-text">{s.unconfigured}</p>
-    <Cmd command="nestegg init --help" />
+    <p class="lead-text"><a class="linkbtn" href={href({ view: "self" })}>{s.unconfiguredLink}</a></p>
   {:else}
     {#if configFailed}
       <!-- Without /config nothing can be changed; the values below come from /status. -->

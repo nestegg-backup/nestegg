@@ -36,6 +36,7 @@
   /* meaning */
   --ok: #8cc8a0;
   --warn: #e3b66e;
+  --on-warn: #241a07; /* text on a filled amber mark */
   --bad: #f0938a;
   --bad-fill: #c4473c;
   --on-bad-fill: #ffffff;
@@ -68,6 +69,7 @@
     --on-accent: #ffffff;
     --ok: #26683e;
     --warn: #845500;
+    --on-warn: #ffffff;
     --bad: #b3372c;
     --bad-fill: #c9443a;
     --on-bad-fill: #ffffff;
@@ -100,6 +102,7 @@
   --on-accent: #ffffff;
   --ok: #26683e;
   --warn: #845500;
+  --on-warn: #ffffff;
   --bad: #b3372c;
   --bad-fill: #c9443a;
   --on-bad-fill: #ffffff;

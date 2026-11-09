@@ -101,6 +101,14 @@ const en = {
     running: "Backing up now",
     unconfigured: "Not set up yet",
     keyMissing: "Key copy not confirmed",
+    keyCreate: "Key still missing",
+    incompleteUndated: "Backed up, incomplete",
+    incomplete: (m: Moment, dayMonth: string) =>
+      m.rel === "today"
+        ? `Backed up today ${m.time}, incomplete`
+        : m.rel === "yesterday"
+          ? `Backed up yesterday ${m.time}, incomplete`
+          : `Backed up ${dayMonth} ${m.time}, incomplete`,
     failing: (day: string) => `Failed on ${day}`,
     failingUndated: "Last backup failed",
     overdue: (day: string) => `Overdue, last ${day}`,
@@ -128,7 +136,7 @@ const en = {
     runStartFailed: (msg: string) => `The backup could not be started. ${msg}`,
     unconfiguredLead: "nestegg is not set up on this computer yet.",
     unconfiguredText:
-      "Setup happens in a terminal. This command shows what it needs (server, datastore, access). Afterwards this page shows when the last backup happened.",
+      "Setup happens in a terminal. Below, you find step by step what to enter; the page moves on by itself as soon as a step is done.",
     keyLead: "Backups are waiting for the key copy to be confirmed.",
     keyText:
       "nestegg only backs up this computer once you have confirmed that a copy of the encryption key is stored outside of it. It takes a few minutes in a terminal, see below.",
@@ -170,6 +178,7 @@ const en = {
     stepUpload: "Upload changed files",
     stepUploadSub: (size: string) => `${size} uploaded`,
     stepUploadCheck: "Comparing files",
+    stepUploadProgress: (done: string, total: string) => `${done} of ${total} gone through (size of the last backup)`,
     stepFinish: "Finish",
     stepFinishSub: "Send the report to the server",
     factsTitle: "About this computer",
@@ -189,18 +198,93 @@ const en = {
     encryptionOnKey: "On. A copy of the key is confirmed.",
     encryptionOnNoKey: "On. A copy of the key is not confirmed yet.",
     encryptionOff: "Off. The backups are stored unencrypted on the server.",
+    incompleteLead: (m: Moment) => `Backed up ${at(m)}, but not completely.`,
+    incompleteLeadUndated: "Backed up, but not completely.",
+    incompleteText: "The backup worked, but it does not contain everything that is set up. What is missing is listed below.",
+    incompleteTitle: "What is missing from the last backup",
+    incompleteNote: "nestegg reports the reasons in English.",
+    keyCreateLead: "There is no key for the backups yet.",
+    keyCreateText:
+      "nestegg encrypts the backups before they leave this computer. That needs a key, which you create below. Backups only start after that.",
+    lastCancelled: (m: Moment) => `The last backup was cancelled ${at(m)}.`,
+    neverCancelled: (m: Moment) => `The last attempt ${at(m)} was cancelled.`,
+    cancel: "Cancel backup",
+    cancelAsk: "Really cancel the backup?",
+    cancelAskText: "Data that was already uploaded is not lost; the next backup can build on it.",
+    cancelYes: "Yes, cancel",
+    cancelNo: "Keep backing up",
+    cancelling: "Cancelling …",
+    cancelCannot:
+      "That is not possible right now: the backup is still starting or already finishing. Try again in a few seconds.",
+    cancelGone: "This backup is no longer running.",
+    cancelFailed: (msg: string) => `Cancelling did not work. ${msg}`,
+    factInterval: "Rhythm",
+    factVerified: "Check",
+    verifiedYes: "Read back from the server and checked after the upload",
+    damagedTitle: "The server found damaged backups",
+    damagedText: (n: number) =>
+      `In its own check, the backup server reported ${n === 1 ? "one backup" : `${n} backups`} of this computer as damaged:`,
+    damagedDay: (day: string, time: string) => `Backup from ${day}, ${time}`,
+    damagedMore:
+      "Newer and other backups are not affected. When restoring, the damaged ones are marked; pick another one then. It is best to start a new backup. If the server reports this again, have a look at its disks and free space.",
+  },
+  guide: {
+    title: "The next steps",
+    stepsLabel: "Steps to the first backup",
+    done: "done",
+    now: "current step",
+    later: "later",
+    setup: "Connect to the backup server",
+    keyCreate: "Create the key",
+    keyStore: "Store the key safely",
+    firstBackup: "First backup",
+    moveOn: "As soon as a step is done, this page moves on to the next one by itself.",
+    terminal: "You type the commands in a terminal. The button next to a command copies it.",
+    setupIntro:
+      "nestegg needs three things from the backup server: its address, the datastore (the storage space there) and an API token, which is an access key for this computer only. You never type the secret of the token on this page, only in the terminal.",
+    setupClient:
+      "The program proxmox-backup-client must be installed as well. How to do that is described in the documentation (docs/configuration.md, section “Installing the backup client”).",
+    server: "Address of the backup server",
+    serverPlaceholder: "pbs.example.com:8007",
+    datastore: "Datastore",
+    datastorePlaceholder: "backups",
+    namespace: "Namespace (may stay empty)",
+    namespacePlaceholder: "desktops",
+    authId: "Token ID",
+    authIdHint: "Format: user@realm!tokenname. Only the ID, not the secret.",
+    authIdPlaceholder: "backup@pbs!desktop",
+    fieldsNote: "These entries stay on this page and are not stored anywhere. They only complete the command below.",
+    commandsIntro: "Then, in the terminal, one after the other:",
+    cmdInit: "Creates the setup.",
+    cmdPassword: "Asks for the secret of the token. What you type stays invisible.",
+    cmdCheck: "Checks that server, access and backup program are fine.",
+    cmdEnable: "Starts nestegg and the automatic backups.",
+    cmdGroup: "Lets your user use this interface. Log out and in once afterwards.",
+    fingerprint:
+      "If the server uses a self-generated certificate, add --fingerprint <SHA-256> to the first command. The server shows the value in its dashboard under “Show Fingerprint”.",
+    keyCreateWhy:
+      "The backups are encrypted on this computer before they go to the server. You create the key for that now.",
+    keyCreateImport:
+      "If you already have a key from before, for example after a reinstall, do not create a new one but bring the old one back: sudo nestegg key import <key file>. Otherwise the older backups cannot be opened.",
+    keyStoreWhy:
+      "Without this key nobody can open the backups, not even you if the computer breaks. That is why a copy must be kept outside this computer. A copy that only lies on this computer does not count. There are two ways; one is enough. Backups only start once you have confirmed the copy.",
+    usbTitle: "On a USB stick",
+    usbText:
+      "Write the key to a USB stick and keep the stick somewhere other than the computer. Replace <stick> with the name of your stick.",
+    usbConfirm: "Then confirm that the file is on the stick:",
+    paperTitle: "On paper",
+    paperText:
+      "Creates a page to print. It shows the key as a QR code and a short check code. Keep the printout safe, not next to the computer.",
+    paperConfirm: "Then confirm with the check code printed on the page. Replace <CODE> with it:",
+    firstBackupText:
+      "Everything is ready. Click “Back up now” above. The first time, everything is uploaded, which can take a long time. You can close the page meanwhile.",
   },
   key: {
-    title: "A copy of the key has not been confirmed yet",
-    text:
-      "The backups of this computer are encrypted. No copy of the key outside this computer has been confirmed yet. If you have not stored one, a hardware failure could make the backups impossible to open. That is why nestegg only backs up once you have confirmed a copy.",
-    steps: "In a terminal, one after the other:",
-    paperkey: "Print the key as a paper copy and keep it in a safe place.",
-    confirm: "Then confirm that the copy is stored safely.",
     otherTitle: "No copy of the key confirmed",
     otherText: (name: string) =>
       `The backups of this computer are encrypted. For ${name}, no copy of the key outside the computer has been confirmed. If there is none, a hardware failure of ${name} could make its backups impossible to open.`,
-    otherFix: (name: string) => `This can only be fixed on ${name} itself, with these commands in a terminal:`,
+    otherFix: (name: string) =>
+      `This can only be fixed on ${name} itself. Open nestegg there in the browser: the page guides you step by step through storing the key safely.`,
   },
   strip: {
     title: "Last 14 days",
@@ -209,6 +293,8 @@ const en = {
     pbs: "Server not reachable",
     none: "No backup",
     run: "Running now",
+    incomplete: "Backed up incompletely",
+    damaged: "Damaged on the server",
   },
   runs: {
     succeeded: "Backed up",
@@ -218,6 +304,8 @@ const en = {
     pbs: "Server not reachable",
     pbsTimes: (n: number) => `Server not reachable, ${n} attempts`,
     cancelled: "Cancelled",
+    succeededIncomplete: "Backed up, but incomplete",
+    incompleteReasons: "What is missing",
     title: "History",
     colDay: "Day",
     colStart: "Start",
@@ -244,6 +332,8 @@ const en = {
     already_running: "already running",
     config: "setup incomplete",
     credentials_unreadable: "stored secrets unreadable",
+    verification_failed: "check after the upload failed",
+    cancelled: "cancelled",
     internal: "internal error",
   },
   explain: {
@@ -259,6 +349,9 @@ const en = {
     config: "The setup is incomplete. The log shows what is missing; sudo nestegg check shows it too.",
     credentials_unreadable:
       "This computer can no longer decrypt the stored token secret or key, for example after a mainboard change or a restore onto other hardware. Store them again with sudo nestegg credentials set-password and sudo nestegg key import followed by your exported key file.",
+    verification_failed:
+      "The backup was uploaded, but reading it back from the server returned something different from what was sent, or nothing at all. That is why it does not count as successful. Start the backup again. If the error repeats, check the backup server: free space, disks, network.",
+    cancelled: "The backup was cancelled. Data that was already uploaded is not lost.",
     internal: "An error happened inside nestegg itself. The log shows what exactly happened.",
   },
   other: {
@@ -306,6 +399,23 @@ const en = {
     off: "Off",
     retention: "Retention",
     retentionText: "Configured on the server.",
+    usage: "Used",
+    usageOf: (used: string, total: string) => `${used} of ${total}`,
+    check: "Check connection",
+    checking: "Checking …",
+    checkingText: "nestegg checks whether the backup server answers and the access works.",
+    checkingWake:
+      "The backup server is woken if needed (Wake-on-LAN). That can take a few minutes. You can leave the page; the result will be here afterwards.",
+    checkTitle: "Result of the check",
+    checkedAt: (m: Moment) => `Checked ${at(m)}.`,
+    checkAllOk: "Everything is fine.",
+    checkProblems: (n: number) => `${n} ${plural(n, "item has", "items have")} a problem.`,
+    checkNames: "The names and messages come from the program and are in English.",
+    checkOkLabel: "fine",
+    checkBadLabel: "problem",
+    checkPbs: "The backup server did not answer.",
+    checkPbsWol: "Wake-on-LAN is switched on, so nestegg tried to wake it. Try again later.",
+    checkFailed: (msg: string) => `The check could not be run. ${msg}`,
   },
   settings: {
     title: "Settings",
@@ -313,7 +423,8 @@ const en = {
     introReadOnly:
       "This nestegg version only shows the settings. Change them in a terminal with sudo nestegg init or in the file /etc/nestegg/config.toml.",
     offline: "Nothing can be changed without a connection to the nestegg service.",
-    unconfigured: "Not set up yet. This command shows what is needed:",
+    unconfigured: "Not set up yet. How to do that is described step by step on the page of the computer.",
+    unconfiguredLink: "Go to the setup",
     schedule: "Schedule",
     automatic: "Back up automatically",
     automaticOn: "nestegg checks every hour whether a backup is due and catches up on missed ones.",
@@ -426,7 +537,12 @@ const en = {
     dirLoading: "Loading …",
     dirEmpty: "Empty folder",
     dirFailed: "This folder could not be opened.",
-    oneArea: (area: string) => `One restore takes files from one area. Start a second one for ${area} afterwards.`,
+    manyAreas: (names: string) => `Each area goes into its own subfolder of the new folder (${names}).`,
+    damaged: "damaged",
+    damagedSnapshot:
+      "This backup is marked as damaged on the server. Files from it may not be restorable completely. Better pick another one.",
+    progress: (done: string, total: string) => `${done} of ${total} restored`,
+    progressDone: (done: string) => `${done} restored`,
     nothingSelected: "Nothing selected yet",
     selected: (n: number, size: string | null) =>
       `${n} ${plural(n, "item", "items")} selected${size ? `, ${size} in total` : ""}`,

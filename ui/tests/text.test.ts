@@ -184,7 +184,7 @@ describe("contract-valid minimal status objects", () => {
     encryption: { enabled: true },
     health,
   });
-  const healths: Status["health"][] = ["ok", "running", "overdue", "failing", "never", "unconfigured"];
+  const healths: Status["health"][] = ["ok", "running", "overdue", "failing", "incomplete", "never", "unconfigured"];
 
   it.each(healths)("health=%s renders without run details", (h) => {
     for (const [msgs, fmt] of [[de, fde], [en, fen]] as const) {
@@ -207,7 +207,7 @@ describe("contract-valid minimal status objects", () => {
 describe("key copy wording", () => {
   it("does not claim that the key exists only on the computer", () => {
     for (const msgs of [de, en]) {
-      const all = [msgs.key.title, msgs.key.text, msgs.key.otherTitle, msgs.key.otherText("media"), msgs.self.keyLead, msgs.row.keyMissing].join(" ");
+      const all = [msgs.key.otherTitle, msgs.key.otherText("media"), msgs.self.keyLead, msgs.row.keyMissing].join(" ");
       expect(all).not.toMatch(/liegt nur|nur auf dem PC|only exists|fehlt\b|missing/i);
       expect(all).toMatch(/bestätigt|confirmed/);
     }

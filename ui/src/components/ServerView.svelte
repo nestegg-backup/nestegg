@@ -2,6 +2,7 @@
   import Dot from "./Dot.svelte";
   import LoadError from "./LoadError.svelte";
   import { app } from "../lib/store.svelte";
+  import { untrack } from "svelte";
   import { historyRows, serverContact } from "../lib/derive";
   import { f, t } from "../lib/locale";
   import type { Status } from "../lib/types";
@@ -9,6 +10,14 @@
   let { status }: { status: Status } = $props();
 
   const p = $derived(status.pbs);
+  const check = $derived(app.pbsCheck);
+  const info = $derived(app.pbs);
+  const bad = $derived(check.state === "done" ? check.result.checks.filter((c) => !c.ok).length : 0);
+
+  $effect(() => {
+    // Disk usage of the datastore, when the daemon can tell.
+    untrack(() => void app.loadPbs());
+  });
   const lead = $derived(
     p.reachable === true ? t.server.reachableLead : p.reachable === false ? t.server.unreachableLead : t.server.unknownLead,
   );
@@ -33,8 +42,51 @@
   <div class="status">
     <h2 class="lead">{#if p.reachable === false}<Dot tone="pbs" />{/if}{lead}</h2>
     <p class="lead-text">{text}</p>
+    <div aria-live="polite">
+      {#if check.state === "running"}
+        <p class="hint" role="status">{check.wake ? t.server.checkingWake : t.server.checkingText}</p>
+      {:else if check.state === "error"}
+        <p class="hint bad" role="status">
+          {#if check.kind === "pbs_unreachable"}
+            {t.server.checkPbs}{check.wake ? ` ${t.server.checkPbsWol}` : ""}
+          {:else}
+            {t.server.checkFailed(check.message)}
+          {/if}
+        </p>
+      {/if}
+    </div>
+  </div>
+  <div class="acts">
+    <button class="btn" type="button" disabled={check.state === "running" || app.offline} onclick={() => app.checkPbs()}>
+      {check.state === "running" ? t.server.checking : t.server.check}
+    </button>
   </div>
 </div>
+
+{#if check.state === "done"}
+  <section class="result notice-box" aria-labelledby="h-check">
+    <h2 id="h-check">{t.server.checkTitle}</h2>
+    <p class="hint">
+      {t.server.checkedAt(f.moment(check.result.checked_at, app.now))}
+      {bad ? t.server.checkProblems(bad) : t.server.checkAllOk}
+    </p>
+    <ul>
+      {#each check.result.checks as c (c.name)}
+        <li>
+          <span class="res">
+            <Dot tone={c.ok ? "neutral" : "bad"} />
+            <span>
+              <strong>{c.name}</strong>
+              <span class="sr">: {c.ok ? t.server.checkOkLabel : t.server.checkBadLabel}</span>
+              {#if c.detail}<span class="detail" class:bad={!c.ok}>{c.detail}</span>{/if}
+            </span>
+          </span>
+        </li>
+      {/each}
+    </ul>
+    <p class="hint">{t.server.checkNames}</p>
+  </section>
+{/if}
 
 <div class="cols">
   <section aria-labelledby="h-contacts">
@@ -91,6 +143,10 @@
       <dd>{p.datastore}</dd>
       <dt>{t.server.namespace}</dt>
       <dd>{p.namespace || t.server.noNamespace}</dd>
+      {#if info && info.used_bytes != null}
+        <dt>{t.server.usage}</dt>
+        <dd>{info.total_bytes != null ? t.server.usageOf(f.size(info.used_bytes), f.size(info.total_bytes)) : f.size(info.used_bytes)}</dd>
+      {/if}
       <dt>{t.server.wol}</dt>
       <dd>{p.wake_on_lan ? t.server.on : t.server.off}</dd>
       <dt>{t.server.retention}</dt>
@@ -100,6 +156,11 @@
 </div>
 
 <style>
+  .result { margin-top: 22px; max-width: 720px; padding: 14px 16px 16px; }
+  .result h2 { font-size: var(--fs-m); font-weight: 600; }
+  .result ul { margin-top: 8px; display: grid; gap: 6px; }
+  .result .detail { display: block; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .result .detail.bad { color: var(--bad); }
   .contacts { margin-top: 10px; }
   .start { font-weight: 500; white-space: nowrap; }
   @media (max-width: 760px) {

@@ -2,7 +2,7 @@
 // No strings here except stable ids; texts live in ../i18n.
 
 import { daysBetween, shiftDayKey, type Formatter } from "./format";
-import type { Machine, Run, RunErrorKind, Status } from "./types";
+import type { ConfigView, Machine, Run, RunErrorKind, Status } from "./types";
 
 export const ACTIVE_STATES = ["starting", "waking_pbs", "inventory", "uploading", "finishing"] as const;
 
@@ -11,7 +11,7 @@ export function isActive(run: Pick<Run, "state"> | null | undefined): boolean {
 }
 
 /** What the detail page of this PC is about, in priority order. */
-export type SelfKind = "unconfigured" | "running" | "key_missing" | "failing" | "overdue" | "never" | "ok";
+export type SelfKind = "unconfigured" | "running" | "key_missing" | "failing" | "overdue" | "incomplete" | "never" | "ok";
 
 export function selfKind(s: Status): SelfKind {
   if (s.health === "unconfigured") return "unconfigured";
@@ -22,6 +22,8 @@ export function selfKind(s: Status): SelfKind {
       return "failing";
     case "overdue":
       return "overdue";
+    case "incomplete":
+      return "incomplete";
     case "never":
       return "never";
     default:
@@ -38,6 +40,7 @@ export function selfTone(kind: SelfKind): Tone {
       return "running";
     case "key_missing":
     case "overdue":
+    case "incomplete":
       return "warn";
     case "failing":
       return "bad";
@@ -62,7 +65,7 @@ export function ageOf(iso: string, now: Date): { hours: number; days: number } {
 
 // ---------------------------------------------------------------- 14-day strip
 
-export type DayKind = "ok" | "fail" | "pbs" | "none" | "run";
+export type DayKind = "ok" | "incomplete" | "damaged" | "fail" | "pbs" | "none" | "run";
 
 export interface DayCell {
   key: string; // YYYY-MM-DD, local calendar day; format it with f.keyShort/keyLong/keyNumber
@@ -84,7 +87,9 @@ export function dayStrip(
     if (!byDay.has(k)) byDay.set(k, new Set());
     byDay.get(k)!.add(e.kind);
   }
-  const rank: DayKind[] = ["ok", "run", "fail", "pbs"];
+  // A complete backup beats an incomplete one of the same day; a day whose
+  // only snapshot is damaged is not a backed-up day.
+  const rank: DayKind[] = ["ok", "incomplete", "damaged", "run", "fail", "pbs"];
   const cells: DayCell[] = [];
   for (let i = count - 1; i >= 0; i--) {
     const key = shiftDayKey(todayKey, -i);
@@ -95,10 +100,18 @@ export function dayStrip(
   return cells;
 }
 
-export function runEvents(runs: Run[], current?: Run | null): { at: string; kind: Exclude<DayKind, "none"> }[] {
+export function runEvents(
+  runs: Run[],
+  current?: Run | null,
+  /** Snapshot paths the server marked as damaged (see `damagedSnapshots`). */
+  damaged: ReadonlySet<string> = new Set(),
+): { at: string; kind: Exclude<DayKind, "none"> }[] {
   const out: { at: string; kind: Exclude<DayKind, "none"> }[] = [];
   for (const r of runs) {
-    if (r.state === "succeeded") out.push({ at: r.started_at, kind: "ok" });
+    if (r.state === "succeeded") {
+      const kind = r.snapshot && damaged.has(r.snapshot) ? "damaged" : isIncomplete(r) ? "incomplete" : "ok";
+      out.push({ at: r.started_at, kind });
+    }
     else if (r.state === "failed") out.push({ at: r.started_at, kind: "fail" });
     else if (r.state === "pbs_unreachable") out.push({ at: r.started_at, kind: "pbs" });
   }
@@ -110,8 +123,11 @@ export function runEvents(runs: Run[], current?: Run | null): { at: string; kind
  * Snapshots on the server as successful days of the strip. The local run
  * history is empty after a reinstall; the server still knows those days.
  */
-export function snapshotEvents(snapshots: { time: string }[]): { at: string; kind: "ok" }[] {
-  return snapshots.map((s) => ({ at: s.time, kind: "ok" }));
+export function snapshotEvents(
+  snapshots: { time: string; snapshot?: string }[],
+  damaged: ReadonlySet<string> = new Set(),
+): { at: string; kind: "ok" | "damaged" }[] {
+  return snapshots.map((s) => ({ at: s.time, kind: s.snapshot && damaged.has(s.snapshot) ? "damaged" : "ok" }));
 }
 
 /**
@@ -122,11 +138,61 @@ export function snapshotEvents(snapshots: { time: string }[]): { at: string; kin
 export function selfStrip(
   runs: Run[],
   current: Run | null | undefined,
-  snapshots: { time: string }[],
+  snapshots: { time: string; snapshot?: string; verified?: "ok" | "failed" | null }[],
   now: Date,
   f: Formatter,
+  /** `status.server_verify_failed`. */
+  verifyFailed: readonly string[] = [],
 ): DayCell[] {
-  return dayStrip([...runEvents(runs, current), ...snapshotEvents(snapshots)], now, f);
+  const damaged = damagedSnapshots(snapshots, verifyFailed);
+  // A snapshot made by a run in the local history is drawn from that run (it may be incomplete);
+  // only the others (older installation, other source) come from the server's list.
+  const known = new Set(runs.map((r) => r.snapshot).filter((x): x is string => !!x));
+  const fromServer = snapshots.filter((x) => !x.snapshot || !known.has(x.snapshot));
+  return dayStrip([...runEvents(runs, current, damaged), ...snapshotEvents(fromServer, damaged)], now, f);
+}
+
+// ---------------------------------------------------------------- incomplete and damaged backups
+
+/** A successful run that does not contain everything the configuration asks for. */
+export function isIncomplete(run: Run): boolean {
+  return run.state === "succeeded" && (run.incomplete?.length ?? 0) > 0;
+}
+
+/** Warnings of a run without the ones that are already listed as reasons for "incomplete". */
+export function otherWarnings(run: Run): string[] {
+  const reasons = new Set(run.incomplete ?? []);
+  return (run.warnings ?? []).filter((w) => !reasons.has(w));
+}
+
+/**
+ * Snapshot paths (`host/desktop/2026-11-08T21:30:12Z`) known to be damaged:
+ * the ones the server's own check named, plus snapshots whose own
+ * verification state is "failed".
+ */
+export function damagedSnapshots(
+  snapshots: { snapshot?: string; verified?: "ok" | "failed" | null }[],
+  verifyFailed: readonly string[] = [],
+): Set<string> {
+  const out = new Set(verifyFailed);
+  for (const s of snapshots) if (s.verified === "failed" && s.snapshot) out.add(s.snapshot);
+  return out;
+}
+
+export function isDamaged(snapshot: { snapshot?: string; verified?: "ok" | "failed" | null }, verifyFailed: readonly string[] = []): boolean {
+  return snapshot.verified === "failed" || (!!snapshot.snapshot && verifyFailed.includes(snapshot.snapshot));
+}
+
+/** Time part of a snapshot path (`host/desktop/2026-11-08T21:30:12Z` -> `2026-11-08T21:30:12Z`). */
+export function snapshotTimeOf(path: string): string {
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+
+/** The days (newest first, as instants) of the damaged snapshots named by the server. */
+export function damagedTimes(verifyFailed: readonly string[] | undefined, snapshots: { time: string; snapshot?: string; verified?: "ok" | "failed" | null }[] = []): string[] {
+  const times = new Set((verifyFailed ?? []).map(snapshotTimeOf).filter((x) => !Number.isNaN(Date.parse(x))));
+  for (const s of snapshots) if (s.verified === "failed") times.add(s.time);
+  return [...times].sort().reverse();
 }
 
 // ---------------------------------------------------------------- run history
@@ -156,7 +222,7 @@ export function historyRows(runs: Run[], f: Formatter): RunRow[] {
       continue;
     }
     const expandable =
-      run.state === "failed" || run.state === "pbs_unreachable" || (run.warnings?.length ?? 0) > 0;
+      run.state === "failed" || run.state === "pbs_unreachable" || (run.warnings?.length ?? 0) > 0 || isIncomplete(run);
     rows.push({ run, count: 1, expandable });
   }
   return rows;
@@ -311,10 +377,24 @@ export function restoreOffer(kind: SelfKind, snaps: SnapshotState): "show" | "em
 
 // ---------------------------------------------------------------- misc
 
-/** "every 24 h" / "every 24 h (checked hourly)" -> 24 */
+/** "every 24 h" / "every 24 h (checked hourly)" -> 24. Only for daemons that predate `interval_hours`. */
 export function intervalHours(schedule: string | undefined | null): number | null {
   const m = /every\s+(\d+)\s*h/i.exec(schedule ?? "");
   return m ? Number(m[1]) : null;
+}
+
+/**
+ * How often a backup is due, in hours. The structured `interval_hours` of the
+ * configuration or the status wins; the text `schedule` is only parsed for
+ * daemons that do not send the number.
+ */
+export function scheduleHours(config: ConfigView | null | undefined, status: Status | null | undefined): number | null {
+  return (
+    config?.interval_hours ??
+    status?.schedule.interval_hours ??
+    intervalHours(config?.schedule ?? status?.schedule.calendar) ??
+    null
+  );
 }
 
 /** Archive file names of a snapshot (`home.pxar.didx`) to restorable archives (`home.pxar`). */
@@ -329,4 +409,74 @@ export function isInventoryArchive(archive: string): boolean {
 /** Days between two instants in local calendar days (b - a). */
 export function calendarDays(a: string | Date, b: string | Date, f: Formatter): number {
   return daysBetween(f.dayKey(a), f.dayKey(b));
+}
+
+// ---------------------------------------------------------------- setup and key guide
+
+export type GuideStep = "setup" | "key_create" | "key_store" | "first_backup";
+
+export interface Guide {
+  /** Steps in order; the key steps are left out when encryption is switched off. */
+  steps: GuideStep[];
+  current: GuideStep;
+}
+
+/**
+ * Where the user is on the way from a fresh install to the first backup, or
+ * null once there is nothing (more) to guide. Setup and key work happen in a
+ * terminal as root; the page only tells which step is next and moves on by
+ * itself when /status shows the step as done.
+ */
+export function setupGuide(s: Status): Guide | null {
+  if (s.health === "running" || isActive(s.current_run)) return null;
+  // Before setup it is not known whether encryption will be used: the default is yes.
+  const encrypted = s.health === "unconfigured" || s.encryption.enabled;
+  const steps: GuideStep[] = ["setup"];
+  if (encrypted) steps.push("key_create", "key_store");
+  // A backup that exists already makes "first backup" meaningless.
+  if (!s.last_success) steps.push("first_backup");
+
+  let current: GuideStep | null = null;
+  if (s.health === "unconfigured") current = "setup";
+  // The daemon reports key_exported=false both before a key exists and while its copy is unconfirmed;
+  // no fingerprint tells the two apart.
+  else if (encrypted && s.encryption.key_exported === false) current = s.encryption.key_fingerprint === null ? "key_create" : "key_store";
+  else if (s.health === "never") current = "first_backup";
+  if (!current || !steps.includes(current)) return null;
+  return { steps, current };
+}
+
+/** Single-quote a value for a POSIX shell when it needs it (the token ID contains `!`). */
+export function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export interface InitFields {
+  server: string;
+  datastore: string;
+  namespace: string;
+  authId: string;
+}
+
+/**
+ * The `nestegg init` command for the entered values. Empty required fields
+ * show as `<NAME>`; `host:port` becomes `--server host --port N`. Never
+ * contains a secret: the token secret is entered in the terminal.
+ */
+export function initCommand(v: InitFields): string {
+  let server = v.server.trim();
+  let port: string | null = null;
+  const bracket = /^\[(.+)\]:(\d{1,5})$/.exec(server);
+  const plain = /^([^:]+):(\d{1,5})$/.exec(server);
+  if (bracket) [, server, port] = bracket as unknown as [string, string, string];
+  else if (plain) [, server, port] = plain as unknown as [string, string, string];
+  const options = [
+    `--server ${server ? shellQuote(server) : "<SERVER>"}`,
+    ...(port ? [`--port ${port}`] : []),
+    `--datastore ${v.datastore.trim() ? shellQuote(v.datastore.trim()) : "<DATASTORE>"}`,
+    `--auth-id ${v.authId.trim() ? shellQuote(v.authId.trim()) : "'<USER@REALM!TOKEN>'"}`,
+  ];
+  if (v.namespace.trim()) options.push(`--namespace ${shellQuote(v.namespace.trim())}`);
+  // One option per line (with a trailing backslash) so the command stays readable; it still pastes as one command.
+  return ["sudo nestegg init", ...options].join(" \\\n  ");
 }

@@ -9,6 +9,8 @@ import type {
   DirEntry,
   Machine,
   MachinesResponse,
+  PbsCheckResult,
+  PbsInfo,
   Restore,
   RestoreRequest,
   Run,
@@ -30,6 +32,11 @@ export const SCENARIOS = [
   "pbs_unreachable",
   "key_not_exported",
   "credentials_unreadable",
+  "incomplete",
+  "verification_failed",
+  "damaged",
+  "no_key",
+  "cancelled",
   "daemon_down",
   "unauthorized",
 ] as const;
@@ -48,13 +55,35 @@ export type Flavor = "full" | "today";
  * - `no_run_details`: `/status` omits last_run and last_success (allowed by the contract)
  * - `no_wake`: the configuration has no `[wake]` section (Wake-on-LAN cannot be switched on)
  * - `timer_fails`: switching automatic backups fails like a missing systemd (500, nothing changes)
+ * - `unverified`: runs carry no `verified` flag (records of older versions)
+ * - `cancel_late`: cancelling a running backup answers 409 `cannot_cancel`
+ * - `check_slow`: `POST /pbs/check` takes 6 s (like a PBS that has to be woken up)
+ * - `check_bad`: the connection check finds a problem (login refused)
+ * - `check_down`: the connection check answers 503 `pbs_unreachable`
+ * - `no_usage`: `GET /pbs` does not know the datastore usage
  */
-export const FAULTS = ["down", "runs", "config", "schedule_off", "no_run_details", "no_wake", "timer_fails"] as const;
+export const FAULTS = [
+  "down",
+  "runs",
+  "config",
+  "schedule_off",
+  "no_run_details",
+  "no_wake",
+  "timer_fails",
+  "unverified",
+  "cancel_late",
+  "check_slow",
+  "check_bad",
+  "check_down",
+  "no_usage",
+] as const;
 export type Fault = (typeof FAULTS)[number];
 
 export interface Reply {
   status: number;
   body: unknown;
+  /** Answer later than the usual short latency (ms). */
+  delayMs?: number;
 }
 
 const HOUR = 3_600_000;
@@ -95,11 +124,14 @@ interface ActiveRun {
   run: StoredRun;
   startedMs: number;
   outcome: "succeeded" | "pbs_unreachable" | "config";
+  /** When the user asked to cancel (ms); the run ends as `cancelled` shortly after. */
+  cancelAtMs?: number;
 }
 
 interface RestoreJob {
   restore: Restore;
   startedMs: number;
+  totalBytes: number;
 }
 
 const fmtClock = (ms: number) => new Date(ms).toTimeString().slice(0, 8);
@@ -127,6 +159,8 @@ function logFor(run: Run, startMs: number): string[] {
         `${t(300)}  no answer after 300 s, giving up`,
         `${t(300)}  result: pbs_unreachable`,
       ];
+    case "cancelled":
+      return [head, `${t(1)}  pbs.example.com:8007 reachable`, `${t(9)}  cancelled by the user`, `${t(run.duration_seconds ?? 9)}  result: cancelled`];
     case "failed":
       return [
         head,
@@ -142,7 +176,15 @@ function logFor(run: Run, startMs: number): string[] {
 function makeRun(
   startMs: number,
   state: Run["state"],
-  opts: { trigger?: Run["trigger"]; duration?: number; uploaded?: number; error?: Run["error"]; warnings?: string[] } = {},
+  opts: {
+    trigger?: Run["trigger"];
+    duration?: number;
+    uploaded?: number;
+    error?: Run["error"];
+    warnings?: string[];
+    incomplete?: string[];
+    verified?: boolean;
+  } = {},
 ): StoredRun {
   const d = new Date(startMs);
   const stamp = d.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
@@ -161,7 +203,11 @@ function makeRun(
         ? [...ARCHIVES.map((a) => ({ ...a, size_bytes: a.name === "home.pxar" ? 380 * GB : 0.4 * GB })), { name: "inventory.pxar", source: "/var/lib/nestegg/inventory", size_bytes: 3_000_000 }]
         : [],
     uploaded_bytes: state === "succeeded" ? (opts.uploaded ?? GB) : null,
-    warnings: opts.warnings ?? [],
+    // Like the daemon: every reason for "incomplete" is also a warning.
+    warnings: [...(opts.warnings ?? []), ...(opts.incomplete ?? [])],
+    ...(opts.incomplete?.length ? { incomplete: opts.incomplete } : {}),
+    ...(state === "succeeded" && opts.verified !== undefined ? { verified: opts.verified } : {}),
+    expected_bytes: state === "succeeded" ? 412 * GB : null,
     error: opts.error ?? null,
   };
   return { ...run, log_tail: logFor(run, startMs) };
@@ -237,6 +283,10 @@ export class World {
   timerEnabled: boolean | null = null;
   /** Snapshots made before the local state was lost (`reinstalled`): on the server, unknown to the daemon. */
   inherited: Snapshot[] = [];
+  /** Snapshot paths the server's own verification marked as failed (`damaged`). */
+  damagedPaths: string[] = [];
+  /** false: encryption is on, but no key exists yet (`no_key`, `unconfigured`). */
+  keyCreated = true;
   faults = new Set<Fault>();
 
   constructor(
@@ -263,6 +313,8 @@ export class World {
         duration: 540 + Math.floor(r() * 480),
         uploaded: Math.round((0.4 + r() * 2.8) * GB),
         warnings: d === 4 ? ["/home/alice/.cache/thumbnails: permission denied, skipped"] : [],
+        // Backups from the last ten days were read back after the upload; older records have no such flag.
+        verified: d <= 9 ? true : undefined,
       });
       this.runs.unshift(run);
     }
@@ -313,7 +365,55 @@ export class World {
       case "unconfigured":
         this.configured = false;
         this.keyExported = false;
+        this.keyCreated = false;
         this.reachable = null;
+        break;
+      case "no_key":
+        // Set up, but `nestegg key create` has not run yet.
+        this.keyExported = false;
+        this.keyCreated = false;
+        this.reachable = null;
+        break;
+      case "incomplete":
+        this.history(now, 13, 0, { skip: [10], pbsNight: 7 });
+        // The last three backups left something out.
+        for (const run of this.runs.filter((r) => r.state === "succeeded").slice(0, 3)) {
+          const reasons = [
+            "full system backup skipped: the root file system (zfs) cannot be recreated by the rescue stick; only the configured folders are backed up",
+            ...(run === this.runs.find((r) => r.state === "succeeded") ? ["optional source /mnt/data does not exist, skipped"] : []),
+          ];
+          run.incomplete = reasons;
+          run.warnings = [...(run.warnings ?? []), ...reasons];
+          run.log_tail = logFor(run, new Date(run.started_at).getTime());
+        }
+        break;
+      case "verification_failed":
+        this.history(now, 13, 1, { skip: [10], pbsNight: 7 });
+        this.runs.unshift(
+          makeRun(localAt(now, 0, 1, 31) < now ? localAt(now, 0, 1, 31) : now - 2 * HOUR, "failed", {
+            duration: 840,
+            error: {
+              kind: "verification_failed",
+              message: "snapshot host/desktop/2026-11-09T00:31:08Z was uploaded, but reading it back failed: archive home.pxar.didx: chunk 3f9a… is missing on the server",
+            },
+          }),
+        );
+        break;
+      case "damaged": {
+        this.history(now, 13, 0, { skip: [10], pbsNight: 7 });
+        const done = this.runs.filter((r) => r.state === "succeeded");
+        this.damagedPaths = [done[4], done[8]].filter((r): r is StoredRun => !!r && !!r.snapshot).map((r) => r.snapshot!);
+        break;
+      }
+      case "cancelled":
+        this.history(now, 13, 0, { skip: [10], pbsNight: 7 });
+        this.runs.unshift(
+          makeRun(now - 3 * HOUR, "cancelled", {
+            trigger: "manual",
+            duration: 140,
+            error: { kind: "cancelled", message: "cancelled by the user" },
+          }),
+        );
         break;
       case "key_not_exported":
         this.keyExported = false;
@@ -376,7 +476,7 @@ export class World {
           "index.json.blob",
         ],
         encrypted: true,
-        verified: s.ms < now - 3 * DAY ? "ok" : null,
+        verified: this.damagedPaths.includes(`host/desktop/${iso(s.ms)}`) ? "failed" : s.ms < now - 3 * DAY ? "ok" : null,
         protected: false,
         comment: null,
       }));
@@ -396,7 +496,10 @@ export class World {
   /** Advance the simulated run to the current time. */
   tick(now = Date.now()) {
     for (const job of this.restores.values()) {
-      if (job.restore.state === "running" && now - job.startedMs > 4_000) {
+      if (job.restore.state !== "running") continue;
+      const el = now - job.startedMs;
+      job.restore.restored_bytes = Math.round(Math.min(1, el / 4_000) * job.totalBytes);
+      if (el > 4_000) {
         job.restore.state = "succeeded";
         job.restore.finished_at = iso(now);
       }
@@ -405,6 +508,10 @@ export class World {
     if (!a) return;
     const el = now - a.startedMs;
     const run = a.run;
+    if (a.cancelAtMs !== undefined && now - a.cancelAtMs > 1_200) {
+      this.finish(now, makeRun(a.startedMs, "cancelled", { trigger: run.trigger, duration: Math.round(el / 1000), error: { kind: "cancelled", message: "cancelled by the user" } }));
+      return;
+    }
     if (a.outcome === "config") {
       if (el > 1_500) this.finish(now, makeRun(a.startedMs, "failed", { trigger: run.trigger, duration: 1, error: { kind: "config", message: "encryption key export not confirmed: run `sudo nestegg key confirm-exported`" } }));
       else run.state = "starting";
@@ -424,14 +531,18 @@ export class World {
     else if (el < 8_000) run.state = "inventory";
     else if (el < 18_000) {
       run.state = "uploading";
-      run.uploaded_bytes = Math.round(((el - 8_000) / 10_000) * total);
+      const progress = (el - 8_000) / 10_000;
+      run.uploaded_bytes = Math.round(progress * total);
+      // Archive sizes are only known after each archive: the estimate moves in steps.
+      run.expected_bytes = 412 * GB;
+      run.processed_bytes = Math.round((Math.floor(progress * 5) / 5) * 412 * GB);
     } else if (el < 20_000) {
       run.state = "finishing";
       run.uploaded_bytes = total;
     } else {
       this.reachable = true;
       this.checkedMs = a.startedMs + 5_000;
-      this.finish(now, makeRun(a.startedMs, "succeeded", { trigger: run.trigger, duration: Math.round(el / 1000), uploaded: total }));
+      this.finish(now, makeRun(a.startedMs, "succeeded", { trigger: run.trigger, duration: Math.round(el / 1000), uploaded: total, verified: true }));
     }
   }
 
@@ -451,6 +562,7 @@ export class World {
   private strip(r: StoredRun | null): Run | null {
     if (!r) return null;
     const { log_tail: _, ...rest } = r;
+    if (this.faults.has("unverified")) delete rest.verified;
     return rest;
   }
 
@@ -464,6 +576,7 @@ export class World {
     else if (!success) health = "never";
     else if (last?.state === "failed") health = "failing";
     else if (now - new Date(success.finished_at ?? success.started_at).getTime() > overdueH * HOUR) health = "overdue";
+    else if (success.incomplete?.length) health = "incomplete";
     else health = "ok";
     const nextRun = (() => {
       if (!this.configured || this.active) return null;
@@ -499,9 +612,10 @@ export class World {
       overdue_after_hours: overdueH,
       encryption: {
         enabled: true,
-        key_fingerprint: this.configured ? "<FINGERPRINT>" : null, // placeholder, see AGENTS.md
+        key_fingerprint: this.configured && this.keyCreated ? "<FINGERPRINT>" : null, // placeholder, see AGENTS.md
         key_exported: this.keyExported,
       },
+      ...(this.damagedPaths.length ? { server_verify_failed: [...this.damagedPaths] } : {}),
     };
   }
 
@@ -626,7 +740,7 @@ export class World {
       // This PC is part of the PBS listing too; the UI filters it out.
       { backup_id: "desktop", hostname: "desktop", last_snapshot: this.snapshots[0]?.time ?? null },
     ];
-    return { machines, read_at: iso(Math.min(now, localAt(now, 0, 7, 20) < now ? localAt(now, 0, 7, 20) : now - 10 * 60_000)) };
+    return { complete: true, machines, read_at: iso(Math.min(now, localAt(now, 0, 7, 20) < now ? localAt(now, 0, 7, 20) : now - 10 * 60_000)) };
   }
 
   // ---------------------------------------------------------------- request handling
@@ -678,6 +792,57 @@ export class World {
       if (!run) return err(404, "not_found", "unknown run");
       return { status: 200, body: run satisfies RunDetail };
     }
+    if (method === "POST" && (m = /^\/runs\/([^/]+)\/cancel$/.exec(path))) {
+      const a = this.active;
+      if (!a || a.run.id !== decodeURIComponent(m[1]!)) return err(404, "not_found", "no running backup with this ID");
+      const el = now - a.startedMs;
+      // Still starting (retry) or already finishing: the daemon cannot stop it cleanly.
+      if (this.faults.has("cancel_late") || el < 1_500 || el >= 18_000)
+        return err(409, "cannot_cancel", el < 1_500 ? "the backup is still starting; try again in a moment" : "the backup is already finishing");
+      a.cancelAtMs ??= now;
+      return { status: 202, body: { cancelling: true } };
+    }
+    if (route === "GET /pbs") {
+      if (!this.configured) return notConfigured();
+      if (today) return err(404, "not_found", "unknown endpoint");
+      const info: PbsInfo = {
+        server: "pbs.example.com:8007",
+        datastore: "backups",
+        namespace: "desktops",
+        reachable: this.reachable === true,
+        used_bytes: this.faults.has("no_usage") ? null : 1_240 * GB,
+        total_bytes: this.faults.has("no_usage") ? null : 4_000 * GB,
+        overview_configured: true,
+      };
+      return { status: 200, body: info };
+    }
+    if (route === "POST /pbs/check") {
+      if (!this.configured) return notConfigured();
+      if (today) return err(404, "not_found", "unknown endpoint");
+      const delayMs = this.faults.has("check_slow") || query.get("wake") === "true" ? 6_000 : undefined;
+      if (this.faults.has("check_down") || this.reachable === false) {
+        return { ...err(503, "pbs_unreachable", "pbs.example.com:8007 did not answer (connection timed out)"), delayMs };
+      }
+      const bad = this.faults.has("check_bad");
+      const body: PbsCheckResult = {
+        checked_at: iso(now + (delayMs ?? 0)),
+        checks: [
+          { name: "configuration", ok: true, detail: "/etc/nestegg/config.toml loaded" },
+          { name: "backup client", ok: true, detail: "proxmox-backup-client 3.4.1" },
+          { name: "stored secrets", ok: true, detail: "token secret and key can be decrypted" },
+          { name: "sources", ok: true, detail: "all 4 folders exist" },
+          { name: "PBS reachable", ok: true, detail: "pbs.example.com:8007 answered in 12 ms" },
+          bad
+            ? { name: "PBS login", ok: false, detail: "authentication failed: 401 invalid credentials for backup@pbs!desktop" }
+            : { name: "PBS login", ok: true, detail: "authenticated as backup@pbs!desktop; datastore backups is readable" },
+        ],
+      };
+      if (!bad) {
+        this.reachable = true;
+        this.checkedMs = now + (delayMs ?? 0);
+      }
+      return { status: 200, body, delayMs };
+    }
     if (route === "GET /snapshots") {
       if (!this.configured) return notConfigured();
       if (this.reachable === false) return err(503, "pbs_unreachable", "PBS is not reachable");
@@ -695,14 +860,28 @@ export class World {
     if (route === "POST /restores") {
       if (today) return err(501, "not_implemented", "planned for v0.2");
       const req = body as Partial<RestoreRequest> | null;
-      if (!req || !req.snapshot_time || !req.archive || !Array.isArray(req.paths) || !req.target_dir)
-        return err(400, "bad_request", "snapshot_time, archive, paths and target_dir are required");
+      const many = Array.isArray(req?.archives) && req.archives.length > 0;
+      if (!req || !req.snapshot_time || !req.target_dir || (!many && (!req.archive || !Array.isArray(req.paths))))
+        return err(400, "bad_request", "snapshot_time, archive (or archives), paths and target_dir are required");
+      if (many && new Set(req.archives!.map((a) => a.archive)).size !== req.archives!.length)
+        return err(400, "bad_request", "an archive may be listed only once");
       if (!req.target_dir.startsWith("/")) return err(400, "bad_request", "target_dir must be an absolute path");
       if (EXISTING_TARGETS.includes(req.target_dir.replace(/\/$/, "")))
         return err(409, "target_exists", `target directory ${req.target_dir} already exists`);
       const id = `restore-${this.restores.size + 1}`;
-      const restore: Restore = { id, state: "running", target_dir: req.target_dir, started_at: iso(now), finished_at: null, error: null };
-      this.restores.set(id, { restore, startedMs: now });
+      const totalBytes = (many ? req.archives!.length : 1) * 3.2 * GB;
+      const restore: Restore = {
+        id,
+        state: "running",
+        target_dir: req.target_dir,
+        started_at: iso(now),
+        finished_at: null,
+        error: null,
+        restored_bytes: 0,
+        total_bytes: (req.paths?.length ?? 1) === 0 || many ? Math.round(totalBytes) : null,
+        warnings: [],
+      };
+      this.restores.set(id, { restore, startedMs: now, totalBytes });
       return { status: 202, body: restore };
     }
     if (method === "GET" && (m = /^\/restores\/([^/]+)$/.exec(path))) {

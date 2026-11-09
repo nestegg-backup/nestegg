@@ -6,14 +6,34 @@ local API described in [`../api/openapi.yaml`](../api/openapi.yaml).
 
 ## Scope
 
-- **v0.1/v0.2 – single machine:** dashboard (health, last success, next run,
-  current run with live state), "back up now", run history with details and
-  log tail, snapshot list, settings (a few editable, decision 0013), encryption key
-  status with a clear warning while the key has not been exported.
-- **v0.2 – restore:** browse a snapshot, select files/folders, restore into a
-  new directory (endpoints `/snapshots/{time}/browse`, `/restores`).
-- **v0.3 – overview of several machines:** same UI, additional view fed by a
-  read-only PBS connection (API to be specified).
+- **Single machine:** dashboard (health, last success, next run, current run
+  with live state and a cancel action), "back up now", run history with
+  details and log tail, snapshot list, settings (a few editable, decision
+  0013).
+- **States of a backup:** besides ok, running, overdue, failing and never
+  there is "backed up, but incomplete" (`health = incomplete`, attention
+  colour, the reasons are listed; also per run in the history and as an
+  amber day in the 14-day strip), runs that were read back from the server
+  (`verified`, shown once in "About this computer", not per row), the error
+  `verification_failed` with its own explanation, cancelled runs, and damaged
+  snapshots (`server_verify_failed` and `Snapshot.verified = failed`: a notice
+  on the page of this PC, a red ring on the day, and a mark in the restore
+  picker, which preselects the newest undamaged snapshot).
+- **Setup and key guide:** a step list derived from `/status` (set up ->
+  create the key -> store the key outside this PC and confirm -> first
+  backup). Everything happens in a terminal as root; the page never asks
+  for a password, token secret or key. It composes the `nestegg init`
+  command from server, datastore, namespace and token ID (not the secret)
+  and moves on by itself while `/status` is polled.
+- **Server view:** "Check connection" (`POST /pbs/check`, with Wake-on-LAN it
+  may take minutes: waiting state, then the list of checks and the time),
+  datastore usage from `GET /pbs` when the daemon knows it.
+- **Restore:** browse a snapshot, select files/folders in one or several
+  areas (several `archives` go into one subfolder each), restore into a new
+  directory with progress in bytes (`/snapshots/{time}/browse`,
+  `/restores`).
+- **Overview of several machines:** same UI, a list fed by a read-only PBS
+  connection (`/machines`).
 
 Read [`../docs/architecture.md`](../docs/architecture.md) and decision
 records `docs/decisions/0003-*.md` first. The look and layout follow
@@ -49,6 +69,11 @@ status bar, settings in the pane), which replaces most of 0005.
    language follows the browser (`navigator.languages`: German if the first
    entry starts with `de`, English otherwise). All strings live in
    `src/i18n/de.ts` and `src/i18n/en.ts` with identical keys.
+8. **No secrets in the browser.** Setup and the key export happen in a
+   terminal as root. The page never asks for a password, a token secret or a
+   key; the setup guide only asks for values that are not secret (server,
+   datastore, namespace, token ID), keeps them in memory and writes them into
+   a command to copy.
 
 ## Development
 
@@ -69,8 +94,7 @@ npm run licenses     # licence check of all installed packages
 
 `npm run dev` serves `/api/v1/*` from a mock (`mock/world.ts`, a Vite
 dev-server middleware; it is not part of the build). It answers the
-endpoints of `api/openapi.yaml` plus the proposals in `API-REQUESTS.md`,
-with placeholder data only.
+endpoints of `api/openapi.yaml` with placeholder data only.
 
 Like `nestegg ui`, the mock answers `/api/` only with
 `Authorization: Bearer <token>` and returns 401 otherwise. The page takes the
@@ -96,6 +120,11 @@ and resets it:
 | `pbs_unreachable` | last attempts did not reach the server, still within the threshold |
 | `key_not_exported` | backups blocked until the key export is confirmed |
 | `credentials_unreadable` | last run failed because the stored secrets no longer decrypt (new mainboard) |
+| `incomplete` | `health = incomplete`: the last three backups left out the root file system and an optional folder |
+| `verification_failed` | last run failed with `verification_failed` (the upload worked, reading it back did not) |
+| `damaged` | the server's own check named two damaged snapshots (`server_verify_failed`, `verified = failed` in the list) |
+| `no_key` | set up, but `nestegg key create` has not run yet (setup guide at the key step) |
+| `cancelled` | the last run was cancelled by the user |
 | `daemon_down` | every call answers 502, like `nestegg ui` without the daemon |
 | `unauthorized` | every call answers 401 |
 
@@ -110,18 +139,27 @@ Add faults to any scenario with `&fault=a,b`:
 | `no_run_details` | `/status` leaves out `last_run` and `last_success` (allowed by the contract) |
 | `no_wake` | no `[wake]` section: Wake-on-LAN cannot be switched on (`PATCH` answers 400) |
 | `timer_fails` | switching automatic backups answers 500, nothing changes |
+| `unverified` | runs carry no `verified` flag (records of older versions) |
+| `cancel_late` | cancelling a running backup answers `409 cannot_cancel` |
+| `check_slow` | `POST /pbs/check` takes 6 s (it does so anyway with `wake=true`, like a PBS that has to wake up) |
+| `check_bad` | the connection check finds a problem (login refused) |
+| `check_down` | the connection check answers `503 pbs_unreachable` |
+| `no_usage` | `GET /pbs` does not know the datastore usage |
 
 `down` can also be switched while the page is open:
 `curl -X POST 'http://127.0.0.1:5173/__mock/fault?down=1'` (and `down=0`); it
 applies to the current scenario.
 
-Add `&daemon=today` to get only what the daemon offers today: no
-`/machines` and `/session` (404), browse and restore answer 501.
+Add `&daemon=today` to get what an older daemon offers: no `/machines`,
+`/session`, `/pbs` and `/pbs/check` (404), browse and restore answer 501.
 
 "Back up now" in the mock runs through all phases in about 20 s; in
-`pbs_unreachable` and `overdue` it ends with "server not reachable".
+`pbs_unreachable` and `overdue` it ends with "server not reachable". While
+it uploads, "Cancel backup" works (`409` in the first seconds and in the last
+two, otherwise the run ends as `cancelled` after about a second).
 Restoring into `/home/alice/Dokumente` (or another existing folder of the
-mock) answers `409 target_exists`.
+mock) answers `409 target_exists`. A restore takes about 4 s and reports
+`restored_bytes` and `total_bytes` while it runs.
 `PATCH /config` changes the settings of the current scenario like the daemon
 (same validation, `src/lib/settings.ts`); later `/config` and `/status` calls
 show the new values. Reloading with `?scenario=` resets them.
@@ -153,18 +191,19 @@ The page comes from the dev server, API calls go to the daemon socket with
 | Path | Content |
 |---|---|
 | `src/App.svelte` | Layout (title bar, sidebar, pane, status bar; two screens below 760 px) and hash routing |
-| `src/components/` | Title bar, sidebar, status bar and the views: this PC, other PCs, server, settings, restore flow |
+| `src/components/` | Title bar, sidebar, status bar and the views: this PC, other PCs, server, settings, restore flow; `SetupGuide` (setup and key steps) and `CancelRun` |
 | `public/theme.js` | Applies the stored theme choice before the first paint (same-origin script; the CSP forbids inline scripts) |
 | `src/lib/theme.ts` | Theme choice System / Hell / Dunkel, kept in localStorage |
 | `src/lib/settings.ts`, `src/lib/settingsForm.ts` | Settings rules (same as the daemon) and the texts and helpers of the settings page |
 | `src/lib/session.ts` | Session token: taken from `#token=`, kept in `sessionStorage`, removed from the address bar |
 | `src/lib/api.ts` | API client (relative URLs, `Authorization: Bearer` header) |
-| `src/lib/derive.ts`, `src/lib/text.ts` | State derivation and status sentences (unit-tested) |
+| `src/lib/store.svelte.ts` | Polling of `/status`; state of the cancel action and of the connection check |
+| `src/lib/derive.ts`, `src/lib/text.ts` | State derivation (including the setup guide step and the `nestegg init` command) and status sentences (unit-tested) |
 | `src/lib/format.ts` | Date, size and duration formatting |
 | `src/i18n/` | German and English strings |
 | `src/styles/tokens.css` | Colour tokens, dark and light (by system preference or by choice) |
 | `mock/` | Dev-server mock of the API |
-| `tests/` | Vitest: derivation, formatting, i18n key parity, contrast (WCAG AA, both themes), theme, settings, mock |
+| `tests/` | Vitest: derivation, the new states and the guide, formatting, i18n key parity, contrast (WCAG AA, both themes), theme, settings, restore, mock |
 
 ## Working agreement between agents
 

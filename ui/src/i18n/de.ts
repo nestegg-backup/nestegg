@@ -103,6 +103,14 @@ const de = {
     running: "Sichert gerade",
     unconfigured: "Noch nicht eingerichtet",
     keyMissing: "Schlüsselkopie nicht bestätigt",
+    keyCreate: "Schlüssel fehlt noch",
+    incompleteUndated: "Gesichert, unvollständig",
+    incomplete: (m: Moment, dayMonth: string) =>
+      m.rel === "today"
+        ? `Heute ${m.time} gesichert, unvollständig`
+        : m.rel === "yesterday"
+          ? `Gestern ${m.time} gesichert, unvollständig`
+          : `${dayMonth} ${m.time} gesichert, unvollständig`,
     failing: (day: string) => `Fehlgeschlagen am ${day}`,
     failingUndated: "Letzte Sicherung fehlgeschlagen",
     overdue: (day: string) => `Überfällig, zuletzt ${day}`,
@@ -126,7 +134,7 @@ const de = {
     runStartFailed: (msg: string) => `Die Sicherung ließ sich nicht starten. ${msg}`,
     unconfiguredLead: "nestegg ist auf diesem PC noch nicht eingerichtet.",
     unconfiguredText:
-      "Eingerichtet wird im Terminal. Welche Angaben dafür nötig sind (Server, Datastore, Zugang), zeigt dieser Befehl. Danach steht hier, wann zuletzt gesichert wurde.",
+      "Eingerichtet wird im Terminal. Unten steht Schritt für Schritt, was du eingibst; die Seite geht von selbst weiter, sobald ein Schritt geschafft ist.",
     keyLead: "Sicherungen warten auf die Bestätigung der Schlüsselkopie.",
     keyText:
       "nestegg sichert diesen PC erst, wenn du bestätigt hast, dass eine Kopie des Schlüssels außerhalb des PCs liegt. Das dauert ein paar Minuten im Terminal, siehe unten.",
@@ -171,6 +179,7 @@ const de = {
     stepUpload: "Geänderte Dateien hochladen",
     stepUploadSub: (size: string) => `${size} hochgeladen`,
     stepUploadCheck: "Dateien werden verglichen",
+    stepUploadProgress: (done: string, total: string) => `${done} von ${total} durchgesehen (Größe der letzten Sicherung)`,
     stepFinish: "Abschließen",
     stepFinishSub: "Bericht an den Server senden",
     factsTitle: "Über diesen PC",
@@ -190,18 +199,93 @@ const de = {
     encryptionOnKey: "Eingeschaltet. Eine Kopie des Schlüssels ist bestätigt.",
     encryptionOnNoKey: "Eingeschaltet. Eine Kopie des Schlüssels ist noch nicht bestätigt.",
     encryptionOff: "Ausgeschaltet. Die Sicherungen liegen unverschlüsselt auf dem Server.",
+    incompleteLead: (m: Moment) => `${cap(at(m))} gesichert, aber nicht vollständig.`,
+    incompleteLeadUndated: "Gesichert, aber nicht vollständig.",
+    incompleteText: "Die Sicherung hat funktioniert, enthält aber nicht alles, was eingestellt ist. Was fehlt, steht unten.",
+    incompleteTitle: "Was in der letzten Sicherung fehlt",
+    incompleteNote: "Die Gründe meldet nestegg auf Englisch.",
+    keyCreateLead: "Es gibt noch keinen Schlüssel für die Sicherungen.",
+    keyCreateText:
+      "nestegg verschlüsselt die Sicherungen, bevor sie diesen PC verlassen. Dafür braucht es einen Schlüssel, den du unten anlegst. Gesichert wird erst danach.",
+    lastCancelled: (m: Moment) => `Die letzte Sicherung wurde ${at(m)} abgebrochen.`,
+    neverCancelled: (m: Moment) => `Der letzte Versuch ${at(m)} wurde abgebrochen.`,
+    cancel: "Sicherung abbrechen",
+    cancelAsk: "Die Sicherung wirklich abbrechen?",
+    cancelAskText: "Schon hochgeladene Daten gehen nicht verloren; die nächste Sicherung kann darauf aufbauen.",
+    cancelYes: "Ja, abbrechen",
+    cancelNo: "Weiter sichern",
+    cancelling: "Wird abgebrochen …",
+    cancelCannot:
+      "Das geht gerade nicht: Die Sicherung startet noch oder schließt schon ab. Versuch es in ein paar Sekunden noch einmal.",
+    cancelGone: "Diese Sicherung läuft nicht mehr.",
+    cancelFailed: (msg: string) => `Das Abbrechen hat nicht geklappt. ${msg}`,
+    factInterval: "Rhythmus",
+    factVerified: "Kontrolle",
+    verifiedYes: "Nach dem Hochladen vom Server zurückgelesen und geprüft",
+    damagedTitle: "Der Server hat beschädigte Sicherungen gefunden",
+    damagedText: (n: number) =>
+      `Bei seiner eigenen Prüfung hat der Backup-Server ${n === 1 ? "einen Stand" : `${n} Stände`} dieses PCs als beschädigt gemeldet:`,
+    damagedDay: (day: string, time: string) => `Stand vom ${day}, ${time}`,
+    damagedMore:
+      "Neuere und andere Sicherungen sind davon nicht betroffen. Beim Wiederherstellen sind die beschädigten Stände markiert; nimm dann einen anderen. Starte am besten eine neue Sicherung. Meldet der Server das wieder, lohnt ein Blick auf seine Platten und den freien Platz.",
+  },
+  guide: {
+    title: "Die nächsten Schritte",
+    stepsLabel: "Schritte bis zur ersten Sicherung",
+    done: "erledigt",
+    now: "jetzt dran",
+    later: "danach",
+    setup: "Mit dem Backup-Server verbinden",
+    keyCreate: "Schlüssel anlegen",
+    keyStore: "Schlüssel sicher aufbewahren",
+    firstBackup: "Erste Sicherung",
+    moveOn: "Sobald ein Schritt geschafft ist, geht diese Seite von selbst zum nächsten.",
+    terminal: "Die Befehle tippst du im Terminal ein. Mit dem Knopf neben dem Befehl kopierst du ihn.",
+    setupIntro:
+      "nestegg braucht drei Angaben vom Backup-Server: seine Adresse, den Datastore (der Speicherplatz dort) und ein API-Token, also einen Zugangsschlüssel nur für diesen PC. Das Geheimnis des Tokens tippst du nie hier auf der Seite ein, sondern nur im Terminal.",
+    setupClient:
+      "Außerdem muss das Programm proxmox-backup-client installiert sein. Wie das geht, steht in der Dokumentation (docs/configuration.md, Abschnitt „Installing the backup client“).",
+    server: "Adresse des Backup-Servers",
+    serverPlaceholder: "pbs.example.com:8007",
+    datastore: "Datastore",
+    datastorePlaceholder: "backups",
+    namespace: "Namespace (kann leer bleiben)",
+    namespacePlaceholder: "desktops",
+    authId: "Token-ID",
+    authIdHint: "Aufbau: benutzer@bereich!tokenname. Nur die ID, nicht das Secret.",
+    authIdPlaceholder: "backup@pbs!desktop",
+    fieldsNote: "Diese Angaben bleiben auf dieser Seite und werden nirgends gespeichert. Sie machen nur den Befehl unten fertig.",
+    commandsIntro: "Dann im Terminal, nacheinander:",
+    cmdInit: "Legt die Einrichtung an.",
+    cmdPassword: "Fragt nach dem Secret des Tokens. Die Eingabe bleibt unsichtbar.",
+    cmdCheck: "Prüft, ob Server, Zugang und Backup-Programm in Ordnung sind.",
+    cmdEnable: "Startet nestegg und die automatische Sicherung.",
+    cmdGroup: "Erlaubt deinem Benutzer, diese Oberfläche zu nutzen. Danach einmal ab- und wieder anmelden.",
+    fingerprint:
+      "Benutzt der Server ein selbst erzeugtes Zertifikat, hängst du an den ersten Befehl noch --fingerprint <SHA-256> an. Den Wert zeigt der Server im Dashboard unter „Fingerprint anzeigen“.",
+    keyCreateWhy:
+      "Die Sicherungen werden auf diesem PC verschlüsselt, bevor sie zum Server gehen. Den Schlüssel dafür legst du jetzt an.",
+    keyCreateImport:
+      "Hast du schon einen Schlüssel von früher, zum Beispiel nach einer Neuinstallation, legst du keinen neuen an, sondern holst den alten zurück: sudo nestegg key import <Schlüsseldatei>. Sonst lassen sich die älteren Sicherungen nicht öffnen.",
+    keyStoreWhy:
+      "Ohne diesen Schlüssel kann niemand die Sicherungen öffnen, auch du nicht, wenn der PC kaputtgeht. Darum muss eine Kopie außerhalb dieses PCs liegen. Eine Kopie, die nur auf diesem PC liegt, zählt nicht. Es gibt zwei Wege, einer genügt. Gesichert wird erst, wenn du die Kopie bestätigt hast.",
+    usbTitle: "Auf einen USB-Stick",
+    usbText:
+      "Schreibe den Schlüssel auf einen USB-Stick und bewahre den Stick an einem anderen Ort auf als den PC. Ersetze <stick> durch den Namen deines Sticks.",
+    usbConfirm: "Danach bestätigst du, dass die Datei auf dem Stick liegt:",
+    paperTitle: "Auf Papier",
+    paperText:
+      "Erzeugt eine Seite zum Ausdrucken. Darauf stehen der Schlüssel als QR-Code und ein kurzer Prüfcode. Lege den Ausdruck sicher ab, nicht neben dem PC.",
+    paperConfirm: "Danach bestätigst du mit dem Prüfcode, der auf der Seite steht. Ersetze <CODE> dadurch:",
+    firstBackupText:
+      "Alles ist vorbereitet. Klicke oben auf „Jetzt sichern“. Beim ersten Mal wird alles hochgeladen, das kann lange dauern. Du kannst die Seite währenddessen schließen.",
   },
   key: {
-    title: "Eine Kopie des Schlüssels ist noch nicht bestätigt",
-    text:
-      "Die Sicherungen dieses PCs werden verschlüsselt. Bisher ist nicht bestätigt, dass es eine Kopie des Schlüssels außerhalb dieses PCs gibt. Falls es keine gibt, ließen sich die Sicherungen nach einem Defekt des PCs nicht mehr öffnen. Deshalb sichert nestegg erst, wenn du eine Kopie bestätigt hast.",
-    steps: "Im Terminal, nacheinander:",
-    paperkey: "Schlüssel als Papierkopie ausgeben, ausdrucken und sicher aufbewahren.",
-    confirm: "Danach bestätigen, dass die Kopie sicher liegt.",
     otherTitle: "Keine Kopie des Schlüssels bestätigt",
     otherText: (name: string) =>
       `Die Sicherungen dieses PCs sind verschlüsselt. Für ${name} ist keine Kopie des Schlüssels außerhalb des PCs bestätigt. Falls es keine gibt, ließen sich seine Sicherungen nach einem Defekt von ${name} nicht mehr öffnen.`,
-    otherFix: (name: string) => `Das lässt sich nur an ${name} selbst beheben, mit diesen Befehlen im Terminal:`,
+    otherFix: (name: string) =>
+      `Das lässt sich nur an ${name} selbst beheben. Öffne dort nestegg im Browser: Die Seite führt Schritt für Schritt durch das Sichern des Schlüssels.`,
   },
   strip: {
     title: "Letzte 14 Tage",
@@ -210,6 +294,8 @@ const de = {
     pbs: "Server nicht erreichbar",
     none: "Keine Sicherung",
     run: "Läuft gerade",
+    incomplete: "Unvollständig gesichert",
+    damaged: "Beschädigt auf dem Server",
   },
   runs: {
     succeeded: "Gesichert",
@@ -219,6 +305,8 @@ const de = {
     pbs: "Server nicht erreichbar",
     pbsTimes: (n: number) => `Server nicht erreichbar, ${n} Versuche`,
     cancelled: "Abgebrochen",
+    succeededIncomplete: "Gesichert, aber unvollständig",
+    incompleteReasons: "Was fehlt",
     title: "Verlauf",
     colDay: "Tag",
     colStart: "Start",
@@ -245,6 +333,8 @@ const de = {
     already_running: "lief schon",
     config: "Einrichtung unvollständig",
     credentials_unreadable: "Zugangsdaten nicht lesbar",
+    verification_failed: "Kontrolle nach dem Hochladen fehlgeschlagen",
+    cancelled: "abgebrochen",
     internal: "interner Fehler",
   } satisfies Record<RunErrorKind, string>,
   explain: {
@@ -263,6 +353,9 @@ const de = {
       "Die Einrichtung ist unvollständig. Was fehlt, steht im Protokoll; sudo nestegg check zeigt es ebenfalls.",
     credentials_unreadable:
       "Dieser PC kann das gespeicherte Token-Secret oder den Schlüssel nicht mehr entschlüsseln, zum Beispiel nach einem Mainboard-Tausch oder einer Wiederherstellung auf anderer Hardware. Neu hinterlegen mit sudo nestegg credentials set-password und sudo nestegg key import mit der exportierten Schlüsseldatei.",
+    verification_failed:
+      "Die Sicherung wurde hochgeladen, aber beim anschließenden Gegenlesen vom Server kam etwas anderes zurück als abgeschickt wurde oder gar nichts. Deshalb gilt sie nicht als gelungen. Starte die Sicherung noch einmal. Wiederholt sich der Fehler, prüfe den Backup-Server: freier Platz, Platten, Netzwerk.",
+    cancelled: "Die Sicherung wurde abgebrochen. Schon hochgeladene Daten gehen nicht verloren.",
     internal: "In nestegg selbst ist ein Fehler aufgetreten. Was genau passiert ist, steht im Protokoll.",
   } satisfies Record<RunErrorKind, string>,
   other: {
@@ -310,6 +403,24 @@ const de = {
     off: "Ausgeschaltet",
     retention: "Aufbewahrung",
     retentionText: "Wird auf dem Server eingestellt.",
+    usage: "Belegt",
+    usageOf: (used: string, total: string) => `${used} von ${total}`,
+    check: "Verbindung prüfen",
+    checking: "Wird geprüft …",
+    checkingText: "nestegg prüft, ob der Backup-Server antwortet und der Zugang passt.",
+    checkingWake:
+      "Der Backup-Server wird bei Bedarf geweckt (Wake-on-LAN). Das kann ein paar Minuten dauern. Du kannst die Seite verlassen, das Ergebnis steht danach hier.",
+    checkTitle: "Ergebnis der Prüfung",
+    checkedAt: (m: Moment) => `Geprüft ${at(m)}.`,
+    checkAllOk: "Alles in Ordnung.",
+    checkProblems: (n: number) => `${n} ${plural(n, "Punkt hat", "Punkte haben")} ein Problem.`,
+    checkNames: "Die Bezeichnungen und Meldungen kommen vom Programm und sind auf Englisch.",
+    checkOkLabel: "in Ordnung",
+    checkBadLabel: "Problem",
+    checkPbs: "Der Backup-Server hat nicht geantwortet.",
+    checkPbsWol:
+      "Wake-on-LAN ist eingeschaltet, nestegg hat also versucht, ihn zu wecken. Versuch es später noch einmal.",
+    checkFailed: (msg: string) => `Die Prüfung ließ sich nicht ausführen. ${msg}`,
   },
   settings: {
     title: "Einstellungen",
@@ -317,7 +428,8 @@ const de = {
     introReadOnly:
       "Diese nestegg-Version zeigt die Einstellungen nur an. Ändern lässt sich das im Terminal mit sudo nestegg init oder in der Datei /etc/nestegg/config.toml.",
     offline: "Ohne Verbindung zum nestegg-Dienst lässt sich gerade nichts ändern.",
-    unconfigured: "Noch nicht eingerichtet. Welche Angaben nötig sind, zeigt dieser Befehl:",
+    unconfigured: "Noch nicht eingerichtet. Wie das geht, steht Schritt für Schritt auf der Seite des PCs.",
+    unconfiguredLink: "Zur Einrichtung",
     schedule: "Zeitplan",
     automatic: "Automatisch sichern",
     automaticOn: "nestegg prüft stündlich, ob eine Sicherung fällig ist, und holt verpasste nach.",
@@ -433,8 +545,12 @@ const de = {
     dirLoading: "Wird geladen …",
     dirEmpty: "Leerer Ordner",
     dirFailed: "Dieser Ordner ließ sich nicht öffnen.",
-    oneArea: (area: string) =>
-      `Eine Wiederherstellung holt Dateien aus einem Bereich. Für ${area} danach eine zweite starten.`,
+    manyAreas: (names: string) => `Jeder Bereich kommt in einen eigenen Unterordner des neuen Ordners (${names}).`,
+    damaged: "beschädigt",
+    damagedSnapshot:
+      "Dieser Stand ist auf dem Server als beschädigt markiert. Dateien daraus lassen sich vielleicht nicht vollständig zurückholen. Nimm lieber einen anderen Stand.",
+    progress: (done: string, total: string) => `${done} von ${total} zurückgeholt`,
+    progressDone: (done: string) => `${done} zurückgeholt`,
     nothingSelected: "Noch nichts ausgewählt",
     selected: (n: number, size: string | null) =>
       `${n} ${plural(n, "Element", "Elemente")} ausgewählt${size ? `, zusammen ${size}` : ""}`,

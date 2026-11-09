@@ -33,7 +33,7 @@
   // This PC: the same days as the boxes on its page, only once the history is loaded.
   const selfCells = $derived(
     status && status.health !== "unconfigured" && app.runs.state === "ok"
-      ? selfStrip(app.runs.value, status.current_run, app.snapshots.list, app.now, f)
+      ? selfStrip(app.runs.value, status.current_run, app.snapshots.list, app.now, f, status.server_verify_failed ?? [])
       : null,
   );
   // Other PCs: snapshot days from /machines. No strip without a current answer.

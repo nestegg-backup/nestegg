@@ -1,7 +1,7 @@
 // Types of the local API, see ../../api/openapi.yaml (single source of truth).
 // Fields the contract marks as optional are optional here; unknown fields are ignored.
 
-export type Health = "ok" | "running" | "overdue" | "failing" | "never" | "unconfigured";
+export type Health = "ok" | "running" | "overdue" | "failing" | "incomplete" | "never" | "unconfigured";
 
 export type RunState =
   | "starting"
@@ -23,6 +23,8 @@ export type RunErrorKind =
   | "already_running"
   | "config"
   | "credentials_unreadable"
+  | "verification_failed"
+  | "cancelled"
   | "internal";
 
 export interface RunError {
@@ -46,7 +48,18 @@ export interface Run {
   snapshot?: string | null;
   archives?: Archive[];
   uploaded_bytes?: number | null;
+  /** Total archive size of the last successful run (progress estimate). */
+  expected_bytes?: number | null;
+  /** Total size of the archives finished so far in this run. */
+  processed_bytes?: number | null;
   warnings?: string[];
+  /**
+   * Why this backup does not contain everything the configuration asks for
+   * (English text; every entry is also in `warnings`). Empty or absent for a complete backup.
+   */
+  incomplete?: string[];
+  /** The snapshot was read back from the server after the upload. Absent in records of older versions. */
+  verified?: boolean;
   error?: RunError | null;
 }
 
@@ -72,6 +85,8 @@ export interface Status {
   health: Health;
   overdue_after_hours?: number;
   encryption: { enabled: boolean; key_fingerprint?: string | null; key_exported?: boolean };
+  /** Snapshots of this machine (`host/desktop/2026-11-08T21:30:12Z`) that the server's own check marked as failed. */
+  server_verify_failed?: string[];
 }
 
 export interface Snapshot {
@@ -92,10 +107,12 @@ export interface DirEntry {
   modified?: string | null;
 }
 
+/** Either `archive` (+ `paths`) or `archives` (takes precedence; each goes into its own subfolder). */
 export interface RestoreRequest {
   snapshot_time: string;
-  archive: string;
-  paths: string[];
+  archive?: string;
+  paths?: string[];
+  archives?: { archive: string; paths: string[] }[];
   target_dir: string;
 }
 
@@ -106,6 +123,11 @@ export interface Restore {
   started_at?: string;
   finished_at?: string | null;
   error?: string | null;
+  /** Bytes restored so far (staging copy). */
+  restored_bytes?: number;
+  /** Expected total when whole archives are restored. */
+  total_bytes?: number | null;
+  warnings?: string[];
 }
 
 export interface ConfigView {
@@ -147,14 +169,30 @@ export interface SettingsLimits {
   excludes: { max_items: number; max_length: number };
 }
 
+/** `GET /api/v1/pbs`: facts about the backup server. */
+export interface PbsInfo {
+  server: string;
+  datastore: string;
+  namespace?: string | null;
+  reachable: boolean;
+  /** Needs read access to the datastore status; null otherwise. */
+  used_bytes?: number | null;
+  total_bytes?: number | null;
+  overview_configured: boolean;
+}
+
+/** Result of `POST /api/v1/pbs/check`. */
+export interface PbsCheckResult {
+  checked_at: string;
+  checks: { name: string; ok: boolean; detail: string }[];
+}
+
 export interface HealthInfo {
   version: string;
   api_version: string;
 }
 
-// ---- Proposed endpoints (see ../API-REQUESTS.md); not in the contract yet. ----
-
-/** Proposed `GET /api/v1/machines`: other machines of the household, read from the PBS. */
+/** `GET /api/v1/machines`: other machines of the household, read from the PBS. */
 export interface Machine {
   backup_id: string;
   hostname?: string | null;
@@ -180,10 +218,14 @@ export interface MachineReport {
 export interface MachinesResponse {
   machines: Machine[];
   read_at?: string | null;
+  /** false if only this machine's own backups are visible (no overview credentials). */
+  complete?: boolean;
 }
 
-/** Proposed `GET /api/v1/session`: the user that runs `nestegg ui`. */
+/** `GET /api/v1/session`: the user that runs `nestegg ui`. */
 export interface SessionInfo {
   user: string;
   home: string;
+  uid?: number;
+  root?: boolean;
 }
