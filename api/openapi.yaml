@@ -115,8 +115,12 @@ paths:
         "202":
           description: |
             Cancellation requested. The run normally ends with state
-            `cancelled`; if the client had already finished, the run
-            completes as `succeeded`.
+            `cancelled`, and its error message names the caller ("cancel
+            requested by alice (uid 1000)"); the daemon also logs it. If
+            the upload had already finished but the read-back check had
+            not, the run also ends as `cancelled` (the snapshot stays on
+            the server, unverified); after the check it completes as
+            `succeeded`.
           content:
             application/json:
               schema:
@@ -258,7 +262,10 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/DirEntry" }
         "403":
-          description: Outside the caller's home directory.
+          description: |
+            Outside the caller's home directory, or (for non-root callers) a
+            snapshot without backup metadata and without a local run record
+            (decision 0016).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -280,8 +287,10 @@ paths:
         `<target_dir>/<archive name without .pxar>/`; an archive may be
         listed only once. One restore at a time. For non-root callers the
         home directory is mapped onto the archive using the source paths
-        recorded in the snapshot's status report; snapshots without that
-        information can only be restored by root. Paths are matched
+        in the snapshot's metadata blob (`nestegg-meta.conf`) or, for
+        snapshots of older versions, in the local run record of that
+        snapshot; never the snapshot notes (decision 0016). Snapshots
+        with neither can only be restored by root (403 `forbidden`). Paths are matched
         literally (no globbing). Some problems (e.g. no matching files)
         only show up in the job's `error`.
       requestBody:
@@ -725,7 +734,11 @@ components:
                 items: { type: string, format: date-time }
               size_bytes: { type: [integer, "null"] }
               report:
-                description: Status report from the notes of the last snapshot.
+                description: |
+                  Status report from the notes of the last snapshot. For
+                  display only: notes can be changed by anyone with write
+                  access to the backup group and are never used for
+                  permissions (decision 0016).
                 type: [object, "null"]
                 properties:
                   reported_at: { type: string, format: date-time }
@@ -739,3 +752,8 @@ components:
                   nestegg_version: { type: string }
                   uploaded_bytes: { type: [integer, "null"] }
                   duration_seconds: { type: integer }
+                  incomplete:
+                    type: array
+                    description: Why the backup is incomplete (decision 0015); empty or absent if complete.
+                    items: { type: string }
+                  verified: { type: boolean, description: The snapshot was read back after the upload. Absent in reports of older versions. }

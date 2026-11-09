@@ -68,8 +68,11 @@ PERL
 '
 
 echo "== setup with the nestegg CLI"
+# --no-system: the container's overlay root cannot be backed up as
+# system.pxar, so system mode would make every backup "incomplete" (checked
+# separately below).
 on_client nestegg init --server pbs.e2e.test --datastore store1 --namespace desktops \
-  --auth-id 'backup@pbs!desktop' --fingerprint "$fp" --backup-id e2e-desktop >/dev/null
+  --auth-id 'backup@pbs!desktop' --fingerprint "$fp" --backup-id e2e-desktop --no-system >/dev/null
 docker exec -i "$client" nestegg credentials set-password --allow-plain <<<"$token_secret" >/dev/null
 on_client nestegg key create --allow-plain >/dev/null
 check "backup refused while key not exported" \
@@ -239,6 +242,77 @@ check "manual second backup succeeds" on_client nestegg run --trigger manual
 check "timer run is skipped when not due" bash -c "docker exec $client nestegg run --trigger timer 2>&1 | grep -q 'not due'"
 check "four snapshots listed" bash -c "[[ \$(docker exec $client nestegg snapshots --json | grep -c '\"snapshot\"') == 4 ]]"
 
+echo "== complete and verified backups (decision 0015)"
+as_admin() {
+  docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$pbs" \
+    proxmox-backup-client "$@" --ns desktops --repository admin@pbs@127.0.0.1:store1
+}
+last_run_json() { on_client nestegg history --json --limit 1; }
+check "every snapshot has the metadata blob" \
+  bash -c "[[ \$(docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot list --ns desktops --repository admin@pbs@127.0.0.1:store1 --output-format json | grep -o 'nestegg-meta.conf.blob' | wc -l) == 4 ]]"
+check "a normal run is verified" bash -c "docker exec $client nestegg history --json --limit 1 | grep -q '\"verified\": true'"
+check "read-back is in the run log" bash -c "docker exec $client sh -c 'tail -n 30 \$(ls -t /var/lib/nestegg/runs/*.log | head -1)' | grep -q 'read-back: inventory.pxar restored and identical'"
+
+on_client cp /etc/nestegg/config.toml /root/config.toml.saved
+on_client bash -c 'printf "\n[[backup.sources]]\narchive = \"data\"\npath = \"/srv/missing-data\"\noptional = true\n" >> /etc/nestegg/config.toml'
+check "run with a missing optional source succeeds" on_client nestegg run --trigger manual
+status_json="$(on_client nestegg status --json)"
+check "missing optional source: health incomplete" grep -q '"health": "incomplete"' <<<"$status_json"
+check "missing optional source: reason recorded" \
+  grep -q '"optional source /srv/missing-data does not exist, skipped"' <<<"$status_json"
+check "missing optional source: still verified" bash -c "docker exec $client nestegg history --json --limit 1 | grep -q '\"verified\": true'"
+check "status text shows the reason" bash -c "docker exec $client nestegg status | grep -q '^Incomplete: *optional source /srv/missing-data'"
+check "history marks the run as incomplete" \
+  bash -c "docker exec $client nestegg history | head -1 | grep -q '^part .* - incomplete: optional source /srv/missing-data'"
+part_snapshot="$(last_run_json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
+check "snapshot notes report the incomplete backup" \
+  bash -c "docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot notes show '$part_snapshot' --ns desktops --repository admin@pbs@127.0.0.1:store1 | grep -q '\"incomplete\":\[\"optional source /srv/missing-data'"
+on_client cp /root/config.toml.saved /etc/nestegg/config.toml
+
+on_client sed -i 's/^\[backup\]$/[backup]\nsystem = true/' /etc/nestegg/config.toml
+check "system mode without a recreatable root still backs up" on_client nestegg run --trigger manual
+check "skipped full system backup makes it incomplete" \
+  bash -c "docker exec $client nestegg status --json | grep -q '\"health\": \"incomplete\"' && docker exec $client nestegg history --json --limit 1 | grep -q '\"full system backup skipped: the root file system'"
+on_client cp /root/config.toml.saved /etc/nestegg/config.toml
+
+# Read-back failures. A test double around the real client changes what
+# the server seems to return; the comparison code in nestegg is the real one.
+on_client bash -c 'cat > /usr/local/bin/pbc-test-double <<"SH"
+#!/bin/bash
+real=/usr/bin/proxmox-backup-client
+case "$DOUBLE:$1:$2:$3" in
+  stale:restore:*:nestegg-meta.conf)
+    # The server hands out the blob of an older snapshot.
+    shift 2; exec "$real" restore "$STALE_FROM" "$@" ;;
+  missing:snapshot:files:*)
+    # The listing lacks home.pxar.
+    "$real" "$@" | sed "s/home\.pxar\.didx/gone.pxar.didx/g"; exit "${PIPESTATUS[0]}" ;;
+  down:restore:*)
+    echo "Error: error trying to connect: tcp connect error: Connection refused (os error 111)" >&2
+    exit 255 ;;
+esac
+exec "$real" "$@"
+SH
+chmod 755 /usr/local/bin/pbc-test-double'
+stale_from="$(on_client nestegg snapshots --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
+run_with_double() {
+  docker exec -e NESTEGG_PBS_CLIENT=/usr/local/bin/pbc-test-double -e DOUBLE="$1" \
+    -e STALE_FROM="$stale_from" "$client" nestegg run --trigger manual
+}
+check "stale metadata from the server fails the run" \
+  fails_with 1 'nestegg-meta.conf has different content' run_with_double stale
+check "stale metadata: kind verification_failed" bash -c "docker exec $client nestegg history --json --limit 1 | grep -q '\"kind\": \"verification_failed\"'"
+check "stale metadata: run not verified" bash -c "docker exec $client nestegg history --json --limit 1 | grep -q '\"verified\": false'"
+check "stale metadata: health failing" bash -c "docker exec $client nestegg status --json | grep -q '\"health\": \"failing\"'"
+check "missing archive on the server fails the run" \
+  fails_with 1 'home\.pxar is missing' run_with_double missing
+check "server gone during the check fails the run" \
+  fails_with 1 'could not be read back from the server' run_with_double down
+check "server gone during the check: verification_failed, not pbs_unreachable" \
+  bash -c "docker exec $client nestegg history --json --limit 1 | grep -q '\"kind\": \"verification_failed\"' && docker exec $client nestegg history --json --limit 1 | grep -q '\"state\": \"failed\"'"
+check "a normal run afterwards is ok and verified again" on_client nestegg run --trigger manual
+check "health ok again" bash -c "docker exec $client nestegg status --json | grep -q '\"health\": \"ok\"'"
+
 echo "== daemon API"
 on_client bash -c 'nestegg daemon >/var/log/nestegg-daemon.log 2>&1 &'
 sleep 1
@@ -309,6 +383,45 @@ check "glob characters in a name are taken literally" bash -c "docker exec $clie
 check "restore job is visible to its owner" responds 200 '"state":"succeeded"' alice "http://localhost/api/v1/restores/$glob_id"
 check "restore job of another user is not visible" responds 404 '"message":"unknown restore"' bob "http://localhost/api/v1/restores/$glob_id"
 check "machines lists this PC with its report" bash -c "$API http://localhost/api/v1/machines | grep -q '\"hostname\":'"
+
+echo "== non-root permissions come from the backup metadata, not the notes (decision 0016)"
+as_backup_token() {
+  docker exec -e PBS_PASSWORD="$token_secret" -e PBS_FINGERPRINT="$fp" "$client" \
+    proxmox-backup-client "$@" --ns desktops --repository 'backup@pbs!desktop@pbs.e2e.test:store1'
+}
+# A snapshot the daemon has not looked at yet; the backup token may rewrite
+# its notes. The forged report claims etc.pxar was made from alice's home.
+forged_snapshot="$(on_client nestegg snapshots --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | sed -n 2p)"
+forged_time="${forged_snapshot##*/}"
+as_backup_token snapshot notes update "$forged_snapshot" \
+  "$(printf 'forged\n\n{"archive_sources":{"etc.pxar":"/home/alice","home.pxar":"/"}}')"
+check "forged notes are on the server" \
+  bash -c "docker exec -e PBS_PASSWORD='$token_secret' -e PBS_FINGERPRINT='$fp' $client proxmox-backup-client snapshot notes show '$forged_snapshot' --ns desktops --repository 'backup@pbs!desktop@pbs.e2e.test:store1' | grep -q '\"etc.pxar\":\"/home/alice\"'"
+check "forged notes do not open etc.pxar to alice" \
+  responds 403 'does not contain your home directory' alice "http://localhost/api/v1/snapshots/$forged_time/browse?archive=etc.pxar&path=/"
+check "forged notes do not change alice's view of home.pxar" \
+  bash -c "[[ \$($API 'http://localhost/api/v1/snapshots/$forged_time/browse?archive=home.pxar&path=/' | grep -o '\"name\":\"[^\"]*\"' | sort -u | tr -d '\n') == '\"name\":\"alice\"' ]]"
+check "forged notes do not allow restoring etc.pxar" \
+  responds 403 'does not contain your home directory' alice -X POST -H 'Content-Type: application/json' \
+  -d "{\"snapshot_time\":\"$forged_time\",\"archive\":\"etc.pxar\",\"paths\":[],\"target_dir\":\"/home/alice/forged\"}" \
+  http://localhost/api/v1/restores
+
+# A snapshot without metadata blob, as older versions made them.
+as_backup_token backup home.pxar:/home --backup-type host --backup-id e2e-desktop \
+  --keyfile /root/nestegg-key-2.json >/dev/null 2>&1
+raw_snapshot="$(on_client nestegg snapshots --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
+raw_time="${raw_snapshot##*/}"
+check "snapshot without metadata blob created" \
+  bash -c "[[ '$raw_snapshot' != '$latest' ]] && ! docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot files '$raw_snapshot' --ns desktops --repository admin@pbs@127.0.0.1:store1 | grep -q nestegg-meta"
+check "no metadata and no local record: refused for a user" \
+  responds 403 'ask an administrator .*sudo nestegg restore' alice "http://localhost/api/v1/snapshots/$raw_time/browse?archive=home.pxar&path=/"
+check "no metadata and no local record: root may still browse" \
+  bash -c "docker exec $client curl -sf --unix-socket /run/nestegg/api.sock 'http://localhost/api/v1/snapshots/$raw_time/browse?archive=home.pxar&path=/' | grep -q '\"name\":\"bob\"'"
+# The local, root-owned run record an older version wrote for it.
+on_client bash -c "f=\$(ls -t /var/lib/nestegg/runs/*.json | head -1) && sed -e 's#\"snapshot\": \"[^\"]*\"#\"snapshot\": \"$raw_snapshot\"#' -e 's#\"id\": \"[^\"]*\"#\"id\": \"20000101T000000Z-cli-0000\"#' \"\$f\" > /var/lib/nestegg/runs/20000101T000000Z-cli-0000.json"
+check "no metadata: the local run record is used" \
+  bash -c "[[ \$($API 'http://localhost/api/v1/snapshots/$raw_time/browse?archive=home.pxar&path=/' | grep -o '\"name\":\"[^\"]*\"' | sort -u | tr -d '\n') == '\"name\":\"alice\"' ]]"
+on_client rm -f /var/lib/nestegg/runs/20000101T000000Z-cli-0000.json
 check "pbs info: reachable" bash -c "$API http://localhost/api/v1/pbs | grep -q '\"reachable\":true'"
 check "connection check via API" bash -c "$API -X POST http://localhost/api/v1/pbs/check | grep -q 'PBS login and datastore access'"
 
@@ -327,6 +440,8 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 check "cancelled run recorded as cancelled" bash -c "$API http://localhost/api/v1/runs/$run_id | grep -q '\"state\":\"cancelled\"'"
+check "run record names who cancelled" bash -c "$API http://localhost/api/v1/runs/$run_id | grep -q 'cancel requested by alice (uid $alice_uid)'"
+check "daemon log names who cancelled" on_client grep -q "backup run $run_id cancelled by alice (uid $alice_uid)" /var/log/nestegg-daemon.log
 check "no backup client left running" exits_with 1 on_client pgrep -f 'proxmox-backup-client backup'
 on_client sed -i '/^rate_limit = "100KiB"$/d' /etc/nestegg/config.toml
 on_client rm -f /home/alice/big-new-file.bin
@@ -359,6 +474,15 @@ token_may_not() {
 }
 check "token is not allowed to forget snapshots" token_may_not forget "$snapshot"
 check "token is not allowed to prune" token_may_not prune "$snapshot"
+
+echo "== failed server-side verification is recorded"
+snap_dir="/datastore/ns/desktops/${snapshot}"
+on_pbs bash -c "printf 'XXXX' | dd of='$snap_dir/nestegg-meta.conf.blob' bs=1 seek=40 conv=notrunc 2>/dev/null"
+on_pbs proxmox-backup-manager verify store1 >/dev/null 2>&1 || true
+check "run after a failed server verification succeeds" on_client nestegg run --trigger manual
+check "state lists the snapshot the server marked as failed" \
+  bash -c "docker exec $client nestegg status --json | tr -d ' \n' | grep -q '\"server_verify_failed\":\[\"$snapshot\"\]'"
+check "status text shows the failed server check" bash -c "docker exec $client nestegg status | grep -q '^Server check: FAILED for 1 snapshot(s): $snapshot'"
 
 echo "== PBS unreachable"
 docker stop "$pbs" >/dev/null

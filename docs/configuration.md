@@ -111,6 +111,18 @@ Notes:
   a source need an own source entry or `include_dev`.
 - **Missing sources fail the run** unless marked `optional = true`. A missing
   data disk must not silently produce an incomplete "successful" backup.
+  A missing optional source is skipped, but the backup is then reported as
+  **incomplete** (health `incomplete`, reasons in `nestegg status`); the
+  same applies when system mode is on but `system.pxar` had to be skipped,
+  and when the inventory could not be written
+  ([decision 0015](decisions/0015-complete-and-verified-backups.md)).
+- **Every snapshot is read back.** After the upload the run checks that all
+  archives are on the server, restores the small metadata blob
+  (`nestegg-meta.conf`) and the inventory with the configured key and
+  compares them with what was uploaded. A mismatch, or a server that stops
+  answering during the check, fails the run (`verification_failed`).
+  Snapshots that the server's own verification jobs marked as failed are
+  listed by `nestegg status` ("Server check").
 - **Unmounted disks fail the run.** If `/etc/fstab` lists a file system at or
   below a source (without `noauto`) and it is not mounted, the run fails
   instead of backing up the empty mount point. `require_mount = true` makes
@@ -136,7 +148,8 @@ Notes:
 The daemon identifies the caller by the socket credentials:
 
 - Everyone in the group can see the status, start and cancel backups and
-  run the connection check.
+  run the connection check. Who cancelled a backup is logged
+  (`journalctl -u nestegg.service`) and named in the run record.
 - Everyone in the group can change these settings in the web UI (or with
   `PATCH /api/v1/config`):
 
@@ -160,11 +173,17 @@ The daemon identifies the caller by the socket credentials:
   Edit the file with `sudo`, then run `sudo nestegg check`.
 - Browsing and restoring is limited to the caller's own home directory
   (other homes and archives such as `/etc` are refused). Restored files are
-  written with the caller's identity into a new directory.
+  written with the caller's identity into a new directory. Which part of
+  an archive is the caller's home comes from the metadata blob inside the
+  snapshot or, for snapshots of older versions, from the local run record;
+  never from the snapshot notes, which others can change
+  ([decision 0016](decisions/0016-restore-scope-from-backup-metadata.md)).
+  Snapshots with neither can only be restored by root. With encryption off
+  the blob is not signed; see the decision for what that means.
 - root (`sudo nestegg restore …`) may restore everything.
 
 The overview of all machines reads each machine's last snapshot and the
-status report stored in its notes. Without `[overview]` credentials only the
+status report stored in its notes (display only). Without `[overview]` credentials only the
 machine's own backups are visible.
 
 ## Secrets

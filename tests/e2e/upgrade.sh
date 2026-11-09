@@ -67,8 +67,10 @@ check "old package installs" apt_in_client install -y -q /tmp/nestegg-old.deb
 check "old version installed" test "$(installed_version)" == "$old_version"
 
 echo "== setup with the old version"
+# --no-system: the container's overlay root cannot be backed up as
+# system.pxar; system mode would make every backup "incomplete".
 on_client nestegg init --server pbs.e2e.test --datastore store1 --namespace desktops \
-  --auth-id 'backup@pbs!desktop' --fingerprint "$fp" --backup-id up-desktop >/dev/null
+  --auth-id 'backup@pbs!desktop' --fingerprint "$fp" --backup-id up-desktop --no-system >/dev/null
 docker exec -i "$client" nestegg credentials set-password <<<"$token_secret" >/dev/null
 on_client nestegg key create >/dev/null
 on_client nestegg key export /root/key.json >/dev/null
@@ -127,6 +129,18 @@ new_snapshot="$(on_client nestegg history --json | sed -n 's/.*"snapshot": "\([^
 check "post-upgrade snapshot is a new one" test -n "$new_snapshot" -a "$new_snapshot" != "$old_snapshot"
 on_client nestegg restore "$new_snapshot" home.pxar /root/restore-new >/dev/null 2>&1 || true
 check "restore of the post-upgrade snapshot" on_client cmp /home/alice/notes.txt /root/restore-new/alice/notes.txt
+
+echo "== a user browses snapshots of both versions (decision 0016)"
+on_client usermod -aG nestegg alice
+user_browse_names() {
+  docker exec -u alice "$client" curl -s --unix-socket /run/nestegg/api.sock \
+    "http://localhost/api/v1/snapshots/${1##*/}/browse?archive=home.pxar&path=/" \
+    | grep -o '"name":"[^"]*"' | sort -u | tr -d '\n'
+}
+check "pre-upgrade snapshot has no metadata blob" bash -c "! docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot files '$old_snapshot' --ns desktops --repository admin@pbs@127.0.0.1:store1 | grep -q nestegg-meta"
+check "post-upgrade snapshot has the metadata blob" bash -c "docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot files '$new_snapshot' --ns desktops --repository admin@pbs@127.0.0.1:store1 | grep -q nestegg-meta.conf.blob"
+check "user browses the pre-upgrade snapshot (local run record)" test "$(user_browse_names "$old_snapshot")" == '"name":"alice"'
+check "user browses the post-upgrade snapshot (metadata blob)" test "$(user_browse_names "$new_snapshot")" == '"name":"alice"'
 
 echo "== apt remove keeps configuration, credentials and state"
 sums_before="$(config_sums)"

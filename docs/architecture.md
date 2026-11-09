@@ -69,15 +69,23 @@ directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
    (package selections, manually installed packages, Flatpak/Snap lists,
    enabled units, `lsblk`/`findmnt` output, OS release).
 5. `proxmox-backup-client backup` with one archive per source
-   (`home.pxar:/home`, `etc.pxar:/etc`, …, `inventory.pxar:…`),
+   (`home.pxar:/home`, `etc.pxar:/etc`, …, `inventory.pxar:…`) and the
+   metadata blob `nestegg-meta.conf` (sources, archive → source path,
+   incomplete reasons; written to `/run/nestegg/tmp/`),
    `--backup-type host --backup-id <id> [--ns <ns>]`, excludes, optional
    `--keyfile`, `--change-detection-mode`, rate limit. Secrets come from
    systemd credentials or `*_FILE` environment variables, never from
    arguments.
-6. Upload a JSON status report as the snapshot log
-   (`snapshot upload-log`), so the read-only overview can show details.
-7. Write the run record (`/var/lib/nestegg/runs/<id>.json`) and update
-   `state.json`.
+6. Read the snapshot back: all archives listed, metadata blob and
+   inventory restored and identical; otherwise `verification_failed`. Then
+   record the snapshots the server's own verification marked as failed
+   ([decision 0015](decisions/0015-complete-and-verified-backups.md)).
+7. Write a JSON status report into the snapshot notes, so the read-only
+   overview can show details (display only; permissions never depend on
+   it, [decision 0016](decisions/0016-restore-scope-from-backup-metadata.md)).
+8. Write the run record (`/var/lib/nestegg/runs/<id>.json`) and update
+   `state.json`. Runs that skipped something the configuration asks for
+   are recorded as `incomplete`.
 
 ## Files
 
@@ -88,7 +96,7 @@ directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
 | `/var/lib/nestegg/state.json` | Last run, last success, next run. |
 | `/var/lib/nestegg/runs/` | Run history, one JSON file per run, pruned to a configurable count. |
 | `/var/lib/nestegg/inventory/` | Generated system inventory (backed up). |
-| `/run/nestegg/` | Lock file and API socket. |
+| `/run/nestegg/` | Lock file and API socket; `tmp/` (root only) holds the metadata file of a running backup, read-back copies and cancel notes. |
 
 ## Interfaces
 

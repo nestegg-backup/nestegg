@@ -1243,6 +1243,12 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
         println!("Running:      {} ({:?})", run.id, run.state);
     }
     println!("Last success: {}", describe(status.last_success.as_ref()));
+    if let Some(success) = &status.last_success {
+        for (i, reason) in success.incomplete.iter().enumerate() {
+            let label = if i == 0 { "Incomplete:" } else { "" };
+            println!("{label:<14}{reason}");
+        }
+    }
     println!("Last run:     {}", describe(status.last_run.as_ref()));
     println!(
         "Schedule:     {}{}",
@@ -1268,6 +1274,13 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
         );
     } else {
         println!("Encryption:   off");
+    }
+    if !status.server_verify_failed.is_empty() {
+        println!(
+            "Server check: FAILED for {} snapshot(s): {}",
+            status.server_verify_failed.len(),
+            status.server_verify_failed.join(", ")
+        );
     }
     Ok(0)
 }
@@ -1298,11 +1311,17 @@ fn history(paths: &Paths, limit: usize, json: bool) -> Result<u8> {
     }
     for run in runs {
         let marker = match run.state {
+            RunState::Succeeded if !run.incomplete.is_empty() => "part",
             RunState::Succeeded => "ok  ",
             RunState::PbsUnreachable => "away",
             _ => "FAIL",
         };
-        println!("{marker} {}", describe(Some(&run)));
+        let incomplete = if run.incomplete.is_empty() {
+            String::new()
+        } else {
+            format!(" - incomplete: {}", run.incomplete.join("; "))
+        };
+        println!("{marker} {}{incomplete}", describe(Some(&run)));
     }
     Ok(0)
 }

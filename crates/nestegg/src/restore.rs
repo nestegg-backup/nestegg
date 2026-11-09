@@ -355,9 +355,11 @@ pub struct UserScope {
 }
 
 /// Map a user's home directory onto an archive: `home = /home/alice` and
-/// the archive's source path `/home` give `/alice`. `source_path` must come
-/// from the snapshot itself (its status report), not from the current
-/// configuration, which may have changed since.
+/// the archive's source path `/home` give `/alice`. `source_path` must
+/// describe the snapshot itself, not the current configuration (which may
+/// have changed since), and must come from a source the user cannot
+/// change: the snapshot's metadata blob or the local run record, never the
+/// snapshot notes (decision 0016).
 pub fn user_scope(source_path: &Path, home: &Path, uid: u32) -> Option<UserScope> {
     use std::os::unix::fs::MetadataExt;
     // The home directory must be a real directory owned by the caller and

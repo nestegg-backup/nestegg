@@ -49,8 +49,10 @@ check "runtime dir from tmpfiles" bash -c "[[ \$(docker exec $client stat -c '%a
 check "units installed" on_client systemctl cat nestegg.service nestegg-backup.service nestegg-backup.timer
 
 echo "== setup"
+# --no-system: the container's overlay root cannot be backed up as
+# system.pxar; system mode would make every backup "incomplete".
 on_client nestegg init --server pbs.e2e.test --datastore store1 --namespace desktops \
-  --auth-id 'backup@pbs!desktop' --fingerprint "$fp" --backup-id sd-desktop >/dev/null
+  --auth-id 'backup@pbs!desktop' --fingerprint "$fp" --backup-id sd-desktop --no-system >/dev/null
 # Kernel modules must reach timer snapshots: a sandbox option such as
 # ProtectKernelModules=yes hides /usr/lib/modules behind an empty tmpfs.
 # The container's overlay root makes nestegg skip system.pxar, so the

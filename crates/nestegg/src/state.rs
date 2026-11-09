@@ -412,6 +412,20 @@ impl Store {
         Ok(self.load_current()?.filter(|run| run.id == id))
     }
 
+    /// The kept run record that produced `snapshot` (`host/<id>/<time>`).
+    /// Run records are written by root only, so unlike snapshot notes they
+    /// can be trusted (decision 0016).
+    pub fn run_for_snapshot(&self, snapshot: &str) -> Result<Option<Run>> {
+        for path in self.run_files()? {
+            if let Ok(run) = read_json::<Run>(&path)
+                && run.snapshot.as_deref() == Some(snapshot)
+            {
+                return Ok(Some(run));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn log_path(&self, id: &str) -> PathBuf {
         self.paths.runs_dir().join(format!("{id}.log"))
     }
@@ -655,5 +669,20 @@ mod tests {
         assert_eq!(state.last_success.unwrap().finished_at, Some(t(4)));
         assert!(store.get_run(&runs[1].id).unwrap().is_some());
         assert!(store.get_run("../x").unwrap().is_none());
+
+        let mut with_snapshot = finished(RunState::Succeeded, t(7));
+        with_snapshot.snapshot = Some("host/desktop/2026-11-08T07:00:00Z".into());
+        store.record_finished(&with_snapshot, 3).unwrap();
+        let found = store
+            .run_for_snapshot("host/desktop/2026-11-08T07:00:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, with_snapshot.id);
+        assert!(
+            store
+                .run_for_snapshot("host/desktop/2026-11-08T08:00:00Z")
+                .unwrap()
+                .is_none()
+        );
     }
 }

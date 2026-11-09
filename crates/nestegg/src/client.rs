@@ -51,6 +51,8 @@ pub struct BackupSpec {
     pub encrypt: bool,
     pub change_detection_mode: Option<ChangeDetectionMode>,
     pub rate_limit: Option<String>,
+    /// File uploaded as the metadata blob (`nestegg-meta.conf`).
+    pub metadata: Option<PathBuf>,
 }
 
 /// Arguments after `proxmox-backup-client` for a backup (no secrets).
@@ -59,6 +61,11 @@ pub fn backup_args(spec: &BackupSpec) -> Vec<OsString> {
     for archive in &spec.archives {
         let mut a = OsString::from(format!("{}:", archive.file_name()));
         a.push(archive.path.as_os_str());
+        args.push(a);
+    }
+    if let Some(meta) = &spec.metadata {
+        let mut a = OsString::from(format!("{}:", crate::metadata::ARCHIVE));
+        a.push(meta.as_os_str());
         args.push(a);
     }
     args.extend(["--backup-type".into(), "host".into()]);
@@ -993,6 +1000,7 @@ mod tests {
             encrypt: true,
             change_detection_mode: Some(ChangeDetectionMode::Metadata),
             rate_limit: Some("10MiB".into()),
+            metadata: Some("/run/nestegg/tmp/run.meta.json".into()),
         }
     }
 
@@ -1005,7 +1013,15 @@ mod tests {
     #[test]
     fn backup_arguments() {
         let args = strs(&backup_args(&spec()));
-        assert_eq!(&args[..3], ["backup", "home.pxar:/home", "etc.pxar:/etc"]);
+        assert_eq!(
+            &args[..4],
+            [
+                "backup",
+                "home.pxar:/home",
+                "etc.pxar:/etc",
+                "nestegg-meta.conf:/run/nestegg/tmp/run.meta.json"
+            ]
+        );
         let joined = args.join(" ");
         assert!(joined.contains("--backup-type host --backup-id desktop --backup-time 1794000000"));
         assert!(joined.contains("--ns desktops"));

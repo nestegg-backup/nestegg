@@ -155,6 +155,27 @@ struct Reporter<'a> {
     store: &'a Store,
     run: Run,
     log: File,
+    /// Written by the daemon before it cancels the run: who asked.
+    cancel_note: PathBuf,
+}
+
+/// File in which the daemon records who cancelled run `run_id`.
+pub fn cancel_note_path(paths: &Paths, run_id: &str) -> PathBuf {
+    paths.tmp_dir().join(format!("cancel-{run_id}"))
+}
+
+/// Who asked to cancel, from the note the daemon wrote (first line, short).
+fn read_cancel_note(path: &std::path::Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let who: String = text
+        .lines()
+        .next()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(100)
+        .collect();
+    let who = who.trim();
+    (!who.is_empty()).then(|| who.to_string())
 }
 
 impl Reporter<'_> {
@@ -180,6 +201,13 @@ impl Reporter<'_> {
         self.run.warnings.push(message);
     }
 
+    /// The backup goes on, but will not contain everything the
+    /// configuration asks for (decision 0015). Also a warning.
+    fn incomplete(&mut self, reason: String) {
+        self.run.incomplete.push(reason.clone());
+        self.warn(reason);
+    }
+
     /// Finish as cancelled if a cancel was requested. Returns true then.
     fn cancelled(&mut self) -> bool {
         if crate::cancel::requested() && !self.run.state.is_finished() {
@@ -195,7 +223,12 @@ impl Reporter<'_> {
         false
     }
 
-    fn fail(&mut self, state: RunState, error: RunError) {
+    fn fail(&mut self, state: RunState, mut error: RunError) {
+        if error.kind == ErrorKind::Cancelled
+            && let Some(who) = read_cancel_note(&self.cancel_note)
+        {
+            error.message = format!("{}; cancel requested by {who}", error.message);
+        }
         self.line(&format!("error: {}", error.message));
         self.run.error = Some(error);
         self.run.finish(state, Utc::now());
@@ -271,10 +304,12 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
         .as_ref()
         .map(|r| r.archives.iter().filter_map(|a| a.size_bytes).sum::<u64>())
         .filter(|b| *b > 0);
+    let cancel_note = cancel_note_path(paths, &run.id);
     let mut rep = Reporter {
         store: &store,
         run,
         log,
+        cancel_note: cancel_note.clone(),
     };
     rep.phase(
         RunState::Starting,
@@ -313,6 +348,7 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     store.record_finished(&rep.run, keep)?;
     store.clear_current_if(&rep.run.id)?;
     let _ = fs::remove_file(&pid_file);
+    let _ = fs::remove_file(&cancel_note);
     Ok(match final_state {
         RunState::Succeeded => RunExit::Succeeded,
         RunState::PbsUnreachable => RunExit::PbsUnreachable,
@@ -341,6 +377,9 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
                 );
                 for n in notes {
                     match n.strip_prefix("warning: ") {
+                        Some(w) if w.starts_with(crate::layout::SYSTEM_SKIPPED) => {
+                            rep.incomplete(w.to_string())
+                        }
                         Some(w) => rep.warn(w.to_string()),
                         None => rep.line(&n),
                     }
@@ -463,7 +502,7 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             }
             if !check.errors.is_empty() {
                 if source.optional {
-                    rep.warn(format!(
+                    rep.incomplete(format!(
                         "optional source {} skipped: {}",
                         source.path.display(),
                         check.errors.join("; ")
@@ -484,7 +523,7 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
                 path: source.path.clone(),
             });
         } else if source.optional {
-            rep.warn(format!(
+            rep.incomplete(format!(
                 "optional source {} does not exist, skipped",
                 source.path.display()
             ));
@@ -557,6 +596,7 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         return Ok(());
     }
     // 4. Inventory.
+    let mut inventory_dir = None;
     if config.backup.inventory {
         rep.phase(RunState::Inventory, "writing system inventory");
         let dir: PathBuf = paths.inventory_dir();
@@ -567,12 +607,29 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
                     report.written.len(),
                     report.skipped.len()
                 ));
+                if config.backup.system
+                    && report
+                        .skipped
+                        .iter()
+                        .any(|f| f == crate::layout::LAYOUT_FILE)
+                {
+                    rep.incomplete(format!(
+                        "the disk layout ({}) could not be recorded; the rescue stick cannot \
+                         restore this snapshot",
+                        crate::layout::LAYOUT_FILE
+                    ));
+                }
                 archives.push(ArchiveSpec {
                     name: "inventory".into(),
-                    path: dir,
+                    path: dir.clone(),
                 });
+                inventory_dir = Some(dir);
             }
-            Err(e) => rep.warn(format!("inventory failed: {e:#}")),
+            Err(e) if config.backup.system => rep.incomplete(format!(
+                "inventory failed: {e:#}; without {} the rescue stick cannot restore this snapshot",
+                crate::layout::LAYOUT_FILE
+            )),
+            Err(e) => rep.incomplete(format!("inventory failed: {e:#}")),
         }
     }
 
@@ -593,6 +650,23 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             backup_time = Utc::now().timestamp();
         }
     }
+    // Metadata blob, part of every snapshot (decisions 0015 and 0016).
+    let ctx = report_context(config, &state);
+    let meta = backup_metadata(config, &ctx, &backup_id, backup_time, &archives, &rep.run);
+    let meta_bytes = meta.to_bytes();
+    let meta_file = match write_metadata_file(paths, &rep.run.id, &meta_bytes) {
+        Ok(f) => f,
+        Err(e) => {
+            rep.fail(
+                RunState::Failed,
+                RunError {
+                    kind: ErrorKind::Internal,
+                    message: format!("cannot write the backup metadata: {e:#}"),
+                },
+            );
+            return Ok(());
+        }
+    };
     let spec = BackupSpec {
         backup_id: backup_id.clone(),
         namespace: config.pbs.namespace.clone(),
@@ -603,6 +677,7 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         encrypt: config.backup.encryption,
         change_detection_mode: config.backup.change_detection_mode,
         rate_limit: config.backup.rate_limit.clone(),
+        metadata: Some(meta_file.path.clone()),
     };
     let snapshot = snapshot_path(&backup_id, backup_time);
     rep.phase(RunState::Uploading, &format!("backing up to {snapshot}"));
@@ -651,15 +726,152 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         .sum();
     rep.run.uploaded_bytes = (!outcome.archives.is_empty()).then_some(uploaded);
 
-    // 6. Notes on the snapshot, readable by the read-only overview.
+    // 6. Read the snapshot back (decision 0015).
+    rep.phase(
+        RunState::Finishing,
+        &format!("reading {snapshot} back from the server"),
+    );
+    let verification = {
+        let expected = crate::verify::Expected {
+            snapshot: &snapshot,
+            archives: archives.iter().map(ArchiveSpec::file_name).collect(),
+            encrypted: config.backup.encryption,
+            metadata: &meta_bytes,
+            inventory: inventory_dir.as_deref(),
+        };
+        match crate::secrets::create_private_dir(&paths.tmp_dir())
+            .and_then(|()| crate::staging::StagingDir::create(&paths.tmp_dir().join("verify")))
+        {
+            Ok(work) => crate::verify::read_back(
+                &client,
+                &expected,
+                work.path(),
+                &mut |msg| rep.line(msg),
+                &crate::cancel::requested,
+            ),
+            Err(e) => {
+                crate::verify::Outcome::Failed(format!("cannot prepare the read-back check: {e:#}"))
+            }
+        }
+    };
+    drop(meta_file);
+    match verification {
+        crate::verify::Outcome::Verified => {
+            rep.run.verified = true;
+            rep.line("snapshot read back from the server and verified");
+        }
+        crate::verify::Outcome::Cancelled => {
+            rep.fail(
+                RunState::Cancelled,
+                RunError {
+                    kind: ErrorKind::Cancelled,
+                    message: format!(
+                        "the backup was cancelled during the read-back check; {snapshot} was \
+                         uploaded but not verified"
+                    ),
+                },
+            );
+            return Ok(());
+        }
+        crate::verify::Outcome::Failed(message) => {
+            record_server_verification(rep, &client, &backup_id);
+            rep.fail(
+                RunState::Failed,
+                RunError {
+                    kind: ErrorKind::VerificationFailed,
+                    message,
+                },
+            );
+            return Ok(());
+        }
+    }
+    // Verified: a cancel request that arrives now comes too late.
+    record_server_verification(rep, &client, &backup_id);
+
+    // 7. Notes on the snapshot, readable by the read-only overview.
     rep.phase(RunState::Finishing, "writing snapshot notes");
     let duration = (Utc::now() - rep.run.started_at).num_seconds();
-    let notes = snapshot_notes(&rep.run, duration, &report_context(config, &state));
+    let notes = snapshot_notes(&rep.run, duration, &ctx);
     if let Err(e) = client.set_notes(&snapshot, &notes) {
         rep.warn(format!("could not write snapshot notes: {e:#}"));
     }
     rep.run.finish(RunState::Succeeded, Utc::now());
     Ok(())
+}
+
+/// The metadata file of a run; removed when dropped.
+struct MetadataFile {
+    path: PathBuf,
+}
+
+impl Drop for MetadataFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Write the metadata into the root-only runtime directory.
+fn write_metadata_file(paths: &Paths, run_id: &str, bytes: &[u8]) -> Result<MetadataFile> {
+    secrets::create_private_dir(&paths.tmp_dir())?;
+    let path = paths.tmp_dir().join(format!("{run_id}.meta.json"));
+    secrets::write_private_file(&path, bytes)?;
+    Ok(MetadataFile { path })
+}
+
+/// Content of the metadata blob of this run.
+fn backup_metadata(
+    config: &Config,
+    ctx: &ReportContext,
+    backup_id: &str,
+    backup_time: i64,
+    archives: &[ArchiveSpec],
+    run: &Run,
+) -> crate::metadata::BackupMetadata {
+    crate::metadata::BackupMetadata {
+        format: crate::metadata::FORMAT,
+        nestegg_version: env!("CARGO_PKG_VERSION").into(),
+        backup_id: backup_id.into(),
+        hostname: ctx.hostname.clone(),
+        backup_time,
+        snapshot: snapshot_path(backup_id, backup_time),
+        archive_sources: ctx
+            .archive_sources
+            .iter()
+            .filter(|(name, _)| archives.iter().any(|a| &a.file_name() == *name))
+            .filter_map(|(name, path)| Some((name.clone(), path.as_str()?.to_string())))
+            .collect(),
+        sources: ctx.sources.clone(),
+        system_mode: config.backup.system,
+        incomplete: run.incomplete.clone(),
+    }
+}
+
+/// Store the snapshots of this machine that the server's own verification
+/// marked as failed (`State::server_verify_failed`).
+fn record_server_verification(rep: &mut Reporter<'_>, client: &Client, backup_id: &str) {
+    let failed = match client.list_snapshots(backup_id) {
+        Ok(list) => crate::verify::failed_snapshots(&list),
+        Err(e) => {
+            rep.warn(format!(
+                "could not read the server's verification state: {e:#}"
+            ));
+            return;
+        }
+    };
+    if !failed.is_empty() {
+        rep.line(&format!(
+            "the server's verification marked {} snapshot(s) as failed: {}",
+            failed.len(),
+            failed.join(", ")
+        ));
+    }
+    let saved = rep.store.load_state().and_then(|mut state| {
+        state.server_verify_failed = failed;
+        rep.store.save_state(&state)
+    });
+    if let Err(e) = saved {
+        rep.warn(format!("cannot update state: {e:#}"));
+    }
 }
 
 fn config_error(message: &str) -> RunError {
@@ -731,6 +943,8 @@ pub fn snapshot_notes(run: &Run, duration_seconds: i64, ctx: &ReportContext) -> 
         "uploaded_bytes": run.uploaded_bytes,
         "archives": run.archives.iter().map(|a| &a.name).collect::<Vec<_>>(),
         "warnings": run.warnings.len(),
+        "incomplete": run.incomplete,
+        "verified": run.verified,
         "hostname": ctx.hostname,
         "os": ctx.os,
         "key_exported": ctx.key_exported,
@@ -739,8 +953,13 @@ pub fn snapshot_notes(run: &Run, duration_seconds: i64, ctx: &ReportContext) -> 
         "overdue_after_hours": ctx.overdue_after_hours,
     });
     format!(
-        "nestegg {}: ok, {} s, {} warnings\n\n{}",
+        "nestegg {}: {}, {} s, {} warnings\n\n{}",
         env!("CARGO_PKG_VERSION"),
+        if run.incomplete.is_empty() {
+            "ok"
+        } else {
+            "incomplete"
+        },
         duration_seconds,
         run.warnings.len(),
         report
@@ -791,6 +1010,79 @@ mod tests {
             !notes.contains("home.pxar:"),
             "no client arguments in notes"
         );
+    }
+
+    #[test]
+    fn cancel_note_names_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("cancel-x");
+        assert_eq!(read_cancel_note(&note), None);
+        fs::write(&note, "alice (uid 1000)\nignored\n").unwrap();
+        assert_eq!(read_cancel_note(&note).as_deref(), Some("alice (uid 1000)"));
+        fs::write(&note, "\x1b[2Jbob\n").unwrap();
+        assert_eq!(read_cancel_note(&note).as_deref(), Some("[2Jbob"));
+        fs::write(&note, "\n").unwrap();
+        assert_eq!(read_cancel_note(&note), None);
+    }
+
+    #[test]
+    fn metadata_lists_only_archives_of_the_snapshot() {
+        let config = crate::config::example("pbs.example.com", "store", "a@pbs!t");
+        let ctx = ReportContext {
+            hostname: "desktop".into(),
+            os: None,
+            key_exported: Some(true),
+            sources: vec!["/home".into(), "/etc".into()],
+            archive_sources: [
+                ("home.pxar".to_string(), serde_json::json!("/home")),
+                ("etc.pxar".to_string(), serde_json::json!("/etc")),
+            ]
+            .into_iter()
+            .collect(),
+            overdue_after_hours: 36,
+        };
+        let mut run = Run::new(Trigger::Timer, Utc::now());
+        run.incomplete.push("optional source /etc skipped".into());
+        let archives = vec![
+            ArchiveSpec {
+                name: "home".into(),
+                path: "/home".into(),
+            },
+            ArchiveSpec {
+                name: "inventory".into(),
+                path: "/var/lib/nestegg/inventory".into(),
+            },
+        ];
+        let meta = backup_metadata(&config, &ctx, "desktop", 1_794_000_000, &archives, &run);
+        assert_eq!(meta.snapshot, "host/desktop/2026-11-06T21:20:00Z");
+        assert!(meta.belongs_to("host/desktop/2026-11-06T21:20:00Z"));
+        assert_eq!(meta.source_of("home.pxar"), Some("/home"));
+        assert_eq!(meta.source_of("etc.pxar"), None);
+        assert_eq!(meta.source_of("inventory.pxar"), None);
+        assert_eq!(meta.incomplete, run.incomplete);
+        assert_eq!(meta.sources, ctx.sources);
+    }
+
+    #[test]
+    fn incomplete_notes_say_so() {
+        let mut run = Run::new(Trigger::Timer, Utc::now());
+        run.incomplete
+            .push("optional source /data does not exist, skipped".into());
+        run.warnings = run.incomplete.clone();
+        run.verified = true;
+        let ctx = ReportContext {
+            hostname: "desktop".into(),
+            os: None,
+            key_exported: None,
+            sources: vec![],
+            archive_sources: Default::default(),
+            overdue_after_hours: 36,
+        };
+        let notes = snapshot_notes(&run, 5, &ctx);
+        assert!(notes.lines().next().unwrap().contains(": incomplete, 5 s"));
+        let report = parse_report(&notes).unwrap();
+        assert_eq!(report["incomplete"][0], run.incomplete[0]);
+        assert_eq!(report["verified"], true);
     }
 
     #[test]

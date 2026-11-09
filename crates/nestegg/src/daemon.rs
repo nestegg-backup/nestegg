@@ -34,8 +34,10 @@ struct App {
     restores: Arc<Mutex<HashMap<String, RestoreJob>>>,
     /// Serialises catalog dumps (one dump per snapshot, no duplicates).
     catalog: Arc<Mutex<()>>,
-    /// Status reports of snapshots (`archive_sources`), by snapshot path.
-    reports: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    /// Backup metadata of snapshots by snapshot path; `None` for snapshots
+    /// without trustworthy metadata (decision 0016). Snapshots do not
+    /// change once finished, so entries never go stale.
+    metadata: Arc<Mutex<HashMap<String, Option<crate::metadata::BackupMetadata>>>>,
     /// Serialises settings changes (read, modify, write, switch the timer).
     settings: Arc<Mutex<()>>,
 }
@@ -153,7 +155,7 @@ pub fn router(paths: Paths) -> Router {
             start: Default::default(),
             restores: Default::default(),
             catalog: Default::default(),
-            reports: Default::default(),
+            metadata: Default::default(),
             settings: Default::default(),
         })
 }
@@ -438,47 +440,106 @@ fn snapshot_of(config: &Config, time: &str) -> ApiResult<String> {
     ))
 }
 
-/// Source path of `archive` as recorded in the snapshot's status report.
-/// Unprivileged access is refused for snapshots without this information.
+/// Source path of `archive` in `snapshot`, for deciding what an
+/// unprivileged user may see (decision 0016). It comes from the snapshot's
+/// metadata blob or, for snapshots of older versions, from the local run
+/// record of exactly that snapshot. Never from the snapshot notes: anyone
+/// with write access to the backup group can change those.
 fn snapshot_source(
     app: &App,
     config: &Config,
     snapshot: &str,
     archive: &str,
 ) -> ApiResult<PathBuf> {
+    let not_in_archive = || forbidden("this archive does not contain your home directory");
     let cached = app
-        .reports
+        .metadata
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(snapshot)
         .cloned();
-    let report = match cached {
-        Some(r) => r,
+    let meta = match cached {
+        Some(m) => m,
         None => {
             if !crate::wake::is_reachable(config, std::time::Duration::from_secs(3)) {
                 return Err(pbs_unreachable());
             }
-            let client =
-                crate::client::Client::new(config, SecretStore::new(&app.paths.credentials_dir));
-            let notes = client
-                .notes(snapshot)
-                .map_err(|e| ApiError::internal(format!("{e:#}")))?;
-            let report = crate::run::parse_report(&notes).unwrap_or(serde_json::Value::Null);
-            app.reports
+            let m = load_metadata(&app.paths, config, snapshot)?;
+            app.metadata
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(snapshot.to_string(), report.clone());
-            report
+                .insert(snapshot.to_string(), m.clone());
+            m
         }
     };
-    report["archive_sources"][archive]
-        .as_str()
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            forbidden(
-                "this snapshot has no source information; restore it with `sudo nestegg restore`",
-            )
-        })
+    if let Some(meta) = meta {
+        return meta
+            .source_of(archive)
+            .map(PathBuf::from)
+            .ok_or_else(not_in_archive);
+    }
+    let record = Store::new(&app.paths)
+        .run_for_snapshot(snapshot)
+        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    match record {
+        Some(run) => run
+            .archives
+            .iter()
+            .find(|a| a.name == archive)
+            .map(|a| PathBuf::from(&a.source))
+            .ok_or_else(not_in_archive),
+        None => Err(forbidden(format!(
+            "this snapshot has no backup metadata (made by an older nestegg version) and \
+             no local run record, so its contents cannot be assigned to your home \
+             directory; ask an administrator to restore it with \
+             `sudo nestegg restore {snapshot} {archive} <target>`"
+        ))),
+    }
+}
+
+/// Read and check the metadata blob of `snapshot`. `None`: no blob, or a
+/// blob that cannot be trusted for permissions (not encrypted although
+/// encryption is on, so it could have been made without the key).
+fn load_metadata(
+    paths: &Paths,
+    config: &Config,
+    snapshot: &str,
+) -> ApiResult<Option<crate::metadata::BackupMetadata>> {
+    let client = crate::client::Client::new(config, SecretStore::new(&paths.credentials_dir));
+    let fetched = crate::secrets::create_private_dir(&paths.tmp_dir())
+        .and_then(|()| crate::staging::StagingDir::create(&paths.tmp_dir().join("metadata")))
+        .and_then(|work| crate::metadata::fetch(&client, snapshot, work.path()))
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "cannot read the backup metadata of {snapshot}: {e:#}"
+            ))
+        })?;
+    let Some(fetched) = fetched else {
+        return Ok(None);
+    };
+    if config.backup.encryption && fetched.crypt_mode != "encrypt" {
+        eprintln!(
+            "backup metadata of {snapshot} is not encrypted although encryption is on; \
+             not used for permissions"
+        );
+        return Ok(None);
+    }
+    let untrusted = |why: String| {
+        eprintln!("backup metadata of {snapshot} refused: {why}");
+        forbidden(format!(
+            "the backup metadata of this snapshot cannot be used ({why}); ask an \
+             administrator to restore it with `sudo nestegg restore`"
+        ))
+    };
+    let meta = crate::metadata::BackupMetadata::parse(&fetched.bytes)
+        .map_err(|e| untrusted(format!("{e:#}")))?;
+    if !meta.belongs_to(snapshot) {
+        return Err(untrusted(format!(
+            "it describes {}, not this snapshot",
+            meta.snapshot
+        )));
+    }
+    Ok(Some(meta))
 }
 
 fn user_scope_for(
@@ -883,8 +944,23 @@ async fn get_restore(
     Ok(Json(job))
 }
 
+/// `alice (uid 1000)` for the daemon log and run records.
+fn caller_name(peer: &PeerInfo) -> String {
+    match peer.as_ref().and_then(|Extension(ConnectInfo(p))| p.uid) {
+        Some(uid) => match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+            Ok(Some(user)) => format!("{} (uid {uid})", user.name),
+            _ => format!("uid {uid}"),
+        },
+        None => "unknown caller".into(),
+    }
+}
+
+/// `POST /api/v1/runs/{id}/cancel`: any group member may cancel (they
+/// operate the backups of this computer); who did it is logged and ends up
+/// in the run record.
 async fn cancel_run(
     AxState(app): AxState<App>,
+    peer: PeerInfo,
     UrlPath(id): UrlPath<String>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     if !is_valid_run_id(&id) {
@@ -894,8 +970,12 @@ async fn cancel_run(
             "unknown run",
         ));
     }
+    let caller = caller_name(&peer);
     let paths = app.paths.clone();
+    let who = caller.clone();
+    let run_id = id.clone();
     let found = blocking(move || {
+        let id = run_id;
         let text = std::fs::read_to_string(paths.runtime_dir.join("run.pid")).unwrap_or_default();
         let mut parts = text.split_whitespace();
         let (Some(pid), Some(run_id)) = (parts.next(), parts.next()) else {
@@ -905,6 +985,13 @@ async fn cancel_run(
             return Ok(false);
         }
         let pid: i32 = pid.parse()?;
+        // Read by the run when it records the cancellation.
+        let note = crate::run::cancel_note_path(&paths, &id);
+        if let Err(e) = crate::secrets::create_private_dir(&paths.tmp_dir())
+            .and_then(|()| crate::secrets::write_private_file(&note, format!("{who}\n").as_bytes()))
+        {
+            eprintln!("cannot record who cancelled run {id}: {e:#}");
+        }
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGTERM,
@@ -913,8 +1000,10 @@ async fn cancel_run(
     })
     .await?;
     if found {
+        eprintln!("backup run {id} cancelled by {caller}");
         Ok((StatusCode::ACCEPTED, Json(json!({ "cancelling": true }))))
     } else {
+        eprintln!("cancel of backup run {id} by {caller}: no running backup with this id");
         Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -1103,6 +1192,88 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn app(dir: &Path) -> App {
+        App {
+            paths: paths(dir),
+            start: Default::default(),
+            restores: Default::default(),
+            catalog: Default::default(),
+            metadata: Default::default(),
+            settings: Default::default(),
+        }
+    }
+
+    const SNAPSHOT: &str = "host/desktop/2026-11-06T21:20:00Z";
+
+    #[test]
+    fn scope_comes_from_metadata_then_local_record_never_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let config = Config::parse(CONFIG).unwrap();
+        let meta = crate::metadata::BackupMetadata {
+            format: crate::metadata::FORMAT,
+            nestegg_version: "0.1.0".into(),
+            backup_id: "desktop".into(),
+            hostname: "desktop".into(),
+            backup_time: 1_794_000_000,
+            snapshot: SNAPSHOT.into(),
+            archive_sources: [("home.pxar".to_string(), "/home".to_string())].into(),
+            sources: vec!["/home".into()],
+            system_mode: false,
+            incomplete: vec![],
+        };
+        app.metadata
+            .lock()
+            .unwrap()
+            .insert(SNAPSHOT.into(), Some(meta));
+        // A local record that claims something else does not matter while
+        // the snapshot has metadata.
+        let store = Store::new(&app.paths);
+        let mut run = Run::new(Trigger::Timer, Utc::now());
+        run.snapshot = Some(SNAPSHOT.into());
+        run.archives = vec![crate::state::ArchiveInfo {
+            name: "etc.pxar".into(),
+            source: "/etc".into(),
+            size_bytes: None,
+        }];
+        run.finish(crate::state::RunState::Succeeded, Utc::now());
+        store.record_run_only(&run).unwrap();
+        assert_eq!(
+            snapshot_source(&app, &config, SNAPSHOT, "home.pxar").ok(),
+            Some(PathBuf::from("/home"))
+        );
+        let err = snapshot_source(&app, &config, SNAPSHOT, "etc.pxar").unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // Without metadata: the local record of exactly this snapshot.
+        app.metadata.lock().unwrap().insert(SNAPSHOT.into(), None);
+        assert_eq!(
+            snapshot_source(&app, &config, SNAPSHOT, "etc.pxar").ok(),
+            Some(PathBuf::from("/etc"))
+        );
+        assert_eq!(
+            snapshot_source(&app, &config, SNAPSHOT, "home.pxar")
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        // Neither: refused with a pointer to the administrator.
+        let other = "host/desktop/2026-11-07T00:00:00Z";
+        app.metadata.lock().unwrap().insert(other.into(), None);
+        let err = snapshot_source(&app, &config, other, "home.pxar").unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert!(
+            err.message.contains("ask an administrator"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("sudo nestegg restore"),
+            "{}",
+            err.message
+        );
     }
 
     #[tokio::test]

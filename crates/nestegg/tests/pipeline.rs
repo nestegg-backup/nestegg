@@ -35,6 +35,25 @@ case "$1" in
       echo "Error: authentication failed - invalid credentials" >&2
       exit 255
     fi
+    # Keep what a server would store: the file list and the metadata blob.
+    mode=encrypt
+    case " $* " in *" --crypt-mode none "*) mode=none ;; esac
+    mkdir -p "$FAKE_STORE"
+    files=""
+    for a in "$@"; do
+      case "$a" in
+        nestegg-meta.conf:*)
+          cp "${a#nestegg-meta.conf:}" "$FAKE_STORE/meta"
+          files="$files{\"filename\":\"nestegg-meta.conf.blob\",\"crypt-mode\":\"$mode\",\"size\":300},"
+          ;;
+        *.pxar:*)
+          name="${a%%:*}"
+          [ "$name" = "$FAKE_DROP_ARCHIVE" ] && continue
+          files="$files{\"filename\":\"$name.didx\",\"crypt-mode\":\"$mode\",\"size\":100},"
+          ;;
+      esac
+    done
+    echo "[$files{\"filename\":\"index.json.blob\",\"crypt-mode\":\"none\",\"size\":1}]" > "$FAKE_STORE/files.json"
     echo "Starting backup: host/test/..."
     echo "home.pxar: had to backup 1 MiB of 2 MiB (compressed 1 MiB) in 0.10 s"
     echo "etc.pxar: had to backup 0 B of 1 KiB (compressed 0 B) in 0.01 s"
@@ -42,14 +61,25 @@ case "$1" in
     ;;
   snapshot)
     if [ "$2" = "list" ]; then
-      echo '[{"backup-type":"host","backup-id":"test","backup-time":1794000000,"files":[{"filename":"home.pxar.didx","crypt-mode":"encrypt"}],"size":2048,"protected":false}]'
+      echo '[{"backup-type":"host","backup-id":"test","backup-time":1794000000,"files":[{"filename":"home.pxar.didx","crypt-mode":"encrypt"}],"size":2048,"protected":false,"verification":{"state":"failed","upid":"x"}}]'
     fi
-    if [ "$2" = "files" ] && [ -f "$FAKE_FILES_FILE" ]; then
-      cat "$FAKE_FILES_FILE"
+    if [ "$2" = "files" ]; then
+      # A test may dictate the file list; otherwise what "backup" stored.
+      if [ -f "$FAKE_FILES_FILE" ]; then
+        cat "$FAKE_FILES_FILE"
+      else
+        cat "$FAKE_STORE/files.json"
+      fi
     fi
     exit 0
     ;;
   restore)
+    # restore <snapshot> <archive> <target> ...
+    if [ "$3" = "nestegg-meta.conf" ]; then
+      cp "$FAKE_STORE/meta" "$4"
+      if [ -n "$FAKE_TAMPER_META" ]; then echo "tampered" >> "$4"; fi
+      exit 0
+    fi
     # `restore <snapshot> index.json - --keyfd N`: only the key the
     # snapshot was made with ("c2Vj..." in its data) opens the manifest.
     keyfd=""
@@ -248,6 +278,7 @@ inventory = false
             .env("NESTEGG_PBS_CLIENT", root.join("fake-client"))
             .env("FAKE_LOG", root.join("fake.log"))
             .env("FAKE_FILES_FILE", root.join("snapshot-files.json"))
+            .env("FAKE_STORE", root.join("fake-store"))
             .env("NESTEGG_SYSTEMD_CREDS", root.join("fake-systemd-creds"))
             .env("FAKE_CREDS_LOG", root.join("creds.log"))
             .env("NESTEGG_SYSTEMCTL", root.join("fake-systemctl"))
@@ -318,17 +349,111 @@ fn successful_run_records_state_and_passes_secrets_via_fds() {
         !log.contains("opt.pxar"),
         "missing optional source is skipped"
     );
+    assert!(log.contains(" nestegg-meta.conf:"), "metadata blob: {log}");
+    assert!(log.contains("ARGS snapshot files host/test/"), "{log}");
+    assert!(log.contains("ARGS restore host/test/"), "{log}");
+    // The notes carry the new fields.
+    let notes_line = log
+        .lines()
+        .find(|l| l.starts_with("ARGS snapshot notes update"))
+        .unwrap();
+    assert!(notes_line.contains("incomplete, "), "{notes_line}");
+    assert!(log.contains("\"verified\":true"), "{log}");
+    assert!(log.contains("\"incomplete\":[\"optional source"), "{log}");
 
     let state = env.state();
     assert_eq!(state["last_success"]["state"], "succeeded");
+    assert_eq!(state["last_success"]["verified"], true);
     assert_eq!(state["last_run"]["uploaded_bytes"], 1_048_576);
     assert_eq!(state["pbs_reachable"], true);
     assert_eq!(state["last_run"]["warnings"].as_array().unwrap().len(), 1);
+    // The missing optional source makes the backup incomplete.
+    let incomplete = state["last_success"]["incomplete"].as_array().unwrap();
+    assert_eq!(incomplete.len(), 1, "{state}");
+    assert!(
+        incomplete[0].as_str().unwrap().contains("does-not-exist"),
+        "{state}"
+    );
+    assert_eq!(
+        state["server_verify_failed"],
+        serde_json::json!(["host/test/2026-11-06T21:20:00Z"])
+    );
+    // No metadata file is left behind.
+    let leftovers: Vec<_> = fs::read_dir(env.root().join("run/tmp"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().ends_with(".meta.json"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    let out = env.run(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["health"], "incomplete");
+    let text = env.run(&["status"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("Incomplete:"), "{text}");
+    let text = env.run(&["history"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("part "), "{text}");
+    assert!(text.contains("does-not-exist"), "{text}");
     assert!(!env.root().join("state/current.json").exists());
 
     let history = env.run(&["history", "--json"]);
     let runs: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
     assert_eq!(runs.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn read_back_mismatch_fails_the_run() {
+    let env = Env::new();
+    let out = env
+        .command(&["run"])
+        .env("FAKE_TAMPER_META", "1")
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    let state = env.state();
+    assert_eq!(state["last_run"]["state"], "failed");
+    assert_eq!(state["last_run"]["error"]["kind"], "verification_failed");
+    let msg = state["last_run"]["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("nestegg-meta.conf has different content"),
+        "{msg}"
+    );
+    assert_eq!(state["last_run"]["verified"], false);
+    assert!(state["last_success"].is_null());
+    // The snapshot exists: it is recorded, and the server state was read.
+    assert!(state["last_run"]["snapshot"].is_string());
+    assert_eq!(state["server_verify_failed"].as_array().unwrap().len(), 1);
+    assert!(!env.fake_log().contains("snapshot notes update"));
+
+    let out = env
+        .command(&["run"])
+        .env("FAKE_DROP_ARCHIVE", "etc.pxar")
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1);
+    let state = env.state();
+    assert_eq!(state["last_run"]["error"]["kind"], "verification_failed");
+    let msg = state["last_run"]["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("etc.pxar is missing"), "{msg}");
+
+    let out = env.run(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // Never succeeded so far: "never" takes precedence over "failing".
+    assert_eq!(status["health"], "never");
+    assert_eq!(code(&env.run(&["run"])), 0);
+    assert_eq!(
+        code(
+            &env.command(&["run"])
+                .env("FAKE_TAMPER_META", "1")
+                .output()
+                .unwrap()
+        ),
+        1
+    );
+    let out = env.run(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["health"], "failing");
 }
 
 #[test]
@@ -1112,7 +1237,8 @@ fn daemon_serves_status_runs_and_snapshots() {
     let start = Instant::now();
     loop {
         let (_, status) = request(&socket, "GET", "/api/v1/status");
-        if status["health"] == "ok" {
+        // The optional source of the test configuration is missing.
+        if status["health"] == "incomplete" {
             assert_eq!(status["last_success"]["id"], id.as_str());
             break;
         }
