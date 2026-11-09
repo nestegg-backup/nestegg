@@ -41,6 +41,9 @@ pub struct PbsStatus {
     #[serde(with = "crate::state::rfc3339_opt")]
     pub checked_at: Option<DateTime<Utc>>,
     pub wake_on_lan: bool,
+    /// The token secret (or password) is stored. `None`: this process may
+    /// not look into the credentials directory (not root).
+    pub credentials_stored: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,6 +60,9 @@ pub struct Encryption {
     pub enabled: bool,
     pub key_fingerprint: Option<String>,
     pub key_exported: bool,
+    /// An encryption key is stored (it may still be unconfirmed). `None`:
+    /// this process may not look into the credentials directory (not root).
+    pub key_present: Option<bool>,
 }
 
 pub fn timer_enabled(paths: &Paths) -> bool {
@@ -88,6 +94,19 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
     let current = crate::run::active_run(paths)?;
     let now = Utc::now();
     let overdue_after_hours = config.map(|c| c.overdue_after_hours).unwrap_or(36);
+    // Only root can list the credentials directory; anyone else gets "unknown"
+    // instead of a wrong "no".
+    let stored = |name: &str| -> Option<bool> {
+        let secrets = crate::secrets::SecretStore::new(&paths.credentials_dir);
+        if secrets.exists(name) {
+            return Some(true);
+        }
+        match std::fs::read_dir(&paths.credentials_dir) {
+            Ok(_) => Some(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        }
+    };
     let interval = config.map(|c| c.schedule.interval_hours).unwrap_or(24);
     Ok(Status {
         machine: Machine {
@@ -106,6 +125,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
             reachable: state.pbs_reachable,
             checked_at: state.pbs_checked_at,
             wake_on_lan: config.is_some_and(|c| c.active_wake().is_some()),
+            credentials_stored: stored(crate::secrets::PASSWORD),
         },
         schedule: Schedule {
             enabled: timer,
@@ -139,6 +159,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
             enabled: config.is_none_or(|c| c.backup.encryption),
             key_fingerprint: state.key_fingerprint.clone(),
             key_exported: state.key_exported(),
+            key_present: stored(crate::secrets::ENCRYPTION_KEY),
         },
         server_verify_failed: state.server_verify_failed.clone(),
     })

@@ -1764,6 +1764,7 @@ mod tests {
                 reachable: Some(true),
                 checked_at: None,
                 wake_on_lan: false,
+                credentials_stored: Some(true),
             },
             schedule: status::Schedule {
                 enabled: true,
@@ -1780,6 +1781,7 @@ mod tests {
                 enabled: true,
                 key_fingerprint: None,
                 key_exported: true,
+                key_present: Some(true),
             },
             server_verify_failed: damaged.iter().map(|s| s.to_string()).collect(),
         }

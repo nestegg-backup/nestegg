@@ -454,6 +454,7 @@ components:
             reachable: { type: [boolean, "null"], description: Result of the last check; null if never checked. }
             checked_at: { type: [string, "null"], format: date-time }
             wake_on_lan: { type: boolean, description: "Wake-on-LAN is configured and switched on (`wake.enabled`)." }
+            credentials_stored: { type: [boolean, "null"], description: "The token secret (or password) is stored on this computer (`nestegg credentials set-password`). Null or absent: unknown." }
         schedule:
           type: object
           required: [enabled]
@@ -496,6 +497,7 @@ components:
             enabled: { type: boolean }
             key_fingerprint: { type: [string, "null"], description: Fingerprint of the encryption key (not secret). }
             key_exported: { type: boolean, description: The user proved with a copy of the key or the check code of the paper key that a copy exists outside this computer. }
+            key_present: { type: [boolean, "null"], description: "An encryption key is stored on this computer (`nestegg key create` or `key import`); it may still be unconfirmed. Null or absent: unknown." }
         server_verify_failed:
           type: array
           description: Snapshots of this machine that the server's own verification marked as failed, as seen at the end of the last run. Empty or absent if none.
