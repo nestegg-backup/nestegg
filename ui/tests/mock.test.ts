@@ -20,6 +20,7 @@ describe("mock API", () => {
       unconfigured: "unconfigured",
       pbs_unreachable: "ok",
       key_not_exported: "never",
+      credentials_unreadable: "failing",
     };
     expect(s.health).toBe(expected[sc]);
     expect(s.encryption.key_exported).toBe(sc !== "key_not_exported" && sc !== "unconfigured");

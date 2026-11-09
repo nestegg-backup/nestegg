@@ -302,10 +302,7 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     if let Err(e) = result {
         rep.fail(
             RunState::Failed,
-            RunError {
-                kind: ErrorKind::Internal,
-                message: format!("{e:#}"),
-            },
+            RunError::from_error(&e, ErrorKind::Internal),
         );
     }
     if !rep.run.state.is_finished() {
@@ -378,7 +375,16 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             );
             return Ok(());
         }
-        let key_digest = secrets::digest(&secrets.load(secrets::ENCRYPTION_KEY)?);
+        let key_digest = match secrets.load(secrets::ENCRYPTION_KEY) {
+            Ok(key) => secrets::digest(&key),
+            Err(e) => {
+                rep.fail(
+                    RunState::Failed,
+                    RunError::from_error(&e, ErrorKind::Config),
+                );
+                return Ok(());
+            }
+        };
         if state.key_exported_digest.as_deref() != Some(key_digest.as_str()) {
             rep.fail(
                 RunState::Failed,

@@ -19,7 +19,13 @@
   // Finished runs and what they prove about the server (see serverContact).
   const contacts = $derived(
     historyRows(app.runs.value.filter((r) => r.state === "succeeded" || r.state === "failed" || r.state === "pbs_unreachable"), f)
-      .filter((row) => !(row.run.state === "failed" && row.run.error?.kind === "config"))
+      .filter(
+        (row) =>
+          !(
+            row.run.state === "failed" &&
+            (row.run.error?.kind === "config" || row.run.error?.kind === "credentials_unreadable")
+          ),
+      )
       .slice(0, 8),
   );
 </script>

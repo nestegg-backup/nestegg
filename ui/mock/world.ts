@@ -26,6 +26,7 @@ export const SCENARIOS = [
   "unconfigured",
   "pbs_unreachable",
   "key_not_exported",
+  "credentials_unreadable",
   "daemon_down",
   "unauthorized",
 ] as const;
@@ -304,6 +305,19 @@ export class World {
           }),
         );
         this.reachable = null;
+        break;
+      case "credentials_unreadable":
+        // Restored onto a new mainboard: the TPM-sealed secrets no longer decrypt.
+        this.history(now, 13, 1, { skip: [10], pbsNight: 7 });
+        this.runs.unshift(
+          makeRun(localAt(now, 0, 1, 30) < now ? localAt(now, 0, 1, 30) : now - 2 * HOUR, "failed", {
+            error: {
+              kind: "credentials_unreadable",
+              message:
+                "cannot decrypt /etc/nestegg/credentials/encryption-key.cred (Failed to unseal secret using TPM2: State not recoverable); it is bound to this computer's TPM and host key. Store it again with: sudo nestegg key import <exported key file>",
+            },
+          }),
+        );
         break;
       default:
         break;

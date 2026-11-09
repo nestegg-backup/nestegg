@@ -206,6 +206,7 @@ const de = {
     client_failed: "Backup-Programm meldete einen Fehler",
     already_running: "lief schon",
     config: "Einrichtung unvollständig",
+    credentials_unreadable: "Zugangsdaten nicht lesbar",
     internal: "interner Fehler",
   } satisfies Record<RunErrorKind, string>,
   explain: {
@@ -222,6 +223,8 @@ const de = {
     already_running: "Zu dieser Zeit lief schon eine andere Sicherung. Es ist nichts verloren gegangen.",
     config:
       "Die Einrichtung ist unvollständig. Was fehlt, steht im Protokoll; sudo nestegg check zeigt es ebenfalls.",
+    credentials_unreadable:
+      "Dieser PC kann das gespeicherte Token-Secret oder den Schlüssel nicht mehr entschlüsseln, zum Beispiel nach einem Mainboard-Tausch oder einer Wiederherstellung auf anderer Hardware. Neu hinterlegen mit sudo nestegg credentials set-password und sudo nestegg key import mit der exportierten Schlüsseldatei.",
     internal: "In nestegg selbst ist ein Fehler aufgetreten. Was genau passiert ist, steht im Protokoll.",
   } satisfies Record<RunErrorKind, string>,
   other: {

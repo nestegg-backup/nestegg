@@ -193,6 +193,18 @@ enum KeyCmd {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Store an exported key file again (e.g. after new hardware). It counts
+    /// as exported, because you already have the file.
+    Import {
+        /// The key file written by `nestegg key export` (no password).
+        file: PathBuf,
+        #[arg(long)]
+        allow_plain: bool,
+        /// Replace a different existing key (old backups stay readable only
+        /// with the old key!).
+        #[arg(long)]
+        force: bool,
+    },
     /// Write the key file to a location of your choice (e.g. a USB stick).
     Export { file: PathBuf },
     /// Confirm that the key is stored safely outside this computer.
@@ -392,7 +404,9 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
     println!("Next steps:");
     println!("  1. sudo nestegg credentials set-password      # API token secret, read from stdin");
     if cfg.backup.encryption {
-        println!("  2. sudo nestegg key create");
+        println!(
+            "  2. sudo nestegg key create                    # or, to keep an exported key: sudo nestegg key import <file>"
+        );
         println!(
             "     sudo nestegg key paperkey                  # print it, or: sudo nestegg key export <file>"
         );
@@ -512,6 +526,7 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
     // never sees a half-replaced key or overwrites the key state.
     let _lock = match &cmd {
         KeyCmd::Create { .. }
+        | KeyCmd::Import { .. }
         | KeyCmd::ConfirmExported
         | KeyCmd::Export { .. }
         | KeyCmd::Paperkey { .. } => Some(
@@ -558,6 +573,64 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                 "Export it now: sudo nestegg key paperkey   or   sudo nestegg key export <file>"
             );
             println!("Then confirm:  sudo nestegg key confirm-exported");
+        }
+        KeyCmd::Import {
+            file,
+            allow_plain,
+            force,
+        } => {
+            let path = absolute_user_path(&file)?;
+            // Through sudo the file is read with the invoking user's rights.
+            let sudo = nestegg::identity::UserIdentity::from_sudo()?;
+            let key = nestegg::restore::read_user_key(&path, sudo.as_ref())?;
+            // Validate a private copy: `key show` needs a path.
+            secrets::create_private_dir(&paths.tmp_dir())?;
+            let tmp = TempKey(
+                paths
+                    .tmp_dir()
+                    .join(format!("import-key-{}.json", std::process::id())),
+            );
+            secrets::write_private_file(&tmp.0, key.as_bytes())?;
+            let info = client::local::key_info(&tmp.0)
+                .with_context(|| format!("{} is not a usable key file", path.display()))?;
+            drop(tmp);
+            info.require_unprotected()?;
+            let mut state = store.load_state()?;
+            // Importing the key that is already recorded (e.g. after a
+            // restore onto new hardware, where the stored copy cannot be
+            // decrypted any more) replaces nothing.
+            let same_key = state.key_fingerprint.as_deref() == Some(info.fingerprint.as_str());
+            if secrets_store.exists(secrets::ENCRYPTION_KEY) && !force && !same_key {
+                bail!(
+                    "a different encryption key is stored (fingerprint {}). Replacing it makes \
+                     backups made with it unreadable without that key. Use --force only if you \
+                     exported that key.",
+                    state.key_fingerprint.as_deref().unwrap_or("unknown")
+                );
+            }
+            let digest = secrets::digest(&key);
+            // Same order as `key create`: no confirmation may survive for a
+            // key that is about to be replaced.
+            state.key_exported_digest = None;
+            state.key_digest = None;
+            state.key_fingerprint = None;
+            store.save_state(&state)?;
+            let storage = secrets_store.store(secrets::ENCRYPTION_KEY, &key, allow_plain)?;
+            state.key_fingerprint = Some(info.fingerprint.clone());
+            state.key_digest = Some(digest.clone());
+            // The user already holds this key outside the computer.
+            state.key_last_exported_digest = Some(digest.clone());
+            state.key_exported_digest = Some(digest);
+            store.save_state(&state)?;
+            println!(
+                "Encryption key imported (fingerprint {}) and stored {}.",
+                info.fingerprint,
+                match storage {
+                    Storage::SystemdCreds => "encrypted with systemd-creds",
+                    Storage::PlainFile => "as a root-only file",
+                }
+            );
+            println!("It counts as exported, because you already have the file. Keep it safe.");
         }
         KeyCmd::Paperkey { format, output } => {
             let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;

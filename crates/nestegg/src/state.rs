@@ -53,6 +53,9 @@ pub enum ErrorKind {
     ClientFailed,
     AlreadyRunning,
     Config,
+    /// A stored secret exists but cannot be decrypted on this computer
+    /// (TPM or mainboard changed, restored onto other hardware).
+    CredentialsUnreadable,
     Cancelled,
     Internal,
 }
@@ -61,6 +64,29 @@ pub enum ErrorKind {
 pub struct RunError {
     pub kind: ErrorKind,
     pub message: String,
+}
+
+impl RunError {
+    /// Turn an error into a run error of kind `fallback`, unless it is a
+    /// secret that cannot be decrypted: that becomes
+    /// [`ErrorKind::CredentialsUnreadable`] with a message naming the fix.
+    pub fn from_error(e: &anyhow::Error, fallback: ErrorKind) -> RunError {
+        match crate::secrets::find_unreadable(e) {
+            Some(unreadable) => RunError {
+                kind: ErrorKind::CredentialsUnreadable,
+                message: format!(
+                    "{unreadable}. Stored secrets cannot be decrypted after a TPM or mainboard \
+                     change or a restore onto other hardware; store them again: \
+                     sudo nestegg credentials set-password (token secret) and \
+                     sudo nestegg key import <exported key file> (encryption key)"
+                ),
+            },
+            None => RunError {
+                kind: fallback,
+                message: format!("{e:#}"),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

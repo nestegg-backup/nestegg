@@ -34,7 +34,9 @@ Decision and scope: [decisions/0006](decisions/0006-bare-metal-restore-rescue-st
 ## Restoring
 
 1. Boot the computer from the stick (boot menu key, often F12, F11 or Esc).
-   Secure Boot may need to be switched off for the stick.
+   Secure Boot may need to be switched off for the stick. Switching it on
+   again afterwards is fine either way: nestegg's stored secrets do not
+   depend on the Secure Boot state.
 2. The wizard starts by itself. Plug in a network cable, or leave the wizard
    with Ctrl+C, run `nmtui` for Wi-Fi and start it again with `nestegg rescue`.
 3. Plug in the stick with the key and settings; the wizard finds them. It
@@ -51,6 +53,27 @@ Decision and scope: [decisions/0006](decisions/0006-bare-metal-restore-rescue-st
 The restored system contains a report of what was changed:
 `/var/lib/nestegg/rescue-report.txt`. The previous versions of modified
 configuration files are kept below `/var/lib/nestegg/rescue-backup/`.
+
+### After restoring onto new hardware
+
+The restored system brings back nestegg's stored token secret and key, but
+they are sealed to the TPM of the computer that made the backup. On the same
+computer (new disk only) they keep working. On a new mainboard or another
+computer they cannot be decrypted, and backups report "stored secrets
+unreadable". Run `sudo nestegg backup` once to find out, and if it reports
+that, store them again with the key file and token secret you used for the
+restore:
+
+```sh
+sudo nestegg credentials set-password                  # token secret
+sudo nestegg key import /media/usb/nestegg-key.json    # same key, no new upload of old data
+sudo nestegg backup
+```
+
+Importing the same key keeps deduplication against the old snapshots and
+keeps them restorable from the web UI. Do not use `nestegg key create
+--force` for this: a new key means a full upload and old snapshots need the
+old key file.
 
 ### Without the wizard
 

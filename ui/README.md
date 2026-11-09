@@ -89,6 +89,7 @@ and resets it:
 | `unconfigured` | setup not finished (`/config` answers 500 like the daemon) |
 | `pbs_unreachable` | last attempts did not reach the server, still within the threshold |
 | `key_not_exported` | backups blocked until the key export is confirmed |
+| `credentials_unreadable` | last run failed because the stored secrets no longer decrypt (new mainboard) |
 | `daemon_down` | every call answers 502, like `nestegg ui` without the daemon |
 | `unauthorized` | every call answers 401 |
 

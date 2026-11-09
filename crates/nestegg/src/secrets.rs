@@ -8,7 +8,14 @@
 //! Secrets are handed to `proxmox-backup-client` through inherited pipe file
 //! descriptors (`PBS_PASSWORD_FD`, `--keyfd`), never through arguments,
 //! environment values or temporary files.
+//!
+//! `.cred` files are sealed to the TPM (when there is one) and the host key,
+//! but deliberately not to any PCR: a Secure Boot or firmware change must not
+//! lock nestegg out of its own key (decision 0008). A credential that cannot
+//! be decrypted any more is reported as [`Unreadable`], whose message tells
+//! the user how to store it again.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -60,15 +67,91 @@ pub enum Storage {
     PlainFile,
 }
 
+/// A stored `.cred` file exists but cannot be decrypted on this computer,
+/// typically after a TPM or mainboard change or a restore onto other
+/// hardware. The message names the command that stores the secret again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    pub name: String,
+    pub path: PathBuf,
+    pub detail: String,
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot decrypt {} ({}); it is bound to this computer's TPM and host key. \
+             Store it again with: {}",
+            self.path.display(),
+            self.detail,
+            restore_command(&self.name)
+        )
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+/// The command that stores the secret `name` again.
+pub fn restore_command(name: &str) -> &'static str {
+    match name {
+        ENCRYPTION_KEY => "sudo nestegg key import <exported key file>",
+        OVERVIEW_PASSWORD => "sudo nestegg credentials set-password --overview",
+        _ => "sudo nestegg credentials set-password",
+    }
+}
+
+/// The [`Unreadable`] error somewhere in the chain of `e`, if any.
+pub fn find_unreadable(e: &anyhow::Error) -> Option<&Unreadable> {
+    e.chain().find_map(|c| c.downcast_ref::<Unreadable>())
+}
+
+/// Which key `systemd-creds encrypt` seals a credential with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealWith {
+    /// systemd's default `auto`: TPM2 and host key when a TPM2 is present,
+    /// host key only otherwise. No PCR binding (`--tpm2-pcrs=`).
+    Auto,
+    /// Host key only (`/var/lib/systemd/credential.secret`), used when a
+    /// TPM is present but not usable.
+    Host,
+}
+
+/// Arguments for `systemd-creds encrypt` that read the secret from stdin
+/// and write `target`. Only options that exist since systemd 250, the first
+/// release with `systemd-creds`.
+pub fn encrypt_args(name: &str, seal: SealWith, target: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["encrypt".into(), format!("--name={name}").into()];
+    match seal {
+        // An empty list binds to no PCR at all. Without it systemd binds to
+        // PCR 7 (Secure Boot state), which changes with firmware updates.
+        SealWith::Auto => args.push("--tpm2-pcrs=".into()),
+        SealWith::Host => args.push("--with-key=host".into()),
+    }
+    args.push("-".into());
+    args.push(target.as_os_str().to_owned());
+    args
+}
+
 pub struct SecretStore {
     dir: PathBuf,
+    creds_binary: PathBuf,
 }
 
 impl SecretStore {
     pub fn new(dir: &Path) -> SecretStore {
         SecretStore {
             dir: dir.to_path_buf(),
+            creds_binary: std::env::var_os("NESTEGG_SYSTEMD_CREDS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("systemd-creds")),
         }
+    }
+
+    /// Use another `systemd-creds` binary (tests).
+    pub fn with_creds_binary(mut self, binary: &Path) -> SecretStore {
+        self.creds_binary = binary.to_path_buf();
+        self
     }
 
     pub fn exists(&self, name: &str) -> bool {
@@ -85,20 +168,27 @@ impl SecretStore {
         }
         let cred = self.dir.join(format!("{name}.cred"));
         if cred.exists() {
-            let output = Command::new("systemd-creds")
+            let unreadable = |detail: String| Unreadable {
+                name: name.to_string(),
+                path: cred.clone(),
+                detail,
+            };
+            let output = Command::new(&self.creds_binary)
                 .args(["decrypt", &format!("--name={name}")])
                 .arg(&cred)
                 .arg("-")
                 .stdin(Stdio::null())
                 .stderr(Stdio::piped())
                 .output()
-                .context("cannot run systemd-creds")?;
+                .with_context(|| {
+                    format!(
+                        "cannot run {} to decrypt {}",
+                        self.creds_binary.display(),
+                        cred.display()
+                    )
+                })?;
             if !output.status.success() {
-                bail!(
-                    "systemd-creds could not decrypt {}: {}",
-                    cred.display(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
+                return Err(unreadable(last_stderr_line(&output.stderr)).into());
             }
             return Ok(Secret(output.stdout));
         }
@@ -121,7 +211,20 @@ impl SecretStore {
         create_private_dir(&self.dir)?;
         let cred = self.dir.join(format!("{name}.cred"));
         let plain = self.dir.join(name);
-        let encrypted = encrypt_with_systemd_creds(name, secret, &cred);
+        let encrypted = self
+            .encrypt(name, secret, &cred, SealWith::Auto)
+            .or_else(|e| {
+                // A TPM that exists but does not work makes `auto` fail; the
+                // host key still keeps the secret encrypted at rest.
+                self.encrypt(name, secret, &cred, SealWith::Host)
+                    .map(|()| {
+                        eprintln!(
+                            "note: the TPM could not be used ({e:#}); {name} is encrypted with \
+                             the host key only"
+                        )
+                    })
+                    .map_err(|_| e)
+            });
         match encrypted {
             Ok(()) => {
                 let _ = fs::remove_file(&plain);
@@ -138,6 +241,30 @@ impl SecretStore {
             Err(e) => Err(e),
         }
     }
+
+    fn encrypt(&self, name: &str, secret: &Secret, target: &Path, seal: SealWith) -> Result<()> {
+        let tmp = target.with_extension("cred.tmp");
+        let mut child = Command::new(&self.creds_binary)
+            .args(encrypt_args(name, seal, &tmp))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("cannot run systemd-creds")?;
+        child
+            .stdin
+            .take()
+            .context("no stdin")?
+            .write_all(secret.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let _ = fs::remove_file(&tmp);
+            bail!("{}", last_stderr_line(&output.stderr));
+        }
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&tmp, target)?;
+        Ok(())
+    }
 }
 
 fn credentials_directory_path(name: &str) -> Option<PathBuf> {
@@ -146,29 +273,16 @@ fn credentials_directory_path(name: &str) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-fn encrypt_with_systemd_creds(name: &str, secret: &Secret, target: &Path) -> Result<()> {
-    let tmp = target.with_extension("cred.tmp");
-    let mut child = Command::new("systemd-creds")
-        .args(["encrypt", &format!("--name={name}"), "-"])
-        .arg(&tmp)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("cannot run systemd-creds")?;
-    child
-        .stdin
-        .take()
-        .context("no stdin")?
-        .write_all(secret.as_bytes())?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let _ = fs::remove_file(&tmp);
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, target)?;
-    Ok(())
+/// The last non-empty line of a tool's stderr: systemd-creds prints TPM
+/// library noise first and its own summary last.
+fn last_stderr_line(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("systemd-creds failed without a message")
+        .to_string()
 }
 
 fn check_private(path: &Path) -> Result<()> {
@@ -411,6 +525,167 @@ mod tests {
         let store = SecretStore::new(dir.path());
         let err = store.load(ENCRYPTION_KEY).unwrap_err().to_string();
         assert!(err.contains("not set up"));
+    }
+
+    /// Fake `systemd-creds`: logs its arguments next to itself, "seals" by
+    /// prefixing `SEALED:`, fails the TPM path when `tpm-broken` exists and
+    /// fails decryption like a changed TPM for content `FOREIGN`.
+    const FAKE_CREDS: &str = r#"#!/bin/bash
+here=$(dirname "$0")
+echo "$*" >> "$here/args.log"
+case "$1" in
+  encrypt)
+    if [ -e "$here/tpm-broken" ] && [ "$3" = "--tpm2-pcrs=" ]; then
+      echo "ERROR:tcti:Failed to open specified TCTI device file /dev/tpmrm0" >&2
+      echo "Failed to create TPM2 context: State not recoverable" >&2
+      exit 1
+    fi
+    { printf 'SEALED:'; cat; } > "${@: -1}"
+    ;;
+  decrypt)
+    content=$(cat "$3")
+    if [ "$content" = "FOREIGN" ]; then
+      echo "WARNING:esys:Esys_Load_Finish() Received TPM Error" >&2
+      echo "Failed to unseal secret using TPM2: State not recoverable" >&2
+      exit 1
+    fi
+    printf '%s' "${content#SEALED:}"
+    ;;
+esac
+"#;
+
+    fn fake_creds(dir: &Path) -> PathBuf {
+        let path = dir.join("systemd-creds");
+        fs::write(&path, FAKE_CREDS).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn encrypt_args_bind_to_no_pcr() {
+        let target = Path::new("/etc/nestegg/credentials/password.cred.tmp");
+        let auto: Vec<String> = encrypt_args(PASSWORD, SealWith::Auto, target)
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert_eq!(
+            auto,
+            [
+                "encrypt",
+                "--name=password",
+                "--tpm2-pcrs=",
+                "-",
+                "/etc/nestegg/credentials/password.cred.tmp"
+            ]
+        );
+        let host = encrypt_args(ENCRYPTION_KEY, SealWith::Host, target);
+        assert!(host.iter().any(|a| a == "--with-key=host"));
+        assert!(!host.iter().any(|a| a == "--tpm2-pcrs="));
+        // Never an option newer than systemd 250.
+        for a in auto.iter().chain(["--with-key=host".to_string()].iter()) {
+            assert!(!a.starts_with("--tpm2-public-key"), "{a}");
+        }
+    }
+
+    #[test]
+    fn store_uses_systemd_creds_without_pcrs() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = fake_creds(dir.path());
+        let store = SecretStore::new(&dir.path().join("cred")).with_creds_binary(&creds);
+        let storage = store
+            .store(PASSWORD, &Secret::new(b"tok".to_vec()), false)
+            .unwrap();
+        assert_eq!(storage, Storage::SystemdCreds);
+        let log = fs::read_to_string(dir.path().join("args.log")).unwrap();
+        assert!(
+            log.starts_with("encrypt --name=password --tpm2-pcrs= - "),
+            "{log}"
+        );
+        let cred = dir.path().join("cred/password.cred");
+        assert_eq!(fs::metadata(&cred).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(store.load(PASSWORD).unwrap().as_bytes(), b"tok");
+    }
+
+    #[test]
+    fn store_falls_back_to_host_key_when_the_tpm_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = fake_creds(dir.path());
+        fs::write(dir.path().join("tpm-broken"), "").unwrap();
+        let store = SecretStore::new(&dir.path().join("cred")).with_creds_binary(&creds);
+        let storage = store
+            .store(ENCRYPTION_KEY, &Secret::new(b"{}".to_vec()), false)
+            .unwrap();
+        assert_eq!(storage, Storage::SystemdCreds);
+        let log = fs::read_to_string(dir.path().join("args.log")).unwrap();
+        assert!(log.contains("--with-key=host"), "{log}");
+        assert!(!dir.path().join("cred/encryption-key.cred.tmp").exists());
+        assert_eq!(store.load(ENCRYPTION_KEY).unwrap().as_bytes(), b"{}");
+    }
+
+    #[test]
+    fn store_without_systemd_creds_needs_allow_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(&dir.path().join("cred"))
+            .with_creds_binary(&dir.path().join("does-not-exist"));
+        let secret = Secret::new(b"tok".to_vec());
+        assert!(store.store(PASSWORD, &secret, false).is_err());
+        assert_eq!(
+            store.store(PASSWORD, &secret, true).unwrap(),
+            Storage::PlainFile
+        );
+        assert_eq!(store.load(PASSWORD).unwrap().as_bytes(), b"tok");
+    }
+
+    #[test]
+    fn undecryptable_credential_is_unreadable_with_a_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = fake_creds(dir.path());
+        let cred_dir = dir.path().join("cred");
+        create_private_dir(&cred_dir).unwrap();
+        write_private_file(&cred_dir.join("encryption-key.cred"), b"FOREIGN").unwrap();
+        write_private_file(&cred_dir.join("password.cred"), b"FOREIGN").unwrap();
+        let store = SecretStore::new(&cred_dir).with_creds_binary(&creds);
+
+        let err = store.load(ENCRYPTION_KEY).unwrap_err();
+        let unreadable = find_unreadable(&err).expect("typed error");
+        assert_eq!(unreadable.name, ENCRYPTION_KEY);
+        // Only systemd's own summary line, not the TPM library noise.
+        assert_eq!(
+            unreadable.detail,
+            "Failed to unseal secret using TPM2: State not recoverable"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sudo nestegg key import <exported key file>"),
+            "{msg}"
+        );
+
+        let err = store.load(PASSWORD).unwrap_err().context("loading");
+        assert!(find_unreadable(&err).is_some(), "found through context");
+        assert!(format!("{err:#}").contains("sudo nestegg credentials set-password"));
+
+        // A missing systemd-creds is a setup problem, not an unreadable secret.
+        let store = SecretStore::new(&cred_dir).with_creds_binary(&dir.path().join("missing"));
+        let err = store.load(PASSWORD).unwrap_err();
+        assert!(find_unreadable(&err).is_none());
+        assert!(format!("{err:#}").contains("cannot run"), "{err:#}");
+
+        // Other failures are not.
+        let empty = SecretStore::new(dir.path()).with_creds_binary(&creds);
+        assert!(find_unreadable(&empty.load(OVERVIEW_PASSWORD).unwrap_err()).is_none());
+    }
+
+    #[test]
+    fn restore_commands_name_the_right_fix() {
+        assert_eq!(
+            restore_command(OVERVIEW_PASSWORD),
+            "sudo nestegg credentials set-password --overview"
+        );
+        assert_eq!(
+            restore_command(PASSWORD),
+            "sudo nestegg credentials set-password"
+        );
+        assert!(restore_command(ENCRYPTION_KEY).contains("key import"));
     }
 
     #[test]

@@ -195,6 +195,7 @@ describe("serverContact", () => {
     // Checked before the PBS is contacted, or anywhere: no evidence.
     expect(serverContact(failed("source_missing"))).toBe("unknown");
     expect(serverContact(failed("config"))).toBe("unknown");
+    expect(serverContact(failed("credentials_unreadable"))).toBe("unknown");
     expect(serverContact(failed("already_running"))).toBe("unknown");
     expect(serverContact(failed("internal"))).toBe("unknown");
     expect(serverContact(run("x", "failed"))).toBe("unknown");

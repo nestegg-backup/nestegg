@@ -22,7 +22,7 @@ sudo nestegg init --server pbs.example.com --datastore backups \
      --namespace desktops --auth-id 'backup@pbs!desktop' \
      [--fingerprint <SHA-256>] [--wake-mac 00:00:5e:00:53:01]
 sudo nestegg credentials set-password     # paste the token secret
-sudo nestegg key create
+sudo nestegg key create                   # reinstalling? keep the old key: sudo nestegg key import <file>
 sudo nestegg key paperkey                 # print it - or: sudo nestegg key export /media/usb/nestegg-key.json
 sudo nestegg key confirm-exported
 sudo nestegg check
@@ -146,14 +146,48 @@ Stored in `/etc/nestegg/credentials/` (mode 0700):
 | `overview-password.cred` / `overview-password` | Secret of the optional read-only overview token |
 | `encryption-key.cred` / `encryption-key` | Encryption key (`proxmox-backup-client` key file without password) |
 
-`*.cred` files are encrypted with `systemd-creds` (bound to the TPM when
-available). Without `systemd-creds`, pass `--allow-plain` to store a root-only
-file instead. Secrets reach `proxmox-backup-client` through inherited file
-descriptors, never via command line arguments, environment values or logs.
+`*.cred` files are encrypted with `systemd-creds` (systemd 250 or newer). They
+are sealed to this computer's TPM when it has one, plus systemd's host key
+(`/var/lib/systemd/credential.secret`), but not to any PCR: Secure Boot
+changes and firmware updates do not make them unreadable
+([decision 0007](decisions/0007-credentials-without-pcr-binding.md)). If the
+TPM is present but not usable, the host key alone is used. Without
+`systemd-creds` (e.g. Ubuntu 22.04 / Linux Mint 21 with systemd 249), pass
+`--allow-plain` to store a root-only file instead. Secrets reach
+`proxmox-backup-client` through inherited file descriptors, never via command
+line arguments, environment values or logs.
+
+Credentials stored by an earlier development build were bound to PCR 7 (the
+Secure Boot state). Store them again once, so they use the new sealing:
+
+```sh
+sudo nestegg credentials set-password            # and --overview, if used
+sudo nestegg key import /media/usb/nestegg-key.json
+```
 
 **The encryption key is the only way to read encrypted backups.** If it only
 exists on this computer and the disk fails, the backups are lost. That is why
 backups refuse to run until `nestegg key confirm-exported` was executed.
+
+### When the stored secrets cannot be decrypted
+
+A new mainboard (new TPM), a TPM reset in the firmware settings, or a restore
+onto other hardware makes the `.cred` files unreadable. Backups then fail with
+"stored secrets unreadable" (`credentials_unreadable`). Nothing on the PBS is
+lost; store the secrets again:
+
+```sh
+sudo nestegg credentials set-password                  # token secret
+sudo nestegg credentials set-password --overview       # only with [overview]
+sudo nestegg key import /media/usb/nestegg-key.json    # the exported key file
+```
+
+`nestegg key import` checks the file with `proxmox-backup-client key show`,
+stores it like `key create` does and counts it as exported, because you
+already have the file. It only accepts keys without a password (as written
+by `nestegg key export`). Importing the key whose fingerprint is already
+recorded needs no `--force`; a different key needs `--force`, because backups
+made with the current key then need its exported copy to be restored.
 
 ## Limitations
 

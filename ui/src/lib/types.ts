@@ -22,6 +22,7 @@ export type RunErrorKind =
   | "client_failed"
   | "already_running"
   | "config"
+  | "credentials_unreadable"
   | "internal";
 
 export interface RunError {

@@ -50,8 +50,45 @@ case "$1" in
     echo '{"client":{"version":"4.2.10","release":"1"}}'
     exit 0
     ;;
+  key)
+    # `key show <file> --output-format json`: test key files are JSON
+    # objects like {"fp":"aa:01"}; "scrypt" marks a password-protected key.
+    if [ "$2" = "show" ]; then
+      content=$(cat "$3")
+      fp=$(printf '%s' "$content" | sed -n 's/.*"fp":"\([^"]*\)".*/\1/p')
+      if [ -z "$fp" ]; then
+        echo "Error: unable to parse key file" >&2
+        exit 255
+      fi
+      case "$content" in
+        *scrypt*) kdf=scrypt ;;
+        *) kdf=none ;;
+      esac
+      echo "{\"path\":\"$3\",\"kdf\":\"$kdf\",\"fingerprint\":\"$fp\",\"hint\":null}"
+    fi
+    exit 0
+    ;;
 esac
 exit 0
+"#;
+
+/// Fake `systemd-creds`: logs its arguments, "seals" by prefixing `SEALED:`
+/// and fails like a replaced TPM for content `FOREIGN`.
+const FAKE_CREDS: &str = r#"#!/bin/bash
+echo "$*" >> "$FAKE_CREDS_LOG"
+case "$1" in
+  encrypt)
+    { printf 'SEALED:'; cat; } > "${@: -1}"
+    ;;
+  decrypt)
+    content=$(cat "$3")
+    if [ "$content" = "FOREIGN" ]; then
+      echo "Failed to unseal secret using TPM2: State not recoverable" >&2
+      exit 1
+    fi
+    printf '%s' "${content#SEALED:}"
+    ;;
+esac
 "#;
 
 struct Env {
@@ -72,6 +109,9 @@ impl Env {
         let client = root.join("fake-client");
         fs::write(&client, FAKE_CLIENT).unwrap();
         fs::set_permissions(&client, fs::Permissions::from_mode(0o755)).unwrap();
+        let creds = root.join("fake-systemd-creds");
+        fs::write(&creds, FAKE_CREDS).unwrap();
+        fs::set_permissions(&creds, fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(root.join("cred"), fs::Permissions::from_mode(0o700)).unwrap();
         write_secret(&root.join("cred/password"), "token-secret\n");
         write_secret(&root.join("cred/encryption-key"), "{\"kdf\":null}");
@@ -149,6 +189,8 @@ inventory = false
             .env("NESTEGG_RUNTIME_DIR", root.join("run"))
             .env("NESTEGG_PBS_CLIENT", root.join("fake-client"))
             .env("FAKE_LOG", root.join("fake.log"))
+            .env("NESTEGG_SYSTEMD_CREDS", root.join("fake-systemd-creds"))
+            .env("FAKE_CREDS_LOG", root.join("creds.log"))
             .env_remove("CREDENTIALS_DIRECTORY")
             .env("PBS_PASSWORD", "must-not-reach-the-client");
         cmd
@@ -444,6 +486,135 @@ fn confirmation_requires_exporting_the_current_key() {
     assert_eq!(
         code(&key_cmd(&["key", "export", export2.to_str().unwrap()])),
         1
+    );
+}
+
+impl Env {
+    /// A root command (`key …`) run by the test user.
+    fn root_cmd(&self, args: &[&str]) -> Output {
+        self.command(args)
+            .env("NESTEGG_ALLOW_NON_ROOT", "1")
+            .env_remove("SUDO_UID")
+            .output()
+            .unwrap()
+    }
+
+    fn write_user_file(&self, name: &str, content: &str) -> String {
+        let path = self.root().join(name);
+        fs::write(&path, content).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn set_state(&self, key: &str, value: serde_json::Value) {
+        let path = self.root().join("state/state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        state[key] = value;
+        fs::write(path, state.to_string()).unwrap();
+    }
+}
+
+#[test]
+fn key_import_stores_the_key_without_pcr_binding_and_counts_as_exported() {
+    let env = Env::new();
+    fs::remove_file(env.root().join("cred/encryption-key")).unwrap();
+    env.set_key_exported(false);
+    let file = env.write_user_file("exported.json", r#"{"fp":"aa:01"}"#);
+
+    let out = env.root_cmd(&["key", "import", &file]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("aa:01"));
+    assert!(env.root().join("cred/encryption-key.cred").exists());
+    assert!(!env.root().join("cred/encryption-key").exists());
+    let creds_log = fs::read_to_string(env.root().join("creds.log")).unwrap();
+    assert!(
+        creds_log.contains("encrypt --name=encryption-key --tpm2-pcrs= -"),
+        "{creds_log}"
+    );
+
+    let digest = nestegg::secrets::digest(&nestegg::secrets::Secret::new(
+        br#"{"fp":"aa:01"}"#.to_vec(),
+    ));
+    let state = env.state();
+    assert_eq!(state["key_fingerprint"], "aa:01");
+    assert_eq!(state["key_digest"], digest.as_str());
+    assert_eq!(state["key_exported_digest"], digest.as_str());
+    assert_eq!(state["key_last_exported_digest"], digest.as_str());
+
+    // Backups run with exactly that key, without a separate confirmation.
+    assert_eq!(code(&env.run(&["run"])), 0);
+    assert!(env.fake_log().contains(r#"KEY {"fp":"aa:01"}"#));
+}
+
+#[test]
+fn key_import_refuses_unusable_files_and_other_keys() {
+    let env = Env::new();
+    env.set_state("key_fingerprint", serde_json::json!("aa:01"));
+    let before = fs::read(env.root().join("cred/encryption-key")).unwrap();
+
+    let garbage = env.write_user_file("garbage.json", "not a key");
+    let out = env.root_cmd(&["key", "import", &garbage]);
+    assert_eq!(code(&out), 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a usable key file"));
+
+    let protected = env.write_user_file("protected.json", r#"{"fp":"bb:02","kdf":"scrypt"}"#);
+    let out = env.root_cmd(&["key", "import", &protected]);
+    assert_eq!(code(&out), 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("protected with a password"));
+
+    let other = env.write_user_file("other.json", r#"{"fp":"bb:02"}"#);
+    let out = env.root_cmd(&["key", "import", &other]);
+    assert_eq!(code(&out), 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("different encryption key"));
+    assert_eq!(
+        fs::read(env.root().join("cred/encryption-key")).unwrap(),
+        before
+    );
+    assert_eq!(env.state()["key_fingerprint"], "aa:01");
+    // The validation copies are gone.
+    assert_eq!(fs::read_dir(env.root().join("run/tmp")).unwrap().count(), 0);
+
+    let out = env.root_cmd(&["key", "import", "--force", &other]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.state()["key_fingerprint"], "bb:02");
+}
+
+#[test]
+fn unreadable_credentials_are_reported_with_the_fix_and_import_repairs_them() {
+    let env = Env::new();
+    // The stored key was sealed to a TPM this computer no longer has.
+    fs::remove_file(env.root().join("cred/encryption-key")).unwrap();
+    write_secret(&env.root().join("cred/encryption-key.cred"), "FOREIGN");
+    env.set_state("key_fingerprint", serde_json::json!("aa:01"));
+
+    let out = env.run(&["run"]);
+    assert_eq!(code(&out), 1);
+    let error = &env.state()["last_run"]["error"];
+    assert_eq!(error["kind"], "credentials_unreadable", "{error}");
+    let msg = error["message"].as_str().unwrap();
+    assert!(
+        msg.contains("sudo nestegg key import <exported key file>"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("sudo nestegg credentials set-password"),
+        "{msg}"
+    );
+    assert!(!env.fake_log().contains("ARGS backup"));
+
+    // Importing the exported copy of the recorded key needs no --force.
+    let file = env.write_user_file("exported.json", r#"{"fp":"aa:01"}"#);
+    let out = env.root_cmd(&["key", "import", &file]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(code(&env.run(&["run"])), 0);
+
+    // An unreadable token secret is classified the same way.
+    fs::remove_file(env.root().join("cred/password")).unwrap();
+    write_secret(&env.root().join("cred/password.cred"), "FOREIGN");
+    assert_eq!(code(&env.run(&["run"])), 1);
+    assert_eq!(
+        env.state()["last_run"]["error"]["kind"],
+        "credentials_unreadable"
     );
 }
 

@@ -205,6 +205,7 @@ const en = {
     client_failed: "backup program reported an error",
     already_running: "already running",
     config: "setup incomplete",
+    credentials_unreadable: "stored secrets unreadable",
     internal: "internal error",
   },
   explain: {
@@ -218,6 +219,8 @@ const en = {
     client_failed: "The backup program stopped with an error. The log shows what exactly happened.",
     already_running: "Another backup was already running at that time. Nothing was lost.",
     config: "The setup is incomplete. The log shows what is missing; sudo nestegg check shows it too.",
+    credentials_unreadable:
+      "This computer can no longer decrypt the stored token secret or key, for example after a mainboard change or a restore onto other hardware. Store them again with sudo nestegg credentials set-password and sudo nestegg key import followed by your exported key file.",
     internal: "An error happened inside nestegg itself. The log shows what exactly happened.",
   },
   other: {

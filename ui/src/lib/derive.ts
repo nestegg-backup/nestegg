@@ -169,7 +169,9 @@ export function runStep(state: Run["state"]): number {
  * What a finished run proves about the backup server. The run pipeline checks
  * the key and the source folders before it contacts the PBS, so `config`,
  * `source_missing` and `already_running` failures say nothing about the
- * server. `authentication`, `client_missing` and `client_failed` happen in the
+ * server. `credentials_unreadable` is a local problem that can show up
+ * before or after the availability check, so it proves nothing either.
+ * `authentication`, `client_missing` and `client_failed` happen in the
  * backup step, after the PBS answered the availability check. `internal` can
  * happen anywhere.
  */

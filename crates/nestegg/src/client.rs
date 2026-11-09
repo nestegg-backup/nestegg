@@ -541,18 +541,14 @@ impl<'a> Client<'a> {
             message: format!("{e:#}"),
         };
         let mut fds = FdPassing::new();
-        let mut cmd = self.command(&mut fds).map_err(|e| RunError {
-            kind: ErrorKind::Config,
-            message: format!("{e:#}"),
-        })?;
+        let mut cmd = self
+            .command(&mut fds)
+            .map_err(|e| RunError::from_error(&e, ErrorKind::Config))?;
         if spec.encrypt {
             let key = self
                 .secrets
                 .load(secrets::ENCRYPTION_KEY)
-                .map_err(|e| RunError {
-                    kind: ErrorKind::Config,
-                    message: format!("{e:#}"),
-                })?;
+                .map_err(|e| RunError::from_error(&e, ErrorKind::Config))?;
             fds.add(&key, KEY_FD).map_err(internal)?;
         }
         cmd.args(backup_args(spec));
@@ -755,6 +751,35 @@ pub mod local {
     }
 
     pub fn key_fingerprint(path: &Path) -> Result<String> {
+        Ok(key_info(path)?.fingerprint)
+    }
+
+    /// What `proxmox-backup-client key show` reports about a key file.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct KeyInfo {
+        pub fingerprint: String,
+        /// Key derivation of the key's password: `none` for keys without a
+        /// password, `scrypt` or `pbkdf2` otherwise.
+        pub kdf: Option<String>,
+    }
+
+    impl KeyInfo {
+        /// nestegg passes the key through a file descriptor and has no key
+        /// password, so it can only use keys created with `--kdf none`.
+        pub fn require_unprotected(&self) -> Result<()> {
+            match self.kdf.as_deref() {
+                None | Some("none") => Ok(()),
+                Some(kdf) => bail!(
+                    "this key file is protected with a password (kdf {kdf}); nestegg needs a key \
+                     without password. Remove the password from a copy first: \
+                     proxmox-backup-client key change-passphrase --kdf none <copy of the file>"
+                ),
+            }
+        }
+    }
+
+    /// Validate a key file with `key show` (it does not need the password).
+    pub fn key_info(path: &Path) -> Result<KeyInfo> {
         let output = Command::new(client_binary())
             .args(["key", "show"])
             .arg(path)
@@ -768,12 +793,20 @@ pub mod local {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let v: Value =
-            serde_json::from_slice(&output.stdout).context("unexpected key show output")?;
-        v["fingerprint"]
+        parse_key_show(&output.stdout)
+    }
+
+    pub fn parse_key_show(stdout: &[u8]) -> Result<KeyInfo> {
+        let v: Value = serde_json::from_slice(stdout).context("unexpected key show output")?;
+        let fingerprint = v["fingerprint"]
             .as_str()
+            .filter(|f| !f.is_empty())
             .map(String::from)
-            .context("key show did not report a fingerprint")
+            .context("key show did not report a fingerprint")?;
+        Ok(KeyInfo {
+            fingerprint,
+            kdf: v["kdf"].as_str().map(|k| k.to_lowercase()),
+        })
     }
 
     /// Paper key (text with QR code) for printing.
@@ -1081,5 +1114,31 @@ mod tests {
     fn trailing_newline_is_trimmed_from_secrets() {
         let s = trim_secret(Secret::new(b"abc\n".to_vec()));
         assert_eq!(s.as_bytes(), b"abc");
+    }
+
+    #[test]
+    fn key_show_output_is_validated_for_import() {
+        let plain = local::parse_key_show(
+            br#"{"path":"/tmp/k.json","kdf":"none","created":1,"modified":1,
+                 "fingerprint":"aa:bb:cc","hint":null}"#,
+        )
+        .unwrap();
+        assert_eq!(plain.fingerprint, "aa:bb:cc");
+        plain.require_unprotected().unwrap();
+
+        let protected =
+            local::parse_key_show(br#"{"kdf":"Scrypt","fingerprint":"aa:bb:cc"}"#).unwrap();
+        let err = protected.require_unprotected().unwrap_err().to_string();
+        assert!(err.contains("protected with a password"), "{err}");
+        assert!(err.contains("--kdf none"), "{err}");
+
+        // Older clients without a kdf field are accepted.
+        local::parse_key_show(br#"{"fingerprint":"aa"}"#)
+            .unwrap()
+            .require_unprotected()
+            .unwrap();
+        assert!(local::parse_key_show(br#"{"kdf":"none"}"#).is_err());
+        assert!(local::parse_key_show(br#"{"kdf":"none","fingerprint":""}"#).is_err());
+        assert!(local::parse_key_show(b"not json").is_err());
     }
 }
