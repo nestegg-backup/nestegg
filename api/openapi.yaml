@@ -473,9 +473,12 @@ components:
             `running` – a run is in progress;
             `overdue` – no success within the threshold;
             `failing` – the last run failed;
+            `incomplete` – the last backup succeeded, but it does not contain
+            everything the configuration asks for (see `last_success.incomplete`);
             `never` – no successful backup yet;
             `unconfigured` – setup not finished.
-          enum: [ok, running, overdue, failing, never, unconfigured]
+            `failing` and `overdue` take precedence over `incomplete`.
+          enum: [ok, running, overdue, failing, incomplete, never, unconfigured]
         overdue_after_hours: { type: integer, examples: [36] }
         encryption:
           type: object
@@ -484,6 +487,10 @@ components:
             enabled: { type: boolean }
             key_fingerprint: { type: [string, "null"], description: Fingerprint of the encryption key (not secret). }
             key_exported: { type: boolean, description: The user confirmed that the key was exported (paper key or file). }
+        server_verify_failed:
+          type: array
+          description: Snapshots of this machine that the server's own verification marked as failed, as seen at the end of the last run. Empty or absent if none.
+          items: { type: string, examples: ["host/desktop/2026-11-08T21:30:12Z"] }
     Run:
       type: object
       required: [id, trigger, state, started_at]
@@ -512,6 +519,17 @@ components:
         warnings:
           type: array
           items: { type: string }
+        incomplete:
+          type: array
+          description: |
+            Why this backup does not contain everything the configuration
+            asks for (full system backup skipped, an optional source missing,
+            ...). Empty or absent for a complete backup. English text; every
+            entry is also in `warnings`.
+          items: { type: string }
+        verified:
+          type: boolean
+          description: The snapshot was read back from the server after the upload and matched. Absent in records of older versions.
         error:
           oneOf:
             - $ref: "#/components/schemas/RunError"
@@ -522,7 +540,8 @@ components:
       properties:
         kind:
           type: string
-          enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, credentials_unreadable, cancelled, internal]
+          description: "`verification_failed`: the upload finished, but reading the snapshot back from the server failed or did not match."
+          enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, credentials_unreadable, verification_failed, cancelled, internal]
         message: { type: string }
     RunDetail:
       allOf:

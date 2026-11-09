@@ -56,6 +56,9 @@ pub enum ErrorKind {
     /// A stored secret exists but cannot be decrypted on this computer
     /// (TPM or mainboard changed, restored onto other hardware).
     CredentialsUnreadable,
+    /// The upload finished, but reading the snapshot back from the server
+    /// failed or did not return what was uploaded.
+    VerificationFailed,
     Cancelled,
     Internal,
 }
@@ -123,6 +126,15 @@ pub struct Run {
     pub processed_bytes: Option<u64>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Why this backup does not contain everything the configuration asks
+    /// for (full system backup skipped, an optional source missing, ...).
+    /// Empty for a complete backup. Each entry is also in `warnings`.
+    #[serde(default)]
+    pub incomplete: Vec<String>,
+    /// The snapshot was read back from the server after the upload and
+    /// matched (see decision 0015).
+    #[serde(default)]
+    pub verified: bool,
     #[serde(default)]
     pub error: Option<RunError>,
 }
@@ -142,6 +154,8 @@ impl Run {
             expected_bytes: None,
             processed_bytes: None,
             warnings: Vec::new(),
+            incomplete: Vec::new(),
+            verified: false,
             error: None,
         }
     }
@@ -197,6 +211,10 @@ pub struct State {
     /// `key confirm-exported` only accepts the current key if it matches.
     #[serde(default)]
     pub key_last_exported_digest: Option<String>,
+    /// Snapshots of this machine (`host/<id>/<time>`) that the server's own
+    /// verification marked as failed, as seen at the end of the last run.
+    #[serde(default)]
+    pub server_verify_failed: Vec<String>,
 }
 
 impl State {
@@ -212,6 +230,9 @@ pub enum Health {
     Running,
     Overdue,
     Failing,
+    /// The last backup succeeded but does not contain everything the
+    /// configuration asks for (`Run::incomplete`).
+    Incomplete,
     Never,
     Unconfigured,
 }
@@ -240,6 +261,9 @@ pub fn health(
     let finished = success.finished_at.unwrap_or(success.started_at);
     if now - finished > Duration::hours(i64::from(overdue_after_hours)) {
         return Health::Overdue;
+    }
+    if !success.incomplete.is_empty() {
+        return Health::Incomplete;
     }
     Health::Ok
 }
@@ -561,6 +585,17 @@ mod tests {
         // An unreachable PBS alone is not a failure while backups are recent.
         state.last_run = Some(finished(RunState::PbsUnreachable, t(11)));
         assert_eq!(health(true, &state, None, 36, t(12)), Health::Ok);
+
+        // A success that left something out is not "ok"; failing and overdue
+        // take precedence.
+        let mut partial = finished(RunState::Succeeded, t(10));
+        partial.incomplete.push("full system backup skipped".into());
+        state.last_success = Some(partial.clone());
+        state.last_run = Some(partial);
+        assert_eq!(health(true, &state, None, 36, t(12)), Health::Incomplete);
+        assert_eq!(health(true, &state, None, 1, t(12)), Health::Overdue);
+        state.last_run = Some(finished(RunState::Failed, t(11)));
+        assert_eq!(health(true, &state, None, 36, t(12)), Health::Failing);
     }
 
     #[test]

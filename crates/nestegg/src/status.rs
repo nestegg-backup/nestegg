@@ -22,6 +22,7 @@ pub struct Status {
     pub health: Health,
     pub overdue_after_hours: u32,
     pub encryption: Encryption,
+    pub server_verify_failed: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +129,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
             key_fingerprint: state.key_fingerprint.clone(),
             key_exported: state.key_exported(),
         },
+        server_verify_failed: state.server_verify_failed.clone(),
     })
 }
 
