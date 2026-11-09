@@ -4,7 +4,7 @@
   import { app } from "../../lib/store.svelte";
   import { restore } from "../../lib/restore.svelte";
   import { href } from "../../lib/router.svelte";
-  import { isDamaged, restorableArchives } from "../../lib/derive";
+  import { allDamaged, isDamaged, restorableArchives } from "../../lib/derive";
   import { f, t } from "../../lib/locale";
   import type { Snapshot, Status } from "../../lib/types";
 
@@ -27,6 +27,8 @@
   });
   const failed = $derived(status.server_verify_failed ?? []);
   const damaged = (s: Snapshot) => isDamaged(s, failed);
+  // Nothing else to pick: then "take another one" would be no advice.
+  const everyDamaged = $derived(allDamaged(list, failed));
   const current = $derived(restore.snapshot(list));
   const showOlder = $derived(restore.showOlder || (!!current && older.includes(current)));
 
@@ -52,7 +54,7 @@
   <label class="choice">
     <input type="radio" name="snap" value={s.time} checked={restore.snapshotTime === s.time} onchange={() => restore.pick(s.time)} />
     <span>{f.dayLongYear(s.time)}</span>
-    <span class="side">{#if damaged(s)}<span class="dmg">{t.restore.damaged}</span>{/if}{f.time(s.time)}</span>
+    <span class="side">{#if damaged(s)}<span class="dmg">{t.restore.damaged}</span><span class="sr">, </span>{/if}{f.time(s.time)}</span>
   </label>
 {/snippet}
 
@@ -96,7 +98,7 @@
       </button>
     </p>
   {/if}
-  {#if current && damaged(current)}<p class="hint bad" role="status">{t.restore.damagedSnapshot}</p>{/if}
+  {#if current && damaged(current)}<p class="hint bad" role="status">{everyDamaged ? t.restore.damagedAll : t.restore.damagedSnapshot}</p>{/if}
   <div class="selbar">
     <span class="muted">{current ? f.dayLong(current.time) : ""}</span>
     <a class="btn primary" href={href({ view: "restore", step: "2" })} aria-disabled={current ? undefined : "true"}>{t.restore.showFiles}</a>

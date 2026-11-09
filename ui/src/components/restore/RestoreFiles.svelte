@@ -5,7 +5,7 @@
   import { app } from "../../lib/store.svelte";
   import { restore } from "../../lib/restore.svelte";
   import { href } from "../../lib/router.svelte";
-  import { isDamaged } from "../../lib/derive";
+  import { allDamaged, isDamaged } from "../../lib/derive";
   import { f, t } from "../../lib/locale";
 
   const snap = $derived(restore.snapshot(app.snapshots.list));
@@ -15,6 +15,7 @@
   });
 
   const damaged = $derived(!!snap && isDamaged(snap, app.status?.server_verify_failed ?? []));
+  const everyDamaged = $derived(allDamaged(app.snapshots.list, app.status?.server_verify_failed ?? []));
   const total = $derived(restore.totalSize());
   const n = $derived(restore.selection.length);
 </script>
@@ -24,7 +25,7 @@
     {t.restore.snapshotOf(f.dayLongYear(snap.time), f.time(snap.time))}
     <a class="linkbtn" href={href({ view: "restore", step: "1" })}>{t.restore.otherSnapshot}</a>
   </p>
-  {#if damaged}<p class="hint bad" role="status">{t.restore.damagedSnapshot}</p>{/if}
+  {#if damaged}<p class="hint bad" role="status">{everyDamaged ? t.restore.damagedAll : t.restore.damagedSnapshot}</p>{/if}
 
   {#if restore.browse === "not_implemented"}
     <p class="lead-text gap">{t.restore.notAvailable}</p>

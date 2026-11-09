@@ -1,6 +1,7 @@
 // The mock offers every new state and endpoint, shaped like api/openapi.yaml.
 import { describe, expect, it } from "vitest";
 import { World } from "../mock/world";
+import { setupGuide } from "../src/lib/derive";
 import type { PbsCheckResult, PbsInfo, Restore, Run, Snapshot, Status } from "../src/lib/types";
 
 const params = new URLSearchParams();
@@ -74,15 +75,74 @@ describe("scenario no_key", () => {
   });
 });
 
+describe("scenarios for every step of the guide", () => {
+  const stepOf = (name: World["scenario"], faults: string[] = []) => {
+    const w = new World(name, "full");
+    for (const f of faults) w.faults.add(f as never);
+    return setupGuide(status(w))?.current ?? null;
+  };
+
+  it("lead to the step they are named after", () => {
+    expect(stepOf("unconfigured")).toBe("connect");
+    expect(stepOf("no_credentials")).toBe("credentials");
+    expect(stepOf("no_key")).toBe("key_create");
+    expect(stepOf("key_not_exported")).toBe("key_store");
+    expect(stepOf("no_timer")).toBe("automatic");
+    expect(stepOf("never")).toBe("first_backup");
+    expect(stepOf("ok")).toBeNull();
+  });
+
+  it("send the new fields: credentials_stored and key_present", () => {
+    expect(status(new World("no_credentials", "full")).pbs.credentials_stored).toBe(false);
+    expect(status(new World("no_credentials", "full")).encryption.key_present).toBe(false);
+    expect(status(new World("no_key", "full")).pbs.credentials_stored).toBe(true);
+    expect(status(new World("no_key", "full")).encryption.key_present).toBe(false);
+    expect(status(new World("key_not_exported", "full")).encryption).toMatchObject({ key_present: true, key_exported: false });
+    expect(status(new World("ok", "full")).encryption).toMatchObject({ key_present: true, key_exported: true });
+  });
+
+  it("the faults make the values unknown or switch encryption off", () => {
+    const w = new World("never", "full");
+    w.faults.add("unknown_stored");
+    expect(status(w).pbs.credentials_stored).toBeNull();
+    expect(status(w).encryption.key_present).toBeNull();
+    const plain = new World("never", "full");
+    plain.faults.add("no_encryption");
+    expect(status(plain).encryption).toMatchObject({ enabled: false, key_exported: false, key_fingerprint: null });
+    expect(plain.handle("GET", "/config", params, null).body).toMatchObject({ encryption: false });
+    expect(setupGuide(status(plain))?.steps).not.toContain("key_create");
+  });
+
+  it("switching automatic backups on moves the guide on", () => {
+    const w = new World("no_timer", "full");
+    expect(w.handle("PATCH", "/config", params, { automatic_backups: true }).status).toBe(200);
+    expect(status(w).schedule.enabled).toBe(true);
+    expect(setupGuide(status(w))?.current).toBe("first_backup");
+  });
+
+  it("a backup without the token secret fails like the daemon, with a message about the secret", () => {
+    const t0 = Date.now();
+    const w = new World("no_credentials", "full", t0);
+    w.handle("POST", "/runs", params, null, t0);
+    const after = status(w, t0 + 3_000);
+    expect(after.last_run).toMatchObject({ state: "failed", error: { kind: "config" } });
+    expect(after.last_run?.error?.message).toMatch(/token secret/);
+  });
+});
+
 describe("cancel a run", () => {
-  it("answers 404 for an unknown run and 409 while the run is still starting", () => {
+  // The daemon answers 404 "no running backup with this id" in every case it cannot cancel
+  // (crates/nestegg/src/daemon.rs, cancel_run). The contract's 409 cannot_cancel does not exist there.
+  it("answers 404 for an unknown run and while the run is still starting", () => {
     const t0 = Date.now();
     const w = new World("ok", "full", t0);
-    expect(w.handle("POST", "/runs/nope/cancel", params, null, t0).status).toBe(404);
+    const unknown = w.handle("POST", "/runs/nope/cancel", params, null, t0);
+    expect(unknown.status).toBe(404);
+    expect((unknown.body as { code: string }).code).toBe("not_found");
     const run = w.handle("POST", "/runs", params, null, t0).body as Run;
     const early = w.handle("POST", `/runs/${run.id}/cancel`, params, null, t0 + 500);
-    expect(early.status).toBe(409);
-    expect((early.body as { code: string }).code).toBe("cannot_cancel");
+    expect(early.status).toBe(404);
+    expect((early.body as { code: string }).code).toBe("not_found");
   });
 
   it("202 while uploading, then the run ends as cancelled and is no longer current", () => {
@@ -100,41 +160,93 @@ describe("cancel a run", () => {
     expect(after.health).toBe("ok");
   });
 
-  it("answers 409 when the run is already finishing, and with the cancel_late fault", () => {
+  it("answers 404 when the run is already finishing, and with the cancel_late fault; never 409", () => {
     const t0 = Date.now();
     const w = new World("ok", "full", t0);
     const run = w.handle("POST", "/runs", params, null, t0).body as Run;
-    expect(w.handle("POST", `/runs/${run.id}/cancel`, params, null, t0 + 19_000).status).toBe(409);
+    expect(w.handle("POST", `/runs/${run.id}/cancel`, params, null, t0 + 19_000).status).toBe(404);
     const late = new World("ok", "full", t0);
     late.faults.add("cancel_late");
     const r2 = late.handle("POST", "/runs", params, null, t0).body as Run;
-    expect(late.handle("POST", `/runs/${r2.id}/cancel`, params, null, t0 + 10_000).status).toBe(409);
+    expect(late.handle("POST", `/runs/${r2.id}/cancel`, params, null, t0 + 10_000).status).toBe(404);
+    // A run that has finished: also 404.
+    expect(w.handle("POST", `/runs/${run.id}/cancel`, params, null, t0 + 30_000).status).toBe(404);
   });
 });
 
 describe("POST /pbs/check", () => {
-  it("returns the checks with a time; waking makes it take a while", () => {
+  const check = (w: World, query = "") => w.handle("POST", "/pbs/check", new URLSearchParams(query), null);
+  const item = (r: ReturnType<typeof check>, name: string) => (r.body as PbsCheckResult).checks.find((c) => c.name === name);
+
+  it("returns the checks of the daemon with a time; waking makes it take a while", () => {
     const w = new World("ok", "full");
-    const r = w.handle("POST", "/pbs/check", params, null);
+    const r = check(w);
     expect(r.status).toBe(200);
     const body = r.body as PbsCheckResult;
     expect(body.checks.every((c) => typeof c.name === "string" && typeof c.ok === "boolean" && typeof c.detail === "string")).toBe(true);
     expect(body.checks.every((c) => c.ok)).toBe(true);
+    expect(body.checks.map((c) => c.name)).toEqual(
+      expect.arrayContaining(["configuration", "proxmox-backup-client", "password / token secret", "encryption key", "PBS reachable", "PBS login and datastore access", "backup timer enabled"]),
+    );
     expect(Number.isNaN(Date.parse(body.checked_at))).toBe(false);
     expect(r.delayMs).toBeUndefined();
-    expect(w.handle("POST", "/pbs/check", new URLSearchParams("wake=true"), null).delayMs).toBeGreaterThan(1000);
+    expect(check(w, "wake=true").delayMs).toBeGreaterThan(1000);
   });
 
-  it("finds a problem with the fault, answers 503 when the server is down", () => {
-    const bad = new World("ok", "full");
-    bad.faults.add("check_bad");
-    expect((bad.handle("POST", "/pbs/check", params, null).body as PbsCheckResult).checks.some((c) => !c.ok)).toBe(true);
+  it("a server that is off is an answer, not an error: 200 with a failed item, never 503", () => {
+    // No Wake-on-LAN: "no answer" is a problem, and nothing can log in.
+    const off = new World("overdue", "full");
+    off.faults.add("no_wake");
+    const r = check(off);
+    expect(r.status).toBe(200);
+    expect(item(r, "PBS reachable")).toMatchObject({ ok: false, detail: "no answer" });
+    expect(item(r, "PBS login and datastore access")).toBeUndefined();
+    // With Wake-on-LAN the daemon calls it fine ("a run will wake it"), still without a login item.
+    const wol = check(new World("overdue", "full"));
+    expect(wol.status).toBe(200);
+    expect(item(wol, "PBS reachable")).toMatchObject({ ok: true });
+    expect(item(wol, "PBS reachable")!.detail).toMatch(/Wake-on-LAN/);
+    expect(item(wol, "PBS login and datastore access")).toBeUndefined();
+    // The fault switches a healthy scenario's server off; waking it does not help.
     const down = new World("ok", "full");
     down.faults.add("check_down");
-    const r = down.handle("POST", "/pbs/check", params, null);
-    expect(r.status).toBe(503);
-    expect((r.body as { code: string }).code).toBe("pbs_unreachable");
-    expect(new World("overdue", "full").handle("POST", "/pbs/check", params, null).status).toBe(503);
+    down.faults.add("no_wake");
+    for (const q of ["", "wake=true"]) {
+      const d = check(down, q);
+      expect(d.status).toBe(200);
+      expect(item(d, "PBS reachable")?.ok).toBe(false);
+    }
+  });
+
+  it("finds a login problem with the fault", () => {
+    const bad = new World("ok", "full");
+    bad.faults.add("check_bad");
+    expect(item(check(bad), "PBS login and datastore access")?.ok).toBe(false);
+  });
+
+  it("reports missing pieces as failed items: token secret, key, key copy, timer", () => {
+    const r = check(new World("no_credentials", "full"));
+    expect(r.status).toBe(200);
+    expect(item(r, "password / token secret")?.ok).toBe(false);
+    expect(item(r, "encryption key")?.ok).toBe(false);
+    expect(item(r, "encryption key exported")?.ok).toBe(false);
+    expect(item(check(new World("no_timer", "full")), "backup timer enabled")?.ok).toBe(false);
+    const plain = new World("ok", "full");
+    plain.faults.add("no_encryption");
+    expect(item(check(plain), "encryption key")).toBeUndefined();
+  });
+
+  it("an unreadable configuration is one failed item, also 200", () => {
+    const r = check(new World("unconfigured", "full"));
+    expect(r.status).toBe(200);
+    expect((r.body as PbsCheckResult).checks).toEqual([expect.objectContaining({ name: "configuration", ok: false })]);
+  });
+
+  it("does not change what /status says about the server", () => {
+    const w = new World("overdue", "full");
+    const before = status(w).pbs;
+    check(w);
+    expect(status(w).pbs).toEqual(before);
   });
 
   it("is not offered in the 'today' flavour", () => {

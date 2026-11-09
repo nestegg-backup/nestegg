@@ -39,19 +39,22 @@
   .cells .k-pbs { background: var(--pbs); color: var(--on-pbs); }
   .cells .k-fail { background: var(--bad-fill); color: var(--on-bad-fill); }
   .cells .k-incomplete { background: var(--warn); color: var(--on-warn); }
-  .cells .k-damaged { background: none; box-shadow: inset 0 0 0 2px var(--bad); color: var(--text); }
+  /* Damaged: dashed red ring. Running: solid blue ring. They must not differ by colour alone. */
+  .cells .k-damaged { background: none; border: 2px dashed var(--bad); color: var(--text); }
   .cells .k-run { background: none; box-shadow: inset 0 0 0 2px var(--accent-text); color: var(--text); }
+  /* The dashed ring is a border: keep the weekday where it is on the other days. */
+  .cells .k-damaged .w { top: -20px; }
   .cells li.today { outline: 2px solid var(--text); outline-offset: 2px; }
   .cells li.today .w { color: var(--text); }
 
   .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 12px; font-size: var(--fs-s); color: var(--muted); }
   .legend li { display: flex; align-items: center; gap: 6px; }
-  .legend i { width: 10px; height: 10px; border-radius: 2px; background: var(--tick); }
+  .legend i { width: 12px; height: 12px; border-radius: 2px; background: var(--tick); }
   .legend .k-none { background: none; box-shadow: inset 0 0 0 1px var(--field-border); }
   .legend .k-pbs { background: var(--pbs); }
   .legend .k-fail { background: var(--bad-fill); }
   .legend .k-incomplete { background: var(--warn); }
-  .legend .k-damaged { background: none; box-shadow: inset 0 0 0 2px var(--bad); }
+  .legend .k-damaged { background: none; border: 2px dashed var(--bad); }
   .legend .k-run { background: none; box-shadow: inset 0 0 0 2px var(--accent-text); }
 
   @media (max-width: 760px) {

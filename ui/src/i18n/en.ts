@@ -31,8 +31,10 @@ const en = {
     loading: "Loading …",
     retry: "Try again",
     copy: "Copy command",
+    copyOf: (command: string) => `Copy command: ${command}`,
     copied: "Copied",
     copyFailed: "Could not copy, please select it",
+    copyMissing: "Not complete yet.",
     version: (v: string) => `nestegg ${v}`,
   },
   theme: {
@@ -102,6 +104,7 @@ const en = {
     unconfigured: "Not set up yet",
     keyMissing: "Key copy not confirmed",
     keyCreate: "Key still missing",
+    credentials: "Token secret missing",
     incompleteUndated: "Backed up, incomplete",
     incomplete: (m: Moment, dayMonth: string) =>
       m.rel === "today"
@@ -145,6 +148,7 @@ const en = {
     okLead: (m: Moment) => `Backed up ${at(m)}.`,
     okLeadUndated: "Backed up.",
     okText: "Everything is fine.",
+    okTextDamaged: "The last backup worked. The server did report damaged backups though, see below.",
     nextRun: (m: Moment) =>
       `The next backup is due ${at(m)}. If the computer is off then, it catches up the next time it is switched on.`,
     nextRunDue: "The next backup is due and starts shortly.",
@@ -178,7 +182,7 @@ const en = {
     stepUpload: "Upload changed files",
     stepUploadSub: (size: string) => `${size} uploaded`,
     stepUploadCheck: "Comparing files",
-    stepUploadProgress: (done: string, total: string) => `${done} of ${total} gone through (size of the last backup)`,
+    stepUploadProgress: (done: string, total: string) => `${done} of about ${total} compared`,
     stepFinish: "Finish",
     stepFinishSub: "Send the report to the server",
     factsTitle: "About this computer",
@@ -201,8 +205,13 @@ const en = {
     incompleteLead: (m: Moment) => `Backed up ${at(m)}, but not completely.`,
     incompleteLeadUndated: "Backed up, but not completely.",
     incompleteText: "The backup worked, but it does not contain everything that is set up. What is missing is listed below.",
+    incompleteTextNoList:
+      "The backup worked, but it does not contain everything that is set up. nestegg did not report what is missing; the log of the backup in the history may show it.",
     incompleteTitle: "What is missing from the last backup",
     incompleteNote: "nestegg reports the reasons in English.",
+    credentialsLead: "The secret of the token is still missing.",
+    credentialsText:
+      "The setup exists, but nestegg cannot log in to the backup server yet: the secret of the API token is not stored on this computer. Backups only start after that. How to do it is shown below.",
     keyCreateLead: "There is no key for the backups yet.",
     keyCreateText:
       "nestegg encrypts the backups before they leave this computer. That needs a key, which you create below. Backups only start after that.",
@@ -214,9 +223,8 @@ const en = {
     cancelYes: "Yes, cancel",
     cancelNo: "Keep backing up",
     cancelling: "Cancelling …",
-    cancelCannot:
-      "That is not possible right now: the backup is still starting or already finishing. Try again in a few seconds.",
-    cancelGone: "This backup is no longer running.",
+    cancelGone:
+      "Cancelling did not work: the backup is no longer running, or it is only just starting or already finishing. If it is still running, try again in a few seconds.",
     cancelFailed: (msg: string) => `Cancelling did not work. ${msg}`,
     factInterval: "Rhythm",
     factVerified: "Check",
@@ -234,14 +242,16 @@ const en = {
     done: "done",
     now: "current step",
     later: "later",
-    setup: "Connect to the backup server",
+    connect: "Connect to the backup server",
+    credentials: "Store the token secret",
     keyCreate: "Create the key",
     keyStore: "Store the key safely",
+    automatic: "Switch on automatic backups",
     firstBackup: "First backup",
     moveOn: "As soon as a step is done, this page moves on to the next one by itself.",
     terminal: "You type the commands in a terminal. The button next to a command copies it.",
     setupIntro:
-      "nestegg needs three things from the backup server: its address, the datastore (the storage space there) and an API token, which is an access key for this computer only. You never type the secret of the token on this page, only in the terminal.",
+      "nestegg needs three things from the backup server: its address, the datastore (the storage space there) and an API token, an access key for this computer only. A token consists of an ID and a secret (the web interface of the server calls it “Secret”). You enter the ID below; you never type the secret on this page, only in the terminal in the next step.",
     setupClient:
       "The program proxmox-backup-client must be installed as well. How to do that is described in the documentation (docs/configuration.md, section “Installing the backup client”).",
     server: "Address of the backup server",
@@ -253,15 +263,25 @@ const en = {
     authId: "Token ID",
     authIdHint: "Format: user@realm!tokenname. Only the ID, not the secret.",
     authIdPlaceholder: "backup@pbs!desktop",
-    fieldsNote: "These entries stay on this page and are not stored anywhere. They only complete the command below.",
-    commandsIntro: "Then, in the terminal, one after the other:",
+    fieldsNote: "These entries stay on this page and are not stored anywhere. They complete the command below.",
+    commandsIntro: "Then, in the terminal:",
     cmdInit: "Creates the setup.",
-    cmdPassword: "Asks for the secret of the token. What you type stays invisible.",
-    cmdCheck: "Checks that server, access and backup program are fine.",
-    cmdEnable: "Starts nestegg and the automatic backups.",
-    cmdGroup: "Lets your user use this interface. Log out and in once afterwards.",
+    fillFields: "Fill in the fields above first.",
     fingerprint:
-      "If the server uses a self-generated certificate, add --fingerprint <SHA-256> to the first command. The server shows the value in its dashboard under “Show Fingerprint”.",
+      "If the server uses a self-generated certificate, add --fingerprint=<SHA-256> to the command. The server shows the value in its dashboard under “Show Fingerprint”.",
+    groupNote:
+      "You are already allowed to open this page. Other users of this computer first have to join the group nestegg: sudo usermod -aG nestegg <NAME>, with their user name instead of <NAME>. After that they log out and in once.",
+    credentialsWhy:
+      "The setup exists, but the secret of the token is not stored on this computer yet. The command asks for it; what you type stays invisible. Then nestegg checks that server, access and backup program are fine.",
+    cmdPassword: "Asks for the secret of the token.",
+    cmdCheck: "Checks that server, access and backup program are fine.",
+    automaticWhy:
+      "With automatic backups on, nestegg checks every hour whether a backup is due and catches up on missed ones. You can switch them on here or in a terminal.",
+    automaticButton: "Switch on automatic backups",
+    automaticWorking: "Switching on …",
+    automaticDone: "Automatic backups are on.",
+    automaticFailed: (reason: string) => `Switching on did not work. ${reason}`,
+    automaticOr: "Or in a terminal:",
     keyCreateWhy:
       "The backups are encrypted on this computer before they go to the server. You create the key for that now.",
     keyCreateImport:
@@ -270,12 +290,24 @@ const en = {
       "Without this key nobody can open the backups, not even you if the computer breaks. That is why a copy must be kept outside this computer. A copy that only lies on this computer does not count. There are two ways; one is enough. Backups only start once you have confirmed the copy.",
     usbTitle: "On a USB stick",
     usbText:
-      "Write the key to a USB stick and keep the stick somewhere other than the computer. Replace <stick> with the name of your stick.",
+      "Write the key to a USB stick and keep the stick somewhere other than the computer. Enter where the stick is mounted, usually below /media.",
+    stickLabel: "Path of the USB stick",
+    stickPlaceholder: "/media/alice/STICK",
+    stickHint: "The full path, starting with /. The file nestegg-key.json is created there.",
+    stickInvalid: "This must be a full path starting with /.",
+    fillStick: "Enter the path of the stick first.",
     usbConfirm: "Then confirm that the file is on the stick:",
+    usbLocal:
+      "If the file lies on a disk of this computer instead, nestegg refuses, because a copy that is lost with the computer is no protection. Only if another copy exists elsewhere, add --accept-local-copy to the second command.",
     paperTitle: "On paper",
     paperText:
-      "Creates a page to print. It shows the key as a QR code and a short check code. Keep the printout safe, not next to the computer.",
-    paperConfirm: "Then confirm with the check code printed on the page. Replace <CODE> with it:",
+      "Creates a page to print, the file nestegg-paper-key.html in your home folder. It shows the key as a QR code and a short check code. Open the file in the browser, print it and keep the printout safe, not next to the computer.",
+    codeLabel: "Check code of the paper key",
+    codePlaceholder: "ABCD-0123",
+    codeHint: "Not secret. Eight characters from 0–9 and A–F, with or without hyphen.",
+    codeInvalid: "That does not look like a check code (eight characters from 0–9 and A–F).",
+    fillCode: "Enter the check code first.",
+    paperConfirm: "Then confirm with the check code at the top of the printed page:",
     firstBackupText:
       "Everything is ready. Click “Back up now” above. The first time, everything is uploaded, which can take a long time. You can close the page meanwhile.",
   },
@@ -305,6 +337,7 @@ const en = {
     pbsTimes: (n: number) => `Server not reachable, ${n} attempts`,
     cancelled: "Cancelled",
     succeededIncomplete: "Backed up, but incomplete",
+    damaged: "Backed up, but damaged on the server",
     incompleteReasons: "What is missing",
     title: "History",
     colDay: "Day",
@@ -413,8 +446,11 @@ const en = {
     checkNames: "The names and messages come from the program and are in English.",
     checkOkLabel: "fine",
     checkBadLabel: "problem",
-    checkPbs: "The backup server did not answer.",
+    checkPbs: "The backup server did not answer. Is it switched on?",
     checkPbsWol: "Wake-on-LAN is switched on, so nestegg tried to wake it. Try again later.",
+    checkRunning: "Running: checking the connection.",
+    checkFinished: (problems: number) =>
+      problems ? `Check finished, ${problems} ${plural(problems, "item has", "items have")} a problem.` : "Check finished, everything is fine.",
     checkFailed: (msg: string) => `The check could not be run. ${msg}`,
   },
   settings: {
@@ -470,6 +506,7 @@ const en = {
     encryption: "Encryption",
     fingerprint: "Key fingerprint",
     retention: "Retention",
+    keyVerify: "To check later whether a copy of the key still fits, use nestegg key verify with the path of the copy.",
     retentionText: "Set on the server",
     saved: "Saved",
     saving: "Saving …",
@@ -541,6 +578,8 @@ const en = {
     damaged: "damaged",
     damagedSnapshot:
       "This backup is marked as damaged on the server. Files from it may not be restorable completely. Better pick another one.",
+    damagedAll:
+      "All backups are marked as damaged on the server, this one too. Files from it may not be restorable completely. You can try anyway.",
     progress: (done: string, total: string) => `${done} of ${total} restored`,
     progressDone: (done: string) => `${done} restored`,
     nothingSelected: "Nothing selected yet",

@@ -2,7 +2,7 @@
   import Dot from "./Dot.svelte";
   import LoadError from "./LoadError.svelte";
   import { app } from "../lib/store.svelte";
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { historyRows, serverContact } from "../lib/derive";
   import { f, t } from "../lib/locale";
   import type { Status } from "../lib/types";
@@ -13,6 +13,30 @@
   const check = $derived(app.pbsCheck);
   const info = $derived(app.pbs);
   const bad = $derived(check.state === "done" ? check.result.checks.filter((c) => !c.ok).length : 0);
+  // The daemon names this item; a server that does not answer is a failed item, not an error.
+  const reachFailed = $derived(check.state === "done" && check.result.checks.some((c) => c.name === "PBS reachable" && !c.ok));
+
+  let button: HTMLButtonElement | undefined = $state();
+  let resultEl: HTMLElement | undefined = $state();
+  let errorEl: HTMLElement | undefined = $state();
+  /** Said once through the live region when the focus was elsewhere at the end of the check. */
+  let announced = $state("");
+
+  async function run() {
+    if (app.pbsCheck.state === "running" || app.offline) return;
+    announced = "";
+    await app.checkPbs();
+    await tick();
+    const a = document.activeElement;
+    // The button is "busy" and keeps the focus. At the end the focus goes to the result, unless
+    // the user went elsewhere meanwhile: then the live region says it.
+    const here = !a || a === document.body || a === button;
+    const end = app.pbsCheck;
+    if (here && end.state === "done") resultEl?.focus();
+    else if (here && end.state === "error") errorEl?.focus();
+    else if (end.state === "done") announced = t.server.checkFinished(end.result.checks.filter((c) => !c.ok).length);
+    else if (end.state === "error") announced = t.server.checkFailed(end.message);
+  }
 
   $effect(() => {
     // Disk usage of the datastore, when the daemon can tell.
@@ -42,36 +66,40 @@
   <div class="status">
     <h2 class="lead">{#if p.reachable === false}<Dot tone="pbs" />{/if}{lead}</h2>
     <p class="lead-text">{text}</p>
-    <div aria-live="polite">
-      {#if check.state === "running"}
-        <p class="hint" role="status">{check.wake ? t.server.checkingWake : t.server.checkingText}</p>
-      {:else if check.state === "error"}
-        <p class="hint bad" role="status">
-          {#if check.kind === "pbs_unreachable"}
-            {t.server.checkPbs}{check.wake ? ` ${t.server.checkPbsWol}` : ""}
-          {:else}
-            {t.server.checkFailed(check.message)}
-          {/if}
-        </p>
-      {/if}
-    </div>
+    <!-- The one live region of the check: it announces that the check runs, and the result when the
+         focus is somewhere else. Otherwise the focus moves to the result and is read from there. -->
+    <p class="hint live" role="status">{check.state === "running" ? (check.wake ? t.server.checkingWake : t.server.checkingText) : announced}</p>
+    {#if check.state === "error"}
+      <p class="hint bad" tabindex="-1" bind:this={errorEl}>{t.server.checkFailed(check.message)}</p>
+    {/if}
   </div>
   <div class="acts">
-    <button class="btn" type="button" disabled={check.state === "running" || app.offline} onclick={() => app.checkPbs()}>
+    <!-- aria-disabled instead of disabled: the button keeps the focus while the check runs. -->
+    <button
+      class="btn"
+      type="button"
+      bind:this={button}
+      disabled={app.offline}
+      aria-disabled={check.state === "running" ? "true" : undefined}
+      onclick={run}
+    >
       {check.state === "running" ? t.server.checking : t.server.check}
     </button>
   </div>
 </div>
 
 {#if check.state === "done"}
-  <section class="result notice-box" aria-labelledby="h-check">
+  <section class="result notice-box" aria-labelledby="h-check" aria-describedby="check-sum" tabindex="-1" bind:this={resultEl}>
     <h2 id="h-check">{t.server.checkTitle}</h2>
-    <p class="hint">
+    <p class="hint" id="check-sum">
       {t.server.checkedAt(f.moment(check.result.checked_at, app.now))}
       {bad ? t.server.checkProblems(bad) : t.server.checkAllOk}
     </p>
+    {#if reachFailed}
+      <p class="hint bad">{t.server.checkPbs}{check.wake ? ` ${t.server.checkPbsWol}` : ""}</p>
+    {/if}
     <ul>
-      {#each check.result.checks as c (c.name)}
+      {#each check.result.checks as c}
         <li>
           <span class="res">
             <Dot tone={c.ok ? "neutral" : "bad"} />
@@ -156,6 +184,7 @@
 </div>
 
 <style>
+  .live:empty { position: absolute; margin: 0; }
   .result { margin-top: 22px; max-width: 720px; padding: 14px 16px 16px; }
   .result h2 { font-size: var(--fs-m); font-weight: 600; }
   .result ul { margin-top: 8px; display: grid; gap: 6px; }

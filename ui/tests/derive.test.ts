@@ -245,8 +245,8 @@ describe("restore entry and backups on the server", () => {
   it("summarises only a loaded list", () => {
     expect(serverBackups(snaps("loading", ["2026-11-01T00:40:00Z"]))).toBeNull();
     expect(serverBackups(snaps("error"))).toBeNull();
-    expect(serverBackups(snaps("ok"))).toEqual({ count: 0, latest: null });
-    expect(serverBackups(snaps("ok", ["2026-10-01T00:40:00Z", "2026-11-01T00:40:00Z"]))).toEqual({ count: 2, latest: "2026-11-01T00:40:00Z" });
+    expect(serverBackups(snaps("ok"))).toEqual({ count: 0, latest: null, damaged: 0 });
+    expect(serverBackups(snaps("ok", ["2026-10-01T00:40:00Z", "2026-11-01T00:40:00Z"]))).toEqual({ count: 2, latest: "2026-11-01T00:40:00Z", damaged: 0 });
   });
 });
 

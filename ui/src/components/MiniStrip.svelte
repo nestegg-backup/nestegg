@@ -16,6 +16,10 @@
   .k-pbs { background: var(--pbs); }
   .k-fail { background: var(--bad); }
   .k-incomplete { background: var(--warn); }
-  .k-damaged { background: none; box-shadow: inset 0 0 0 1px var(--bad); }
+  /* Damaged: hollow with a red base; running: solid blue. Not told apart by colour alone. */
+  .k-damaged {
+    background: linear-gradient(var(--bad), var(--bad)) bottom / 100% 5px no-repeat;
+    box-shadow: inset 0 0 0 1px var(--bad);
+  }
   .k-run { background: var(--accent-text); }
 </style>

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import CancelRun from "./CancelRun.svelte";
   import DayStrip from "./DayStrip.svelte";
   import Dot from "./Dot.svelte";
@@ -9,7 +9,7 @@
   import SetupGuide from "./SetupGuide.svelte";
   import { app } from "../lib/store.svelte";
   import { href } from "../lib/router.svelte";
-  import { damagedTimes, historyRows, restoreOffer, scheduleHours, selfStrip, selfTone, serverBackups, setupGuide } from "../lib/derive";
+  import { damagedSnapshots, damagedTimes, historyRows, restoreOffer, scheduleHours, selfStrip, selfTone, serverBackups, setupGuide } from "../lib/derive";
   import { selfSummary } from "../lib/text";
   import { f, t } from "../lib/locale";
   import type { Status } from "../lib/types";
@@ -23,6 +23,8 @@
   const guide = $derived(setupGuide(status));
   const incompleteReasons = $derived(summary.kind === "incomplete" ? (status.last_success?.incomplete ?? []) : []);
   const damaged = $derived(damagedTimes(status.server_verify_failed, app.snapshots.list));
+  // Snapshot paths marked as damaged: the history rows say the same as the strip.
+  const damagedPaths = $derived(damagedSnapshots(app.snapshots.list, status.server_verify_failed ?? []));
   const hours = $derived(scheduleHours(app.config.value, status));
   const verified = $derived(status.last_success?.verified === true);
   const rows = $derived(historyRows(app.runs.value, f));
@@ -35,6 +37,17 @@
   const latest = $derived(app.snapshots.state === "ok" ? (app.snapshots.list[0] ?? null) : null);
   const next = $derived(status.schedule.next_run ?? null);
 
+  // The run ends and the cancel block disappears. If the focus is in it, it would fall to <body>:
+  // the new status sentence takes it. (Before the DOM changes, so the block is still there to ask.)
+  let wasRunning = false;
+  $effect.pre(() => {
+    const now = running;
+    if (wasRunning && !now && document.activeElement?.closest(".cancel")) {
+      void tick().then(() => document.querySelector<HTMLElement>("h2.lead")?.focus());
+    }
+    wasRunning = now;
+  });
+
   $effect(() => {
     // What the server holds decides about restoring, also without any local history.
     // Needs the PBS, so only asked once per page load.
@@ -43,17 +56,20 @@
 </script>
 
 <div class="head" class:solo={summary.kind === "unconfigured"}>
-  <div class="status" aria-live="polite">
-    {#if running && status.current_run}
-      <RunProgress run={status.current_run} wakeOnLan={!!status.pbs.wake_on_lan} stale={app.offline} />
-    {:else}
-      <h2 class="lead" class:bad={tone === "bad"}>{#if tone === "bad" || tone === "warn"}<Dot {tone} />{/if}{summary.lead}</h2>
-      <p class="lead-text">{summary.text}</p>
-      {#if offer === "empty" && status.last_success}
-        <!-- The local history knows a backup, the server has none: say so instead of a dead end. -->
-        <p class="hint" role="status">{t.restore.noSnapshots}</p>
+  <div class="status">
+    <!-- The one live region of the head. The cancel action and the start error sit outside it. -->
+    <div aria-live="polite">
+      {#if running && status.current_run}
+        <RunProgress run={status.current_run} wakeOnLan={!!status.pbs.wake_on_lan} stale={app.offline} />
+      {:else}
+        <h2 class="lead" tabindex="-1" class:bad={tone === "bad"}>{#if tone === "bad" || tone === "warn"}<Dot {tone} />{/if}{summary.lead}</h2>
+        <p class="lead-text">{summary.text}</p>
+        {#if offer === "empty" && status.last_success}
+          <!-- The local history knows a backup, the server has none: say so instead of a dead end. -->
+          <p class="hint">{t.restore.noSnapshots}</p>
+        {/if}
       {/if}
-    {/if}
+    </div>
     {#if running}<CancelRun />{/if}
     {#if app.startError}
       <p class="hint" class:bad={app.startError.kind !== "conflict"} role="status">
@@ -89,7 +105,7 @@
   <section class="reasons notice-box" aria-labelledby="h-incomplete">
     <h2 id="h-incomplete"><Dot tone="warn" />{t.self.incompleteTitle}</h2>
     <ul>
-      {#each incompleteReasons as reason (reason)}<li>{reason}</li>{/each}
+      {#each incompleteReasons as reason}<li>{reason}</li>{/each}
     </ul>
     <p class="hint">{t.self.incompleteNote}</p>
   </section>
@@ -118,7 +134,7 @@
         <p class="empty" role="status">{t.app.loading}</p>
       {:else}
         <DayStrip {cells} />
-        <RunHistory {rows} loaded emptyText={server?.count ? t.runs.emptyHere : undefined} />
+        <RunHistory {rows} loaded damaged={damagedPaths} emptyText={server?.count ? t.runs.emptyHere : undefined} />
       {/if}
     </section>
 

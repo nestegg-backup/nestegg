@@ -77,6 +77,8 @@ export interface Status {
     checked_at?: string | null;
     /** Wake-on-LAN is configured and switched on. */
     wake_on_lan?: boolean;
+    /** The token secret (or password) is stored on this computer. null or absent: unknown. */
+    credentials_stored?: boolean | null;
   };
   schedule: { enabled: boolean; calendar?: string; interval_hours?: number; next_run?: string | null };
   current_run?: Run | null;
@@ -84,7 +86,13 @@ export interface Status {
   last_success?: Run | null;
   health: Health;
   overdue_after_hours?: number;
-  encryption: { enabled: boolean; key_fingerprint?: string | null; key_exported?: boolean };
+  encryption: {
+    enabled: boolean;
+    key_fingerprint?: string | null;
+    key_exported?: boolean;
+    /** An encryption key is stored on this computer (it may still be unconfirmed). null or absent: unknown. */
+    key_present?: boolean | null;
+  };
   /** Snapshots of this machine (`host/desktop/2026-11-08T21:30:12Z`) that the server's own check marked as failed. */
   server_verify_failed?: string[];
 }

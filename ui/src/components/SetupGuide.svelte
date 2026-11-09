@@ -1,20 +1,42 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import Cmd from "./Cmd.svelte";
-  import { initCommand, type Guide, type GuideStep } from "../lib/derive";
-  import { t } from "../lib/locale";
+  import {
+    CHECK_COMMAND,
+    ENABLE_TIMERS_COMMAND,
+    KEY_CREATE_COMMAND,
+    PAPER_KEY_COMMAND,
+    SET_PASSWORD_COMMAND,
+    initCommand,
+    keyConfirmCodeCommand,
+    keyConfirmFileCommand,
+    keyExportCommand,
+    normalizeCheckCode,
+    stickFile,
+    type Guide,
+    type GuideStep,
+  } from "../lib/derive";
+  import { ApiFailure } from "../lib/api";
+  import { saveFailure } from "../lib/settingsForm";
+  import { app } from "../lib/store.svelte";
+  import { statusBar } from "../lib/statusbar.svelte";
+  import { f, t } from "../lib/locale";
 
   /**
    * The way from a fresh install to the first backup. Everything happens in a
    * terminal as root; this page never asks for a password, token secret or key.
    * It shows where the user is and moves on by itself when /status says so.
+   * A command that still has a placeholder cannot be copied (see Cmd).
    */
   let { guide }: { guide: Guide } = $props();
 
   const g = t.guide;
   const titles: Record<GuideStep, string> = {
-    setup: g.setup,
+    connect: g.connect,
+    credentials: g.credentials,
     key_create: g.keyCreate,
     key_store: g.keyStore,
+    automatic: g.automatic,
     first_backup: g.firstBackup,
   };
   const at = $derived(guide.steps.indexOf(guide.current));
@@ -24,11 +46,43 @@
   let datastore = $state("");
   let namespace = $state("");
   let authId = $state("");
+  let stick = $state("");
+  let code = $state("");
   const initCmd = $derived(initCommand({ server, datastore, namespace, authId }));
+  const stickBad = $derived(stick.trim() !== "" && !stickFile(stick));
+  const codeBad = $derived(code.trim() !== "" && !normalizeCheckCode(code));
+
+  // "Switch on automatic backups" is the same change as the switch in the settings.
+  const canSwitch = $derived(!!app.config.value?.editable?.includes("automatic_backups"));
+  let switching = $state(false);
+  let switchProblem = $state<string | null>(null);
+  let heading: HTMLElement | undefined = $state();
+  let problemEl: HTMLElement | undefined = $state();
+
+  async function switchOn() {
+    // aria-disabled instead of disabled: the button keeps the focus while it works.
+    if (switching || app.offline) return;
+    switching = true;
+    switchProblem = null;
+    try {
+      await app.saveSettings({ automatic_backups: true });
+      statusBar.show(t.sbar.saved(f.time(new Date()), t.settings.sumAutomatic(true)));
+      // The step is done and the button goes away with it: the focus moves to the list of steps.
+      await tick();
+      heading?.focus();
+    } catch (e) {
+      const failure = e instanceof ApiFailure ? e : new ApiFailure("other", 0, null, String(e));
+      switchProblem = saveFailure(failure, t).text;
+      await tick();
+      problemEl?.focus();
+    } finally {
+      switching = false;
+    }
+  }
 </script>
 
 <section class="guide" aria-labelledby="h-guide">
-  <h2 class="sec-title" id="h-guide">{g.title}</h2>
+  <h2 class="sec-title" id="h-guide" tabindex="-1" bind:this={heading}>{g.title}</h2>
   <ol class="steps" aria-label={g.stepsLabel}>
     {#each guide.steps as step, i (step)}
       <li class="step" class:done={i < at} class:now={i === at} aria-current={i === at ? "step" : undefined}>
@@ -39,7 +93,7 @@
             <span class="sr">, {i < at ? g.done : i === at ? g.now : g.later}</span>
           </p>
           {#if i === at}
-            {#if step === "setup"}
+            {#if step === "connect"}
               <p class="text">{g.setupIntro}</p>
               <p class="text">{g.setupClient}</p>
               <div class="fields">
@@ -63,17 +117,19 @@
               </div>
               <p class="hint">{g.fieldsNote}</p>
               <p class="text lead-in">{g.commandsIntro}</p>
-              <ol class="cmds">
-                <li><Cmd command={initCmd} /><p class="hint">{g.cmdInit}</p></li>
-                <li><Cmd command="sudo nestegg credentials set-password" /><p class="hint">{g.cmdPassword}</p></li>
-                <li><Cmd command="sudo nestegg check" /><p class="hint">{g.cmdCheck}</p></li>
-                <li><Cmd command="sudo systemctl enable --now nestegg.service nestegg-backup.timer" /><p class="hint">{g.cmdEnable}</p></li>
-                <li><Cmd command={'sudo usermod -aG nestegg "$USER"'} /><p class="hint">{g.cmdGroup}</p></li>
-              </ol>
+              <Cmd command={initCmd} missing={g.fillFields} />
+              <p class="hint">{g.cmdInit}</p>
               <p class="hint">{g.fingerprint}</p>
+              <p class="hint">{g.groupNote}</p>
+            {:else if step === "credentials"}
+              <p class="text">{g.credentialsWhy}</p>
+              <ol class="cmds">
+                <li><Cmd command={SET_PASSWORD_COMMAND} /><p class="hint">{g.cmdPassword}</p></li>
+                <li><Cmd command={CHECK_COMMAND} /><p class="hint">{g.cmdCheck}</p></li>
+              </ol>
             {:else if step === "key_create"}
               <p class="text">{g.keyCreateWhy}</p>
-              <Cmd command="sudo nestegg key create" />
+              <Cmd command={KEY_CREATE_COMMAND} />
               <p class="hint">{g.keyCreateImport}</p>
             {:else if step === "key_store"}
               <p class="text">{g.keyStoreWhy}</p>
@@ -81,18 +137,56 @@
                 <section aria-labelledby="h-usb">
                   <h3 id="h-usb">{g.usbTitle}</h3>
                   <p class="text">{g.usbText}</p>
-                  <Cmd command="sudo nestegg key export /media/<stick>/nestegg-key.json" />
+                  <div class="field one">
+                    <label for="g-stick">{g.stickLabel}</label>
+                    <input
+                      id="g-stick" class="input" autocomplete="off" spellcheck="false" placeholder={g.stickPlaceholder}
+                      bind:value={stick} aria-invalid={stickBad ? "true" : undefined}
+                      aria-describedby={stickBad ? "g-stick-hint g-stick-bad" : "g-stick-hint"}
+                    />
+                    <p class="hint" id="g-stick-hint">{g.stickHint}</p>
+                    {#if stickBad}<p class="hint bad" id="g-stick-bad">{g.stickInvalid}</p>{/if}
+                  </div>
+                  <Cmd command={keyExportCommand(stick)} missing={g.fillStick} />
                   <p class="hint">{g.usbConfirm}</p>
-                  <Cmd command="sudo nestegg key confirm-exported --file /media/<stick>/nestegg-key.json" />
+                  <Cmd command={keyConfirmFileCommand(stick)} missing={g.fillStick} />
+                  <p class="hint">{g.usbLocal}</p>
                 </section>
                 <section aria-labelledby="h-paper">
                   <h3 id="h-paper">{g.paperTitle}</h3>
                   <p class="text">{g.paperText}</p>
-                  <Cmd command="sudo nestegg key paperkey --output ~/nestegg-paper-key.html" />
+                  <Cmd command={PAPER_KEY_COMMAND} />
                   <p class="hint">{g.paperConfirm}</p>
-                  <Cmd command="sudo nestegg key confirm-exported --paper-code <CODE>" />
+                  <div class="field one">
+                    <label for="g-code">{g.codeLabel}</label>
+                    <input
+                      id="g-code" class="input code" autocomplete="off" spellcheck="false" placeholder={g.codePlaceholder}
+                      bind:value={code} aria-invalid={codeBad ? "true" : undefined}
+                      aria-describedby={codeBad ? "g-code-hint g-code-bad" : "g-code-hint"}
+                    />
+                    <p class="hint" id="g-code-hint">{g.codeHint}</p>
+                    {#if codeBad}<p class="hint bad" id="g-code-bad">{g.codeInvalid}</p>{/if}
+                  </div>
+                  <Cmd command={keyConfirmCodeCommand(code)} missing={g.fillCode} />
                 </section>
               </div>
+            {:else if step === "automatic"}
+              <p class="text">{g.automaticWhy}</p>
+              {#if canSwitch}
+                <div class="actions">
+                  <button
+                    class="btn primary"
+                    type="button"
+                    aria-disabled={switching || app.offline ? "true" : undefined}
+                    onclick={switchOn}>{switching ? g.automaticWorking : g.automaticButton}</button
+                  >
+                </div>
+                {#if switchProblem}
+                  <p class="hint bad" tabindex="-1" bind:this={problemEl}>{g.automaticFailed(switchProblem)}</p>
+                {/if}
+                <p class="hint or">{g.automaticOr}</p>
+              {/if}
+              <Cmd command={ENABLE_TIMERS_COMMAND} />
             {:else}
               <p class="text">{g.firstBackupText}</p>
             {/if}
@@ -130,6 +224,10 @@
   }
   .input:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 1px; }
   .cmds { margin-top: 2px; }
+  .actions { margin-top: 12px; }
+  .or { margin-top: 12px; }
+  .field.one { margin-top: 12px; max-width: 420px; }
+  .input[aria-invalid="true"] { border-color: var(--bad); }
   .cmds li { margin-top: 12px; }
   .cmds .hint { margin-top: 4px; }
   .ways { display: grid; gap: 22px; margin-top: 14px; }

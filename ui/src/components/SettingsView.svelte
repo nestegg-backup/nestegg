@@ -428,6 +428,9 @@
         {/if}
         <div class="pref ro-row"><dt class="l">{s.retention}</dt><dd class="c">{s.retentionText}</dd></div>
       </dl>
+      {#if status.encryption.enabled && status.encryption.key_exported}
+        <p class="hint">{s.keyVerify}</p>
+      {/if}
       <Cmd label={s.changeIn} command="sudo nestegg init" />
       <Cmd label={s.checkIn} command="sudo nestegg check" />
     </section>

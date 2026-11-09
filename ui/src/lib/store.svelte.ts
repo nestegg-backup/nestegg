@@ -57,8 +57,8 @@ class AppState {
   pbsCheck = $state<
     | { state: "idle" }
     | { state: "running"; wake: boolean }
-    | { state: "done"; result: PbsCheckResult }
-    | { state: "error"; kind: "pbs_unreachable" | "other"; message: string; wake: boolean }
+    | { state: "done"; result: PbsCheckResult; wake: boolean }
+    | { state: "error"; message: string }
   >({ state: "idle" });
   /** The cancel action of the running backup. */
   cancel = $state<
@@ -66,7 +66,7 @@ class AppState {
     | { state: "asking" }
     | { state: "sending" }
     | { state: "requested"; runId: string }
-    | { state: "error"; kind: "cannot_cancel" | "gone" | "other"; message: string }
+    | { state: "error"; kind: "gone" | "other"; message: string }
   >({ state: "idle" });
   now = $state(new Date());
   starting = $state(false);
@@ -230,9 +230,10 @@ class AppState {
       this.cancel = { state: "requested", runId: run.id };
     } catch (e) {
       const f = asFailure(e);
-      // 409 cannot_cancel: still starting or already finishing. 404: it is over already.
-      if (f.kind === "conflict") this.cancel = { state: "error", kind: "cannot_cancel", message: f.message };
-      else if (f.kind === "not_found") this.cancel = { state: "error", kind: "gone", message: f.message };
+      // The daemon answers 404 "no running backup with this id" whenever it cannot cancel: the run
+      // is over, has not begun yet or is already finishing. The contract also names a 409
+      // `cannot_cancel` for the latter; no daemon sends it, but it means the same for the user.
+      if (f.kind === "not_found" || f.kind === "conflict") this.cancel = { state: "error", kind: "gone", message: f.message };
       else this.cancel = { state: "error", kind: "other", message: f.message };
     }
     await this.poll();
@@ -256,17 +257,11 @@ class AppState {
     const wake = !!this.status?.pbs.wake_on_lan;
     this.pbsCheck = { state: "running", wake };
     try {
-      this.pbsCheck = { state: "done", result: await api.checkPbs(wake) };
+      // An unreachable server is a normal answer (200 with a failed "PBS reachable" item), not an error.
+      this.pbsCheck = { state: "done", result: await api.checkPbs(wake), wake };
     } catch (e) {
-      const f = asFailure(e);
-      this.pbsCheck = {
-        state: "error",
-        kind: f.kind === "pbs_unreachable" ? "pbs_unreachable" : "other",
-        message: f.message,
-        wake,
-      };
+      this.pbsCheck = { state: "error", message: asFailure(e).message };
     }
-    // The result also updates what /status knows about the server.
     void this.poll();
     void this.loadPbs();
   }

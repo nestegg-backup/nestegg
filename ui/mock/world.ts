@@ -35,7 +35,10 @@ export const SCENARIOS = [
   "incomplete",
   "verification_failed",
   "damaged",
+  "damaged_all",
+  "no_credentials",
   "no_key",
+  "no_timer",
   "cancelled",
   "daemon_down",
   "unauthorized",
@@ -56,11 +59,15 @@ export type Flavor = "full" | "today";
  * - `no_wake`: the configuration has no `[wake]` section (Wake-on-LAN cannot be switched on)
  * - `timer_fails`: switching automatic backups fails like a missing systemd (500, nothing changes)
  * - `unverified`: runs carry no `verified` flag (records of older versions)
- * - `cancel_late`: cancelling a running backup answers 409 `cannot_cancel`
+ * - `cancel_late`: cancelling a running backup answers 404 `not_found` although it runs (the daemon
+ *   answers 404 whenever it cannot cancel: over, not begun or already finishing)
  * - `check_slow`: `POST /pbs/check` takes 6 s (like a PBS that has to be woken up)
  * - `check_bad`: the connection check finds a problem (login refused)
- * - `check_down`: the connection check answers 503 `pbs_unreachable`
+ * - `check_down`: the backup server is switched off (it does not wake): the connection check answers
+ *   200 like the daemon, with a failed or "not now" item "PBS reachable" and no login check
  * - `no_usage`: `GET /pbs` does not know the datastore usage
+ * - `no_encryption`: encryption is switched off
+ * - `unknown_stored`: `credentials_stored` and `key_present` are null (the daemon cannot tell)
  */
 export const FAULTS = [
   "down",
@@ -76,6 +83,8 @@ export const FAULTS = [
   "check_bad",
   "check_down",
   "no_usage",
+  "no_encryption",
+  "unknown_stored",
 ] as const;
 export type Fault = (typeof FAULTS)[number];
 
@@ -124,6 +133,8 @@ interface ActiveRun {
   run: StoredRun;
   startedMs: number;
   outcome: "succeeded" | "pbs_unreachable" | "config";
+  /** Message of a `config` failure. */
+  configMessage?: string;
   /** When the user asked to cancel (ms); the run ends as `cancelled` shortly after. */
   cancelAtMs?: number;
 }
@@ -285,8 +296,12 @@ export class World {
   inherited: Snapshot[] = [];
   /** Snapshot paths the server's own verification marked as failed (`damaged`). */
   damagedPaths: string[] = [];
+  /** `damaged_all`: every snapshot is damaged (also the older ones made up in `rebuildSnapshots`). */
+  allDamaged = false;
   /** false: encryption is on, but no key exists yet (`no_key`, `unconfigured`). */
   keyCreated = true;
+  /** false: the token secret is not stored yet (`no_credentials`, `unconfigured`). */
+  credentialsStored = true;
   faults = new Set<Fault>();
 
   constructor(
@@ -366,12 +381,25 @@ export class World {
         this.configured = false;
         this.keyExported = false;
         this.keyCreated = false;
+        this.credentialsStored = false;
+        this.reachable = null;
+        break;
+      case "no_credentials":
+        // `nestegg init` has run; the token secret is not stored yet, and no key either.
+        this.credentialsStored = false;
+        this.keyExported = false;
+        this.keyCreated = false;
         this.reachable = null;
         break;
       case "no_key":
         // Set up, but `nestegg key create` has not run yet.
         this.keyExported = false;
         this.keyCreated = false;
+        this.reachable = null;
+        break;
+      case "no_timer":
+        // Everything is ready except the timer: automatic backups are off, no backup yet.
+        this.timerEnabled = false;
         this.reachable = null;
         break;
       case "incomplete":
@@ -405,6 +433,11 @@ export class World {
         this.damagedPaths = [done[4], done[8]].filter((r): r is StoredRun => !!r && !!r.snapshot).map((r) => r.snapshot!);
         break;
       }
+      case "damaged_all":
+        // Every snapshot the server holds is damaged: the restore picker has nothing better to offer.
+        this.history(now, 13, 0, { skip: [10], pbsNight: 7 });
+        this.allDamaged = true;
+        break;
       case "cancelled":
         this.history(now, 13, 0, { skip: [10], pbsNight: 7 });
         this.runs.unshift(
@@ -445,6 +478,7 @@ export class World {
     const checked = this.runs.find((r) => r.state === "succeeded" || r.state === "pbs_unreachable");
     if (checked && this.reachable !== null) this.checkedMs = new Date(checked.started_at).getTime();
     this.rebuildSnapshots(now);
+    if (this.allDamaged) this.damagedPaths = this.snapshots.map((x) => x.snapshot);
     if (this.scenario === "reinstalled") {
       // Like a fresh install with the same backup id: /var/lib/nestegg is empty
       // (no runs, no last_success, server never checked), the PBS keeps every snapshot.
@@ -476,7 +510,7 @@ export class World {
           "index.json.blob",
         ],
         encrypted: true,
-        verified: this.damagedPaths.includes(`host/desktop/${iso(s.ms)}`) ? "failed" : s.ms < now - 3 * DAY ? "ok" : null,
+        verified: this.allDamaged || this.damagedPaths.includes(`host/desktop/${iso(s.ms)}`) ? "failed" : s.ms < now - 3 * DAY ? "ok" : null,
         protected: false,
         comment: null,
       }));
@@ -513,7 +547,7 @@ export class World {
       return;
     }
     if (a.outcome === "config") {
-      if (el > 1_500) this.finish(now, makeRun(a.startedMs, "failed", { trigger: run.trigger, duration: 1, error: { kind: "config", message: "encryption key export not confirmed: run `sudo nestegg key confirm-exported`" } }));
+      if (el > 1_500) this.finish(now, makeRun(a.startedMs, "failed", { trigger: run.trigger, duration: 1, error: { kind: "config", message: a.configMessage ?? "encryption key export not confirmed: run `sudo nestegg key confirm-exported`" } }));
       else run.state = "starting";
       return;
     }
@@ -597,8 +631,17 @@ export class World {
             reachable: this.reachable,
             checked_at: this.checkedMs ? iso(this.checkedMs) : null,
             wake_on_lan: this.wakeOn(),
+            credentials_stored: this.faults.has("unknown_stored") ? null : this.credentialsStored,
           }
-        : { server: "", datastore: "", namespace: null, reachable: null, checked_at: null, wake_on_lan: false },
+        : {
+            server: "",
+            datastore: "",
+            namespace: null,
+            reachable: null,
+            checked_at: null,
+            wake_on_lan: false,
+            credentials_stored: this.faults.has("unknown_stored") ? null : false,
+          },
       schedule: {
         enabled: this.configured && this.timerOn(),
         calendar: `every ${this.intervalHours} h (checked hourly)`,
@@ -611,12 +654,17 @@ export class World {
       health,
       overdue_after_hours: overdueH,
       encryption: {
-        enabled: true,
-        key_fingerprint: this.configured && this.keyCreated ? "<FINGERPRINT>" : null, // placeholder, see AGENTS.md
-        key_exported: this.keyExported,
+        enabled: this.encryptionOn(),
+        key_fingerprint: this.encryptionOn() && this.configured && this.keyCreated ? "<FINGERPRINT>" : null, // placeholder, see AGENTS.md
+        key_exported: this.encryptionOn() && this.keyExported,
+        key_present: this.faults.has("unknown_stored") ? null : this.configured && this.keyCreated,
       },
       ...(this.damagedPaths.length ? { server_verify_failed: [...this.damagedPaths] } : {}),
     };
+  }
+
+  private encryptionOn(): boolean {
+    return !this.faults.has("no_encryption");
   }
 
   private timerOn(): boolean {
@@ -639,7 +687,7 @@ export class World {
       excludes: [...this.excludes],
       schedule: `every ${this.intervalHours} h`,
       interval_hours: this.intervalHours,
-      encryption: true,
+      encryption: this.encryptionOn(),
       overdue_after_hours: this.overdueHours,
       automatic_backups: this.timerOn(),
       wake_on_lan: this.wakeOn(),
@@ -782,8 +830,13 @@ export class World {
     }
     if (route === "POST /runs") {
       if (this.active) return err(409, "run_in_progress", "a backup run is already in progress");
-      const outcome = !this.configured || !this.keyExported ? "config" : this.scenario === "pbs_unreachable" || this.scenario === "overdue" ? "pbs_unreachable" : "succeeded";
+      const needKey = this.encryptionOn() && !this.keyExported;
+      const outcome = !this.configured || !this.credentialsStored || needKey ? "config" : this.scenario === "pbs_unreachable" || this.scenario === "overdue" ? "pbs_unreachable" : "succeeded";
       this.beginRun(now, outcome, "manual");
+      const started = this.active as ActiveRun | null;
+      if (started && !this.credentialsStored) {
+        started.configMessage = "password / token secret: cannot read /etc/nestegg/credentials/password.cred: No such file or directory (os error 2); store it with `sudo nestegg credentials set-password`";
+      }
       return { status: 202, body: this.strip(this.active!.run) };
     }
     if (method === "GET" && (m = /^\/runs\/([^/]+)$/.exec(path))) {
@@ -794,11 +847,11 @@ export class World {
     }
     if (method === "POST" && (m = /^\/runs\/([^/]+)\/cancel$/.exec(path))) {
       const a = this.active;
-      if (!a || a.run.id !== decodeURIComponent(m[1]!)) return err(404, "not_found", "no running backup with this ID");
+      // Like the daemon: one answer, 404, whenever there is nothing to cancel (finished, no process
+      // yet, or already past the point where it listens). The contract's 409 `cannot_cancel` does not exist.
+      if (!a || a.run.id !== decodeURIComponent(m[1]!)) return err(404, "not_found", "no running backup with this id");
       const el = now - a.startedMs;
-      // Still starting (retry) or already finishing: the daemon cannot stop it cleanly.
-      if (this.faults.has("cancel_late") || el < 1_500 || el >= 18_000)
-        return err(409, "cannot_cancel", el < 1_500 ? "the backup is still starting; try again in a moment" : "the backup is already finishing");
+      if (this.faults.has("cancel_late") || el < 1_500 || el >= 18_000) return err(404, "not_found", "no running backup with this id");
       a.cancelAtMs ??= now;
       return { status: 202, body: { cancelling: true } };
     }
@@ -817,30 +870,66 @@ export class World {
       return { status: 200, body: info };
     }
     if (route === "POST /pbs/check") {
-      if (!this.configured) return notConfigured();
       if (today) return err(404, "not_found", "unknown endpoint");
-      const delayMs = this.faults.has("check_slow") || query.get("wake") === "true" ? 6_000 : undefined;
-      if (this.faults.has("check_down") || this.reachable === false) {
-        return { ...err(503, "pbs_unreachable", "pbs.example.com:8007 did not answer (connection timed out)"), delayMs };
+      // Like `check::run` of the daemon: it never fails. Problems are items with ok=false, also an
+      // unreadable configuration or a server that does not answer (200, never 503). It does not
+      // change what /status says about the server.
+      const wakeParam = query.get("wake") === "true";
+      const serverOff = this.reachable === false || this.faults.has("check_down");
+      const delayMs = this.faults.has("check_slow") || wakeParam ? 6_000 : undefined;
+      const checkedAt = iso(now + (delayMs ?? 0));
+      if (!this.configured) {
+        const none: PbsCheckResult = {
+          checked_at: checkedAt,
+          checks: [{ name: "configuration", ok: false, detail: "cannot read /etc/nestegg/config.toml: No such file or directory (os error 2)" }],
+        };
+        return { status: 200, body: none, delayMs };
       }
-      const bad = this.faults.has("check_bad");
-      const body: PbsCheckResult = {
-        checked_at: iso(now + (delayMs ?? 0)),
-        checks: [
-          { name: "configuration", ok: true, detail: "/etc/nestegg/config.toml loaded" },
-          { name: "backup client", ok: true, detail: "proxmox-backup-client 3.4.1" },
-          { name: "stored secrets", ok: true, detail: "token secret and key can be decrypted" },
-          { name: "sources", ok: true, detail: "all 4 folders exist" },
-          { name: "PBS reachable", ok: true, detail: "pbs.example.com:8007 answered in 12 ms" },
-          bad
-            ? { name: "PBS login", ok: false, detail: "authentication failed: 401 invalid credentials for backup@pbs!desktop" }
-            : { name: "PBS login", ok: true, detail: "authenticated as backup@pbs!desktop; datastore backups is readable" },
-        ],
-      };
-      if (!bad) {
-        this.reachable = true;
-        this.checkedMs = now + (delayMs ?? 0);
+      const checks: PbsCheckResult["checks"] = [
+        { name: "configuration", ok: true, detail: "/etc/nestegg/config.toml" },
+        { name: "proxmox-backup-client", ok: true, detail: "proxmox-backup-client 3.4.1" },
+        this.credentialsStored
+          ? { name: "password / token secret", ok: true, detail: "" }
+          : { name: "password / token secret", ok: false, detail: "cannot read /etc/nestegg/credentials/password.cred: No such file or directory (os error 2)" },
+      ];
+      if (this.encryptionOn()) {
+        checks.push(
+          this.keyCreated
+            ? { name: "encryption key", ok: true, detail: "" }
+            : { name: "encryption key", ok: false, detail: "cannot read /etc/nestegg/credentials/encryption-key.cred: No such file or directory (os error 2)" },
+          {
+            name: "encryption key exported",
+            ok: this.keyExported,
+            detail: this.keyExported ? "" : "export the key, then run `nestegg key confirm-exported --file <copy>` (or `--paper-code <code>`)",
+          },
+        );
       }
+      const sources = [
+        ...ARCHIVES.map((a) => ({ archive: a.name.replace(/\.pxar$/, ""), path: a.source })),
+        ...this.extraSources.map((e) => ({ archive: e.archive.replace(/\.pxar$/, ""), path: e.path })),
+      ];
+      for (const src of sources) {
+        const missing = src.archive === "fotos" && this.scenario === "failing";
+        checks.push({ name: `source ${src.archive}`, ok: !missing, detail: `${src.path}${missing ? " (missing)" : ""}` });
+      }
+      // A server that is off but can be woken is "ok" for the daemon ("a run will wake it"); without
+      // Wake-on-LAN it is a problem. A wake attempt (wake=true) that finds nobody changes nothing.
+      const wakeOn = this.wakeOn();
+      checks.push({
+        name: "PBS reachable",
+        ok: !serverOff || wakeOn,
+        detail: !serverOff ? "pbs.example.com:8007" : wakeOn ? "not now (Wake-on-LAN configured; a run will wake it)" : "no answer",
+      });
+      if (!serverOff) {
+        checks.push(
+          this.faults.has("check_bad")
+            ? { name: "PBS login and datastore access", ok: false, detail: "authentication failed: 401 invalid credentials for backup@pbs!desktop" }
+            : { name: "PBS login and datastore access", ok: true, detail: `${this.snapshots.length} snapshots` },
+          { name: "overview access", ok: true, detail: "4 machines" },
+        );
+      }
+      checks.push({ name: "backup timer enabled", ok: this.timerOn(), detail: "nestegg-backup.timer" });
+      const body: PbsCheckResult = { checked_at: checkedAt, checks };
       return { status: 200, body, delayMs };
     }
     if (route === "GET /snapshots") {

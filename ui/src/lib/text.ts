@@ -33,6 +33,10 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
   // Times shown to the user are start times, like in the run history and the snapshot names.
   const successAt = success?.started_at ?? server?.latest ?? null;
   const lastSuccessText = successAt ? t.self.lastSuccessSentence(m(successAt)) : t.self.noSuccessYet;
+  // The token secret comes before the key and before the first backup (see setupGuide).
+  if ((kind === "key_missing" || kind === "never") && setupGuide(s)?.current === "credentials") {
+    return { kind, lead: t.self.credentialsLead, text: t.self.credentialsText };
+  }
   switch (kind) {
     case "unconfigured":
       return { kind, lead: t.self.unconfiguredLead, text: t.self.unconfiguredText };
@@ -64,7 +68,8 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       return { kind, lead: t.self.overdueLead(age.days, age.hours), text: parts.join(" ") };
     }
     case "incomplete": {
-      const parts = [t.self.incompleteText];
+      // The daemon may report health=incomplete without saying what is missing: do not point at an empty list.
+      const parts = [success?.incomplete?.length ? t.self.incompleteText : t.self.incompleteTextNoList];
       const cancelled = cancelledAfter(last, success);
       if (cancelled) parts.push(t.self.lastCancelled(m(cancelled.started_at)));
       if (!s.schedule.enabled) parts.push(t.self.scheduleOff);
@@ -95,7 +100,9 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       return { kind, lead: earlier ? t.self.neverLeadServer : t.self.neverLead, text: parts.join(" ") };
     }
     default: {
-      const parts = [t.self.okText];
+      // The lead must not say "everything is fine" above a notice about damaged backups.
+      const damaged = (s.server_verify_failed?.length ?? 0) > 0 || (server?.damaged ?? 0) > 0;
+      const parts = [damaged ? t.self.okTextDamaged : t.self.okText];
       const pbsAfterSuccess =
         !!last && last.state === "pbs_unreachable" && (!success || last.started_at > success.started_at);
       if (pbsAfterSuccess) parts.push(t.self.lastAttemptPbs(m(last.started_at)));
@@ -120,6 +127,7 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
 export function selfRowText(s: Status, t: Messages, f: Formatter, now: Date, server: ServerBackups | null = null): string {
   const kind = selfKind(s);
   const successAt = s.last_success?.started_at ?? server?.latest ?? null;
+  if ((kind === "key_missing" || kind === "never") && setupGuide(s)?.current === "credentials") return t.row.credentials;
   switch (kind) {
     case "unconfigured":
       return t.row.unconfigured;

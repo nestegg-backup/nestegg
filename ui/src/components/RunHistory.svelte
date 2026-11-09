@@ -8,7 +8,7 @@
 <script lang="ts">
   import Dot from "./Dot.svelte";
   import { api } from "../lib/api";
-  import { errorKind, isIncomplete, otherWarnings, type RunRow } from "../lib/derive";
+  import { errorKind, isIncomplete, otherWarnings, succeededKind, type RunRow } from "../lib/derive";
   import { f, t } from "../lib/locale";
   import type { Run } from "../lib/types";
 
@@ -16,13 +16,15 @@
    * `remote`: rows of another PC, built from what the PBS reports; there is no
    * log to load and no duration or upload size.
    * `emptyText`: replaces the default text of an empty list.
+   * `damaged`: snapshot paths the server marked as damaged; their rows say so, like the 14-day strip.
    */
   let {
     rows,
     loaded,
     remote = false,
     emptyText,
-  }: { rows: RunRow[]; loaded: boolean; remote?: boolean; emptyText?: string } = $props();
+    damaged = new Set<string>(),
+  }: { rows: RunRow[]; loaded: boolean; remote?: boolean; emptyText?: string; damaged?: ReadonlySet<string> } = $props();
 
   const LIMIT = 8;
   let showAll = $state(false);
@@ -40,8 +42,14 @@
     const r = row.run;
     switch (r.state) {
       case "succeeded":
-        if (isIncomplete(r)) return t.runs.succeededIncomplete;
-        if (otherWarnings(r).length) return t.runs.succeededWarnings(otherWarnings(r).length);
+        switch (succeededKind(r, damaged)) {
+          case "damaged":
+            return t.runs.damaged;
+          case "incomplete":
+            return t.runs.succeededIncomplete;
+          case "warnings":
+            return t.runs.succeededWarnings(otherWarnings(r).length);
+        }
         return r.trigger === "timer" ? t.runs.succeeded : t.runs.succeededManual;
       case "failed":
         return t.runs.failed(t.reason[errorKind(r) ?? "internal"]);
@@ -55,7 +63,10 @@
   function tone(r: Run) {
     if (r.state === "failed") return "bad";
     if (r.state === "pbs_unreachable") return "pbs";
-    if (r.state === "succeeded" && (isIncomplete(r) || otherWarnings(r).length)) return "warn";
+    if (r.state === "succeeded") {
+      const k = succeededKind(r, damaged);
+      return k === "damaged" ? "bad" : k === "incomplete" || k === "warnings" ? "warn" : "neutral";
+    }
     return "neutral";
   }
 
@@ -127,7 +138,7 @@
               {#if isIncomplete(r)}
                 <div class="explain">
                   <strong>{t.runs.incompleteReasons}:</strong>
-                  <ul class="reasons">{#each r.incomplete ?? [] as reason (reason)}<li>{reason}</li>{/each}</ul>
+                  <ul class="reasons">{#each r.incomplete ?? [] as reason}<li>{reason}</li>{/each}</ul>
                   <span class="faint">{t.self.incompleteNote}</span>
                 </div>
               {/if}

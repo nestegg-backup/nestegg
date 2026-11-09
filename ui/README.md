@@ -19,12 +19,24 @@ local API described in [`../api/openapi.yaml`](../api/openapi.yaml).
   snapshots (`server_verify_failed` and `Snapshot.verified = failed`: a notice
   on the page of this PC, a red ring on the day, and a mark in the restore
   picker, which preselects the newest undamaged snapshot).
-- **Setup and key guide:** a step list derived from `/status` (set up ->
-  create the key -> store the key outside this PC and confirm -> first
-  backup). Everything happens in a terminal as root; the page never asks
-  for a password, token secret or key. It composes the `nestegg init`
-  command from server, datastore, namespace and token ID (not the secret)
-  and moves on by itself while `/status` is polled.
+- **Setup and key guide:** a step list derived from `/status`, in this
+  order: (1) connect (`health = unconfigured`: `nestegg init`), (2) store the
+  token secret (`pbs.credentials_stored === false`), (3) create the key
+  (encryption on and `encryption.key_present === false`; without that field:
+  no fingerprint and no confirmed copy; a key that exists never leads to
+  "create"), (4) keep the key safe (`key_exported === false`), (5) switch on
+  automatic backups (`schedule.enabled === false`, with a button that does
+  what the settings switch does, and the `systemctl` command as the
+  alternative; only while the setup is not finished, so that nobody who
+  switched the timer off on purpose is nagged), (6) first backup. Unknown
+  values (null or absent) never count as missing. Everything happens in a
+  terminal as root; the page never asks for a password, token secret or
+  key. It composes the commands from non-secret entries (server, datastore,
+  namespace, token ID, path of the USB stick, check code of the paper key)
+  and moves on by itself while `/status` is polled. **A command that still
+  has a placeholder (`<NAME>`) cannot be copied** (the copy button is
+  `aria-disabled` with a short reason next to it) and is written so that a
+  shell fails on it.
 - **Server view:** "Check connection" (`POST /pbs/check`, with Wake-on-LAN it
   may take minutes: waiting state, then the list of checks and the time),
   datastore usage from `GET /pbs` when the daemon knows it.
@@ -123,7 +135,10 @@ and resets it:
 | `incomplete` | `health = incomplete`: the last three backups left out the root file system and an optional folder |
 | `verification_failed` | last run failed with `verification_failed` (the upload worked, reading it back did not) |
 | `damaged` | the server's own check named two damaged snapshots (`server_verify_failed`, `verified = failed` in the list) |
-| `no_key` | set up, but `nestegg key create` has not run yet (setup guide at the key step) |
+| `damaged_all` | every snapshot on the server is damaged (the restore picker has nothing better to offer) |
+| `no_credentials` | `nestegg init` has run, the token secret is not stored yet (guide step 2) |
+| `no_key` | set up, but `nestegg key create` has not run yet (guide step 3) |
+| `no_timer` | everything ready, but the timer is off and there is no backup yet (guide step 5) |
 | `cancelled` | the last run was cancelled by the user |
 | `daemon_down` | every call answers 502, like `nestegg ui` without the daemon |
 | `unauthorized` | every call answers 401 |
@@ -140,10 +155,12 @@ Add faults to any scenario with `&fault=a,b`:
 | `no_wake` | no `[wake]` section: Wake-on-LAN cannot be switched on (`PATCH` answers 400) |
 | `timer_fails` | switching automatic backups answers 500, nothing changes |
 | `unverified` | runs carry no `verified` flag (records of older versions) |
-| `cancel_late` | cancelling a running backup answers `409 cannot_cancel` |
+| `cancel_late` | cancelling a running backup answers `404 not_found` although it runs (the daemon answers 404 whenever it cannot cancel; it never sends the contract's `409 cannot_cancel`) |
 | `check_slow` | `POST /pbs/check` takes 6 s (it does so anyway with `wake=true`, like a PBS that has to wake up) |
 | `check_bad` | the connection check finds a problem (login refused) |
-| `check_down` | the connection check answers `503 pbs_unreachable` |
+| `check_down` | the backup server is switched off: the connection check answers `200` as the daemon does (item "PBS reachable" `ok: false` / "not now" with Wake-on-LAN, no login item), never `503`; the scenarios `overdue` and `pbs_unreachable` behave the same |
+| `no_encryption` | encryption is switched off (no key steps in the guide) |
+| `unknown_stored` | `credentials_stored` and `key_present` are `null` (the daemon cannot tell) |
 | `no_usage` | `GET /pbs` does not know the datastore usage |
 
 `down` can also be switched while the page is open:
@@ -155,8 +172,11 @@ Add `&daemon=today` to get what an older daemon offers: no `/machines`,
 
 "Back up now" in the mock runs through all phases in about 20 s; in
 `pbs_unreachable` and `overdue` it ends with "server not reachable". While
-it uploads, "Cancel backup" works (`409` in the first seconds and in the last
-two, otherwise the run ends as `cancelled` after about a second).
+it uploads, "Cancel backup" works; in the first seconds and in the last two
+it answers `404` like the daemon (see `API-REQUESTS.md`), otherwise the run
+ends as `cancelled` after about a second. `POST /pbs/check` answers like
+`check::run` of the daemon (never fails, real item names) and does not
+change `/status`.
 Restoring into `/home/alice/Dokumente` (or another existing folder of the
 mock) answers `409 target_exists`. A restore takes about 4 s and reports
 `restored_bytes` and `total_bytes` while it runs.

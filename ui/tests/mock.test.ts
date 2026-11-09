@@ -25,11 +25,14 @@ describe("mock API", () => {
       incomplete: "incomplete",
       verification_failed: "failing",
       damaged: "ok",
+      damaged_all: "ok",
+      no_credentials: "never",
       no_key: "never",
+      no_timer: "never",
       cancelled: "ok",
     };
     expect(s.health).toBe(expected[sc]);
-    expect(s.encryption.key_exported).toBe(sc !== "key_not_exported" && sc !== "unconfigured" && sc !== "no_key");
+    expect(s.encryption.key_exported).toBe(!["key_not_exported", "unconfigured", "no_credentials", "no_key"].includes(sc));
   });
 
   it("a started run goes through all phases and succeeds", () => {
