@@ -73,13 +73,12 @@ on_client nestegg init --server pbs.e2e.test --datastore store1 --namespace desk
 docker exec -i "$client" nestegg credentials set-password --allow-plain <<<"$token_secret" >/dev/null
 on_client nestegg key create --allow-plain >/dev/null
 check "backup refused while key not exported" \
-  bash -c "! docker exec $client nestegg backup >/dev/null 2>&1"
+  fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
 on_client nestegg key export /root/nestegg-key.json >/dev/null
 check "paper key contains a QR code" \
   bash -c "docker exec $client nestegg key paperkey | grep -q 'BEGIN PROXMOX BACKUP KEY\|-----BEGIN'"
 on_client nestegg key confirm-exported >/dev/null
-check "config contains no secret" \
-  bash -c "! docker exec $client grep -q '$token_secret' /etc/nestegg/config.toml"
+check "config contains no secret" exits_with 1 on_client grep -qF "$token_secret" /etc/nestegg/config.toml
 on_client nestegg check || true
 
 echo "== first backup"
@@ -91,7 +90,7 @@ check "snapshot is encrypted" grep -q '"encrypted": true' <<<"$snaps"
 check "snapshot has nestegg notes" grep -q '"comment": "nestegg' <<<"$snaps"
 check "uploaded bytes recorded" bash -c "docker exec $client nestegg status --json | grep -Eq '\"uploaded_bytes\": [1-9]'"
 check "archive sizes recorded" bash -c "docker exec $client nestegg status --json | grep -Eq '\"size_bytes\": [1-9]'"
-check "secret not in run logs" bash -c "! docker exec $client grep -rq '$token_secret' /var/lib/nestegg"
+check "secret not in run logs" exits_with 1 on_client grep -rqF "$token_secret" /var/lib/nestegg
 snapshot="$(sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' <<<"$snaps" | head -1)"
 admin_list="$(docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$pbs" \
   proxmox-backup-client snapshot list --ns desktops --repository admin@pbs@127.0.0.1:store1 --output-format json)"
@@ -103,9 +102,11 @@ on_client nestegg restore "$snapshot" home.pxar /root/restore-home >/dev/null 2>
 check "restored file content matches" on_client cmp /home/alice/Documents/photo.bin /root/restore-home/alice/Documents/photo.bin
 check "symlink restored" bash -c "[[ \$(docker exec $client readlink /root/restore-home/alice/link-to-report) == Documents/report.txt ]]"
 check "owner and mode restored" bash -c "[[ \$(docker exec $client stat -c '%U %a' /root/restore-home/alice/Documents/report.txt) == 'alice 640' ]]"
-check "excluded cache not in backup" bash -c "! docker exec $client test -e /root/restore-home/alice/.cache/big/blob"
-check "excluded node_modules not in backup" bash -c "! docker exec $client test -e /root/restore-home/alice/project/node_modules"
-check "restore refuses existing target" bash -c "! docker exec $client nestegg restore $snapshot home.pxar /root/restore-home >/dev/null 2>&1"
+check "excluded cache not in backup" absent_in /root/restore-home/alice .cache/big/blob
+check "excluded node_modules not in backup" absent_in /root/restore-home/alice/project node_modules
+check "restore refuses existing target" \
+  fails_with 1 'restore-home already exists; restores only go into a new directory' \
+  on_client nestegg restore "$snapshot" home.pxar /root/restore-home
 on_client nestegg restore "$snapshot" home.pxar /root/restore-docs --pattern 'alice/Documents/report.txt' >/dev/null 2>&1 || true
 check "pattern restore limits files" bash -c "docker exec $client test -e /root/restore-docs/alice/Documents/report.txt && ! docker exec $client test -e /root/restore-docs/alice/Documents/photo.bin"
 check "restore with plain client and exported key" docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$client" \
@@ -116,35 +117,46 @@ alice_uid="$(on_client id -u alice)"
 alice_gid="$(on_client id -g alice)"
 as_sudo_alice() { docker exec -e SUDO_UID="$alice_uid" -e SUDO_GID="$alice_gid" "$client" "$@"; }
 on_client bash -c 'echo keep > /root/victim && ln -s /root/victim /home/alice/evil-key.json'
-check "export refuses a planted symlink" bash -c "! docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg key export /home/alice/evil-key.json >/dev/null 2>&1"
+check "export refuses a planted symlink" \
+  fails_with 1 'File exists' as_sudo_alice nestegg key export /home/alice/evil-key.json
 check "symlink target untouched" bash -c "[[ \$(docker exec $client cat /root/victim) == keep ]]"
 as_sudo_alice nestegg key export /home/alice/key-copy.json >/dev/null
 check "confirm after export of the same key works" on_client nestegg key confirm-exported
 check "export as sudo user: owned by user, mode 600" bash -c "[[ \$(docker exec $client stat -c '%U %a' /home/alice/key-copy.json) == 'alice 600' ]]"
-check "export cannot write where the user may not" bash -c "! docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg key export /etc/nestegg-key.json >/dev/null 2>&1"
+check "export cannot write where the user may not" \
+  fails_with 1 'Permission denied' as_sudo_alice nestegg key export /etc/nestegg-key.json
 check "restore into user dir succeeds (exit code)" bash -c "docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg restore $snapshot home.pxar /home/alice/restore-home > /tmp/nestegg-user-restore.log 2>&1"
 check "user restore: full content matches" on_client diff -r /home/alice/Documents /home/alice/restore-home/alice/Documents
-check "user restore: files owned by the user" bash -c "[[ -z \$(docker exec $client find /home/alice/restore-home ! -user alice) ]]"
+check "user restore: files owned by the user" no_output on_client find /home/alice/restore-home ! -user alice
 check "user restore with 3000 sockets did not hang (warnings shown)" bash -c "[[ \$(grep -c 'socket ignored' /tmp/nestegg-user-restore.log) -ge 3000 ]]"
 check "user restore: read-only directory restored" on_client test -f /home/alice/restore-home/alice/Archive/frozen/note.txt
 long_name="$(printf 'r%.0s' $(seq 1 240))"
 check "user restore into a 240-character target name" bash -c "docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg restore $snapshot etc.pxar /home/alice/$long_name >/dev/null 2>&1 && docker exec $client test -f /home/alice/$long_name/hostname"
-check "failing user restore (target full) reports an error" bash -c "! docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg restore $snapshot home.pxar /mnt/small/target --pattern 'alice/Documents/photo.bin' >/tmp/nestegg-fail.log 2>&1"
-check "failing user restore: error names the cause" grep -qi "no space" /tmp/nestegg-fail.log
-check "failing user restore: no partial copy left" bash -c "[[ -z \$(docker exec $client ls -A /mnt/small) ]]"
-check "failing user restore: staging cleaned up" bash -c "[[ -z \$(docker exec $client ls -A /var/lib/nestegg/restore-staging) ]]"
-check "restore into missing parent fails before any work" bash -c "docker exec -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg restore $snapshot etc.pxar /home/alice/missing/target 2>&1 | grep -q 'does not exist'"
+check "failing user restore (target full) reports the cause" \
+  fails_with 1 '[Nn]o space left on device' \
+  as_sudo_alice nestegg restore "$snapshot" home.pxar /mnt/small/target --pattern 'alice/Documents/photo.bin'
+check "failing user restore: no partial copy left" no_output on_client ls -A /mnt/small
+check "failing user restore: staging cleaned up" no_output on_client ls -A /var/lib/nestegg/restore-staging
+check "restore into missing parent fails before any work" \
+  fails_with 1 '/home/alice/missing does not exist; create it first' \
+  as_sudo_alice nestegg restore "$snapshot" etc.pxar /home/alice/missing/target
 check "user restore: sparse file stays sparse" bash -c "[[ \$(docker exec $client du -k /home/alice/restore-home/alice/Documents/sparse.img | cut -f1) -lt 1024 ]]"
-check "user restore: no partial directory left" bash -c "[[ -z \$(docker exec $client find /home/alice -maxdepth 1 -name '.*nestegg-partial*') ]]"
-check "user restore: staging cleaned up" bash -c "[[ -z \$(docker exec $client ls -A /var/lib/nestegg/restore-staging) ]]"
+check "user restore: no partial directory left" no_output on_client find /home/alice -maxdepth 1 -name '.*nestegg-partial*'
+check "user restore: staging cleaned up" no_output on_client ls -A /var/lib/nestegg/restore-staging
 check "relative export path as sudo user" bash -c "docker exec -w /home/alice -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg key export rel-key.json >/dev/null && docker exec $client test -f /home/alice/rel-key.json"
 check "relative --keyfile as sudo user" bash -c "docker exec -w /home/alice -e SUDO_UID=$alice_uid -e SUDO_GID=$alice_gid $client nestegg restore $snapshot etc.pxar /root/restore-relkey --keyfile rel-key.json >/dev/null 2>&1"
-check "invalid SUDO_UID is rejected" bash -c "! docker exec -e SUDO_UID=abc $client nestegg key export /root/x.json >/dev/null 2>&1"
-check "user restore: capability not applied" bash -c "[[ -z \$(docker exec $client getcap /home/alice/restore-home/alice/Documents/tool-with-capability) ]]"
+check "invalid SUDO_UID is rejected" \
+  fails_with 1 "SUDO_UID 'abc' is not a valid user id" docker exec -e SUDO_UID=abc "$client" nestegg key export /root/x.json
+check "user restore: capability not applied" bash -c "docker exec $client test -f /home/alice/restore-home/alice/Documents/tool-with-capability \
+  && [[ -z \$(docker exec $client getcap /home/alice/restore-home/alice/Documents/tool-with-capability) ]]"
 check "root restore keeps the capability" bash -c "docker exec $client getcap /root/restore-home/alice/Documents/tool-with-capability | grep -q cap_net_raw"
 check "relative restore target is resolved" bash -c "docker exec -w /root $client nestegg restore $snapshot etc.pxar relative-restore >/dev/null 2>&1 && docker exec $client test -e /root/relative-restore/hostname"
-check "restore target with .. is refused" bash -c "! docker exec $client nestegg restore $snapshot etc.pxar /root/missing/../../tmp/x >/dev/null 2>&1"
-check "restore into /tmp without sudo user is refused" bash -c "! docker exec $client nestegg restore $snapshot etc.pxar /tmp/restore-etc >/dev/null 2>&1"
+check "restore target with .. is refused" \
+  fails_with 1 "the restore target must not contain '\.\.'" \
+  on_client nestegg restore "$snapshot" etc.pxar /root/missing/../../tmp/x
+check "restore into /tmp without sudo user is refused" \
+  fails_with 1 '/tmp/restore-etc is inside a directory that other users can modify' \
+  on_client nestegg restore "$snapshot" etc.pxar /tmp/restore-etc
 
 on_client sed -i 's/^encryption = true/encryption = false/' /etc/nestegg/config.toml
 check "unencrypted backup succeeds" on_client nestegg run --trigger manual
@@ -154,9 +166,11 @@ check "older encrypted snapshot still restores" on_client nestegg restore "$snap
 on_client sed -i 's/^encryption = false/encryption = true/' /etc/nestegg/config.toml
 
 on_client nestegg key create --force --allow-plain >/dev/null
-check "new key blocks backups until exported" bash -c "! docker exec $client nestegg backup >/dev/null 2>&1"
+check "new key blocks backups until exported" \
+  fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
 check "status shows key not exported" bash -c "docker exec $client nestegg status | grep -q 'KEY NOT EXPORTED'"
-check "confirm before exporting the new key is refused" bash -c "! docker exec $client nestegg key confirm-exported >/dev/null 2>&1"
+check "confirm before exporting the new key is refused" \
+  fails_with 1 'the current key has not been exported yet' on_client nestegg key confirm-exported
 on_client nestegg key export /root/nestegg-key-2.json >/dev/null
 on_client nestegg key confirm-exported >/dev/null
 check "backup runs again after confirming the new key" on_client nestegg backup
@@ -178,12 +192,25 @@ echo "== API as unprivileged user: session, browse, restore, machines, cancel"
 on_client usermod -aG nestegg alice
 on_client usermod -aG nestegg bob
 API="docker exec -u alice $client curl -s --unix-socket /run/nestegg/api.sock"
+# responds CODE PATTERN USER CURL-ARGS...: the daemon answers USER with HTTP
+# status CODE and a body matching the extended regular expression PATTERN.
+responds() {
+  local want="$1" pattern="$2" user="$3" out code
+  shift 3
+  out="$(docker exec -u "$user" "$client" curl -s -w '\n%{http_code}' --unix-socket /run/nestegg/api.sock "$@")" \
+    || { echo "    curl failed"; return 1; }
+  code="${out##*$'\n'}"
+  out="${out%$'\n'*}"
+  [[ "$code" == "$want" ]] || { echo "    expected HTTP $want, got $code:"; show "$out"; return 1; }
+  grep -Eq -- "$pattern" <<<"$out" || { echo "    body does not match /$pattern/:"; show "$out"; return 1; }
+}
 latest="$(on_client nestegg snapshots --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
 ltime="${latest##*/}"
 check "session identifies the caller" bash -c "$API http://localhost/api/v1/session | grep -q '\"user\":\"alice\"'"
 check "browse root shows only the own home" bash -c "[[ \$($API 'http://localhost/api/v1/snapshots/$ltime/browse?archive=home.pxar&path=/' | grep -o '\"name\":\"[^\"]*\"' | sort -u | tr -d '\n') == '\"name\":\"alice\"' ]]"
 check "browse inside the own home" bash -c "$API 'http://localhost/api/v1/snapshots/$ltime/browse?archive=home.pxar&path=/alice/Documents' | grep -q report.txt"
-check "browse of another archive is refused" bash -c "$API -o /dev/null -w '%{http_code}' 'http://localhost/api/v1/snapshots/$ltime/browse?archive=etc.pxar&path=/' | grep -q 403"
+check "browse of another archive is refused" \
+  responds 403 'does not contain your home directory' alice "http://localhost/api/v1/snapshots/$ltime/browse?archive=etc.pxar&path=/"
 restore_resp="$($API -X POST -H 'Content-Type: application/json' -d "{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[\"/alice/Documents\"],\"target_dir\":\"/home/alice/api-restore\"}" http://localhost/api/v1/restores)"
 restore_id="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$restore_resp")"
 check "restore accepted" test -n "$restore_id"
@@ -194,10 +221,16 @@ for _ in $(seq 1 60); do
 done
 check "API restore succeeded" test "$rstate" = succeeded
 check "API restore: content matches" on_client cmp /home/alice/Documents/report.txt /home/alice/api-restore/alice/Documents/report.txt
-check "API restore: owned by the caller" bash -c "[[ -z \$(docker exec $client find /home/alice/api-restore ! -user alice) ]]"
-check "API restore: only the selected folder" bash -c "! docker exec $client test -e /home/alice/api-restore/alice/.bashrc"
-check "API restore outside the own home is refused" bash -c "$API -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[\"/root\"],\"target_dir\":\"/home/alice/x1\"}' http://localhost/api/v1/restores | grep -q 403"
-check "API restore into an existing target is 409" bash -c "$API -X POST -H 'Content-Type: application/json' -d '{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[],\"target_dir\":\"/home/alice/api-restore\"}' http://localhost/api/v1/restores | grep -q target_exists"
+check "API restore: owned by the caller" no_output on_client find /home/alice/api-restore ! -user alice
+check "API restore: only the selected folder" absent_in /home/alice/api-restore/alice .bashrc
+check "API restore outside the own home is refused" \
+  responds 403 '/root is outside your home directory' alice -X POST -H 'Content-Type: application/json' \
+  -d "{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[\"/root\"],\"target_dir\":\"/home/alice/x1\"}" \
+  http://localhost/api/v1/restores
+check "API restore into an existing target is 409" \
+  responds 409 '"code":"target_exists"' alice -X POST -H 'Content-Type: application/json' \
+  -d "{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[],\"target_dir\":\"/home/alice/api-restore\"}" \
+  http://localhost/api/v1/restores
 full_resp="$($API -X POST -H 'Content-Type: application/json' -d "{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[],\"target_dir\":\"/home/alice/api-full\"}" http://localhost/api/v1/restores)"
 full_id="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$full_resp")"
 for _ in $(seq 1 120); do
@@ -215,7 +248,8 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 check "glob characters in a name are taken literally" bash -c "docker exec $client test -f '/home/alice/api-glob/alice/Documents/[ab].txt' && ! docker exec $client test -e /home/alice/api-glob/alice/Documents/a.txt"
-check "restore job of another user is not visible" bash -c "docker exec -u bob $client curl -s -o /dev/null -w '%{http_code}' --unix-socket /run/nestegg/api.sock http://localhost/api/v1/restores/$glob_id | grep -q '403\|404'"
+check "restore job is visible to its owner" responds 200 '"state":"succeeded"' alice "http://localhost/api/v1/restores/$glob_id"
+check "restore job of another user is not visible" responds 404 '"message":"unknown restore"' bob "http://localhost/api/v1/restores/$glob_id"
 check "machines lists this PC with its report" bash -c "$API http://localhost/api/v1/machines | grep -q '\"hostname\":'"
 check "pbs info: reachable" bash -c "$API http://localhost/api/v1/pbs | grep -q '\"reachable\":true'"
 check "connection check via API" bash -c "$API -X POST http://localhost/api/v1/pbs/check | grep -q 'PBS login and datastore access'"
@@ -235,13 +269,38 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 check "cancelled run recorded as cancelled" bash -c "$API http://localhost/api/v1/runs/$run_id | grep -q '\"state\":\"cancelled\"'"
-check "no backup client left running" bash -c "! docker exec $client pgrep -f 'proxmox-backup-client backup' >/dev/null"
+check "no backup client left running" exits_with 1 on_client pgrep -f 'proxmox-backup-client backup'
 on_client sed -i '/^rate_limit = "100KiB"$/d' /etc/nestegg/config.toml
 on_client rm -f /home/alice/big-new-file.bin
 
 echo "== token cannot delete backups"
-check "token is not allowed to forget snapshots" bash -c "! docker exec -e PBS_PASSWORD='$token_secret' -e PBS_FINGERPRINT='$fp' $client \
-  proxmox-backup-client snapshot forget '$snapshot' --ns desktops --repository 'backup@pbs!desktop@pbs.e2e.test:store1' >/dev/null 2>&1"
+as_token() {
+  docker exec -e PBS_PASSWORD="$token_secret" -e PBS_FINGERPRINT="$fp" "$client" \
+    proxmox-backup-client "$@" --ns desktops --repository 'backup@pbs!desktop@pbs.e2e.test:store1'
+}
+pbs_has_snapshot() {
+  docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$pbs" \
+    proxmox-backup-client snapshot files "$1" --ns desktops --repository admin@pbs@127.0.0.1:store1 >/dev/null 2>&1
+}
+# token_may_not forget|prune SNAPSHOT: the PBS permission check refuses to let
+# the token forget SNAPSHOT or prune its group down to the newest snapshot
+# (which would remove SNAPSHOT, the oldest one). The PBS checks privileges
+# before it looks the snapshot up, so SNAPSHOT is also checked to exist
+# before and after: a wrong name or a refusal for another reason (login,
+# connection, usage) cannot pass.
+no_delete_priv='permission check failed - missing Datastore\.Modify\|Datastore\.Prune on /datastore/store1/desktops'
+token_may_not() {
+  local action="$1" snap="$2"
+  pbs_has_snapshot "$snap" || { echo "    $snap is not on the PBS"; return 1; }
+  case "$action" in
+    forget) fails_with 255 "$no_delete_priv" as_token snapshot forget "$snap" ;;
+    prune)  fails_with 255 "$no_delete_priv" as_token prune "${snap%/*}" --keep-last 1 ;;
+    *)      echo "    unknown action $action"; false ;;
+  esac || return 1
+  pbs_has_snapshot "$snap" || { echo "    $snap was removed"; return 1; }
+}
+check "token is not allowed to forget snapshots" token_may_not forget "$snapshot"
+check "token is not allowed to prune" token_may_not prune "$snapshot"
 
 echo "== PBS unreachable"
 docker stop "$pbs" >/dev/null

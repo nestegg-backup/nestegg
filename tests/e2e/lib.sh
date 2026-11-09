@@ -10,6 +10,48 @@ check() { local what="$1"; shift; if "$@"; then ok "$what"; else bad "$what"; fi
 on_pbs()    { docker exec "$pbs" "$@"; }
 on_client() { docker exec "$client" "$@"; }
 
+# Negative checks must fail for the expected reason only: an unrelated
+# failure (typo, wrong path, server down) must not count as a pass.
+# The helpers print what they got when they do not pass.
+show() { tail -n 5 <<<"$1" | sed 's/^/      | /'; }
+
+# fails_with CODE PATTERN CMD...: CMD exits with CODE and its combined
+# stdout/stderr matches the extended regular expression PATTERN.
+fails_with() {
+  local want="$1" pattern="$2" out code=0
+  shift 2
+  out="$("$@" 2>&1)" || code=$?
+  if [[ $code -ne $want ]]; then
+    echo "    expected exit code $want, got $code:"; show "$out"; return 1
+  fi
+  if ! grep -Eq -- "$pattern" <<<"$out"; then
+    echo "    output does not match /$pattern/:"; show "$out"; return 1
+  fi
+}
+
+# exits_with CODE CMD...: CMD exits with exactly CODE, e.g. 1 for "grep
+# found nothing" (2 would mean a missing file).
+exits_with() {
+  local want="$1" code=0
+  shift
+  "$@" >/dev/null 2>&1 || code=$?
+  [[ $code -eq $want ]] || { echo "    expected exit code $want, got $code"; return 1; }
+}
+
+# no_output CMD...: CMD succeeds and prints nothing on stdout.
+no_output() {
+  local out
+  out="$("$@")" || { echo "    command failed: $*"; return 1; }
+  [[ -z "$out" ]] || { echo "    unexpected output:"; show "$out"; return 1; }
+}
+
+# absent_in DIR PATH: the client directory DIR exists and PATH below it does
+# not, so a wrong DIR cannot make the check pass.
+absent_in() {
+  on_client test -d "$1" || { echo "    $1 is not a directory"; return 1; }
+  exits_with 1 on_client test -e "$1/$2"
+}
+
 build_pbs_image() {
   DOCKER_BUILDKIT=0 docker build -q -t nestegg-e2e-pbs -f "$here/pbs.Dockerfile" "$here" >/dev/null
 }
