@@ -12,11 +12,12 @@ base="${2:-ubuntu:24.04}"
 net="nestegg-e2e-$$"
 pbs="nestegg-e2e-pbs-$$"
 client="nestegg-e2e-client-$$"
+wol="nestegg-e2e-wol-$$"
 client_image="nestegg-e2e-client:$(echo "$base" | tr ':/' '--')"
 
 cleanup() {
   [[ -n "${KEEP:-}" ]] && { echo "(KEEP set: containers $pbs $client left running)"; return; }
-  docker rm -f "$pbs" "$client" >/dev/null 2>&1 || true
+  docker rm -f "$pbs" "$client" "$wol" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -494,5 +495,49 @@ set -e
 check "exit code 75 when PBS is down" test "$code" -eq 75
 check "state is pbs_unreachable" bash -c "docker exec $client nestegg status --json | grep -q '\"state\": \"pbs_unreachable\"'"
 check "health stays ok after a recent success" bash -c "docker exec $client nestegg status --json | grep -q '\"health\": \"ok\"'"
+
+echo "== Wake-on-LAN wakes the sleeping PBS"
+# The PBS is still stopped. A second container on the same network stands in
+# for the network card of the sleeping server and prints every datagram that
+# arrives on UDP port 9. This script plays the mainboard: once the magic
+# packet for the configured MAC address has arrived, it switches the PBS on.
+subnet="$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$net")"
+bcast="$(python3 -c 'import ipaddress, sys; print(ipaddress.ip_network(sys.argv[1]).broadcast_address)' "$subnet")"
+docker run -d --name "$wol" --network "$net" "$client_image" perl -MIO::Socket::INET -e '
+  $| = 1;
+  my $s = IO::Socket::INET->new(Proto => "udp", LocalPort => 9, ReuseAddr => 1, Broadcast => 1) or die $!;
+  while (defined $s->recv(my $buf, 200)) { print unpack("H*", $buf), "\n"; }' >/dev/null
+docker exec -i "$client" tee -a /etc/nestegg/config.toml >/dev/null <<WAKE
+
+[wake]
+mac = "00:00:5e:00:53:01"
+broadcast = "$bcast"
+port = 9
+timeout_seconds = 120
+WAKE
+magic="ffffffffffff$(printf '00005e005301%.0s' $(seq 1 16))"
+(
+  for _ in $(seq 1 200); do
+    if docker logs "$wol" 2>/dev/null | grep -qx "$magic"; then
+      docker start "$pbs" >/dev/null
+      exit 0
+    fi
+    sleep 0.5
+  done
+  exit 1
+) &
+waker=$!
+set +e
+wake_out="$(on_client nestegg run --trigger manual 2>&1)"
+code=$?
+wait "$waker"
+woke=$?
+set -e
+check "the magic packet for the configured MAC arrived on the network" test "$woke" -eq 0
+check "backup succeeds after the PBS was woken" test "$code" -eq 0
+check "the run says the PBS answered after Wake-on-LAN" \
+  bash -c "grep -q 'PBS reachable after Wake-on-LAN' <<<\"\$1\"" _ "$wake_out"
+check "the last run is recorded as succeeded" \
+  bash -c "docker exec $client nestegg status --json | tr -d ' \n' | grep -q '\"last_run\":{[^}]*\"state\":\"succeeded\"'"
 
 result
