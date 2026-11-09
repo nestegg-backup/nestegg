@@ -871,11 +871,12 @@ impl Env {
 }
 
 #[test]
-fn key_import_stores_the_key_without_pcr_binding_and_counts_as_exported() {
+fn key_import_stores_the_key_without_pcr_binding_and_needs_proof_for_a_local_file() {
+    const IMPORTED: &str = r#"{"kdf":null,"data":"aW1wb3J0ZWQ=","fp":"aa:01"}"#;
     let env = Env::new();
     fs::remove_file(env.root().join("cred/encryption-key")).unwrap();
     env.set_key_exported(false);
-    let file = env.write_user_file("exported.json", r#"{"fp":"aa:01"}"#);
+    let file = env.write_user_file("exported.json", IMPORTED);
 
     let out = env.root_cmd(&["key", "import", &file]);
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
@@ -888,18 +889,50 @@ fn key_import_stores_the_key_without_pcr_binding_and_counts_as_exported() {
         "{creds_log}"
     );
 
-    let digest = nestegg::secrets::digest(&nestegg::secrets::Secret::new(
-        br#"{"fp":"aa:01"}"#.to_vec(),
-    ));
+    let digest =
+        nestegg::secrets::digest(&nestegg::secrets::Secret::new(IMPORTED.as_bytes().to_vec()));
     let state = env.state();
     assert_eq!(state["key_fingerprint"], "aa:01");
     assert_eq!(state["key_digest"], digest.as_str());
-    assert_eq!(state["key_exported_digest"], digest.as_str());
-    assert_eq!(state["key_last_exported_digest"], digest.as_str());
+    // The file lies on this computer's own disk (the test directory): that
+    // is no copy outside the computer, so the import alone confirms nothing.
+    assert!(state["key_exported_digest"].is_null(), "{state}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("does NOT count as exported"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(code(&env.run(&["run"])), 1);
+    assert_eq!(env.state()["last_run"]["error"]["kind"], "config");
 
-    // Backups run with exactly that key, without a separate confirmation.
+    // With the statement that another copy exists, backups run with exactly
+    // that key.
+    let out = env.root_cmd(&[
+        "key",
+        "confirm-exported",
+        "--file",
+        &file,
+        "--accept-local-copy",
+    ]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.state()["key_exported_digest"], digest.as_str());
     assert_eq!(code(&env.run(&["run"])), 0);
-    assert!(env.fake_log().contains(r#"KEY {"fp":"aa:01"}"#));
+    assert!(env.fake_log().contains(&format!("KEY {IMPORTED}")));
+}
+
+#[test]
+fn key_export_then_import_of_the_same_file_does_not_confirm_the_key() {
+    let env = Env::new();
+    env.set_state("key_fingerprint", serde_json::json!("aa:01"));
+    env.set_key_exported(false);
+    let export = env.root().join("exported.json");
+    let export = export.to_str().unwrap();
+    let out = env.root_cmd(&["key", "export", export]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let out = env.root_cmd(&["key", "import", export]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(env.state()["key_exported_digest"].is_null());
+    assert_eq!(code(&env.run(&["run"])), 1);
 }
 
 #[test]
@@ -958,10 +991,16 @@ fn unreadable_credentials_are_reported_with_the_fix_and_import_repairs_them() {
     );
     assert!(!env.fake_log().contains("ARGS backup"));
 
-    // Importing the exported copy of the recorded key needs no --force.
-    let file = env.write_user_file("exported.json", r#"{"fp":"aa:01"}"#);
+    // Importing the exported copy of the recorded key needs no --force, and
+    // the confirmation given for exactly this key before stays valid.
+    let file = env.write_user_file("exported.json", KEY_JSON);
     let out = env.root_cmd(&["key", "import", &file]);
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("counts as exported"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     assert_eq!(code(&env.run(&["run"])), 0);
 
     // An unreadable token secret is classified the same way.

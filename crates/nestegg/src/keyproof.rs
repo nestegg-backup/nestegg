@@ -250,6 +250,8 @@ pub struct DeviceFacts {
     pub hotplug: bool,
     /// `usb`, `sata`, `nvme`, ... as `lsblk` reports it.
     pub transport: Option<String>,
+    /// `disk`, `part`, `crypt`, `lvm`, `raid1`, `loop`, ... (`lsblk` TYPE).
+    pub kind: Option<String>,
 }
 
 impl DeviceFacts {
@@ -283,19 +285,28 @@ impl Location {
     }
 }
 
-/// Decide from the layers behind a file. One removable layer is enough
-/// (a LUKS volume on a USB stick has the stick below it).
+/// Decide from the layers behind a file. Only the whole disks at the bottom
+/// count, and ALL of them must be external: a volume group, RAID or btrfs
+/// that spans the internal disk and a USB disk may keep the file on the
+/// internal one. (A LUKS volume on a USB stick has only the stick below it.)
 pub fn classify_devices(chain: &[DeviceFacts]) -> Location {
     if chain.is_empty() {
-        Location::Unknown("the file is not on a block device".into())
-    } else if chain.iter().any(DeviceFacts::is_external) {
+        return Location::Unknown("the file is not on a block device".into());
+    }
+    let disks: Vec<&DeviceFacts> = chain
+        .iter()
+        .filter(|d| d.kind.as_deref() == Some("disk"))
+        .collect();
+    if disks.is_empty() {
+        Location::Unknown("no physical disk found behind the file".into())
+    } else if disks.iter().all(|d| d.is_external()) {
         Location::Removable
     } else {
         Location::Internal
     }
 }
 
-/// Parse `lsblk -P -o RM,HOTPLUG,TRAN` (lines of `KEY="value"` pairs).
+/// Parse `lsblk -P -o RM,HOTPLUG,TRAN,TYPE` (lines of `KEY="value"` pairs).
 pub fn parse_lsblk_pairs(output: &str) -> Vec<DeviceFacts> {
     output
         .lines()
@@ -307,6 +318,7 @@ pub fn parse_lsblk_pairs(output: &str) -> Vec<DeviceFacts> {
                     "RM" => facts.removable = value == "1" || value == "true",
                     "HOTPLUG" => facts.hotplug = value == "1" || value == "true",
                     "TRAN" if !value.is_empty() => facts.transport = Some(value),
+                    "TYPE" if !value.is_empty() => facts.kind = Some(value),
                     _ => {}
                 }
             }
@@ -359,7 +371,7 @@ pub fn locate(path: &Path) -> Location {
     };
     // `-s` adds the devices below (encryption layers, partitions' disks).
     let chain = Command::new("lsblk")
-        .args(["-s", "-n", "-P", "-o", "RM,HOTPLUG,TRAN"])
+        .args(["-s", "-n", "-P", "-o", "RM,HOTPLUG,TRAN,TYPE"])
         .arg(&device)
         .stdin(Stdio::null())
         .output();
@@ -578,47 +590,89 @@ mod tests {
         assert!(paperkey_stdout_allowed(true, false));
     }
 
-    fn facts(removable: bool, hotplug: bool, tran: Option<&str>) -> DeviceFacts {
+    fn layer(removable: bool, hotplug: bool, tran: Option<&str>, kind: &str) -> DeviceFacts {
         DeviceFacts {
             removable,
             hotplug,
             transport: tran.map(String::from),
+            kind: Some(kind.into()),
         }
+    }
+
+    fn disk(removable: bool, hotplug: bool, tran: Option<&str>) -> DeviceFacts {
+        layer(removable, hotplug, tran, "disk")
     }
 
     #[test]
     fn location_follows_removable_hotplug_and_transport() {
-        let internal = [facts(false, false, None), facts(false, false, Some("nvme"))];
+        let internal = [
+            layer(false, false, Some("nvme"), "part"),
+            disk(false, false, Some("nvme")),
+        ];
         assert_eq!(classify_devices(&internal), Location::Internal);
         // SATA controllers often flag every port as hot-plug.
-        let sata = [facts(false, true, Some("sata"))];
+        let sata = [disk(false, true, Some("sata"))];
         assert_eq!(classify_devices(&sata), Location::Internal);
-        let stick = [facts(true, true, Some("usb"))];
+        let stick = [
+            layer(true, true, Some("usb"), "part"),
+            disk(true, true, Some("usb")),
+        ];
         assert_eq!(classify_devices(&stick), Location::Removable);
-        let usb_disk = [facts(false, false, Some("usb"))];
+        let usb_disk = [disk(false, false, Some("usb"))];
         assert_eq!(classify_devices(&usb_disk), Location::Removable);
-        let card = [facts(true, false, None)];
+        let card = [disk(true, false, None)];
         assert_eq!(classify_devices(&card), Location::Removable);
-        let hotplug_only = [facts(false, true, None)];
+        let hotplug_only = [disk(false, true, None)];
         assert_eq!(classify_devices(&hotplug_only), Location::Removable);
         // LUKS on a stick: the layer above is plain, the disk below is USB.
-        let luks_on_stick = [facts(false, false, None), facts(true, true, Some("usb"))];
+        let luks_on_stick = [
+            layer(false, false, None, "crypt"),
+            layer(true, true, Some("usb"), "part"),
+            disk(true, true, Some("usb")),
+        ];
         assert_eq!(classify_devices(&luks_on_stick), Location::Removable);
         assert!(matches!(classify_devices(&[]), Location::Unknown(_)));
     }
 
     #[test]
+    fn a_volume_spanning_internal_and_usb_disks_is_not_removable() {
+        // LVM volume group with one physical volume on the internal NVMe and
+        // one on a USB disk: the file may lie on either.
+        let spanning = [
+            layer(false, false, None, "lvm"),
+            layer(false, false, Some("nvme"), "part"),
+            disk(false, false, Some("nvme")),
+            layer(true, true, Some("usb"), "part"),
+            disk(true, true, Some("usb")),
+        ];
+        assert_eq!(classify_devices(&spanning), Location::Internal);
+        // A removable-looking layer above an internal disk does not count.
+        let odd = [
+            layer(true, true, Some("usb"), "part"),
+            disk(false, false, Some("nvme")),
+        ];
+        assert_eq!(classify_devices(&odd), Location::Internal);
+        // No whole disk in the chain (loop device, image file): unknown.
+        let image = [layer(false, false, None, "loop")];
+        assert!(matches!(classify_devices(&image), Location::Unknown(_)));
+        assert!(classify_devices(&image).needs_statement());
+    }
+
+    #[test]
     fn lsblk_and_findmnt_output_is_parsed() {
-        let out = "RM=\"0\" HOTPLUG=\"0\" TRAN=\"\"\nRM=\"1\" HOTPLUG=\"1\" TRAN=\"usb\"\n";
+        let out = "RM=\"0\" HOTPLUG=\"0\" TRAN=\"\" TYPE=\"crypt\"\nRM=\"1\" HOTPLUG=\"1\" TRAN=\"usb\" TYPE=\"disk\"\n";
         let chain = parse_lsblk_pairs(out);
         assert_eq!(
             chain,
-            vec![facts(false, false, None), facts(true, true, Some("usb"))]
+            vec![
+                layer(false, false, None, "crypt"),
+                disk(true, true, Some("usb"))
+            ]
         );
         assert_eq!(classify_devices(&chain), Location::Removable);
         assert_eq!(
-            parse_lsblk_pairs("RM=\"0\" HOTPLUG=\"0\" TRAN=\"sata\"\n"),
-            vec![facts(false, false, Some("sata"))]
+            parse_lsblk_pairs("RM=\"0\" HOTPLUG=\"0\" TRAN=\"sata\" TYPE=\"disk\"\n"),
+            vec![disk(false, false, Some("sata"))]
         );
         assert!(parse_lsblk_pairs("\n").is_empty());
         assert_eq!(parse_findmnt_source("/dev/sda2\n").unwrap(), "/dev/sda2");

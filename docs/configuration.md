@@ -211,8 +211,8 @@ Two ways to keep a copy; use at least one, better both:
   datastore, the key fingerprint, a **check code** (`XXXX-XXXX`) and how to
   restore with it, then the key and a QR code. Without `--output` the command
   refuses to write into a terminal; piping to a printer
-  (`nestegg key paperkey | lpr`) works. The check code appears on the sheet
-  only, no command prints it.
+  (`nestegg key paperkey | lpr`) works. The check code appears in the paper
+  key output only; no other command, log or page shows it.
 - **Key file:** `sudo nestegg key export /media/usb/nestegg-key.json`. The
   file is read back and compared with the key. If it lies on a disk of this
   computer you get a warning: that copy is lost together with the disk and
@@ -258,9 +258,13 @@ sudo nestegg credentials set-password --overview       # only with [overview]
 sudo nestegg key import /media/usb/nestegg-key.json    # the exported key file
 ```
 
-`nestegg key import` checks the file with `proxmox-backup-client key show`,
-stores it like `key create` does and counts it as exported, because you
-already have the file. It only accepts keys without a password (as written
+`nestegg key import` checks the file with `proxmox-backup-client key show`
+and stores it like `key create` does. A key imported from a USB stick or
+another removable medium counts as exported, because you hold that copy. A
+file on this computer's own disk does not: confirm it afterwards with
+`sudo nestegg key confirm-exported` like any other copy. Importing the key
+that is already stored (new hardware) keeps the confirmation you gave
+before. It only accepts keys without a password (as written
 by `nestegg key export`). Importing the key whose fingerprint is already
 recorded needs no `--force`; a different key needs `--force`, because backups
 made with the current key then need its exported copy to be restored.

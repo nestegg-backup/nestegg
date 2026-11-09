@@ -53,7 +53,9 @@ use full-disk encryption, which also covers these files.
    the file with `proxmox-backup-client key show`, accepts only keys without
    a password, stores it through the same path as `key create`, records
    fingerprint and digest, and marks it as exported (the user holds the
-   file). It refuses to replace a different key without `--force`; the key
+   file; narrowed by decision 0018: only for a file on removable media, and
+   importing the key that is already stored keeps the earlier confirmation
+   instead of creating one). It refuses to replace a different key without `--force`; the key
    whose fingerprint is already recorded can be imported without it, which
    is exactly the "stored copy unreadable after new hardware" case.
 4. **A dedicated error kind `credentials_unreadable`.** A `.cred` file that

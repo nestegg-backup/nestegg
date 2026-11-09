@@ -338,8 +338,11 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
             Ok(0)
         }
         Cmd::ReadFile { path } => {
-            let data =
-                std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+            // Only ever used for key files named by the user.
+            let data = nestegg::restore::read_small_regular_file(
+                &path,
+                nestegg::restore::MAX_KEY_FILE_BYTES,
+            )?;
             std::io::stdout().write_all(&data)?;
             Ok(0)
         }
@@ -641,6 +644,18 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                 );
             }
             let digest = secrets::digest(&key);
+            // Does this import prove a copy outside this computer? For the
+            // key that is already stored it proves nothing new (it could be
+            // the file `key export` just wrote): an earlier confirmation
+            // stays, none is created. For a new key the file counts when it
+            // comes from a removable medium; a file on this computer's own
+            // disk needs `key confirm-exported` like any other copy.
+            let location = nestegg::keyproof::locate(&path);
+            let counts_as_exported = if same_key {
+                state.key_exported_digest.as_deref() == Some(digest.as_str())
+            } else {
+                !location.needs_statement()
+            };
             // Same order as `key create`: no confirmation may survive for a
             // key that is about to be replaced.
             state.key_exported_digest = None;
@@ -650,9 +665,8 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             let storage = secrets_store.store(secrets::ENCRYPTION_KEY, &key, allow_plain)?;
             state.key_fingerprint = Some(info.fingerprint.clone());
             state.key_digest = Some(digest.clone());
-            // The user already holds this key outside the computer.
             state.key_last_exported_digest = Some(digest.clone());
-            state.key_exported_digest = Some(digest);
+            state.key_exported_digest = counts_as_exported.then_some(digest);
             store.save_state(&state)?;
             println!(
                 "Encryption key imported (fingerprint {}) and stored {}.",
@@ -662,7 +676,19 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                     Storage::PlainFile => "as a root-only file",
                 }
             );
-            println!("It counts as exported, because you already have the file. Keep it safe.");
+            if counts_as_exported {
+                println!(
+                    "It counts as exported: you hold a copy outside this computer. Keep it safe."
+                );
+            } else {
+                println!(
+                    "It does NOT count as exported yet: {} lies on a disk of this computer, and                      a copy that is lost together with the computer is no protection.",
+                    path.display()
+                );
+                println!(
+                    "Backups start after: sudo nestegg key confirm-exported --file <copy on a USB                      stick>   (or --paper-code <code on the paper key>)"
+                );
+            }
         }
         KeyCmd::Paperkey { format, output } => {
             if !nestegg::keyproof::paperkey_stdout_allowed(output.is_some(), stdout_is_terminal()) {
@@ -828,6 +854,22 @@ fn read_key_copy(file: &Path) -> Result<(PathBuf, String, nestegg::keyproof::Key
     Ok((path, json, material))
 }
 
+/// A leading `~/` typed at a prompt (no shell expands it there): the home
+/// directory of the user who called sudo, else of the current user.
+fn expand_home(input: &str) -> PathBuf {
+    let Some(rest) = input.strip_prefix("~/") else {
+        return PathBuf::from(input);
+    };
+    let home = match nestegg::identity::UserIdentity::from_sudo() {
+        Ok(Some(user)) => Some(user.home),
+        _ => std::env::var_os("HOME").map(PathBuf::from),
+    };
+    match home {
+        Some(home) => home.join(rest),
+        None => PathBuf::from(input),
+    }
+}
+
 /// `nestegg key confirm-exported`: record that the key is safe outside this
 /// computer, but only against proof (see docs/decisions/0018).
 fn confirm_exported(
@@ -848,7 +890,7 @@ fn confirm_exported(
             eprintln!("  1) as a file (from `key export`, or a saved paper key)");
             eprintln!("  2) as a printed paper key");
             match prompt_line("Choose 1 or 2: ")?.as_str() {
-                "1" => (Some(prompt_line("Path of the file: ")?.into()), None),
+                "1" => (Some(expand_home(&prompt_line("Path of the file: ")?)), None),
                 "2" => (
                     None,
                     Some(prompt_line("Check code at the top of the paper key: ")?),
@@ -863,6 +905,17 @@ fn confirm_exported(
     };
     if let Some(file) = file {
         let (path, _, copy) = read_key_copy(&file)?;
+        // The place nestegg itself keeps the key in is not a copy.
+        let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        for own in [&paths.credentials_dir, &paths.tmp_dir()] {
+            let own = std::fs::canonicalize(own).unwrap_or_else(|_| own.clone());
+            if resolved.starts_with(&own) {
+                bail!(
+                    "{} is where nestegg itself stores the key, not a copy of it; nothing was                      recorded. Export a copy: sudo nestegg key export <file>",
+                    path.display()
+                );
+            }
+        }
         if copy != stored {
             bail!(
                 "{} does not contain the key stored on this computer; nothing was recorded. \
@@ -980,6 +1033,13 @@ fn verify_opens_newest(paths: &Paths, json: String) -> Result<String, (bool, Str
             "the PBS does not answer; run this again when it is reachable".into(),
         ));
     }
+    // A snapshot that is still being written has no manifest to check.
+    let Ok(Some(_no_run)) = nestegg::run::RunLock::try_acquire(paths) else {
+        return Err((
+            false,
+            "a backup is running; run this again when it has finished".into(),
+        ));
+    };
     let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
     let snapshots = client
         .list_snapshots(&cfg.effective_backup_id())

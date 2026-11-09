@@ -33,9 +33,10 @@ rescue stick) only look between the markers.
 
 The check code is the first 8 hex digits, upper case, of
 `SHA-256("nestegg-paper-check:" + data)`, shown as `XXXX-XXXX`, where `data`
-is the `data` field of the key file. It is printed on the paper key only,
-never by any command, log or status page. Typing it later proves that the
-user holds that sheet. Without `--output`, a terminal on stdout is refused
+is the `data` field of the key file. It appears in the paper key output
+only (the file written with `--output`, or what is piped to a printer),
+never in another command, a log or the status page. Typing it later shows
+that the user has that sheet (or its file) in front of them. Without `--output`, a terminal on stdout is refused
 with a hint; a pipe (for example to a printer) is allowed.
 
 **Export.** `nestegg key export <file>` reads the file back after writing (with
@@ -74,15 +75,34 @@ reported as "not checked" and do not fail the command.
 
 **Where is a file?** `findmnt` gives the device behind the path, `lsblk -s`
 the layers below it (a LUKS volume on a USB stick has the stick below it).
-A copy is on removable media if any layer is removable (`RM`), is on the USB
-or IEEE 1394 transport, or is hot-pluggable on a bus that is not an internal
-one (SATA/ATA/NVMe/SAS/MMC controllers often flag every port hot-pluggable).
+Only the whole disks at the bottom count (`TYPE="disk"`), and all of them
+must be external: a volume group, RAID or btrfs that spans the internal disk
+and a USB disk may keep the file on the internal one. A disk is external if
+it is removable (`RM`), is on the USB or IEEE 1394 transport, or is
+hot-pluggable on a bus that is not an internal one (SATA/ATA/NVMe/SAS/MMC
+controllers often flag every port hot-pluggable).
 Everything else, including what cannot be decided (RAM disk, network share,
 overlay file system, tools missing), counts as a disk of this computer: the
 cost of a wrong guess is one more question, not a lost key.
 
 The state keeps `key_last_exported_digest`; it is still recorded by `key
 export` and `key paperkey` but no longer decides anything.
+
+**`key import` is no way around the proof.** It used to mark every imported
+key as exported ("you already have the file"), so `key export x` followed by
+`key import x` confirmed a key whose only copy lay on the internal disk.
+Now: importing the key that is already stored creates no confirmation (one
+given earlier for exactly this key stays valid, which is the "stored copy
+unreadable after new hardware" case of decision 0008); a new key counts as
+exported only when the file comes from removable media, otherwise
+`key confirm-exported` is needed like for any other copy.
+
+**Which files are read.** A copy must be a regular file of at most 1 MiB;
+FIFOs, terminals and devices are refused instead of blocking or filling the
+memory. The place nestegg itself keeps the key in (the credentials and
+temporary directories) is refused as a "copy". `key verify` reports "not
+checked" while a backup is running, because the snapshot being written has
+no manifest yet.
 
 ## Consequences
 
