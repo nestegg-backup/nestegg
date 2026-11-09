@@ -58,8 +58,13 @@ pub struct Encryption {
     pub key_exported: bool,
 }
 
-pub fn timer_enabled() -> bool {
-    Command::new("systemctl")
+pub fn timer_enabled(paths: &Paths) -> bool {
+    systemctl_is_enabled(&paths.systemctl)
+}
+
+/// `systemctl is-enabled` of the backup timer; false if systemctl is missing.
+pub fn systemctl_is_enabled(systemctl: &std::path::Path) -> bool {
+    Command::new(systemctl)
         .args(["is-enabled", "--quiet", TIMER_UNIT])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -99,7 +104,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
             namespace: config.and_then(|c| c.pbs.namespace.clone()),
             reachable: state.pbs_reachable,
             checked_at: state.pbs_checked_at,
-            wake_on_lan: config.is_some_and(|c| c.wake.is_some()),
+            wake_on_lan: config.is_some_and(|c| c.active_wake().is_some()),
         },
         schedule: Schedule {
             enabled: timer,
@@ -126,8 +131,14 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
     })
 }
 
-/// Configuration without secrets (the config file never contains any).
-pub fn config_view(config: &Config) -> serde_json::Value {
+/// Configuration without secrets (the config file never contains any),
+/// plus what the settings form of the web UI needs (decision 0013).
+pub fn config_view(config: &Config, timer_enabled: bool) -> serde_json::Value {
+    let wake_configured = config.wake.is_some();
+    let editable: Vec<&str> = crate::settings::EDITABLE
+        .into_iter()
+        .filter(|key| *key != "wake_on_lan" || wake_configured)
+        .collect();
     serde_json::json!({
         "backup_id": config.effective_backup_id(),
         "sources": config.backup.sources.iter().map(|s| serde_json::json!({
@@ -139,5 +150,10 @@ pub fn config_view(config: &Config) -> serde_json::Value {
         "interval_hours": config.schedule.interval_hours,
         "encryption": config.backup.encryption,
         "overdue_after_hours": config.overdue_after_hours,
+        "automatic_backups": timer_enabled,
+        "wake_on_lan": config.active_wake().is_some(),
+        "wake_on_lan_configured": wake_configured,
+        "editable": editable,
+        "limits": crate::settings::limits_json(),
     })
 }

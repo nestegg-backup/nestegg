@@ -14,6 +14,7 @@ import type {
   Run,
   RunDetail,
   SessionInfo,
+  SettingsChange,
   Snapshot,
   Status,
 } from "./types";
@@ -99,6 +100,12 @@ export const api = {
     request<Restore>("restores", { method: "POST", body: JSON.stringify(body) }),
   restore: (id: string) => request<Restore>(`restores/${q(id)}`),
   config: () => request<ConfigView>("config"),
+  /**
+   * Change settings (only the given fields); resolves to the new configuration.
+   * Validation errors reject with kind `bad_request` and the daemon's message.
+   */
+  updateConfig: (change: SettingsChange) =>
+    request<ConfigView>("config", { method: "PATCH", body: JSON.stringify(change) }),
   // Proposed endpoints (API-REQUESTS.md). A 404 means "not offered by this daemon".
   machines: () => request<MachinesResponse>("machines"),
   session: () => request<SessionInfo>("session"),

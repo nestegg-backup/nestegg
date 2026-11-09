@@ -382,6 +382,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
             broadcast: std::net::Ipv4Addr::BROADCAST,
             port: 9,
             timeout_seconds: 180,
+            enabled: true,
         });
     }
     cfg.validate()?;
@@ -852,7 +853,8 @@ fn snapshots(paths: &Paths, json: bool) -> Result<u8> {
 
 fn status(paths: &Paths, json: bool) -> Result<u8> {
     let cfg = Config::load(&paths.config_file).ok();
-    let status = nestegg::status::build(paths, cfg.as_ref(), nestegg::status::timer_enabled())?;
+    let status =
+        nestegg::status::build(paths, cfg.as_ref(), nestegg::status::timer_enabled(paths))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
         return Ok(0);

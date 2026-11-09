@@ -86,22 +86,21 @@
   </div>
 
   <section class="summary" aria-labelledby="h-sum">
-    <h2 id="h-sum">{t.restore.summary}</h2>
-    <dl class="facts">
-      <dt>{t.restore.sumSnapshot}</dt>
-      <dd>{f.dayLongYear(snap.time)}, {f.time(snap.time)}</dd>
-      <dt>{t.restore.sumSelection}</dt>
-      <dd>
-        <ul>
-          {#each restore.selection as sel (sel.archive + sel.path)}<li><code>{label(sel)}</code></li>{/each}
-        </ul>
-      </dd>
+    <h2 class="sec-title" id="h-sum">{t.restore.summary}</h2>
+    <dl class="box sum">
+      <div><dt>{t.restore.sumSnapshot}</dt><dd>{f.dayLongYear(snap.time)}, {f.time(snap.time)}</dd></div>
+      <div>
+        <dt>{t.restore.sumSelection}</dt>
+        <dd>
+          <ul>
+            {#each restore.selection as sel (sel.archive + sel.path)}<li><code>{label(sel)}</code></li>{/each}
+          </ul>
+        </dd>
+      </div>
       {#if total != null}
-        <dt>{t.restore.sumSize}</dt>
-        <dd>{f.size(total)}</dd>
+        <div><dt>{t.restore.sumSize}</dt><dd>{f.size(total)}</dd></div>
       {/if}
-      <dt>{t.restore.sumTarget}</dt>
-      <dd><code>{restore.targetDir(home) || "–"}</code></dd>
+      <div><dt>{t.restore.sumTarget}</dt><dd><code>{restore.targetDir(home) || "–"}</code></dd></div>
     </dl>
   </section>
 
@@ -114,27 +113,39 @@
 {/if}
 
 <style>
-  .gap { margin-top: 24px; }
-  .field { margin-top: 28px; }
-  .field-label { display: block; font-weight: 500; margin-bottom: 8px; }
+  .gap { margin-top: 20px; }
+  .field { margin-top: 22px; }
+  .field-label { display: block; font-weight: 500; margin-bottom: 6px; }
   .input {
-    width: 100%; background: var(--bg2); border: 1px solid var(--field-border); border-radius: 8px;
-    padding: 10px 12px; outline: none;
+    width: 100%; background: var(--field); border: 1px solid var(--field-border); border-radius: 6px;
+    padding: 8px 10px; outline: none; min-height: 38px;
   }
-  .input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .input.mono { font-family: var(--mono); font-size: var(--fs-s); padding: 12px; }
+  .input:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 1px; }
+  .input.mono { font-family: var(--mono); font-size: 13.5px; }
+  .input[aria-invalid="true"] { border-color: var(--bad); box-shadow: inset 0 0 0 1px var(--bad); }
   .prefix { display: flex; align-items: stretch; min-width: 0; }
   .prefix code {
-    display: flex; align-items: center; padding: 0 2px 0 12px; background: var(--bg2);
-    border: 1px solid var(--field-border); border-right: 0; border-radius: 8px 0 0 8px; color: var(--muted); white-space: nowrap;
+    display: flex; align-items: center; padding: 0 2px 0 10px; background: var(--field);
+    border: 1px solid var(--field-border); border-right: 0; border-radius: 6px 0 0 6px; color: var(--muted); white-space: nowrap;
   }
-  .prefix .input { border-left: 0; border-radius: 0 8px 8px 0; padding-left: 2px; min-width: 0; }
-  .prefix:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 8px; }
+  .prefix .input { border-left: 0; border-radius: 0 6px 6px 0; padding-left: 2px; min-width: 0; }
+  .prefix:focus-within { outline: 2px solid var(--accent-text); outline-offset: 1px; border-radius: 6px; }
   .prefix .input:focus-visible { outline: none; }
-  .summary { margin-top: 30px; }
-  .summary :global(.facts) { grid-template-columns: 140px minmax(0, 1fr); }
-  .summary ul { display: grid; gap: 2px; }
+  .summary { margin-top: 26px; }
+  .sum { margin: 0; }
+  .sum > div { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 4px 16px; padding: 10px 14px; border-top: 1px solid var(--rule); }
+  .sum > div:first-child { border-top: 0; }
+  .sum dt { color: var(--muted); }
+  .sum dd { min-width: 0; overflow-wrap: anywhere; }
+  .sum ul { display: grid; gap: 2px; }
   @media (max-width: 760px) {
-    .summary :global(.facts) { grid-template-columns: minmax(0, 1fr); }
+    .sum > div { grid-template-columns: minmax(0, 1fr); }
+    /* The home folder goes on its own line above the name. */
+    .prefix { display: block; }
+    .prefix code {
+      display: block; padding: 6px 10px; border-right: 1px solid var(--field-border); border-bottom: 0;
+      border-radius: 6px 6px 0 0; white-space: normal; overflow-wrap: anywhere;
+    }
+    .prefix .input { border-left: 1px solid var(--field-border); border-radius: 0 0 6px 6px; padding-left: 10px; }
   }
 </style>

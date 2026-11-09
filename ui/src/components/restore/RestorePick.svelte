@@ -70,27 +70,25 @@
   <Cmd command={cliExample} />
 {:else}
   <p class="lead-text gap">{t.restore.pickIntro}</p>
-  <div class="groups">
-    <fieldset class="choice-group">
-      <legend>{t.restore.newest}</legend>
-      <div class="choices">
-        {#each newest as s (s.time)}{@render choice(s)}{/each}
-      </div>
-    </fieldset>
-    {#if showOlder}
-      {#each olderGroups as g (g.title)}
-        <fieldset class="choice-group">
-          <legend>{g.title}</legend>
-          <div class="choices">
-            {#each g.items as s (s.time)}{@render choice(s)}{/each}
-          </div>
-        </fieldset>
-      {/each}
-    {/if}
-  </div>
+  <fieldset class="choice-group">
+    <legend class="sec-title">{t.restore.newest}</legend>
+    <div class="box choices">
+      {#each newest as s (s.time)}{@render choice(s)}{/each}
+    </div>
+  </fieldset>
+  {#if showOlder}
+    {#each olderGroups as g (g.title)}
+      <fieldset class="choice-group">
+        <legend class="sec-title">{g.title}</legend>
+        <div class="box choices">
+          {#each g.items as s (s.time)}{@render choice(s)}{/each}
+        </div>
+      </fieldset>
+    {/each}
+  {/if}
   {#if older.length && !showOlder}
     <p class="older">
-      <button class="linkbtn" type="button" onclick={() => (restore.showOlder = true)}>
+      <button class="btn small" type="button" onclick={() => (restore.showOlder = true)}>
         {t.restore.older(older.length, f.monthYear(older[older.length - 1]!.time))}
       </button>
     </p>
@@ -102,19 +100,19 @@
 {/if}
 
 <style>
-  .gap { margin-top: 24px; }
-  .groups { margin-top: 26px; }
-  fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
-  legend { font-size: var(--fs-m); font-weight: 600; padding: 0; margin-bottom: 4px; }
-  .choice-group + .choice-group { margin-top: 30px; }
-  .choices { margin-top: 10px; display: grid; gap: 2px; }
+  .gap { margin-top: 20px; }
+  .actions { margin-top: 14px; }
+  fieldset { border: 0; margin: 22px 0 0; padding: 0; min-width: 0; }
+  legend { padding: 0; }
+  .choices { margin-top: 0; overflow: hidden; }
   .choice {
-    display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 14px; align-items: center;
-    padding: 12px 14px; border-radius: 8px; cursor: pointer;
+    display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 12px; align-items: center;
+    padding: 9px 14px; cursor: pointer; border-top: 1px solid var(--rule);
   }
-  .choice:hover { background: var(--bg1); }
-  .choice:has(input:checked) { background: var(--bg2); }
-  .choice input { margin: 0; width: 18px; height: 18px; accent-color: var(--accent); }
+  .choice:first-child { border-top: 0; }
+  .choice:hover { background: var(--box-hover); }
+  .choice:has(input:checked) { background: var(--sel); }
+  .choice input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
   .side { color: var(--muted); font-size: var(--fs-s); text-align: right; }
-  .older { margin-top: 14px; }
+  .older { margin-top: 12px; }
 </style>

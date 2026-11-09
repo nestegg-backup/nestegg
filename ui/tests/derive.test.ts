@@ -5,11 +5,13 @@ import {
   intervalHours,
   isActive,
   machineKind,
+  machineSnapshotEvents,
   restorableArchives,
   restoreOffer,
   runEvents,
   runStep,
   selfKind,
+  selfStrip,
   serverBackups,
   serverContact,
   snapshotEvents,
@@ -245,5 +247,41 @@ describe("restore entry and backups on the server", () => {
     expect(serverBackups(snaps("error"))).toBeNull();
     expect(serverBackups(snaps("ok"))).toEqual({ count: 0, latest: null });
     expect(serverBackups(snaps("ok", ["2026-10-01T00:40:00Z", "2026-11-01T00:40:00Z"]))).toEqual({ count: 2, latest: "2026-11-01T00:40:00Z" });
+  });
+});
+
+describe("mini strips", () => {
+  it("other PCs show snapshot days only, never a failure from a report", () => {
+    const m: Machine = {
+      backup_id: "media",
+      last_snapshot: "2026-11-07T00:50:00Z",
+      recent_snapshots: ["2026-11-06T00:50:00Z"],
+      report: { reported_at: "2026-11-08T00:36:00Z", result: "failed", run_started_at: "2026-11-08T00:31:00Z" },
+    };
+    const events = machineSnapshotEvents(m);
+    expect(events.map((e) => e.kind)).toEqual(["ok", "ok"]);
+    const cells = dayStrip(events, now, f);
+    expect(cells).toHaveLength(14);
+    expect(cells.filter((c) => c.kind === "ok").map((c) => c.key)).toEqual(["2026-11-06", "2026-11-07"]);
+    expect(cells.at(-1)).toMatchObject({ key: "2026-11-08", kind: "none", today: true });
+  });
+
+  it("an empty answer draws no backed-up day", () => {
+    expect(dayStrip(machineSnapshotEvents({ backup_id: "x" }), now, f).every((c) => c.kind === "none")).toBe(true);
+  });
+
+  it("this PC uses its run history plus the snapshots on the server", () => {
+    const cells = selfStrip(
+      [run("2026-11-08T00:31:00Z", "failed"), run("2026-11-07T00:31:00Z", "pbs_unreachable")],
+      null,
+      [{ time: "2026-11-01T00:40:00Z" }],
+      now,
+      f,
+    );
+    const kind = (key: string) => cells.find((c) => c.key === key)?.kind;
+    expect(kind("2026-11-08")).toBe("fail");
+    expect(kind("2026-11-07")).toBe("pbs");
+    expect(kind("2026-11-01")).toBe("ok");
+    expect(kind("2026-11-02")).toBe("none");
   });
 });

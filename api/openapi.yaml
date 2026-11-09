@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: nestegg local API
-  version: 0.2.0
+  version: 0.3.0
   summary: Local control API of the nestegg daemon.
   description: |
     Served by `nestegg daemon` on the Unix socket `/run/nestegg/api.sock`
@@ -25,6 +25,9 @@ info:
       browse and restore everything; other users (members of group
       `nestegg`) only paths inside their own home directory, and their
       restores are written with their own identity (files owned by them).
+      Every caller may change the settings offered by `PATCH /config`
+      (decision 0013); server, credentials, encryption and sources stay
+      terminal-only.
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
@@ -339,6 +342,65 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ConfigView" }
+    patch:
+      operationId: updateConfig
+      summary: Change the settings that may be changed from the web UI.
+      description: |
+        Partial update: only the fields present (and not `null`) change.
+        Allowed for every caller (members of group `nestegg` and root);
+        the daemon logs the caller and the change to its journal. Only the
+        touched keys of `/etc/nestegg/config.toml` are rewritten (comments
+        and layout stay); the result is validated before it atomically
+        replaces the file. Changes are serialised; a run in progress is not
+        affected (it read the configuration when it started), so they are
+        also accepted during a run. `automatic_backups` runs
+        `systemctl enable|disable --now nestegg-backup.timer` only when the
+        state differs; if that fails, the file change is undone and the
+        response is 500 `internal`. Server, datastore, namespace, auth id,
+        fingerprint, credentials, encryption and sources are rejected with
+        400: they can only be changed by root in the terminal
+        (decision 0013).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SettingsChange" }
+            examples:
+              rhythm:
+                value: { interval_hours: 12, overdue_after_hours: 30 }
+              excludes:
+                value: { excludes: ["**/.cache", "**/node_modules", "*.iso"] }
+              switches:
+                value: { automatic_backups: false, wake_on_lan: true }
+      responses:
+        "200":
+          description: Saved; the new configuration (same as `GET /config`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigView" }
+        "400":
+          description: |
+            `bad_request`: a value is out of range or invalid, a field is
+            unknown or terminal-only, or Wake-on-LAN should be switched on
+            without a `[wake]` section; also for a body that is not valid
+            JSON or is sent without `Content-Type: application/json`.
+            Nothing was changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: The caller could not be identified.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: |
+            `internal`: the configuration file is missing or invalid, could
+            not be written, or the timer could not be switched (nothing was
+            changed).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 components:
   parameters:
     RunId:
@@ -382,7 +444,7 @@ components:
             namespace: { type: [string, "null"], examples: ["desktops"] }
             reachable: { type: [boolean, "null"], description: Result of the last check; null if never checked. }
             checked_at: { type: [string, "null"], format: date-time }
-            wake_on_lan: { type: boolean, description: Wake-on-LAN is configured. }
+            wake_on_lan: { type: boolean, description: "Wake-on-LAN is configured and switched on (`wake.enabled`)." }
         schedule:
           type: object
           required: [enabled]
@@ -546,6 +608,63 @@ components:
         interval_hours: { type: integer }
         encryption: { type: boolean }
         overdue_after_hours: { type: integer }
+        automatic_backups: { type: boolean, description: "`nestegg-backup.timer` is enabled." }
+        wake_on_lan: { type: boolean, description: Wake-on-LAN is configured and switched on. }
+        wake_on_lan_configured: { type: boolean, description: "A `[wake]` section with a MAC address exists; only then can `wake_on_lan` be switched on." }
+        editable:
+          type: array
+          description: Fields `PATCH /config` accepts for this configuration (`wake_on_lan` only when configured).
+          items: { type: string, enum: [interval_hours, overdue_after_hours, excludes, wake_on_lan, automatic_backups] }
+        limits: { $ref: "#/components/schemas/SettingsLimits" }
+    SettingsChange:
+      type: object
+      additionalProperties: false
+      description: Absent or `null` fields stay unchanged.
+      properties:
+        interval_hours:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 168
+          description: |
+            A backup runs when the last success is older than this (the timer
+            checks hourly; there is no time of day).
+        overdue_after_hours:
+          type: [integer, "null"]
+          minimum: 2
+          maximum: 744
+          description: Must be greater than `interval_hours` (checked when either changes).
+        excludes:
+          type: [array, "null"]
+          description: |
+            The complete new list (replaces the old one; send the current
+            list with items added or removed). `proxmox-backup-client
+            --exclude` syntax. At most 200 patterns, each 1-256 characters,
+            no control characters, no leading or trailing spaces, no
+            duplicates, and no pattern that matches everything (`*`, `**`,
+            `/`, `/*`, `**/*`, ...).
+          maxItems: 200
+          items: { type: string, minLength: 1, maxLength: 256 }
+        wake_on_lan:
+          type: [boolean, "null"]
+          description: Sets `wake.enabled`; the MAC address is kept when switching off. `true` needs a `[wake]` section.
+        automatic_backups:
+          type: [boolean, "null"]
+          description: Enable or disable `nestegg-backup.timer` (`systemctl enable|disable --now`).
+    SettingsLimits:
+      type: object
+      properties:
+        interval_hours:
+          type: object
+          properties: { min: { type: integer }, max: { type: integer } }
+        overdue_after_hours:
+          type: object
+          properties:
+            min: { type: integer }
+            max: { type: integer }
+            greater_than_interval: { type: boolean }
+        excludes:
+          type: object
+          properties: { max_items: { type: integer }, max_length: { type: integer } }
     SessionInfo:
       type: object
       required: [user, home, uid, root]

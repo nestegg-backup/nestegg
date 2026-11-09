@@ -600,6 +600,7 @@ mod tests {
             credentials_dir: dir.path().join("cred"),
             state_dir: dir.path().join("state"),
             runtime_dir: dir.path().join("run"),
+            systemctl: PathBuf::from("systemctl"),
         };
         let store = Store::new(&paths);
         for h in 0..5 {

@@ -114,6 +114,21 @@ export function snapshotEvents(snapshots: { time: string }[]): { at: string; kin
   return snapshots.map((s) => ({ at: s.time, kind: "ok" }));
 }
 
+/**
+ * The 14 days of this PC: its local run history plus the snapshots on the
+ * server (which also cover the days before a reinstall). The boxes on its
+ * page and the mini strip in the sidebar use the same cells.
+ */
+export function selfStrip(
+  runs: Run[],
+  current: Run | null | undefined,
+  snapshots: { time: string }[],
+  now: Date,
+  f: Formatter,
+): DayCell[] {
+  return dayStrip([...runEvents(runs, current), ...snapshotEvents(snapshots)], now, f);
+}
+
 // ---------------------------------------------------------------- run history
 
 export interface RunRow {
@@ -249,6 +264,17 @@ export function machineEvents(m: Machine): { at: string; kind: Exclude<DayKind, 
     out.push({ at: r.run_started_at ?? r.reported_at, kind: r.result === "failed" ? "fail" : "pbs" });
   }
   return out;
+}
+
+/**
+ * Days with a snapshot of another PC, for its mini strip in the sidebar.
+ * The PBS only knows successful backups (a failed run leaves no snapshot),
+ * so these strips tell "backed up" from "no backup" and nothing more.
+ */
+export function machineSnapshotEvents(m: Machine): { at: string; kind: "ok" }[] {
+  const times = [...(m.recent_snapshots ?? [])];
+  if (m.last_snapshot && !times.includes(m.last_snapshot)) times.push(m.last_snapshot);
+  return times.map((at) => ({ at, kind: "ok" }));
 }
 
 // ---------------------------------------------------------------- backups on the server

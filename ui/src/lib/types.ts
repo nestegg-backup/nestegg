@@ -62,9 +62,10 @@ export interface Status {
     namespace?: string | null;
     reachable?: boolean | null;
     checked_at?: string | null;
+    /** Wake-on-LAN is configured and switched on. */
     wake_on_lan?: boolean;
   };
-  schedule: { enabled: boolean; calendar?: string; next_run?: string | null };
+  schedule: { enabled: boolean; calendar?: string; interval_hours?: number; next_run?: string | null };
   current_run?: Run | null;
   last_run?: Run | null;
   last_success?: Run | null;
@@ -112,8 +113,38 @@ export interface ConfigView {
   sources?: { archive: string; path: string }[];
   excludes?: string[];
   schedule?: string;
+  interval_hours?: number;
   encryption?: boolean;
   overdue_after_hours?: number;
+  /** `nestegg-backup.timer` is enabled. */
+  automatic_backups?: boolean;
+  /** Wake-on-LAN is configured and switched on. */
+  wake_on_lan?: boolean;
+  /** A `[wake]` section with a MAC address exists; only then can `wake_on_lan` be switched on. */
+  wake_on_lan_configured?: boolean;
+  /** Fields `PATCH /config` accepts (older daemons: absent, nothing is editable). */
+  editable?: SettingKey[];
+  limits?: SettingsLimits;
+}
+
+/** Settings the web UI may change (`PATCH /api/v1/config`, decision 0013). */
+export type SettingKey = "interval_hours" | "overdue_after_hours" | "excludes" | "wake_on_lan" | "automatic_backups";
+
+/** Body of `PATCH /api/v1/config`: absent fields stay unchanged. */
+export interface SettingsChange {
+  interval_hours?: number;
+  /** Must be greater than `interval_hours`. */
+  overdue_after_hours?: number;
+  /** The complete new list (replaces the old one). */
+  excludes?: string[];
+  wake_on_lan?: boolean;
+  automatic_backups?: boolean;
+}
+
+export interface SettingsLimits {
+  interval_hours: { min: number; max: number };
+  overdue_after_hours: { min: number; max: number; greater_than_interval?: boolean };
+  excludes: { max_items: number; max_length: number };
 }
 
 export interface HealthInfo {

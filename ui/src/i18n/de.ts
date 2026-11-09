@@ -1,4 +1,4 @@
-// German UI strings. The wording follows the chosen design prototype (variant C).
+// German UI strings. The wording follows the design prototypes (decisions 0005 and 0014).
 // en.ts must have exactly the same keys (checked by the type system and by
 // tests/i18n.test.ts).
 
@@ -34,6 +34,30 @@ const de = {
     copy: "Befehl kopieren",
     copied: "Kopiert",
     copyFailed: "Kopieren ging nicht, bitte markieren",
+    version: (v: string) => `nestegg ${v}`,
+  },
+  theme: {
+    label: "Darstellung",
+    system: "System",
+    light: "Hell",
+    dark: "Dunkel",
+  },
+  title: {
+    selfSub: (os: string | null) => (os ? `dieser PC, ${os}` : "dieser PC"),
+    otherSub: "nur zur Ansicht",
+  },
+  sbar: {
+    serverReachable: (m: Moment, dayMonth: string) =>
+      m.rel === "today" ? `Backup-Server erreichbar, geprüft heute um ${m.time}` : `Backup-Server erreichbar, geprüft am ${dayMonth}`,
+    serverUnreachable: (m: Moment, dayMonth: string) =>
+      m.rel === "today"
+        ? `Backup-Server nicht erreichbar, geprüft heute um ${m.time}`
+        : `Backup-Server nicht erreichbar, geprüft am ${dayMonth}`,
+    serverUnknown: "Backup-Server noch nicht geprüft",
+    offline: "Keine Verbindung zum nestegg-Dienst",
+    sessionEnded: "Sitzung beendet",
+    saved: (time: string, what: string) => `Gespeichert um ${time}: ${what}`,
+    notSaved: (what: string) => `Nicht gespeichert: ${what}`,
   },
   errors: {
     daemonTitle: "Keine Verbindung zum nestegg-Dienst",
@@ -74,7 +98,6 @@ const de = {
     server: "Backup-Server",
     settings: "Einstellungen",
     allPcs: "Alle PCs",
-    back: "Zurück",
   },
   row: {
     running: "Sichert gerade",
@@ -96,7 +119,6 @@ const de = {
     serverUnknown: "Noch nicht geprüft",
   },
   self: {
-    kicker: "Dieser PC",
     runNow: "Jetzt sichern",
     starting: "Wird gestartet …",
     restore: "Dateien wiederherstellen",
@@ -152,12 +174,15 @@ const de = {
     stepFinish: "Abschließen",
     stepFinishSub: "Bericht an den Server senden",
     factsTitle: "Über diesen PC",
-    factName: "Name",
     factBackupId: "Name auf dem Server",
     factOs: "System",
     factSources: "Gesichert werden",
     factSourcesExtra: "und eine Liste der installierten Programme, Dienste und Laufwerke",
     factOnServer: "Auf dem Server",
+    factNext: "Nächste Sicherung",
+    nextAt: (m: Moment) => cap(at(m)),
+    nextDue: "Fällig, startet in Kürze",
+    nextOff: "Keine, automatisch sichern ist aus",
     onServer: (size: string, count: number) =>
       `${size} im letzten Stand, ${count} ${plural(count, "Stand", "Stände")} insgesamt`,
     onServerCount: (count: number) => `${count} ${plural(count, "Stand", "Stände")}`,
@@ -194,15 +219,20 @@ const de = {
     pbs: "Server nicht erreichbar",
     pbsTimes: (n: number) => `Server nicht erreichbar, ${n} Versuche`,
     cancelled: "Abgebrochen",
-    uploaded: (size: string) => `${size} hochgeladen`,
-    showLog: "Protokoll zeigen",
+    title: "Verlauf",
+    colDay: "Tag",
+    colStart: "Start",
+    colResult: "Ergebnis",
+    colDuration: "Dauer",
+    colUploaded: "Hochgeladen",
+    showLog: "Protokoll",
     hideLog: "Protokoll ausblenden",
     logLoading: "Protokoll wird geladen …",
     logEmpty: "Zu diesem Lauf gibt es kein Protokoll.",
     logFailed: "Das Protokoll ließ sich nicht laden.",
     warnings: "Hinweise",
     showAll: (n: number) => `Alle ${n} Einträge zeigen`,
-    showFewer: "Nur die letzten 7 zeigen",
+    showFewer: "Weniger zeigen",
     empty: "Noch keine Sicherungen.",
     emptyHere: "Noch keine Sicherung von dieser Installation. Die früheren liegen auf dem Server.",
   },
@@ -236,7 +266,6 @@ const de = {
     internal: "In nestegg selbst ist ein Fehler aufgetreten. Was genau passiert ist, steht im Protokoll.",
   } satisfies Record<RunErrorKind, string>,
   other: {
-    kicker: "Nur zur Ansicht, wird am PC selbst verwaltet",
     failingLead: (m: Moment) => `Die Sicherung ${at(m)} ist fehlgeschlagen.`,
     overdueLead: (days: number, hours: number) =>
       days >= 2 ? `Seit ${days} Tagen nicht gesichert.` : `Seit ${hours} Stunden nicht gesichert.`,
@@ -259,7 +288,6 @@ const de = {
     notFound: "Diesen PC gibt es in der Liste nicht (mehr).",
   },
   server: {
-    title: "Backup-Server",
     reachableLead: "Bei der letzten Prüfung erreichbar.",
     unreachableLead: "Bei der letzten Prüfung nicht erreichbar.",
     unknownLead: "Noch nicht geprüft.",
@@ -285,38 +313,103 @@ const de = {
   },
   settings: {
     title: "Einstellungen",
-    intro:
-      "So ist nestegg auf diesem PC eingerichtet. Ändern lässt sich das im Terminal mit sudo nestegg init oder in der Datei /etc/nestegg/config.toml.",
-    checkHint: "Ob Zugang und Server funktionieren, prüft dieser Befehl:",
-    server: "Backup-Server",
-    backupId: "Name auf dem Server",
-    wake: "Server aufwecken",
-    when: "Wann gesichert wird",
+    intro: "Änderungen werden sofort gespeichert und gelten ab der nächsten Sicherung.",
+    introReadOnly:
+      "Diese nestegg-Version zeigt die Einstellungen nur an. Ändern lässt sich das im Terminal mit sudo nestegg init oder in der Datei /etc/nestegg/config.toml.",
+    offline: "Ohne Verbindung zum nestegg-Dienst lässt sich gerade nichts ändern.",
+    unconfigured: "Noch nicht eingerichtet. Welche Angaben nötig sind, zeigt dieser Befehl:",
+    schedule: "Zeitplan",
+    automatic: "Automatisch sichern",
+    automaticOn: "nestegg prüft stündlich, ob eine Sicherung fällig ist, und holt verpasste nach.",
+    automaticOff: "Gesichert wird nur, wenn du es selbst startest.",
     interval: "Rhythmus",
-    everyHours: (h: number) => (h === 24 ? "Einmal am Tag" : h % 24 === 0 ? `Alle ${h / 24} Tage` : `Alle ${h} Stunden`),
-    automatic: "Automatisch",
-    automaticOn:
-      "Eingeschaltet. nestegg prüft stündlich, ob eine Sicherung fällig ist, und holt verpasste nach.",
-    automaticOff: "Ausgeschaltet. Der Zeitplan (nestegg-backup.timer) ist nicht aktiv.",
-    nextRun: "Nächste Sicherung",
-    overdueAfter: "Überfällig nach",
-    overdueHours: (h: number) => `${h} Stunden ohne erfolgreiche Sicherung`,
-    what: "Was gesichert wird",
-    folders: "Ordner",
-    extra: "Zusätzlich",
-    extraText:
-      "Liste der installierten Programme, Dienste und Laufwerke, damit sich der PC nach einer Neuinstallation wieder einrichten lässt",
-    excluded: "Ausgenommen",
-    nothing: "nichts",
+    intervalHint: "Wie oft eine Sicherung fällig ist.",
+    everyHours: (h: number) =>
+      h === 1
+        ? "Stündlich"
+        : h === 24
+          ? "Täglich"
+          : h === 168
+            ? "Wöchentlich"
+            : h % 24 === 0
+              ? `Alle ${h / 24} Tage`
+              : `Alle ${h} Stunden`,
+    overdue: "Überfällig melden nach",
+    overdueHint: "Wird gespeichert, wenn du das Feld verlässt oder Enter drückst.",
+    hours: "Stunden",
+    excludes: "Ausgeschlossene Ordner",
+    excludesHint: (sources: string) => `Was zu diesen Mustern passt, wird nicht gesichert. Gesichert werden ${sources}.`,
+    excludesHintPlain: "Was zu diesen Mustern passt, wird nicht gesichert.",
+    excludesNone: "Bisher ist nichts ausgeschlossen.",
+    remove: "Entfernen",
+    removeLabel: (pattern: string) => `${pattern} entfernen`,
+    add: "Hinzufügen",
+    newPattern: "Neues Muster",
+    placeholder: "zum Beispiel **/Downloads",
+    wake: "Server aufwecken",
+    wol: "Wake-on-LAN",
+    wolHint: "Schläft der Backup-Server, schickt nestegg vor jeder Sicherung ein Weck-Signal und wartet, bis er antwortet.",
+    wolNotConfigured:
+      "Nicht eingerichtet. Dafür braucht nestegg die MAC-Adresse des Backup-Servers. Sie wird im Terminal eingetragen (Abschnitt [wake] in /etc/nestegg/config.toml), danach lässt sich Wake-on-LAN hier ein- und ausschalten.",
+    on: "Eingeschaltet",
+    off: "Ausgeschaltet",
+    fixed: "Server und Verschlüsselung",
+    fixedHint:
+      "Nur zum Nachsehen. Weil Zugangsdaten und Schlüssel daran hängen, ändert man das im Terminal mit Administratorrechten.",
+    changeIn: "Ändern im Terminal:",
+    checkIn: "Prüfen, ob Zugang und Server funktionieren:",
+    address: "Server-Adresse",
+    backupId: "Name auf dem Server",
     encryption: "Verschlüsselung",
     fingerprint: "Fingerabdruck des Schlüssels",
-    version: (v: string, api: string) => `nestegg ${v}, API ${api}`,
-    unconfigured: "Noch nicht eingerichtet. Welche Angaben nötig sind, zeigt dieser Befehl:",
+    retention: "Aufbewahrung",
+    retentionText: "Wird auf dem Server eingestellt",
+    saved: "Gespeichert",
+    saving: "Wird gespeichert …",
+    notSaved: (reason: string) => `Nicht gespeichert. ${reason}`,
+    sumAutomatic: (on: boolean) => `Automatisch sichern ${on ? "eingeschaltet" : "ausgeschaltet"}`,
+    sumInterval: (label: string) => `Rhythmus ${label.charAt(0).toLowerCase()}${label.slice(1)}`,
+    sumIntervalOverdue: (label: string, hours: number) =>
+      `Rhythmus ${label.charAt(0).toLowerCase()}${label.slice(1)}, überfällig melden nach ${hours} Stunden`,
+    sumOverdue: (hours: number) => `Überfällig melden nach ${hours} Stunden`,
+    sumExcludeAdded: (pattern: string) => `${pattern} wird ab jetzt ausgelassen`,
+    sumExcludeRemoved: (pattern: string) => `${pattern} wird wieder gesichert`,
+    sumWol: (on: boolean) => `Wake-on-LAN ${on ? "eingeschaltet" : "ausgeschaltet"}`,
+    overdueRaised: (hours: number) =>
+      `Auf ${hours} Stunden angehoben, weil es länger sein muss als der Rhythmus.`,
+    problem: {
+      wholeNumber: "Bitte eine ganze Zahl von Stunden eingeben.",
+      intervalRange: (min: number, max: number) => `Der Rhythmus muss zwischen ${min} und ${max} Stunden liegen.`,
+      overdueRange: (min: number, max: number) => `Erlaubt sind ${min} bis ${max} Stunden.`,
+      overdueNotGreater: (interval: number) =>
+        `Muss länger sein als der Rhythmus (${interval} Stunden). Sonst gilt jede Sicherung schon als überfällig, bevor die nächste fällig ist.`,
+      excludeEmpty: "Bitte ein Muster eingeben, zum Beispiel **/.cache.",
+      excludeTooLong: (n: number) => `Ein Muster darf höchstens ${n} Zeichen lang sein.`,
+      excludeControl: "Das Muster enthält einen Zeilenumbruch oder ein anderes Steuerzeichen.",
+      excludeSpaces: "Das Muster darf nicht mit einem Leerzeichen beginnen oder enden.",
+      excludeDash: "Das Muster darf nicht mit einem Minuszeichen beginnen.",
+      excludeEverything: "Damit würde nichts mehr gesichert. Bitte ein engeres Muster wählen.",
+      excludeDuplicate: "Dieses Muster ist schon in der Liste.",
+      excludeTooMany: (n: number) => `Mehr als ${n} Muster sind nicht möglich.`,
+      wakeNotConfigured:
+        "Wake-on-LAN ist nicht eingerichtet: Die MAC-Adresse des Backup-Servers fehlt. Sie wird im Terminal eingetragen.",
+      terminalOnly: "Das lässt sich nur im Terminal ändern.",
+      timerHalf:
+        "Gespeichert, aber der Zeitplan ließ sich nicht starten oder anhalten. Prüfe es im Terminal mit systemctl status nestegg-backup.timer.",
+      daemon: "Der nestegg-Dienst antwortet nicht. Versuche es gleich noch einmal.",
+      session: "Die Sitzung ist beendet. Öffne die Adresse, die nestegg ui im Terminal ausgegeben hat.",
+      forbidden:
+        "nestegg konnte nicht feststellen, wer die Änderung schickt. Starte nestegg ui neu und versuche es noch einmal.",
+      timer: "Die automatische Sicherung ließ sich nicht umschalten. Es wurde nichts geändert.",
+      configBroken:
+        "Die Einrichtungsdatei ist fehlerhaft. Bitte zuerst im Terminal reparieren; sudo nestegg check zeigt, was nicht stimmt.",
+      other: "Der nestegg-Dienst hat die Änderung abgelehnt.",
+    },
   },
   restore: {
     title: "Dateien wiederherstellen",
     cancel: "Abbrechen",
-    step: (n: number, title: string) => `Schritt ${n} von 3: ${title}`,
+    stepOf: (n: number) => `Schritt ${n} von 3`,
     stepTitles: ["Stand wählen", "Dateien wählen", "Zielordner festlegen"],
     pickIntro:
       "Von welchem Tag sollen die Dateien stammen? Nimm den letzten Stand, an dem sie noch in Ordnung waren.",

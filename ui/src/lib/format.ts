@@ -27,6 +27,8 @@ export interface Formatter {
   dayMonth(d: Date | string): string;
   /** "8" */
   dayNumber(d: Date | string): string;
+  /** "So" / "Su": two-letter weekday, for the 14-day boxes. */
+  weekdayShort(d: Date | string): string;
   /** "Oktober 2026" / "October 2026" */
   monthYear(d: Date | string): string;
   /** Local calendar day as YYYY-MM-DD. */
@@ -35,6 +37,7 @@ export interface Formatter {
   keyShort(key: string): string;
   keyLong(key: string): string;
   keyNumber(key: string): string;
+  keyWeekday(key: string): string;
   moment(d: Date | string, now: Date): Moment;
   size(bytes: number): string;
   duration(seconds: number): string;
@@ -101,11 +104,16 @@ export function createFormatter(lang: Lang, locale: string, timeZone?: string): 
       return lang === "de" ? `${day}. ${mon}` : `${day} ${mon.replace(/\.$/, "")}`;
     },
     dayNumber: (d) => parts(toDate(d)).day,
+    weekdayShort: (d) => {
+      const wd = parts(toDate(d)).wd;
+      return lang === "de" ? wd : wd.slice(0, 2);
+    },
     monthYear: (d) => monthYearF.format(toDate(d)),
     dayKey,
     keyShort: (key) => (utc ?? f).dayShort(keyDate(key)),
     keyLong: (key) => (utc ?? f).dayLong(keyDate(key)),
     keyNumber: (key) => String(Number(key.slice(8, 10))),
+    keyWeekday: (key) => (utc ?? f).weekdayShort(keyDate(key)),
     moment: (d, now) => {
       const date = toDate(d);
       const diff = daysBetween(dayKey(now), dayKey(date));

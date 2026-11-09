@@ -109,7 +109,8 @@ pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
         );
     }
     let mut reachable = crate::wake::is_reachable(&cfg, Duration::from_secs(5));
-    if !reachable && options.wake && cfg.wake.is_some() {
+    let wake_on = cfg.active_wake().is_some();
+    if !reachable && options.wake && wake_on {
         reachable = matches!(
             crate::wake::ensure_available(&cfg, |_| {}),
             Ok(crate::wake::Availability::ReachableAfterWake { .. })
@@ -117,11 +118,11 @@ pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
         );
     }
     report(
-        reachable || cfg.wake.is_some(),
+        reachable || wake_on,
         "PBS reachable",
         if reachable {
             format!("{}:{}", cfg.pbs.server, cfg.pbs.port)
-        } else if cfg.wake.is_some() {
+        } else if wake_on {
             "not now (Wake-on-LAN configured; a run will wake it)".into()
         } else {
             "no answer".into()
@@ -151,7 +152,7 @@ pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
         }
     }
     report(
-        crate::status::timer_enabled(),
+        crate::status::timer_enabled(paths),
         "backup timer enabled",
         crate::status::TIMER_UNIT.into(),
     );

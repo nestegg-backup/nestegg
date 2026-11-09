@@ -85,6 +85,7 @@ impl Settings {
                 broadcast: std::net::Ipv4Addr::BROADCAST,
                 port: 9,
                 timeout_seconds: 300,
+                enabled: true,
             });
         }
         c.validate()?;

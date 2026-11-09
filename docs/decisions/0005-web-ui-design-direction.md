@@ -1,6 +1,6 @@
 # 0005 – Web UI design direction
 
-- Status: accepted
+- Status: accepted; look and layout partly superseded by [0014](0014-web-ui-redesign-dense-app.md)
 - Date: 2026-11-08
 
 ## Context

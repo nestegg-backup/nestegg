@@ -535,7 +535,7 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             let message = if wake_send_failed {
                 "PBS did not answer, also not after Wake-on-LAN (sending the wake-up packet \
                  failed, see the warning above)"
-            } else if config.wake.is_some() {
+            } else if config.active_wake().is_some() {
                 "PBS did not answer, also not after Wake-on-LAN"
             } else {
                 "PBS did not answer"
@@ -812,6 +812,7 @@ mod tests {
             credentials_dir: dir.path().join("cred"),
             state_dir: dir.path().join("state"),
             runtime_dir: dir.path().join("run"),
+            systemctl: PathBuf::from("systemctl"),
         };
         let lock = RunLock::try_acquire(&paths).unwrap().unwrap();
         assert_eq!(lock_is_held(&paths), Some(true));
@@ -827,6 +828,7 @@ mod tests {
             credentials_dir: dir.path().join("cred"),
             state_dir: dir.path().join("state"),
             runtime_dir: dir.path().join("run"),
+            systemctl: PathBuf::from("systemctl"),
         };
         let first = RunLock::try_acquire(&paths).unwrap();
         assert!(first.is_some());

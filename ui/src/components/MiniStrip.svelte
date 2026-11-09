@@ -1,0 +1,19 @@
+<script lang="ts">
+  import type { DayCell } from "../lib/derive";
+
+  /** The 14 days as small ticks next to a name. The status line next to it says the same in words. */
+  let { cells }: { cells: DayCell[] } = $props();
+</script>
+
+<span class="ticks" aria-hidden="true">
+  {#each cells as c (c.key)}<i class="k-{c.kind}"></i>{/each}
+</span>
+
+<style>
+  .ticks { display: flex; gap: 2px; align-items: flex-end; height: 13px; }
+  i { display: block; width: 4px; height: 13px; border-radius: 1px; background: var(--tick); }
+  .k-none { height: 3px; }
+  .k-pbs { background: var(--pbs); }
+  .k-fail { background: var(--bad); }
+  .k-run { background: var(--accent-text); }
+</style>

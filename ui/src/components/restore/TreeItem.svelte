@@ -62,7 +62,7 @@
 
 <style>
   .node { display: grid; grid-template-columns: 28px 22px minmax(0, 1fr) auto; align-items: center; gap: 6px; padding: 5px 8px 5px 0; border-radius: 6px; }
-  .node:hover { background: var(--bg1); }
+  .node:hover { background: var(--box-hover); }
   .twist {
     appearance: none; border: 0; background: none; width: 28px; height: 28px; cursor: pointer; border-radius: 6px;
     display: grid; place-items: center; color: var(--muted);

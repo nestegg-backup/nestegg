@@ -17,6 +17,8 @@ pub struct Paths {
     pub credentials_dir: PathBuf,
     pub state_dir: PathBuf,
     pub runtime_dir: PathBuf,
+    /// `systemctl` binary used to read and switch the backup timer.
+    pub systemctl: PathBuf,
 }
 
 impl Paths {
@@ -31,6 +33,7 @@ impl Paths {
             credentials_dir: env_path("NESTEGG_CREDENTIALS_DIR", "/etc/nestegg/credentials"),
             state_dir: env_path("NESTEGG_STATE_DIR", "/var/lib/nestegg"),
             runtime_dir: env_path("NESTEGG_RUNTIME_DIR", "/run/nestegg"),
+            systemctl: env_path("NESTEGG_SYSTEMCTL", "systemctl"),
         }
     }
 
@@ -123,6 +126,10 @@ pub struct WakeConfig {
     /// How long to wait for the PBS after sending the magic packet.
     #[serde(default = "default_wake_timeout")]
     pub timeout_seconds: u64,
+    /// Switch Wake-on-LAN off without forgetting the MAC address (the web
+    /// UI toggles this key).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -375,6 +382,11 @@ impl Config {
             bail!("schedule.interval_hours must be at least 1");
         }
         Ok(())
+    }
+
+    /// The Wake-on-LAN settings if Wake-on-LAN is configured and switched on.
+    pub fn active_wake(&self) -> Option<&WakeConfig> {
+        self.wake.as_ref().filter(|w| w.enabled)
     }
 
     /// Backup ID, falling back to the host name.

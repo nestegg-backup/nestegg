@@ -8,7 +8,7 @@ local API described in [`../api/openapi.yaml`](../api/openapi.yaml).
 
 - **v0.1/v0.2 – single machine:** dashboard (health, last success, next run,
   current run with live state), "back up now", run history with details and
-  log tail, snapshot list, configuration view (read-only), encryption key
+  log tail, snapshot list, settings (a few editable, decision 0013), encryption key
   status with a clear warning while the key has not been exported.
 - **v0.2 – restore:** browse a snapshot, select files/folders, restore into a
   new directory (endpoints `/snapshots/{time}/browse`, `/restores`).
@@ -16,7 +16,9 @@ local API described in [`../api/openapi.yaml`](../api/openapi.yaml).
   read-only PBS connection (API to be specified).
 
 Read [`../docs/architecture.md`](../docs/architecture.md) and decision
-records `docs/decisions/0003-*.md` first.
+records `docs/decisions/0003-*.md` first. The look and layout follow
+decision 0014 (dense app layout: title bar, sidebar with mini strips,
+status bar, settings in the pane), which replaces most of 0005.
 
 ## Hard requirements
 
@@ -29,9 +31,11 @@ records `docs/decisions/0003-*.md` first.
 3. **Auth:** `nestegg ui` opens `/#token=<token>`. On load, read the token
    from `location.hash`, store it in `sessionStorage`, remove it from the
    address bar (`history.replaceState`) and send it as
-   `Authorization: Bearer <token>` with every `api/v1/*` request. No cookies,
-   no localStorage. A 401 means the session ended: show "open the address
-   printed by `nestegg ui`". Relative URLs only (`api/v1/status`).
+   `Authorization: Bearer <token>` with every `api/v1/*` request. No cookies;
+   the token never goes to localStorage. A 401 means the session ended: show
+   "open the address printed by `nestegg ui`". Relative URLs only
+   (`api/v1/status`). The only value in localStorage is the theme choice
+   (`nestegg.theme`, decision 0014); every access tolerates blocked storage.
 4. **License:** all dependencies must be AGPL-3.0-compatible (MIT, BSD,
    Apache-2.0, ISC, MPL-2.0, GPL/AGPL are fine). Run a license check before
    adding dependencies.
@@ -39,7 +43,8 @@ records `docs/decisions/0003-*.md` first.
    data and screenshots use placeholders such as `desktop`,
    `pbs.example.com`, `/home/alice`.
 6. **Accessible and responsive:** keyboard usable, readable at phone width
-   (the overview will be opened from phones later), light and dark mode.
+   (the overview will be opened from phones later), light and dark mode
+   (System / Hell / Dunkel in the title bar, decision 0014).
 7. **Language:** German and English from the start (decision 0005). The
    language follows the browser (`navigator.languages`: German if the first
    entry starts with `de`, English otherwise). All strings live in
@@ -100,9 +105,11 @@ Add faults to any scenario with `&fault=a,b`:
 |---|---|
 | `down` | every call answers 502, like a daemon that stopped after the page loaded |
 | `runs` | `/runs` answers 500 |
-| `config` | `/config` answers 500 |
-| `schedule_off` | the timer is disabled |
+| `config` | `/config` answers 500 (also `PATCH /config`) |
+| `schedule_off` | the timer is disabled (automatic backups off) |
 | `no_run_details` | `/status` leaves out `last_run` and `last_success` (allowed by the contract) |
+| `no_wake` | no `[wake]` section: Wake-on-LAN cannot be switched on (`PATCH` answers 400) |
+| `timer_fails` | switching automatic backups answers 500, nothing changes |
 
 `down` can also be switched while the page is open:
 `curl -X POST 'http://127.0.0.1:5173/__mock/fault?down=1'` (and `down=0`); it
@@ -115,6 +122,9 @@ Add `&daemon=today` to get only what the daemon offers today: no
 `pbs_unreachable` and `overdue` it ends with "server not reachable".
 Restoring into `/home/alice/Dokumente` (or another existing folder of the
 mock) answers `409 target_exists`.
+`PATCH /config` changes the settings of the current scenario like the daemon
+(same validation, `src/lib/settings.ts`); later `/config` and `/status` calls
+show the new values. Reloading with `?scenario=` resets them.
 
 To use another port, set `NESTEGG_UI_PORT` (not `--port`), so the HMR
 websocket uses the same port.
@@ -142,16 +152,19 @@ The page comes from the dev server, API calls go to the daemon socket with
 
 | Path | Content |
 |---|---|
-| `src/App.svelte` | Layout (list and detail; two screens below 760 px) and hash routing |
-| `src/components/` | Views: this PC, other PCs, server, settings, restore flow |
+| `src/App.svelte` | Layout (title bar, sidebar, pane, status bar; two screens below 760 px) and hash routing |
+| `src/components/` | Title bar, sidebar, status bar and the views: this PC, other PCs, server, settings, restore flow |
+| `public/theme.js` | Applies the stored theme choice before the first paint (same-origin script; the CSP forbids inline scripts) |
+| `src/lib/theme.ts` | Theme choice System / Hell / Dunkel, kept in localStorage |
+| `src/lib/settings.ts`, `src/lib/settingsForm.ts` | Settings rules (same as the daemon) and the texts and helpers of the settings page |
 | `src/lib/session.ts` | Session token: taken from `#token=`, kept in `sessionStorage`, removed from the address bar |
 | `src/lib/api.ts` | API client (relative URLs, `Authorization: Bearer` header) |
 | `src/lib/derive.ts`, `src/lib/text.ts` | State derivation and status sentences (unit-tested) |
 | `src/lib/format.ts` | Date, size and duration formatting |
 | `src/i18n/` | German and English strings |
-| `src/styles/tokens.css` | Colour tokens, dark (reference) and light |
+| `src/styles/tokens.css` | Colour tokens, dark and light (by system preference or by choice) |
 | `mock/` | Dev-server mock of the API |
-| `tests/` | Vitest: derivation, formatting, i18n key parity, contrast (WCAG AA), mock |
+| `tests/` | Vitest: derivation, formatting, i18n key parity, contrast (WCAG AA, both themes), theme, settings, mock |
 
 ## Working agreement between agents
 

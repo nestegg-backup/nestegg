@@ -38,7 +38,7 @@
   ]);
 </script>
 
-<p class="lead">{t.self.runningLead}</p>
+<h2 class="lead"><span class="pulse" aria-hidden="true"></span>{t.self.runningLead}</h2>
 <p class="lead-text">{t.self.runningText}</p>
 <ol class="steps">
   {#each steps as s, i (i)}
@@ -51,23 +51,21 @@
     </li>
   {/each}
 </ol>
-{#if stale}
-  <p class="hint">{t.conn.runUnknown}</p>
-{:else}
-  <p class="hint">{t.self.runningSince(f.duration(elapsed), run.trigger !== "timer")}</p>
-{/if}
+<p class="hint">{stale ? t.conn.runUnknown : t.self.runningSince(f.duration(elapsed), run.trigger !== "timer")}</p>
 
 <style>
-  .steps { margin-top: 26px; display: grid; gap: 14px; }
+  .pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--accent-text); flex: none; transform: translateY(-2px); animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  .steps { margin-top: 16px; display: grid; gap: 10px; }
   .step { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 12px; align-items: start; color: var(--faint); }
   .n {
     width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center;
-    font-size: var(--fs-s); box-shadow: inset 0 0 0 1.5px var(--mark); margin-top: 1px;
+    font-size: var(--fs-s); box-shadow: inset 0 0 0 1px var(--field-border); margin-top: 0;
   }
-  .step.now { color: var(--text); }
-  .step.now .n { box-shadow: inset 0 0 0 1.5px var(--text); }
+  .step.now { color: var(--text); font-weight: 500; }
+  .step.now .n { box-shadow: inset 0 0 0 2px var(--accent-text); }
   .step.done { color: var(--muted); }
-  .step.done .n { background: var(--mark); box-shadow: none; color: var(--text); }
-  .sub { font-size: var(--fs-s); color: var(--muted); margin-top: 2px; }
-  .hint { margin-top: 22px; }
+  .step.done .n { background: var(--tick); box-shadow: none; color: var(--on-tick); }
+  .sub { font-size: var(--fs-s); color: var(--muted); margin-top: 1px; font-weight: 400; }
+  .hint { margin-top: 14px; }
 </style>

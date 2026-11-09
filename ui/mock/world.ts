@@ -13,9 +13,11 @@ import type {
   RestoreRequest,
   Run,
   RunDetail,
+  SettingsChange,
   Snapshot,
   Status,
 } from "../src/lib/types.ts";
+import { DEFAULT_LIMITS, SETTING_KEYS, settingsProblem } from "../src/lib/settings.ts";
 
 export const SCENARIOS = [
   "ok",
@@ -42,10 +44,12 @@ export type Flavor = "full" | "today";
  *   (toggle at runtime with `POST /__mock/fault?down=1|0`)
  * - `runs`: `/runs` fails with 500
  * - `config`: `/config` fails with 500
- * - `schedule_off`: the timer is disabled
+ * - `schedule_off`: the timer is disabled (automatic backups off; `PATCH /config` can switch it on)
  * - `no_run_details`: `/status` omits last_run and last_success (allowed by the contract)
+ * - `no_wake`: the configuration has no `[wake]` section (Wake-on-LAN cannot be switched on)
+ * - `timer_fails`: switching automatic backups fails like a missing systemd (500, nothing changes)
  */
-export const FAULTS = ["down", "runs", "config", "schedule_off", "no_run_details"] as const;
+export const FAULTS = ["down", "runs", "config", "schedule_off", "no_run_details", "no_wake", "timer_fails"] as const;
 export type Fault = (typeof FAULTS)[number];
 
 export interface Reply {
@@ -224,6 +228,13 @@ export class World {
   keyExported = true;
   configured = true;
   extraSources: { archive: string; path: string }[] = [];
+  /** Settings the web UI can change (`PATCH /config`). */
+  intervalHours = 24;
+  overdueHours = 36;
+  excludes = ["**/.cache", "**/node_modules", "**/.local/share/Trash"];
+  wakeEnabled = true;
+  /** null: follows the `schedule_off` fault; set by `PATCH /config`. */
+  timerEnabled: boolean | null = null;
   /** Snapshots made before the local state was lost (`reinstalled`): on the server, unknown to the daemon. */
   inherited: Snapshot[] = [];
   faults = new Set<Fault>();
@@ -446,7 +457,7 @@ export class World {
   status(now = Date.now()): Status {
     const success = this.lastSuccess();
     const last = this.runs[0] ?? null;
-    const overdueH = 36;
+    const overdueH = this.overdueHours;
     let health: Status["health"];
     if (!this.configured) health = "unconfigured";
     else if (this.active) health = "running";
@@ -457,7 +468,7 @@ export class World {
     const nextRun = (() => {
       if (!this.configured || this.active) return null;
       // The timer fires hourly; a run starts at the first full hour after it is due.
-      const due = success ? new Date(success.started_at).getTime() + DAY : now;
+      const due = success ? new Date(success.started_at).getTime() + this.intervalHours * HOUR : now;
       const next = new Date(Math.max(due, now));
       next.setMinutes(0, 0, 0);
       next.setHours(next.getHours() + 1);
@@ -472,13 +483,14 @@ export class World {
             namespace: "desktops",
             reachable: this.reachable,
             checked_at: this.checkedMs ? iso(this.checkedMs) : null,
-            wake_on_lan: true,
+            wake_on_lan: this.wakeOn(),
           }
         : { server: "", datastore: "", namespace: null, reachable: null, checked_at: null, wake_on_lan: false },
       schedule: {
-        enabled: this.configured && !this.faults.has("schedule_off"),
-        calendar: "every 24 h (checked hourly)",
-        next_run: this.faults.has("schedule_off") ? null : nextRun,
+        enabled: this.configured && this.timerOn(),
+        calendar: `every ${this.intervalHours} h (checked hourly)`,
+        interval_hours: this.intervalHours,
+        next_run: this.timerOn() ? nextRun : null,
       },
       current_run: this.strip(this.active?.run ?? null),
       last_run: this.strip(last),
@@ -493,16 +505,61 @@ export class World {
     };
   }
 
+  private timerOn(): boolean {
+    return this.timerEnabled ?? !this.faults.has("schedule_off");
+  }
+
+  private wakeConfigured(): boolean {
+    return !this.faults.has("no_wake");
+  }
+
+  private wakeOn(): boolean {
+    return this.wakeConfigured() && this.wakeEnabled;
+  }
+
   config(): ConfigView | null {
     if (!this.configured) return null;
     return {
       backup_id: "desktop",
       sources: [...ARCHIVES.map((a) => ({ archive: a.name, path: a.source })), ...this.extraSources],
-      excludes: ["**/.cache", "**/node_modules", "**/.local/share/Trash"],
-      schedule: "every 24 h",
+      excludes: [...this.excludes],
+      schedule: `every ${this.intervalHours} h`,
+      interval_hours: this.intervalHours,
       encryption: true,
-      overdue_after_hours: 36,
+      overdue_after_hours: this.overdueHours,
+      automatic_backups: this.timerOn(),
+      wake_on_lan: this.wakeOn(),
+      wake_on_lan_configured: this.wakeConfigured(),
+      editable: SETTING_KEYS.filter((k) => k !== "wake_on_lan" || this.wakeConfigured()),
+      limits: DEFAULT_LIMITS,
     };
+  }
+
+  /** `PATCH /config` like the daemon: validate everything, then apply all or nothing. */
+  updateConfig(body: unknown): Reply {
+    const err = (status: number, code: string, message: string): Reply => ({ status, body: { code, message } });
+    if (!this.configured) return err(500, "internal", "cannot read configuration /etc/nestegg/config.toml: No such file or directory (os error 2)");
+    const problem = settingsProblem(body, {
+      interval_hours: this.intervalHours,
+      overdue_after_hours: this.overdueHours,
+      wake_on_lan_configured: this.wakeConfigured(),
+    });
+    if (problem) return err(400, "bad_request", problem);
+    const change = body as SettingsChange;
+    const timer = change.automatic_backups;
+    if (timer !== undefined && timer !== null && timer !== this.timerOn() && this.faults.has("timer_fails")) {
+      return err(
+        500,
+        "internal",
+        `cannot switch automatic backups ${timer ? "on" : "off"}; nothing was changed: systemctl ${timer ? "enable" : "disable"} --now nestegg-backup.timer failed (exit status: 1): Failed to connect to bus: No such file or directory`,
+      );
+    }
+    if (change.interval_hours != null) this.intervalHours = change.interval_hours;
+    if (change.overdue_after_hours != null) this.overdueHours = change.overdue_after_hours;
+    if (change.excludes != null) this.excludes = [...change.excludes];
+    if (change.wake_on_lan != null && this.wakeConfigured()) this.wakeEnabled = change.wake_on_lan;
+    if (timer != null) this.timerEnabled = timer;
+    return { status: 200, body: this.config() };
   }
 
   machines(now = Date.now()): MachinesResponse {
@@ -602,6 +659,8 @@ export class World {
     }
     if (route === "GET /runs" && this.faults.has("runs")) return err(500, "internal", "cannot read /var/lib/nestegg/runs: Permission denied (os error 13)");
     if (route === "GET /config" && this.faults.has("config")) return err(500, "internal", "cannot parse /etc/nestegg/config.toml: expected `=`");
+    if (route === "PATCH /config" && this.faults.has("config"))
+      return err(500, "internal", "invalid configuration /etc/nestegg/config.toml; fix it in the terminal first: expected `=`");
     if (route === "GET /runs") {
       const limit = Math.min(500, Math.max(1, Number(query.get("limit") ?? 50) || 50));
       const list = [...(this.active ? [this.active.run] : []), ...this.runs].slice(0, limit).map((r) => this.strip(r));
@@ -655,6 +714,7 @@ export class World {
       const c = this.config();
       return c ? { status: 200, body: c } : notConfigured();
     }
+    if (route === "PATCH /config") return this.updateConfig(body);
     // Proposed endpoints (API-REQUESTS.md).
     if (route === "GET /machines" && !today) return { status: 200, body: this.machines(now) };
     if (route === "GET /session" && !today) return { status: 200, body: { user: "alice", home: "/home/alice" } };

@@ -15,6 +15,7 @@ pub mod rescue;
 pub mod restore;
 pub mod run;
 pub mod secrets;
+pub mod settings;
 pub mod staging;
 pub mod state;
 pub mod status;

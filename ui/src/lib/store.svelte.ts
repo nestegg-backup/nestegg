@@ -3,7 +3,7 @@
 import { api, ApiFailure, optional } from "./api";
 import { initBrowserSession } from "./session";
 import { isActive } from "./derive";
-import type { ConfigView, HealthInfo, MachinesResponse, Run, SessionInfo, Snapshot, Status } from "./types";
+import type { ConfigView, HealthInfo, MachinesResponse, Run, SessionInfo, SettingsChange, Snapshot, Status } from "./types";
 
 const POLL_RUNNING_MS = 2_000;
 const POLL_IDLE_MS = 30_000;
@@ -63,6 +63,8 @@ class AppState {
     void this.loadRuns();
     void this.loadConfig();
     void this.loadMachines();
+    // The sidebar strip of this PC needs the server's snapshots on every page.
+    void this.loadSnapshots();
     api.health().then((h) => (this.healthInfo = h), () => {});
     optional(api.session()).then((s) => (this.session = s), () => (this.session = undefined));
     setInterval(() => (this.now = new Date()), 15_000);
@@ -102,7 +104,8 @@ class AppState {
         before?.last_success?.id !== after.last_success?.id ||
         before?.current_run?.id !== after.current_run?.id;
       if (changed || this.running || wasRunning || wasOffline) void this.loadRuns();
-      if (wasOffline && this.config.state === "error") void this.loadConfig();
+      // Settings can change elsewhere (another tab, the terminal): keep them fresh.
+      if (!this.running || (wasOffline && this.config.state === "error")) void this.loadConfig();
       if (before && before.last_success?.id !== after.last_success?.id && this.snapshots.state !== "idle") {
         void this.loadSnapshots(true);
       }
@@ -138,6 +141,28 @@ class AppState {
       this.config = { state: "ok", value: await api.config(), error: null };
     } catch (e) {
       if (this.config.state !== "ok") this.config = { state: "error", value: null, error: asFailure(e) };
+    }
+  }
+
+  /**
+   * Save a settings change (`PATCH /config`). On success the new
+   * configuration replaces the loaded one and /status is asked again, so the
+   * next run and the overdue state follow at once. Rejects with ApiFailure.
+   */
+  async saveSettings(change: SettingsChange): Promise<ConfigView> {
+    try {
+      const config = await api.updateConfig(change);
+      this.config = { state: "ok", value: config, error: null };
+      void this.poll();
+      return config;
+    } catch (e) {
+      const f = asFailure(e);
+      // The daemon stopped or the session ended: let the page show it.
+      if (f.kind === "daemon" || f.kind === "unauthorized") void this.poll();
+      // A failed save can still have changed something (e.g. the timer was
+      // switched but not started): show what the daemon has now.
+      else void this.loadConfig();
+      throw f;
     }
   }
 

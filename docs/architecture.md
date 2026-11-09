@@ -36,7 +36,7 @@ transfer and restore stay in the official client.
 |---|---|---|
 | `nestegg run` | root, started by the timer or the daemon | One backup run: lock, optional Wake-on-LAN, wait for PBS, build system inventory, call `proxmox-backup-client backup`, upload status report, record result. |
 | `nestegg-backup.timer` | systemd | Daily schedule, `Persistent=true` (catch-up after the machine was off), randomized delay. |
-| `nestegg daemon` (`nestegg.service`) | root | Local JSON API over a Unix socket. Reads state/history, lists snapshots, starts runs (`systemctl start nestegg-backup.service`) and restores. |
+| `nestegg daemon` (`nestegg.service`) | root | Local JSON API over a Unix socket. Reads state/history, lists snapshots, starts runs (`systemctl start nestegg-backup.service`) and restores, and changes the few settings group members may change (rhythm, overdue threshold, excludes, Wake-on-LAN on/off, timer on/off; [decision 0013](decisions/0013-editable-settings-in-the-web-ui.md)). |
 | `nestegg <command>` | user in group `nestegg`, or root | CLI. Read commands go through the socket; `init`, `credentials` and `key` need root. |
 | `nestegg ui` | user in group `nestegg` | Starts a local HTTP server on `127.0.0.1:<random>` with a one-time token in the URL, opens the browser, serves the embedded web UI from `ui/dist`, and forwards `/api/v1/*` to the socket. |
 
@@ -83,7 +83,7 @@ directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
 
 | Path | Content |
 |---|---|
-| `/etc/nestegg/config.toml` | Configuration (no secrets). |
+| `/etc/nestegg/config.toml` | Configuration (no secrets). Written by `nestegg init` and, for the settings of decision 0013, by the daemon (only the touched keys, atomically). |
 | `/etc/nestegg/credentials/` | Encrypted credentials (`*.cred`, `systemd-creds`) or root-only plain files. |
 | `/var/lib/nestegg/state.json` | Last run, last success, next run. |
 | `/var/lib/nestegg/runs/` | Run history, one JSON file per run, pruned to a configurable count. |

@@ -104,7 +104,7 @@ fn ensure_available_with(
     if is_reachable(config, probe) {
         return Ok(Availability::Reachable);
     }
-    let Some(wake) = &config.wake else {
+    let Some(wake) = config.active_wake() else {
         return Ok(Availability::Unreachable);
     };
     on_event(WakeEvent::Info(
@@ -235,6 +235,7 @@ mod tests {
             broadcast: "127.0.0.1".parse().unwrap(),
             port: receiver.local_addr().unwrap().port(),
             timeout_seconds: 1,
+            enabled: true,
         };
         send_magic_packet(&wake).unwrap();
         let mut buf = [0u8; 200];
@@ -263,6 +264,7 @@ mod tests {
             broadcast: "255.255.255.255".parse().unwrap(),
             port: 9,
             timeout_seconds,
+            enabled: true,
         }
     }
 
@@ -373,6 +375,31 @@ mod tests {
             seen.iter().any(|s| matches!(s, Seen::Warning(_))),
             "{seen:?}"
         );
+    }
+
+    #[test]
+    fn switched_off_wake_sends_nothing() {
+        let mut config = config_for(closed_port());
+        let mut wake = wake_config(10);
+        wake.enabled = false;
+        config.wake = Some(wake);
+        let mut attempts = 0;
+        let mut seen = Vec::new();
+        let start = Instant::now();
+        let result = ensure_available_with(
+            &config,
+            |_| {
+                attempts += 1;
+                Ok(())
+            },
+            Duration::from_millis(10),
+            record(&mut seen),
+        )
+        .unwrap();
+        assert_eq!(result, Availability::Unreachable);
+        assert_eq!(attempts, 0);
+        assert!(seen.is_empty(), "{seen:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

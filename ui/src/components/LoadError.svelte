@@ -11,5 +11,5 @@
 </p>
 
 <style>
-  .load-error { color: var(--muted); padding: 14px 0; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+  .load-error { color: var(--muted); padding: 10px 0; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
 </style>

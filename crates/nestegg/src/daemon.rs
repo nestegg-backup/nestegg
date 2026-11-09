@@ -36,6 +36,8 @@ struct App {
     catalog: Arc<Mutex<()>>,
     /// Status reports of snapshots (`archive_sources`), by snapshot path.
     reports: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    /// Serialises settings changes (read, modify, write, switch the timer).
+    settings: Arc<Mutex<()>>,
 }
 
 /// Credentials of the process on the other end of the socket.
@@ -138,7 +140,7 @@ pub fn router(paths: Paths) -> Router {
         .route("/api/v1/snapshots/{time}/browse", get(browse))
         .route("/api/v1/restores", axum::routing::post(start_restore))
         .route("/api/v1/restores/{id}", get(get_restore))
-        .route("/api/v1/config", get(config))
+        .route("/api/v1/config", get(config).patch(update_config))
         .route("/api/v1/session", get(session))
         .route("/api/v1/pbs", get(pbs_info))
         .route("/api/v1/pbs/check", axum::routing::post(pbs_check))
@@ -152,6 +154,7 @@ pub fn router(paths: Paths) -> Router {
             restores: Default::default(),
             catalog: Default::default(),
             reports: Default::default(),
+            settings: Default::default(),
         })
 }
 
@@ -166,8 +169,11 @@ fn load_config(paths: &Paths) -> Option<Config> {
 async fn status(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Value>> {
     let status = blocking(move || {
         let config = load_config(&app.paths);
-        let status =
-            crate::status::build(&app.paths, config.as_ref(), crate::status::timer_enabled())?;
+        let status = crate::status::build(
+            &app.paths,
+            config.as_ref(),
+            crate::status::timer_enabled(&app.paths),
+        )?;
         Ok(serde_json::to_value(status)?)
     })
     .await?;
@@ -329,8 +335,67 @@ async fn list_snapshots(AxState(app): AxState<App>) -> ApiResult<Json<serde_json
 }
 
 async fn config(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Value>> {
-    let config = blocking(move || Config::load(&app.paths.config_file)).await?;
-    Ok(Json(crate::status::config_view(&config)))
+    let (config, timer) = blocking(move || {
+        let config = Config::load(&app.paths.config_file)?;
+        Ok((config, crate::status::timer_enabled(&app.paths)))
+    })
+    .await?;
+    Ok(Json(crate::status::config_view(&config, timer)))
+}
+
+/// `PATCH /api/v1/config`: change the settings group members may change
+/// (decision 0013). Every change and every refusal is logged with the
+/// caller to the daemon's journal.
+async fn update_config(
+    AxState(app): AxState<App>,
+    peer: PeerInfo,
+    body: std::result::Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let uid = peer
+        .as_ref()
+        .and_then(|Extension(ConnectInfo(p))| p.uid)
+        .ok_or_else(|| forbidden("unknown caller"))?;
+    let caller = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+        Ok(Some(user)) => format!("{} (uid {uid})", user.name),
+        _ => format!("uid {uid}"),
+    };
+    let refuse = |msg: String| {
+        eprintln!("settings change by {caller} refused: {msg}");
+        bad_request(msg)
+    };
+    let Json(body) = body.map_err(|e| refuse(e.body_text()))?;
+    let patch =
+        crate::settings::SettingsPatch::from_json(body).map_err(|e| refuse(e.to_string()))?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _one_change_at_a_time = app.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let timer = crate::settings::SystemdTimer {
+            systemctl: &app.paths.systemctl,
+        };
+        crate::settings::update(&app.paths.config_file, &patch, &timer)
+    })
+    .await
+    .map_err(ApiError::internal)?;
+    match result {
+        Ok(outcome) => {
+            if outcome.changes.is_empty() {
+                eprintln!("settings saved by {caller}: no changes");
+            } else {
+                eprintln!(
+                    "settings changed by {caller}: {}",
+                    outcome.changes.join("; ")
+                );
+            }
+            Ok(Json(crate::status::config_view(
+                &outcome.config,
+                outcome.timer_enabled,
+            )))
+        }
+        Err(crate::settings::SettingsError::Invalid(msg)) => Err(refuse(msg)),
+        Err(e @ crate::settings::SettingsError::Failed(_)) => {
+            eprintln!("settings change by {caller} failed: {e}");
+            Err(ApiError::internal(e))
+        }
+    }
 }
 
 fn pbs_unreachable() -> ApiError {
@@ -997,5 +1062,107 @@ pub async fn shutdown_signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn paths(dir: &Path) -> Paths {
+        Paths {
+            config_file: dir.join("config.toml"),
+            credentials_dir: dir.join("cred"),
+            state_dir: dir.join("state"),
+            runtime_dir: dir.join("run"),
+            systemctl: dir.join("no-systemctl"),
+        }
+    }
+
+    const CONFIG: &str = "[pbs]\nserver = \"pbs.example.com\"\ndatastore = \"backups\"\nauth_id = \"backup@pbs!desktop\"\n";
+
+    fn patch(body: &str, uid: Option<u32>) -> Request<Body> {
+        let mut req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/config")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        if let Some(uid) = uid {
+            req.extensions_mut()
+                .insert(ConnectInfo(Peer { uid: Some(uid) }));
+        }
+        req
+    }
+
+    async fn json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn settings_change_needs_a_known_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), CONFIG).unwrap();
+        let resp = router(paths(dir.path()))
+            .oneshot(patch(r#"{"interval_hours":12}"#, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+            CONFIG
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_change_through_the_router() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), CONFIG).unwrap();
+        let me = nix::unistd::getuid().as_raw();
+        let resp = router(paths(dir.path()))
+            .oneshot(patch(
+                r#"{"interval_hours":12,"overdue_after_hours":30}"#,
+                Some(me),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let view = json(resp).await;
+        assert_eq!(view["interval_hours"], 12);
+        assert_eq!(view["automatic_backups"], false);
+        let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(text.contains("interval_hours = 12"), "{text}");
+
+        // Without systemctl, automatic backups cannot be switched on.
+        let resp = router(paths(dir.path()))
+            .oneshot(patch(r#"{"automatic_backups":true}"#, Some(me)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let err = json(resp).await;
+        assert_eq!(err["code"], "internal");
+        assert!(
+            err["message"].as_str().unwrap().contains("need systemd"),
+            "{err}"
+        );
+        // Switching off what is already off needs no systemctl.
+        let resp = router(paths(dir.path()))
+            .oneshot(patch(r#"{"automatic_backups":false}"#, Some(me)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = router(paths(dir.path()))
+            .oneshot(patch(r#"{"datastore":"other"}"#, Some(me)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(resp).await["code"], "bad_request");
     }
 }

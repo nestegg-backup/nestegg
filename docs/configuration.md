@@ -57,6 +57,7 @@ mac = "00:00:5e:00:53:01"
 broadcast = "255.255.255.255"   # or the subnet broadcast, e.g. 192.0.2.255
 port = 9
 timeout_seconds = 180
+enabled = true                  # false: keep the MAC, but do not wake
 
 [backup]
 encryption = true               # client-side encryption (recommended)
@@ -119,7 +120,8 @@ Notes:
 - **Schedule:** the timer checks hourly; a backup runs when the last success
   is older than `interval_hours`. If the PBS is unreachable, the run ends
   with state `pbs_unreachable` and the next hourly check tries again.
-- **Wake-on-LAN:** with `[wake]`, a run that finds the PBS down sends the
+- **Wake-on-LAN:** with `[wake]` (and `enabled = true`, the default), a
+  run that finds the PBS down sends the
   magic packet, repeats it every minute and waits up to `timeout_seconds`.
   If the packet cannot be sent at all (for example a laptop that is offline
   or still reconnecting after sleep), the run logs a warning, keeps trying
@@ -133,6 +135,27 @@ The daemon identifies the caller by the socket credentials:
 
 - Everyone in the group can see the status, start and cancel backups and
   run the connection check.
+- Everyone in the group can change these settings in the web UI (or with
+  `PATCH /api/v1/config`):
+
+  | Setting | Key in `config.toml` | Allowed |
+  |---|---|---|
+  | Backup rhythm | `schedule.interval_hours` | 1 to 168 hours |
+  | "Overdue" after | `overdue_after_hours` | 2 to 744 hours, more than the rhythm |
+  | Excludes | `backup.excludes` | up to 200 patterns, none that excludes everything (`*`, `**`, `/`, ...) |
+  | Wake-on-LAN on/off | `wake.enabled` | only with a `[wake]` section; switching off keeps the MAC |
+  | Automatic backups on/off | `nestegg-backup.timer` | `systemctl enable/disable --now` |
+
+  The daemon changes only these keys in `/etc/nestegg/config.toml` and
+  keeps your comments and layout. Each change is logged with the user who
+  made it: `journalctl -u nestegg.service`. Changes made during a backup
+  apply from the next run on.
+- Everything else stays terminal-only (root): server, port, datastore,
+  namespace, auth id, fingerprint, backup id, credentials, encryption and
+  the key, sources, the `[wake]` details and the overview credentials.
+  Anyone who could change these could send the backups of this computer to
+  another server ([decision 0013](decisions/0013-editable-settings-in-the-web-ui.md)).
+  Edit the file with `sudo`, then run `sudo nestegg check`.
 - Browsing and restoring is limited to the caller's own home directory
   (other homes and archives such as `/etc` are refused). Restored files are
   written with the caller's identity into a new directory.

@@ -91,6 +91,27 @@ case "$1" in
 esac
 "#;
 
+/// Fake `systemctl` for the backup timer: the state lives in a file,
+/// `<state>.fail` makes enable/disable fail like a missing system bus.
+const FAKE_SYSTEMCTL: &str = r#"#!/bin/bash
+echo "$*" >> "$FAKE_SYSTEMCTL_STATE.log"
+case "$1" in
+  is-enabled)
+    [ "$(cat "$FAKE_SYSTEMCTL_STATE" 2>/dev/null)" = enabled ]
+    ;;
+  enable|disable)
+    if [ -e "$FAKE_SYSTEMCTL_STATE.fail" ]; then
+      echo "Failed to connect to bus: No such file or directory" >&2
+      exit 1
+    fi
+    echo "$1d" > "$FAKE_SYSTEMCTL_STATE"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#;
+
 struct Env {
     dir: tempfile::TempDir,
     pbs: Option<TcpListener>,
@@ -109,6 +130,9 @@ impl Env {
         let client = root.join("fake-client");
         fs::write(&client, FAKE_CLIENT).unwrap();
         fs::set_permissions(&client, fs::Permissions::from_mode(0o755)).unwrap();
+        let systemctl = root.join("fake-systemctl");
+        fs::write(&systemctl, FAKE_SYSTEMCTL).unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
         let creds = root.join("fake-systemd-creds");
         fs::write(&creds, FAKE_CREDS).unwrap();
         fs::set_permissions(&creds, fs::Permissions::from_mode(0o755)).unwrap();
@@ -191,6 +215,8 @@ inventory = false
             .env("FAKE_LOG", root.join("fake.log"))
             .env("NESTEGG_SYSTEMD_CREDS", root.join("fake-systemd-creds"))
             .env("FAKE_CREDS_LOG", root.join("creds.log"))
+            .env("NESTEGG_SYSTEMCTL", root.join("fake-systemctl"))
+            .env("FAKE_SYSTEMCTL_STATE", root.join("timer-state"))
             .env_remove("CREDENTIALS_DIRECTORY")
             .env("PBS_PASSWORD", "must-not-reach-the-client");
         cmd
@@ -333,6 +359,35 @@ fn wake_packet_that_cannot_be_sent_ends_as_unreachable() {
     assert_eq!(wake_warnings, 1, "state: {state}");
     assert_eq!(state["pbs_reachable"], false);
     assert!(!env.fake_log().contains("ARGS backup"));
+}
+
+#[test]
+fn switched_off_wake_on_lan_is_not_used() {
+    let mut env = Env::new();
+    // Port 0 would make a send attempt fail with a warning (see above).
+    let config = env.root().join("etc/config.toml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "\n[wake]\nmac = \"00:00:5e:00:53:01\"\nport = 0\ntimeout_seconds = 0\nenabled = false\n",
+    );
+    fs::write(&config, text).unwrap();
+    env.close_pbs();
+    let out = env.run(&["run", "--trigger", "timer"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code(&out), 75, "stderr: {stderr}");
+    assert!(!stderr.contains("Wake-on-LAN"), "stderr: {stderr}");
+    let state = env.state();
+    assert_eq!(state["last_run"]["state"], "pbs_unreachable");
+    assert_eq!(state["last_run"]["error"]["message"], "PBS did not answer");
+    assert!(
+        !state["last_run"]["warnings"]
+            .to_string()
+            .contains("Wake-on-LAN"),
+        "{state}"
+    );
+    let out = env.run(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["pbs"]["wake_on_lan"], false);
 }
 
 #[test]
@@ -873,4 +928,175 @@ fn daemon_serves_status_runs_and_snapshots() {
             .iter()
             .any(|c| c["name"] == "PBS reachable" && c["ok"] == true)
     );
+}
+
+#[test]
+fn daemon_changes_settings() {
+    let env = Env::new();
+    let config = env.root().join("etc/config.toml");
+    // A comment and a [wake] section the change must keep.
+    let original = format!(
+        "# Hand-written, keep me.\n{}\n[wake]\nmac = \"00:00:5e:00:53:01\" # PBS\n",
+        fs::read_to_string(&config).unwrap()
+    );
+    fs::write(&config, &original).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let _daemon = start_daemon(&env);
+    let socket = env.root().join("run/api.sock");
+
+    let (code, view) = request(&socket, "GET", "/api/v1/config");
+    assert_eq!(code, 200, "{view}");
+    assert_eq!(view["automatic_backups"], false);
+    assert_eq!(view["wake_on_lan"], true);
+    assert_eq!(view["wake_on_lan_configured"], true);
+    assert_eq!(view["limits"]["interval_hours"]["max"], 168);
+    assert!(
+        view["editable"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("wake_on_lan"))
+    );
+
+    let (code, view) = request_body(
+        &socket,
+        "PATCH",
+        "/api/v1/config",
+        r#"{"interval_hours":12,"overdue_after_hours":20,"excludes":["**/.cache","*.iso"],"wake_on_lan":false,"automatic_backups":true}"#,
+    );
+    assert_eq!(code, 200, "{view}");
+    assert_eq!(view["interval_hours"], 12);
+    assert_eq!(view["schedule"], "every 12 h");
+    assert_eq!(view["overdue_after_hours"], 20);
+    assert_eq!(view["excludes"], serde_json::json!(["**/.cache", "*.iso"]));
+    assert_eq!(view["wake_on_lan"], false);
+    assert_eq!(view["wake_on_lan_configured"], true);
+    assert_eq!(view["automatic_backups"], true);
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.starts_with("# Hand-written, keep me.\n"), "{text}");
+    assert!(
+        text.contains("mac = \"00:00:5e:00:53:01\" # PBS\nenabled = false\n"),
+        "{text}"
+    );
+    assert!(text.contains("server = \"127.0.0.1\""));
+    assert_eq!(
+        fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_eq!(
+        fs::read_to_string(env.root().join("timer-state")).unwrap(),
+        "enabled\n"
+    );
+    // GET /status reflects the new values.
+    let (_, status) = request(&socket, "GET", "/api/v1/status");
+    assert_eq!(status["schedule"]["enabled"], true);
+    assert_eq!(status["schedule"]["interval_hours"], 12);
+    assert!(status["schedule"]["next_run"].is_string(), "{status}");
+    assert_eq!(status["overdue_after_hours"], 20);
+    assert_eq!(status["pbs"]["wake_on_lan"], false);
+
+    // Validation errors are 400 bad_request and change nothing.
+    let before = fs::read_to_string(&config).unwrap();
+    for (body, needle) in [
+        (r#"{"interval_hours":0}"#, "interval_hours"),
+        (r#"{"interval_hours":200}"#, "interval_hours"),
+        (r#"{"interval_hours":24}"#, "greater than interval_hours"),
+        (r#"{"excludes":["**"]}"#, "exclude everything"),
+        (r#"{"excludes":["a\nb"]}"#, "control character"),
+        (r#"{"server":"pbs.example.com"}"#, "cannot be changed here"),
+        (r#"{"sources":[]}"#, "cannot be changed here"),
+        (r#"{"bogus":1}"#, "unknown setting"),
+        (r#"{"interval_hours":"12"}"#, "invalid settings"),
+        ("not json", ""),
+    ] {
+        let (code, err) = request_body(&socket, "PATCH", "/api/v1/config", body);
+        assert_eq!(code, 400, "{body}: {err}");
+        assert_eq!(err["code"], "bad_request", "{body}: {err}");
+        assert!(
+            err["message"].as_str().unwrap().contains(needle),
+            "{body}: {err}"
+        );
+    }
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+
+    // A failing systemctl leaves everything as it was.
+    fs::write(env.root().join("timer-state.fail"), "").unwrap();
+    let (code, err) = request_body(
+        &socket,
+        "PATCH",
+        "/api/v1/config",
+        r#"{"interval_hours":6,"automatic_backups":false}"#,
+    );
+    assert_eq!(code, 500, "{err}");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("Failed to connect to bus"),
+        "{err}"
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    fs::remove_file(env.root().join("timer-state.fail")).unwrap();
+
+    // Concurrent changes of different settings are all kept.
+    let bodies = [
+        r#"{"interval_hours":8}"#,
+        r#"{"overdue_after_hours":30}"#,
+        r#"{"excludes":["**/.cache"]}"#,
+        r#"{"wake_on_lan":true}"#,
+        r#"{"automatic_backups":false}"#,
+    ];
+    let handles: Vec<_> = bodies
+        .iter()
+        .map(|body| {
+            let socket = socket.clone();
+            let body = body.to_string();
+            std::thread::spawn(move || request_body(&socket, "PATCH", "/api/v1/config", &body))
+        })
+        .collect();
+    for h in handles {
+        let (code, v) = h.join().unwrap();
+        assert_eq!(code, 200, "{v}");
+    }
+    let (_, view) = request(&socket, "GET", "/api/v1/config");
+    assert_eq!(view["interval_hours"], 8);
+    assert_eq!(view["overdue_after_hours"], 30);
+    assert_eq!(view["excludes"], serde_json::json!(["**/.cache"]));
+    assert_eq!(view["wake_on_lan"], true);
+    assert_eq!(view["automatic_backups"], false);
+    let leftovers: Vec<_> = fs::read_dir(env.root().join("etc"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(leftovers, ["config.toml"]);
+}
+
+#[test]
+fn wake_on_lan_cannot_be_switched_on_without_a_mac() {
+    let env = Env::new();
+    let _daemon = start_daemon(&env);
+    let socket = env.root().join("run/api.sock");
+    let (_, view) = request(&socket, "GET", "/api/v1/config");
+    assert_eq!(view["wake_on_lan_configured"], false);
+    assert_eq!(view["wake_on_lan"], false);
+    assert!(
+        !view["editable"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("wake_on_lan"))
+    );
+    let (code, err) = request_body(
+        &socket,
+        "PATCH",
+        "/api/v1/config",
+        r#"{"wake_on_lan":true}"#,
+    );
+    assert_eq!(code, 400, "{err}");
+    assert!(err["message"].as_str().unwrap().contains("[wake]"), "{err}");
+    let (code, _) = request_body(
+        &socket,
+        "PATCH",
+        "/api/v1/config",
+        r#"{"wake_on_lan":false}"#,
+    );
+    assert_eq!(code, 200);
 }

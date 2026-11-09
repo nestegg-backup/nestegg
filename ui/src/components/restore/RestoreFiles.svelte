@@ -34,7 +34,7 @@
     <p class="lead-text gap">{t.restore.notAvailable}</p>
     <Cmd command="sudo nestegg restore {snap.snapshot} {restore.roots[0]?.archive ?? 'home.pxar'} {t.restore.notAvailableTarget}" />
   {:else}
-    <ul class="tree" aria-label={t.restore.treeLabel}>
+    <ul class="tree box" aria-label={t.restore.treeLabel}>
       {#each restore.roots as node (node.archive)}
         <TreeItem {node} depth={0} />
       {/each}
@@ -54,7 +54,7 @@
 {/if}
 
 <style>
-  .gap { margin-top: 24px; }
-  .tree { margin-top: 18px; }
+  .gap { margin-top: 20px; }
+  .tree { margin-top: 14px; padding: 6px; }
   .linkbtn { margin-left: 4px; }
 </style>

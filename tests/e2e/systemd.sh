@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Package and service test: install the .deb into a container running
 # systemd, store secrets with systemd-creds, run backups through the timer
-# unit and the daemon, and use the CLI and web UI as an unprivileged user.
+# unit and the daemon, use the CLI and web UI as an unprivileged user and
+# change settings through the API.
 #
 # The systemd container needs the host cgroup namespace (--cgroupns=host with
 # a writable /sys/fs/cgroup) and CAP_SYS_ADMIN without seccomp/AppArmor
@@ -133,6 +134,49 @@ check "ui rejects API requests without token" bash -c "[[ \$(docker exec $client
 check "ui proxies the API with bearer token" bash -c "docker exec $client curl -sf -H 'Authorization: Bearer $token' http://127.0.0.1:18080/api/v1/status | grep -q '\"health\":\"ok\"'"
 check "ui sets no cookies" bash -c "! docker exec $client curl -s -D - -o /dev/null http://127.0.0.1:18080/ | grep -qi 'set-cookie'"
 check "ui only listens on loopback" bash -c "docker exec $client grep -qi ' 0100007F:46A0 ' /proc/net/tcp && ! docker exec $client grep -qi ' 00000000:46A0 ' /proc/net/tcp"
+
+echo "== settings changed through the API (decision 0013)"
+contains() { grep -q -- "$2" <<<"$1" || { echo "    no '$2' in:"; show "$1"; return 1; }; }
+# PATCH /config as $1 with body $2; prints the response body, then the status code.
+patch_config() {
+  "$1" curl -s --unix-socket /run/nestegg/api.sock -X PATCH -H 'Content-Type: application/json' \
+    -d "$2" -w '\n%{http_code}' http://localhost/api/v1/config
+}
+cfg=/etc/nestegg/config.toml
+out="$(patch_config as_alice '{"interval_hours":12,"overdue_after_hours":30,"excludes":["**/.cache","*.iso"],"automatic_backups":false}')"
+check "group member changes settings" test "$(tail -1 <<<"$out")" = 200
+check "response shows the new values" contains "$out" '"interval_hours":12'
+check "config.toml has the new interval" on_client grep -qx 'interval_hours = 12' "$cfg"
+check "config.toml has the new excludes" on_client grep -q '"\*\.iso"' "$cfg"
+check "config.toml keeps the header comment" bash -c "docker exec $client head -1 $cfg | grep -q '^# nestegg configuration'"
+check "config.toml keeps the hand-added source" on_client grep -q 'archive = "e2e-modules"' "$cfg"
+check "config.toml keeps owner and mode" bash -c "[[ \$(docker exec $client stat -c '%a %U:%G' $cfg) == '644 root:root' ]]"
+check "no temporary files left in /etc/nestegg" no_output on_client find /etc/nestegg -maxdepth 1 -name '.*.tmp'
+check "timer disabled" exits_with 1 on_client systemctl is-enabled --quiet nestegg-backup.timer
+check "timer stopped" exits_with 3 on_client systemctl is-active --quiet nestegg-backup.timer
+check "status shows the new interval" bash -c "docker exec -u alice $client nestegg status --json | grep -q '\"interval_hours\": 12'"
+out="$(patch_config as_alice '{"automatic_backups":true}')"
+check "group member enables automatic backups" test "$(tail -1 <<<"$out")" = 200
+check "timer enabled again" on_client systemctl is-enabled --quiet nestegg-backup.timer
+check "timer running again" on_client systemctl is-active --quiet nestegg-backup.timer
+before="$(on_client sha256sum "$cfg")"
+out="$(patch_config as_alice '{"server":"pbs.example.com"}')"
+check "server cannot be changed" test "$(tail -1 <<<"$out")" = 400
+check "refusal names the reason" contains "$out" 'cannot be changed here'
+out="$(patch_config as_alice '{"excludes":["**"]}')"
+check "exclude-everything pattern refused" contains "$out" 'would exclude everything'
+out="$(patch_config as_alice '{"wake_on_lan":true}')"
+check "Wake-on-LAN without MAC refused" contains "$out" '\[wake\]'
+check "refused changes leave config.toml alone" test "$(on_client sha256sum "$cfg")" = "$before"
+check "change logged with the caller" bash -c "docker exec $client journalctl -u nestegg.service --no-pager | grep -q 'settings changed by alice (uid [0-9]*): interval_hours: 24 -> 12'"
+check "refusal logged with the caller" bash -c "docker exec $client journalctl -u nestegg.service --no-pager | grep -q 'settings change by alice (uid [0-9]*) refused'"
+check "web UI forwards a settings change" bash -c "[[ \$(docker exec $client curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+  -H 'Authorization: Bearer $token' -H 'Content-Type: application/json' -d '{\"overdue_after_hours\":40}' \
+  http://127.0.0.1:18080/api/v1/config) == 200 ]] && docker exec $client grep -qx 'overdue_after_hours = 40' $cfg"
+check "web UI rejects a cross-origin settings change" bash -c "[[ \$(docker exec $client curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+  -H 'Authorization: Bearer $token' -H 'Origin: http://attacker.example.com' -H 'Content-Type: application/json' \
+  -d '{\"automatic_backups\":false}' http://127.0.0.1:18080/api/v1/config) == 403 ]]"
+check "timer still enabled after the rejected request" on_client systemctl is-enabled --quiet nestegg-backup.timer
 
 echo "== removal keeps credentials"
 check "package removes cleanly" on_client bash -c 'DEBIAN_FRONTEND=noninteractive apt-get remove -y -q nestegg >/tmp/apt-rm.log 2>&1'

@@ -72,3 +72,14 @@ describe("durations", () => {
     expect(en.duration(65 * 60)).toBe("1 h 5 min");
   });
 });
+
+describe("weekday labels of the 14-day boxes", () => {
+  it("are two letters and independent of the time zone", () => {
+    const de = createFormatter("de", "de-DE", "Pacific/Auckland");
+    const en = createFormatter("en", "en-GB", "America/Los_Angeles");
+    expect(de.keyWeekday("2026-11-09")).toBe("Mo");
+    expect(de.keyWeekday("2026-11-08")).toBe("So");
+    expect(en.keyWeekday("2026-11-09")).toBe("Mo");
+    expect(en.keyWeekday("2026-11-12")).toBe("Th");
+  });
+});
