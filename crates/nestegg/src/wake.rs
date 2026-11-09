@@ -235,8 +235,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(is_reachable(&config_for(port), Duration::from_secs(1)));
-        drop(listener);
-        assert!(!is_reachable(&config_for(port), Duration::from_millis(300)));
+        let closed = ClosedPort::reserve();
+        assert!(!is_reachable(
+            &config_for(closed.port),
+            Duration::from_millis(300)
+        ));
     }
 
     #[test]
@@ -261,16 +264,44 @@ mod tests {
 
     #[test]
     fn unreachable_without_wake_config() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let result = ensure_available(&config_for(port), |_| {}).unwrap();
+        let closed = ClosedPort::reserve();
+        let result = ensure_available(&config_for(closed.port), |_| {}).unwrap();
         assert_eq!(result, Availability::Unreachable);
     }
 
-    fn closed_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+    /// A TCP port on 127.0.0.1 that refuses connections for as long as the
+    /// value lives: a socket that is bound but never listens. Unlike "bind,
+    /// read the port, close", no other process (tests running in parallel)
+    /// can start listening on it in the meantime.
+    struct ClosedPort {
+        port: u16,
+        _socket: std::os::fd::OwnedFd,
+    }
+
+    impl ClosedPort {
+        fn reserve() -> ClosedPort {
+            use nix::libc;
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            let size = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            // SAFETY: plain socket calls on a descriptor owned right away,
+            // with a zero-initialised address of the size passed along.
+            unsafe {
+                let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+                assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+                let socket = OwnedFd::from_raw_fd(fd);
+                let mut addr: libc::sockaddr_in = std::mem::zeroed();
+                addr.sin_family = libc::AF_INET as libc::sa_family_t;
+                addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+                let addr_ptr = std::ptr::addr_of_mut!(addr).cast::<libc::sockaddr>();
+                assert_eq!(libc::bind(socket.as_raw_fd(), addr_ptr, size), 0);
+                let mut len = size;
+                assert_eq!(libc::getsockname(socket.as_raw_fd(), addr_ptr, &mut len), 0);
+                ClosedPort {
+                    port: u16::from_be(addr.sin_port),
+                    _socket: socket,
+                }
+            }
+        }
     }
 
     fn wake_config(timeout_seconds: u64) -> WakeConfig {
@@ -306,7 +337,8 @@ mod tests {
 
     #[test]
     fn send_failure_is_a_warning_and_ends_unreachable() {
-        let mut config = config_for(closed_port());
+        let closed = ClosedPort::reserve();
+        let mut config = config_for(closed.port);
         config.wake = Some(wake_config(1));
         let mut attempts = 0;
         let mut seen = Vec::new();
@@ -341,7 +373,8 @@ mod tests {
 
     #[test]
     fn packet_goes_out_once_the_network_is_back() {
-        let port = closed_port();
+        let mut closed = Some(ClosedPort::reserve());
+        let port = closed.as_ref().unwrap().port;
         let mut config = config_for(port);
         config.wake = Some(wake_config(10));
         let mut attempts = 0;
@@ -355,6 +388,7 @@ mod tests {
                 if attempts == 1 {
                     return Err(offline());
                 }
+                closed.take();
                 pbs = Some(TcpListener::bind(("127.0.0.1", port)).unwrap());
                 Ok(())
             },
@@ -381,7 +415,8 @@ mod tests {
     fn real_send_failure_does_not_abort() {
         // Linux refuses UDP datagrams to port 0 with EINVAL, a deterministic
         // stand-in for "Network is unreachable".
-        let mut config = config_for(closed_port());
+        let closed = ClosedPort::reserve();
+        let mut config = config_for(closed.port);
         let mut wake = wake_config(0);
         wake.port = 0;
         config.wake = Some(wake);
@@ -396,7 +431,8 @@ mod tests {
 
     #[test]
     fn switched_off_wake_sends_nothing() {
-        let mut config = config_for(closed_port());
+        let closed = ClosedPort::reserve();
+        let mut config = config_for(closed.port);
         let mut wake = wake_config(10);
         wake.enabled = false;
         config.wake = Some(wake);
@@ -429,7 +465,8 @@ mod tests {
 
     #[test]
     fn packet_is_resent_with_growing_pauses_until_the_pbs_answers() {
-        let port = closed_port();
+        let mut closed = Some(ClosedPort::reserve());
+        let port = closed.as_ref().unwrap().port;
         let mut config = config_for(port);
         config.wake = Some(wake_config(30));
         // Pauses of 10, 20 and 40 ms instead of seconds; the "PBS" starts
@@ -442,6 +479,7 @@ mod tests {
             |_| {
                 sent_at.push(Instant::now());
                 if sent_at.len() == 4 {
+                    closed.take();
                     pbs = Some(TcpListener::bind(("127.0.0.1", port)).unwrap());
                 }
                 Ok(())
