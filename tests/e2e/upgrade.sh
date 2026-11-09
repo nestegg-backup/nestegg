@@ -3,8 +3,9 @@
 # systemd, set it up against a disposable PBS and back up through the timer
 # unit, then install the NEW .deb over it. Checks that services, timer,
 # configuration, credentials and run history survive the upgrade, that the
-# new version backs up and restores, and what `apt remove` and `apt purge`
-# keep (see packaging/debian/postrm).
+# new version backs up and restores, what `apt remove` and `apt purge` keep
+# (see packaging/debian/postrm) and that reinstalling enables the units that
+# were enabled before removal (prerm, postinst).
 #
 # The NEW package must have a higher version than the OLD one, otherwise apt
 # does not upgrade. Build the old one with a lower version, for example:
@@ -139,11 +140,34 @@ check "run history kept after purge" on_client test -f "/var/lib/nestegg/runs/$o
 
 echo "== reinstall after purge picks up the kept setup"
 check "new package reinstalls" apt_in_client install -y -q /tmp/nestegg-new.deb
-# prerm disables the units on removal and postinst never enables them, so
-# they are enabled again here as after a first installation.
-check "services enable again" on_client systemctl enable --now nestegg.service nestegg-backup.timer
+# prerm records the enabled units before disabling them, postinst enables
+# them again.
+check "daemon enabled again after reinstall" on_client systemctl is-enabled --quiet nestegg.service
+check "timer enabled again after reinstall" on_client systemctl is-enabled --quiet nestegg-backup.timer
+check "daemon running again after reinstall" on_client systemctl is-active --quiet nestegg.service
+check "timer running again after reinstall" on_client systemctl is-active --quiet nestegg-backup.timer
+check "enable marker consumed" absent_in /var/lib/nestegg enabled-units
 check "check passes with the kept setup" on_client nestegg check
 check "history still lists the earlier run" bash -c "docker exec $client nestegg history --json | grep -q '\"id\": \"$old_run\"'"
+
+echo "== a unit disabled before removal stays disabled"
+check "timer disabled by the user" on_client systemctl disable --now nestegg-backup.timer
+check "package removes again" apt_in_client remove -y -q nestegg
+check "marker lists only the daemon" test "$(on_client cat /var/lib/nestegg/enabled-units)" == nestegg.service
+check "package reinstalls again" apt_in_client install -y -q /tmp/nestegg-new.deb
+check "timer still disabled" test "$(on_client systemctl is-enabled nestegg-backup.timer || true)" == disabled
+check "daemon enabled again" test "$(on_client systemctl is-enabled nestegg.service || true)" == enabled
+
+echo "== a stale marker is ignored on an upgrade"
+# A marker can be left behind, for example when an older package version
+# without this logic was installed after the removal. The next upgrade must
+# neither re-enable units from it nor skip the daemon restart (preinst).
+on_client sh -c 'printf "nestegg.service\nnestegg-backup.timer\n" > /var/lib/nestegg/enabled-units'
+pid_before="$(daemon_pid)"
+check "same package reinstalls over itself" apt_in_client install -y -q --reinstall /tmp/nestegg-new.deb
+check "timer not re-enabled by a stale marker" test "$(on_client systemctl is-enabled nestegg-backup.timer || true)" == disabled
+check "stale marker removed" absent_in /var/lib/nestegg enabled-units
+check "daemon restarted on upgrade" test "$(daemon_pid)" != "$pid_before" -a "$(daemon_pid)" != 0
 
 [[ $fail -eq 0 ]] || { echo "-- apt log:"; on_client tail -40 /tmp/upgrade-apt.log | sed 's/^/    /'; }
 result

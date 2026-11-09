@@ -215,6 +215,29 @@ made with the current key then need its exported copy to be restored.
 | `/var/lib/nestegg/inventory/` | Generated inventory, backed up as `inventory.pxar` |
 | `/run/nestegg/api.sock` | Local API (group `nestegg`) |
 
+## Removing the package
+
+`sudo apt remove nestegg` stops and disables the daemon and the timer and
+removes the program. **`apt purge` does not delete more:** the
+configuration and the encryption key in `/etc/nestegg/` and the run history
+in `/var/lib/nestegg/` stay on disk in both cases. Deleting the key would make
+every existing backup unreadable if no exported copy is at hand.
+
+Installing nestegg again picks up the kept setup and enables the units that
+were enabled before the removal; nothing has to be set up again. If
+`/etc/nestegg/config.toml` is gone by then, nothing is enabled.
+
+To remove everything, first make sure the key is exported and kept somewhere
+safe (`sudo nestegg key export <file>`), then:
+
+```sh
+sudo apt purge nestegg
+sudo rm -r /etc/nestegg /var/lib/nestegg
+sudo groupdel nestegg
+```
+
+The backups on the PBS are not touched by any of this.
+
 ## Restore
 
 ```sh

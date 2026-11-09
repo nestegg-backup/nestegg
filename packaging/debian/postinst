@@ -7,11 +7,37 @@ if [ "$1" = "configure" ]; then
     chmod 0755 /etc/nestegg
     chgrp nestegg /var/lib/nestegg 2>/dev/null || true
     chmod 0750 /var/lib/nestegg
+    running=no
     if [ -d /run/systemd/system ]; then
+        running=yes
         systemctl daemon-reload >/dev/null 2>&1 || true
         if systemctl is-active --quiet nestegg.service; then
             systemctl restart nestegg.service || true
         fi
+    fi
+    # Units that were enabled before an `apt remove` (see prerm, preinst).
+    # They are enabled again only while the configuration still exists.
+    marker=/var/lib/nestegg/enabled-units
+    if [ -f "$marker" ]; then
+        if [ -e /etc/nestegg/config.toml ]; then
+            reenabled=""
+            while read -r unit; do
+                case "$unit" in
+                    nestegg.service|nestegg-backup.timer) ;;
+                    *) continue ;;
+                esac
+                # Without a running systemd (chroot, image build): enable only.
+                now=""
+                [ "$running" = yes ] && now=--now
+                if systemctl enable $now "$unit" >/dev/null 2>&1; then
+                    reenabled="$reenabled $unit"
+                fi
+            done < "$marker"
+            if [ -n "$reenabled" ]; then
+                echo "nestegg: enabled again as before removal:$reenabled"
+            fi
+        fi
+        rm -f "$marker"
     fi
     if [ ! -e /etc/nestegg/config.toml ]; then
         echo "nestegg: run 'sudo nestegg init --help' to set up backups."
