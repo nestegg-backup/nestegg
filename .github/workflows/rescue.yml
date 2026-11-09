@@ -58,7 +58,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: ["debian-btrfs-uefi", "ubuntu-ext4-bios-luks"]
+        # wizard 1: the interactive wizard (default of run.sh); wizard 0: a
+        # complete non-interactive `nestegg rescue restore`, on the variant
+        # that also passes --encrypt-passphrase-file.
+        include:
+          - variant: debian-btrfs-uefi
+            wizard: "1"
+          - variant: ubuntu-ext4-bios-luks
+            wizard: "1"
+          - variant: ubuntu-ext4-bios-luks
+            wizard: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -74,10 +83,11 @@ jobs:
         env:
           # Keep the work directory so the console logs can be collected.
           KEEP: "1"
+          WIZARD: ${{ matrix.wizard }}
         run: |
           # Artifacts do not keep the executable bit.
           chmod +x rescue-iso/release/nestegg
-          sudo --preserve-env=KEEP tests/rescue/run.sh rescue-iso/release/nestegg \
+          sudo --preserve-env=KEEP,WIZARD tests/rescue/run.sh rescue-iso/release/nestegg \
             rescue-iso/nestegg-rescue-amd64.iso "${{ matrix.variant }}"
       - name: Collect the VM console logs
         if: failure()
@@ -89,5 +99,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: rescue-logs-${{ matrix.variant }}
+          name: rescue-logs-${{ matrix.variant }}-wizard${{ matrix.wizard }}
           path: rescue-logs/

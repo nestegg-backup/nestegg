@@ -12,10 +12,16 @@ use super::exec::{self, Job, Runner};
 use super::guard;
 use super::plan::{Target, human, make_plan};
 use super::{
-    Disk, Inventory, Session, Settings, ask, ask_secret, ask_yes, booted_uefi, choose,
-    fetch_fingerprint, list_disks, paperkey, scan_media, work_dir,
+    Disk, FoundSettings, Inventory, Protection, Session, Settings, ask, ask_secret, ask_yes,
+    booted_uefi, choose, fetch_fingerprint, list_disks, paperkey, protection_label, scan_media,
+    work_dir,
 };
+use crate::client::RestoreKey;
 use crate::secrets::Secret;
+
+/// Printed when the key check passed.
+const KEY_FITS: &str = "The key fits this backup: its signature was checked with the key, and \
+                        everything that is restored is encrypted with it.";
 
 #[derive(Subcommand)]
 pub enum RescueCmd {
@@ -55,9 +61,15 @@ pub struct RestoreArgs {
     /// File with the PBS password or API token secret.
     #[arg(long)]
     pub password_file: PathBuf,
-    /// Exported encryption key (omit for unencrypted backups).
+    /// Exported encryption key or saved paper key (omit for unencrypted
+    /// backups).
     #[arg(long)]
     pub keyfile: Option<PathBuf>,
+    /// With --keyfile: also restore a backup that is not encrypted and
+    /// signed with that key (refused otherwise: anyone with write access to
+    /// the backup server could have made or changed such a backup).
+    #[arg(long)]
+    pub allow_unprotected_backup: bool,
     /// Snapshot path or `latest`.
     #[arg(long, default_value = "latest")]
     pub snapshot: String,
@@ -237,6 +249,36 @@ fn restore(a: RestoreArgs) -> Result<u8> {
         .iter()
         .find(|s| s.snapshot == snapshot)
         .map_or(snapshot.clone(), |s| s.time.clone());
+    // The key is checked before any disk is looked at.
+    eprintln!("Checking the key against {snapshot} ...");
+    let protection = session
+        .check_key(&snapshot)
+        .map_err(|e| anyhow::anyhow!("{e:#}\nNothing was changed."))?;
+    match &protection {
+        Protection::KeyMissing => bail!(
+            "{snapshot} is encrypted: give its key with --keyfile (an exported key file or a \
+             saved paper key). Nothing was changed."
+        ),
+        Protection::Encrypted => eprintln!("{KEY_FITS}"),
+        p => {
+            if let Some(concern) = p.concern() {
+                if !a.allow_unprotected_backup {
+                    bail!(
+                        "{snapshot}: {concern}\nNothing was changed. Only if you know that \
+                         this backup was made this way, restore it with \
+                         --allow-unprotected-backup."
+                    );
+                }
+                eprintln!(
+                    "Warning: {snapshot}: {concern} Restoring it anyway \
+                     (--allow-unprotected-backup)."
+                );
+            }
+        }
+    }
+    let restore_key = protection.restore_key(session.key());
+    eprintln!("Reading the disk layout of {snapshot} ...");
+    let inventory = session.inventory(&snapshot, restore_key.duplicate())?;
     let disks = list_disks()?;
     let disk = disks
         .iter()
@@ -248,8 +290,6 @@ fn restore(a: RestoreArgs) -> Result<u8> {
             disk.path
         );
     }
-    eprintln!("Reading the disk layout of {snapshot} ...");
-    let inventory = session.inventory(&snapshot)?;
     let assessment = guard::assess(disk, &inventory.recorded_ids(), &[]);
     run_restore(
         &session,
@@ -257,6 +297,7 @@ fn restore(a: RestoreArgs) -> Result<u8> {
         &backup_time,
         archive_bytes,
         &inventory,
+        &restore_key,
         disk,
         &assessment,
         luks.as_ref(),
@@ -277,37 +318,117 @@ fn restore(a: RestoreArgs) -> Result<u8> {
 
 /// An exported key file or a saved paper key (text or html).
 fn read_key_file(path: &Path) -> Result<Secret> {
-    Ok(Secret::new(super::read_key(path)?.json.into_bytes()))
+    let key = super::read_key(path)?;
+    if let Some(note) = &key.note {
+        eprintln!("{}: {note}", path.display());
+    }
+    Ok(Secret::new(key.json.into_bytes()))
 }
 
 /// Does this error from reading a backup come from the encryption key
-/// (wrong, missing, or not usable)?
+/// (wrong, missing, or not usable)? "error decoding base64 data" is what
+/// the client says about a damaged `data` value.
 fn is_key_problem(e: &anyhow::Error) -> bool {
     let m = format!("{e:#}").to_lowercase();
-    ["key", "decrypt", "signature"]
+    ["key", "decrypt", "signature", "base64"]
         .iter()
         .any(|w| m.contains(w))
+}
+
+/// A certificate fingerprint read from a settings file, with the file it
+/// came from.
+struct SavedFingerprint<'a> {
+    fingerprint: &'a str,
+    origin: &'a str,
+}
+
+fn same_fingerprint(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 /// Decide whether to trust the certificate the server presented.
 /// Returns the fingerprint to pin, or `None` to rely on the certificate
 /// authorities of the system. Trusting needs an explicit yes: pressing Enter
-/// must never trust a certificate nobody has compared.
+/// must never trust a certificate nobody has compared. A fingerprint from a
+/// settings file is no exception (any attached drive can carry one); only a
+/// certificate the user already trusted in this session is taken again
+/// without a question.
 fn decide_fingerprint(
     fp: &str,
-    saved: Option<&str>,
+    saved: Option<SavedFingerprint<'_>>,
+    trusted: Option<&str>,
     yes_no: &mut dyn FnMut(&str, bool) -> Result<bool>,
 ) -> Result<Option<String>> {
-    if saved == Some(fp) {
-        eprintln!("(matches the saved settings)");
+    if trusted.is_some_and(|t| same_fingerprint(t, fp)) {
+        eprintln!("(this is the certificate you trusted before)");
         return Ok(Some(fp.to_string()));
     }
-    eprintln!("Compare it with the fingerprint on the PBS dashboard (\"Show Fingerprint\").");
+    match &saved {
+        Some(s) if same_fingerprint(s.fingerprint, fp) => {
+            eprintln!(
+                "It matches the fingerprint saved in {}. Trust it only if that file is yours.",
+                s.origin
+            );
+        }
+        Some(s) => {
+            eprintln!();
+            eprintln!(
+                "!!! WARNING: this is NOT the certificate fingerprint saved in {}:",
+                s.origin
+            );
+            eprintln!("!!!   saved:  {}", s.fingerprint);
+            eprintln!("!!!   server: {fp}");
+            eprintln!(
+                "!!! Either the certificate of the PBS was replaced, or this is not your PBS."
+            );
+            eprintln!(
+                "Compare it with the fingerprint on the PBS dashboard (\"Show Fingerprint\")."
+            );
+        }
+        None => {
+            eprintln!(
+                "Compare it with the fingerprint on the PBS dashboard (\"Show Fingerprint\")."
+            );
+        }
+    }
     eprintln!("Answer no only if the PBS has a certificate from a trusted authority.");
     if yes_no("Trust this certificate?", false)? {
         Ok(Some(fp.to_string()))
     } else {
         Ok(None)
+    }
+}
+
+/// Which of the settings files found to use; `None`: enter everything.
+fn choose_settings(found: &[FoundSettings]) -> Result<Option<&FoundSettings>> {
+    match found {
+        [] => Ok(None),
+        [one] => {
+            eprintln!("Found settings in {}.", one.origin);
+            Ok(Some(one))
+        }
+        many => {
+            eprintln!("Found {} settings files:", many.len());
+            let mut items: Vec<String> = many
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}  (server {}, datastore {}{})",
+                        f.origin,
+                        f.settings.server,
+                        f.settings.datastore,
+                        f.settings
+                            .backup_id
+                            .as_deref()
+                            .map(|b| format!(", computer {b}"))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect();
+            items.push("none: enter everything by hand".into());
+            let i = choose("Which settings", &items, Some(0))?;
+            Ok(many.get(i))
+        }
     }
 }
 
@@ -339,6 +460,7 @@ fn run_restore(
     backup_time: &str,
     archive_bytes: Option<u64>,
     inventory: &Inventory,
+    restore_key: &RestoreKey,
     disk: &Disk,
     assessment: &guard::Assessment,
     luks: Option<&Secret>,
@@ -411,6 +533,7 @@ fn run_restore(
         layout,
         client: &client,
         snapshot,
+        key: restore_key,
         luks_passphrase: luks,
         dpkg_selections: selections.as_deref(),
     };
@@ -465,21 +588,34 @@ fn wizard() -> Result<u8> {
     show_network();
     eprintln!();
 
+    eprintln!("Looking for settings and keys on the attached drives ...");
     let media = scan_media();
+    for note in &media.notes {
+        eprintln!("{note}");
+    }
     let keys = media.keys.clone();
-    let mut settings = match media.settings.clone() {
-        Some((path, s)) => {
-            eprintln!("Found settings in {}.", path.display());
-            s
-        }
+    let chosen = choose_settings(&media.settings)?;
+    let mut settings = match chosen {
+        Some(f) => f.settings.clone(),
         None => Settings {
             port: 8007,
             ..Default::default()
         },
     };
+    // A certificate fingerprint from a settings file is only a suggestion;
+    // `trusted` is what the user confirmed in this session.
+    let file_fingerprint = chosen.and_then(|f| {
+        f.settings
+            .fingerprint
+            .clone()
+            .filter(|fp| !fp.is_empty())
+            .map(|fp| (fp, f.origin.clone()))
+    });
+    let mut trusted: Option<String> = None;
+    settings.fingerprint = None;
 
     // Connection, repeated until the PBS answers.
-    let (session, backup_id, mut key) = loop {
+    let (session, backup_id) = loop {
         eprintln!("Step 1/4: backup server");
         settings.server = ask("PBS address (host name or IP)", Some(&settings.server))?;
         settings.port = ask("Port", Some(&settings.port.to_string()))?
@@ -509,11 +645,20 @@ fn wizard() -> Result<u8> {
         match fetch_fingerprint(&settings.server, settings.port) {
             Ok(fp) => {
                 eprintln!("Certificate fingerprint of the server:\n  {fp}");
-                settings.fingerprint =
-                    decide_fingerprint(&fp, settings.fingerprint.as_deref(), &mut ask_yes)?;
+                let saved =
+                    file_fingerprint
+                        .as_ref()
+                        .map(|(fingerprint, origin)| SavedFingerprint {
+                            fingerprint,
+                            origin,
+                        });
+                trusted = decide_fingerprint(&fp, saved, trusted.as_deref(), &mut ask_yes)?;
             }
             Err(e) => eprintln!("Could not read the certificate: {e:#}"),
         }
+        // Only a confirmed fingerprint is ever pinned (never one taken
+        // unconfirmed from a settings file).
+        settings.fingerprint = trusted.clone();
         let password = ask_secret("Password or API token secret")?;
         let key = choose_key(&keys)?;
         let session = match Session::new(&settings, &password, key.as_ref()) {
@@ -553,7 +698,7 @@ fn wizard() -> Result<u8> {
             .and_then(|id| machines.iter().position(|m| m == id))
             .unwrap_or(0);
         let i = choose("Which computer", &machines, Some(default))?;
-        break (session, machines[i].clone(), key);
+        break (session, machines[i].clone());
     };
 
     let snaps = session.system_snapshots(&backup_id)?;
@@ -567,10 +712,16 @@ fn wizard() -> Result<u8> {
         .iter()
         .take(15)
         .map(|s| {
+            let label = protection_label(s);
             format!(
-                "{}  {}{}",
+                "{}  {}{}{}",
                 s.time,
                 s.size_bytes.map(human).unwrap_or_default(),
+                if label.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {label}")
+                },
                 if s.verified.as_deref() == Some("ok") {
                     "  verified"
                 } else {
@@ -579,10 +730,11 @@ fn wizard() -> Result<u8> {
             )
         })
         .collect();
-    // The key is checked against the chosen backup right here, by reading
-    // its disk layout: a wrong key stops at this point, before any disk is
-    // looked at, let alone changed.
-    let (snapshot, backup_time, archive_bytes, inventory) = 'backup: loop {
+    // The key is checked against the chosen backup right here, before any
+    // disk is looked at, let alone changed: the manifest is read with the
+    // key (its signature is verified) and every archive that will be
+    // restored must be encrypted. Then the disk layout is read.
+    let (snapshot, backup_time, archive_bytes, inventory, restore_key) = 'backup: loop {
         eprintln!("Backups of {backup_id} (newest first):");
         let i = choose("Which backup", &items, Some(0))?;
         let snapshot = snaps[i].snapshot.clone();
@@ -590,27 +742,29 @@ fn wizard() -> Result<u8> {
         let archive_bytes = system_archive_bytes(&snaps, &snapshot);
         loop {
             eprintln!("Reading the disk layout of {snapshot} (this checks the key) ...");
-            let e = match session.inventory(&snapshot) {
-                Ok(inventory) => {
-                    match (&key, snaps[i].encrypted) {
-                        (Some(_), Some(true)) => eprintln!("The key fits this backup."),
-                        (Some(_), _) => {
-                            eprintln!("This backup is not encrypted; the key is not needed.")
-                        }
-                        _ => {}
-                    }
-                    break 'backup (snapshot, backup_time, archive_bytes, inventory);
+            let failure = match prepare_backup(&session, &snapshot, &mut ask_yes) {
+                Ok((inventory, restore_key)) => {
+                    break 'backup (snapshot, backup_time, archive_bytes, inventory, restore_key);
                 }
-                Err(e) => e,
+                Err(f) => f,
             };
             eprintln!();
-            eprintln!("{e:#}");
-            let key_problem = is_key_problem(&e);
-            if key_problem {
-                eprintln!("The encryption key does not fit this backup (or none was given).");
-            } else {
-                eprintln!("The backup could not be read.");
-            }
+            let default = match &failure {
+                Failure::Key(e) => {
+                    eprintln!("{e:#}");
+                    eprintln!("The encryption key does not fit this backup (or none was given).");
+                    0
+                }
+                Failure::Declined => {
+                    eprintln!("This backup is not restored.");
+                    1
+                }
+                Failure::Other(e) => {
+                    eprintln!("{e:#}");
+                    eprintln!("The backup could not be read.");
+                    2
+                }
+            };
             eprintln!("Nothing was changed.");
             let options = [
                 "Enter or select another key".to_string(),
@@ -618,9 +772,9 @@ fn wizard() -> Result<u8> {
                 "Try again with the same key".to_string(),
                 "Quit without changing anything".to_string(),
             ];
-            match choose("What now", &options, Some(if key_problem { 0 } else { 2 }))? {
+            match choose("What now", &options, Some(default))? {
                 0 => {
-                    key = choose_key(&keys)?;
+                    let key = choose_key(&keys)?;
                     session.set_key(key.as_ref())?;
                 }
                 1 => continue 'backup,
@@ -711,6 +865,7 @@ fn wizard() -> Result<u8> {
         &backup_time,
         archive_bytes,
         &inventory,
+        &restore_key,
         &disk,
         &assessment,
         luks.as_ref(),
@@ -745,6 +900,72 @@ fn wizard() -> Result<u8> {
             .status();
     }
     Ok(code)
+}
+
+/// Why the chosen backup is not restored (yet).
+enum Failure {
+    /// The key does not open it, or none was given for an encrypted backup.
+    Key(anyhow::Error),
+    /// Not protected by the key, and the user did not accept that.
+    Declined,
+    Other(anyhow::Error),
+}
+
+/// Check the key against `snapshot` (see [`Session::check_key`]), ask before
+/// accepting a backup the key does not protect, and read the disk layout.
+fn prepare_backup(
+    session: &Session,
+    snapshot: &str,
+    yes_no: &mut dyn FnMut(&str, bool) -> Result<bool>,
+) -> std::result::Result<(Inventory, RestoreKey), Failure> {
+    let classify = |e: anyhow::Error| {
+        if is_key_problem(&e) {
+            Failure::Key(e)
+        } else {
+            Failure::Other(e)
+        }
+    };
+    let protection = session.check_key(snapshot).map_err(classify)?;
+    if !accept_protection(&protection, yes_no).map_err(Failure::Other)? {
+        return Err(if protection == Protection::KeyMissing {
+            Failure::Key(anyhow::anyhow!(
+                "this backup is encrypted, but no encryption key was given"
+            ))
+        } else {
+            Failure::Declined
+        });
+    }
+    let restore_key = protection.restore_key(session.key());
+    let inventory = session
+        .inventory(snapshot, restore_key.duplicate())
+        .map_err(classify)?;
+    Ok((inventory, restore_key))
+}
+
+/// Tell what the key check found; `true` to go on. A backup the key does
+/// not protect needs an explicit yes (Enter means no).
+fn accept_protection(
+    p: &Protection,
+    yes_no: &mut dyn FnMut(&str, bool) -> Result<bool>,
+) -> Result<bool> {
+    match p {
+        Protection::Plain => Ok(true),
+        Protection::Encrypted => {
+            eprintln!("{KEY_FITS}");
+            Ok(true)
+        }
+        Protection::KeyMissing => Ok(false),
+        other => {
+            let concern = other.concern().unwrap_or_default();
+            eprintln!();
+            eprintln!("!!! WARNING: {concern}");
+            eprintln!(
+                "!!! Restore it only if you know that this backup was made this way. Your key \
+                 cannot vouch for it."
+            );
+            yes_no("Restore this backup anyway?", false)
+        }
+    }
 }
 
 /// Where the encryption key comes from: a key file or saved paper key on
@@ -825,35 +1046,80 @@ fn type_key() -> Result<Option<Secret>> {
 mod tests {
     use super::*;
 
+    fn saved<'a>(fingerprint: &'a str) -> Option<SavedFingerprint<'a>> {
+        Some(SavedFingerprint {
+            fingerprint,
+            origin: "/media/usb/nestegg-rescue.toml",
+        })
+    }
+
     #[test]
     fn enter_does_not_trust_a_certificate() {
         // Pressing Enter gives the default of the question.
         let mut enter = |_: &str, default_yes: bool| Ok(default_yes);
-        assert_eq!(decide_fingerprint("aa:bb", None, &mut enter).unwrap(), None);
         assert_eq!(
-            decide_fingerprint("aa:bb", Some("cc:dd"), &mut enter).unwrap(),
+            decide_fingerprint("aa:bb", None, None, &mut enter).unwrap(),
+            None
+        );
+        assert_eq!(
+            decide_fingerprint("aa:bb", saved("cc:dd"), None, &mut enter).unwrap(),
+            None
+        );
+        // Not even when it matches a settings file: any attached drive can
+        // carry one.
+        assert_eq!(
+            decide_fingerprint("aa:bb", saved("AA:BB"), None, &mut enter).unwrap(),
             None
         );
     }
 
     #[test]
-    fn explicit_yes_trusts_and_saved_match_needs_no_question() {
-        let mut yes = |_: &str, _: bool| Ok(true);
-        assert_eq!(
-            decide_fingerprint("aa:bb", None, &mut yes)
-                .unwrap()
-                .as_deref(),
-            Some("aa:bb")
-        );
+    fn explicit_yes_trusts_and_a_trusted_certificate_is_not_asked_again() {
+        let mut asked = 0;
+        let mut yes = |_: &str, _: bool| {
+            asked += 1;
+            Ok(true)
+        };
+        for s in [None, saved("aa:bb"), saved("cc:dd")] {
+            assert_eq!(
+                decide_fingerprint("aa:bb", s, None, &mut yes)
+                    .unwrap()
+                    .as_deref(),
+                Some("aa:bb")
+            );
+        }
+        assert_eq!(asked, 3, "a settings file must not spare the question");
         let mut never = |_: &str, _: bool| -> Result<bool> { panic!("must not ask") };
         assert_eq!(
-            decide_fingerprint("aa:bb", Some("aa:bb"), &mut never)
+            decide_fingerprint("aa:bb", saved("aa:bb"), Some("aa:bb"), &mut never)
                 .unwrap()
                 .as_deref(),
             Some("aa:bb")
         );
+        // Trusted before, but the server now shows another certificate.
         let mut no = |_: &str, _: bool| Ok(false);
-        assert_eq!(decide_fingerprint("aa:bb", None, &mut no).unwrap(), None);
+        assert_eq!(
+            decide_fingerprint("ee:ff", None, Some("aa:bb"), &mut no).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unprotected_backup_needs_an_explicit_yes() {
+        let mut enter = |_: &str, default_yes: bool| Ok(default_yes);
+        let mut yes = |_: &str, _: bool| Ok(true);
+        let mut never = |_: &str, _: bool| -> Result<bool> { panic!("must not ask") };
+        for p in [
+            Protection::Unsigned,
+            Protection::NotEncrypted(vec![("system.pxar".into(), "sign-only".into())]),
+        ] {
+            assert!(!accept_protection(&p, &mut enter).unwrap(), "{p:?}");
+            assert!(accept_protection(&p, &mut yes).unwrap(), "{p:?}");
+        }
+        assert!(accept_protection(&Protection::Encrypted, &mut never).unwrap());
+        // Without a key, an unencrypted backup is restored as before.
+        assert!(accept_protection(&Protection::Plain, &mut never).unwrap());
+        assert!(!accept_protection(&Protection::KeyMissing, &mut never).unwrap());
     }
 
     #[test]
@@ -862,6 +1128,10 @@ mod tests {
             "wrong key - unable to verify signature since manifest's key e4:84 does not match provided key 87:2f",
             "missing key - manifest was created with key e4:84",
             "this archive is encrypted or signed; pass the exported key with --keyfile",
+            "error decoding base64 data at line 1 column 143",
+            "KeyConfig contains wrong fingerprint 00:11:22:33, contained key has fingerprint d7:99",
+            "manifest has no signature, but an encryption key is set - refusing to trust a \
+             potentially tampered, unsigned backup",
         ] {
             assert!(is_key_problem(&anyhow::anyhow!("{m}")), "{m}");
         }

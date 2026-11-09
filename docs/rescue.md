@@ -55,15 +55,27 @@ paper key and certificate question: [decisions/0019](decisions/0019-rescue-paper
    depend on the Secure Boot state.
 2. The wizard starts by itself. Plug in a network cable, or leave the wizard
    with Ctrl+C, run `nmtui` for Wi-Fi and start it again with `nestegg rescue`.
-3. Plug in the stick with the key and settings; the wizard finds them. It
-   looks at other disks read-only, without replaying journals, so nothing is
-   written to them.
+3. Plug in the stick with the key and settings; the wizard finds them
+   ("Looking for settings and keys on the attached drives ...") and names
+   the settings file it uses. When several are found, it lists them and
+   you choose one (or none). It looks at other disks read-only, without
+   replaying journals, so nothing is written to them. It searches the top
+   three directory levels of every partition and only opens files with
+   the names of key files and paper keys (`.json`, `.txt`, `.html`, …, not
+   files without extension), at most 64 files and 8 MiB per partition; a
+   key elsewhere is given by its path.
 4. Answer the questions: server, token secret, key, computer, backup,
-   target disk, optional encryption. When the PBS shows a certificate that
-   is not in the saved settings, the wizard prints its fingerprint and asks
-   "Trust this certificate?". Compare it with the PBS dashboard ("Show
-   Fingerprint"); only an explicit `y` trusts it, Enter means no. Answer no
-   only if the PBS has a certificate from a trusted authority. The disk list shows model, size and
+   target disk, optional encryption. The wizard prints the fingerprint of
+   the certificate the PBS shows and asks "Trust this certificate?".
+   Compare it with the PBS dashboard ("Show Fingerprint"); only an
+   explicit `y` trusts it, Enter means no. This also holds when the
+   settings file has the same fingerprint: the wizard says which file it
+   matches, but any attached drive can carry such a file, so it does not
+   decide alone. When the fingerprint differs from the settings file, the
+   wizard says so in a warning. Once trusted, the certificate is not asked
+   about again in the same run. Answer no only if the PBS has a
+   certificate from a trusted authority. The list of backups says for each
+   one whether it is `encrypted` or `NOT ENCRYPTED`. The disk list shows model, size and
    serial number of every disk and marks it `empty`, `NOT EMPTY` or
    `HOLDS DATA OF THE BACKED-UP COMPUTER`, with what was found on it (see
    below). A disk is pre-selected only if exactly one disk is empty and big
@@ -90,7 +102,11 @@ At the question "Encryption key" you can give:
   files (`nestegg key export`) and paper keys saved as text or html
   (`nestegg key paperkey --output …`) work; only the part between `-----BEGIN
   PROXMOX BACKUP KEY-----` and `-----END PROXMOX BACKUP KEY-----` is read, a
-  header above it and the QR code below it are ignored.
+  header above it and the QR code below it are ignored. A file with several
+  key blocks is used with its first valid one; the wizard says how many it
+  found and which one it uses. The `fingerprint` line is not needed and not
+  used (the client computes it, and a damaged copy of it would spoil the
+  key).
 - **`type`**: type the paper key by hand. Only one line is needed, the
   `data` line:
 
@@ -101,20 +117,36 @@ At the question "Encryption key" you can give:
   Type the 44 characters between the quotes. Upper and lower case matter, so
   do `+`, `/` and the `=` at the end. Quotes, commas and blanks you add are
   ignored. The text stays visible while you type so you can compare it with
-  the paper; a mistyped letter is not detected by the wizard itself but by
-  the check below. Mind `l` (small L), `I` (capital i) and `1`, and `O` and
+  the paper; most mistyped letters are not detected by the wizard itself
+  but by the check below. A wrong last character before the `=` is found
+  at once: it must be one of `A E I M Q U Y c g k o s w 0 4 8`. Mind `l` (small L), `I` (capital i) and `1`, and `O` and
   `0`. The other lines of the paper key (`kdf`, `created`, `modified`,
   `fingerprint`) are not needed.
 - **`-`**: the backup is not encrypted.
 
 **The key is checked before anything is erased.** After you choose the
-backup, the wizard reads its disk layout with the key. If the key does not
-fit, it shows the message of the client (it names the fingerprint of the key
-the backup was made with and the one you gave), says "Nothing was changed"
-and offers: enter or select another key, choose another backup (an older
-backup may have been made with an older key), try again, or quit. The disk
-list comes only after this check passed. `nestegg rescue restore` does the
-same read and stops before changing anything.
+backup, the wizard reads its manifest with the key: the client verifies the
+manifest's signature with the key, and every archive that will be restored
+(`inventory.pxar` and `system.pxar`) must be encrypted according to that
+verified manifest. Only then it says "The key fits this backup" and reads
+the disk layout. If the key does not fit, it shows the message of the
+client (it names the fingerprint of the key the backup was made with and
+the one you gave), says "Nothing was changed" and offers: enter or select
+another key, choose another backup (an older backup may have been made with
+an older key), try again, or quit. The disk list comes only after this
+check passed. `nestegg rescue restore` does the same check and stops before
+changing anything.
+
+**A backup your key does not protect needs an explicit yes.** When you gave
+a key but the chosen backup is not encrypted and signed with it, the wizard
+warns: "this backup is NOT encrypted and NOT signed, so it is not protected
+by your key: anyone with access to the backup server could have changed
+it" (or names the archives that are only signed). Someone with write access
+to the PBS could push such a backup, newer than yours, with a manipulated
+system; the wizard pre-selects the newest backup. "Restore this backup
+anyway?" defaults to no; then choose another backup. `nestegg rescue
+restore` refuses such a backup unless `--allow-unprotected-backup` is
+given. Without any key (`-`), unencrypted backups are restored as before.
 
 ### Keyboard layout
 
@@ -165,8 +197,10 @@ nestegg rescue restore --settings /media/usb/nestegg-rescue.toml \
   [--backup-id <other machine>] [--encrypt-passphrase-file /root/pass] [--dry-run]
 ```
 
-`--keyfile` takes an exported key file or a saved paper key. `--wipe` must
-repeat the disk; `--dry-run` only prints the plan. A disk that
+`--keyfile` takes an exported key file or a saved paper key. With
+`--keyfile`, a backup that is not encrypted and signed with that key is
+refused unless `--allow-unprotected-backup` is given (see above). `--wipe`
+must repeat the disk; `--dry-run` only prints the plan. A disk that
 is not empty is refused unless `--erase-data-disk` is given.
 
 ### When is a disk "not empty"?
@@ -239,14 +273,20 @@ Needs Docker (privileged container with Debian `live-build`) and network
 access. The end-to-end test boots everything in VMs and drives the wizard over the
 serial console, including wrong answers. The first variant gives the key as a
 saved paper-key file on the media, the second types it in; both first try a
-wrong key (which must be refused with the target disk untouched) and check
-that Enter does not trust the certificate. `WIZARD=0` tests the
-non-interactive `nestegg rescue restore` instead.
+wrong key (which must be refused with the target disk untouched), check
+that Enter does not trust the certificate even when the settings file on
+the stick has its fingerprint, and that a second settings file with another
+fingerprint is pointed out. Before the rescue VM starts, the test pushes a
+newer, unencrypted "decoy" backup of the same computer to the PBS; it must
+be refused (non-interactive) or declined by default (wizard) while a key is
+given. `WIZARD=0` tests a complete non-interactive `nestegg rescue restore`
+instead.
 
 ```sh
 sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso debian-btrfs-uefi
 sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso ubuntu-ext4-bios-luks
+sudo WIZARD=0 tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso ubuntu-ext4-bios-luks
 ```
 
-CI runs both variants weekly, on pull requests that touch the rescue code
+CI runs these three weekly, on pull requests that touch the rescue code
 (`.github/workflows/rescue.yml`) and before every release.

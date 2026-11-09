@@ -2,7 +2,8 @@ name: release
 
 # Builds the downloads of a release: the .deb package and the rescue stick
 # image (ISO), each with a SHA-256 checksum. Runs the rescue end-to-end test
-# in VMs first, for every variant (rescue.yml also runs it weekly). Tags
+# in VMs first, for every variant and mode of rescue.yml (which also runs it
+# weekly). Tags
 # create a DRAFT release; a maintainer publishes it by hand. A manual run
 # only keeps the files as workflow artifacts.
 
@@ -43,6 +44,8 @@ jobs:
         run: sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso debian-btrfs-uefi
       - name: Rescue end-to-end test, Ubuntu on ext4 with BIOS and LUKS
         run: sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso ubuntu-ext4-bios-luks
+      - name: Rescue end-to-end test, non-interactive restore (Ubuntu, BIOS, LUKS)
+        run: sudo WIZARD=0 tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso ubuntu-ext4-bios-luks
       - name: Checksums
         run: |
           cd target

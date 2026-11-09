@@ -107,6 +107,9 @@ pub struct Job<'a> {
     pub layout: &'a Layout,
     pub client: &'a Client<'a>,
     pub snapshot: &'a str,
+    /// How to read `system.pxar`, as decided by the key check
+    /// ([`super::Protection::restore_key`]).
+    pub key: &'a RestoreKey,
     pub luks_passphrase: Option<&'a Secret>,
     /// Package selections of the backed-up system (from the inventory).
     pub dpkg_selections: Option<&'a str>,
@@ -535,7 +538,7 @@ fn execute_inner(job: &Job<'_>, runner: &mut Runner, say: &mut dyn FnMut(&str)) 
         archive: &archive,
         target: &target,
         patterns: &[],
-        key: RestoreKey::Auto,
+        key: job.key.duplicate(),
     };
     let restored = job.client.restore_into_existing(&request, &mut *runner.log);
     stop.store(true, Ordering::Relaxed);

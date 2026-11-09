@@ -192,6 +192,11 @@ pub struct SnapshotInfo {
     /// Logical size of each archive (`system.pxar.didx` → bytes).
     #[serde(skip)]
     pub archive_bytes: Vec<(String, u64)>,
+    /// Crypt mode of each file as the server lists it
+    /// (`system.pxar.didx` → `encrypt`). Not verified: only the manifest
+    /// read with the key is (see [`Client::read_manifest_with_key`]).
+    #[serde(skip)]
+    pub crypt_modes: Vec<(String, String)>,
 }
 
 /// Convert the JSON of `snapshot list --output-format json`.
@@ -223,14 +228,19 @@ pub fn parse_snapshot_list(json: &str) -> Result<Vec<SnapshotInfo>> {
             .iter()
             .filter_map(|f| Some((f["filename"].as_str()?.to_string(), f["size"].as_u64()?)))
             .collect();
-        let crypt_modes: Vec<&str> = files
+        let crypt_modes: Vec<(String, String)> = files
             .iter()
-            .filter_map(|f| f["crypt-mode"].as_str())
+            .filter_map(|f| {
+                Some((
+                    f["filename"].as_str()?.to_string(),
+                    f["crypt-mode"].as_str()?.to_string(),
+                ))
+            })
             .collect();
         let encrypted = if crypt_modes.is_empty() {
             None
         } else {
-            Some(crypt_modes.contains(&"encrypt"))
+            Some(crypt_modes.iter().any(|(_, m)| m == "encrypt"))
         };
         out.push(SnapshotInfo {
             snapshot: format!("{backup_type}/{backup_id}/{time_str}"),
@@ -242,6 +252,7 @@ pub fn parse_snapshot_list(json: &str) -> Result<Vec<SnapshotInfo>> {
             protected: item["protected"].as_bool().unwrap_or(false),
             comment: item["comment"].as_str().map(String::from),
             archive_bytes,
+            crypt_modes,
         });
     }
     out.sort_by(|a, b| b.time.cmp(&a.time));
@@ -255,6 +266,17 @@ pub enum RestoreKey {
     File(Secret),
     /// Never pass a key.
     Without,
+}
+
+impl RestoreKey {
+    /// An independent copy (the key bytes are copied).
+    pub fn duplicate(&self) -> RestoreKey {
+        match self {
+            RestoreKey::Auto => RestoreKey::Auto,
+            RestoreKey::File(s) => RestoreKey::File(Secret::new(s.as_bytes().to_vec())),
+            RestoreKey::Without => RestoreKey::Without,
+        }
+    }
 }
 
 pub struct RestoreRequest<'a> {
@@ -296,30 +318,34 @@ pub fn size_for_archive(json: &str, archive: &str) -> Option<u64> {
     (!sizes.is_empty()).then(|| sizes.iter().sum())
 }
 
+/// Crypt modes of every file that belongs to `archive` (e.g. `home.pxar`;
+/// a split archive has two: `home.mpxar` and `home.ppxar`) in the JSON of
+/// `snapshot files` or the `files` of a manifest.
+pub fn crypt_modes_for_archive(json: &str, archive: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(json) else {
+        return Vec::new();
+    };
+    let candidates = archive_candidates(archive);
+    value
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter(|f| {
+                    f["filename"]
+                        .as_str()
+                        .is_some_and(|n| candidates.iter().any(|c| c == n))
+                })
+                .filter_map(|f| f["crypt-mode"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Find the crypt mode of `archive` (e.g. `home.pxar`) in the JSON of
 /// `snapshot files`. Split archives (`home.mpxar`/`home.ppxar`) count too.
 pub fn crypt_mode_for_archive(json: &str, archive: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(json).ok()?;
-    let base = archive
-        .strip_suffix(".pxar")
-        .or_else(|| archive.strip_suffix(".mpxar"))
-        .or_else(|| archive.strip_suffix(".ppxar"))
-        .unwrap_or(archive);
-    let candidates: Vec<String> = ["pxar", "mpxar", "ppxar", "img"]
-        .iter()
-        .flat_map(|ext| [format!("{base}.{ext}.didx"), format!("{base}.{ext}.fidx")])
-        .chain([format!("{archive}.blob"), archive.to_string()])
-        .collect();
-    let modes: Vec<String> = value
-        .as_array()?
-        .iter()
-        .filter(|f| {
-            f["filename"]
-                .as_str()
-                .is_some_and(|n| candidates.iter().any(|c| c == n))
-        })
-        .filter_map(|f| f["crypt-mode"].as_str().map(String::from))
-        .collect();
+    let modes = crypt_modes_for_archive(json, archive);
     if modes.is_empty() {
         return None;
     }
@@ -666,18 +692,20 @@ impl<'a> Client<'a> {
     /// nothing about a key.
     pub fn open_snapshot_with_key(&self, snapshot: &str, key: &Secret) -> Result<bool> {
         let files = self.snapshot_files(snapshot)?;
-        let signed = serde_json::from_str::<Value>(&files)
-            .ok()
-            .and_then(|v| {
-                v.as_array().map(|list| {
-                    list.iter()
-                        .any(|f| f["crypt-mode"].as_str().is_some_and(|m| m != "none"))
-                })
-            })
-            .unwrap_or(false);
-        if !signed {
+        if !listed_as_signed(&files) {
             return Ok(false);
         }
+        self.read_manifest_with_key(snapshot, key)?;
+        Ok(true)
+    }
+
+    /// The manifest (`index.json`) of `snapshot`, read with `key`. The
+    /// client verifies the manifest's signature with the key before it
+    /// prints it, so the result (including the crypt mode of every file)
+    /// is what the holder of the key wrote. Fails for a wrong key ("wrong
+    /// key - unable to verify signature ...") and for an unsigned manifest
+    /// ("manifest has no signature, but an encryption key is set ...").
+    pub fn read_manifest_with_key(&self, snapshot: &str, key: &Secret) -> Result<Value> {
         let mut fds = FdPassing::new();
         let mut cmd = self.command(&mut fds)?;
         // Target "-" writes the manifest to stdout.
@@ -691,8 +719,7 @@ impl<'a> Client<'a> {
             bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
         }
         serde_json::from_slice::<Value>(&output.stdout)
-            .context("the client did not return the manifest of the snapshot")?;
-        Ok(true)
+            .context("the client did not return the manifest of the snapshot")
     }
 
     /// Restore into a directory that already exists and may contain
@@ -755,6 +782,20 @@ impl<'a> Client<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether any file in the JSON of `snapshot files` is signed or encrypted
+/// (as the server lists it).
+pub fn listed_as_signed(files_json: &str) -> bool {
+    serde_json::from_str::<Value>(files_json)
+        .ok()
+        .and_then(|v| {
+            v.as_array().map(|list| {
+                list.iter()
+                    .any(|f| f["crypt-mode"].as_str().is_some_and(|m| m != "none"))
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Commands that do not talk to the server.
