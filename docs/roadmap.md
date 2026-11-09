@@ -19,14 +19,15 @@ for this.
 Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
 
 - Configuration file: PBS repository, datastore, namespace, backup sources,
-  exclusions, optional Wake-on-LAN target, allowed time window.
-- Credentials outside the configuration file (systemd credentials or the
-  system keyring); never in logs.
+  exclusions, optional Wake-on-LAN target.
+- Credentials outside the configuration file (systemd credentials, with a
+  root-only file as fallback); never in logs.
 - Commands: `init`, `backup`, `status`, `list`, `restore` (file or directory),
   `check` (configuration and PBS reachability).
 - Scheduling via systemd timer with catch-up after the machine was off.
-- PBS availability: optional Wake-on-LAN, wait with timeout and backoff,
-  "PBS unreachable" reported as its own state.
+- PBS availability: optional Wake-on-LAN, wait with a timeout, the wake-up
+  packet repeated with growing pauses, "PBS unreachable" reported as its own
+  state.
 - Status file with last success, last attempt, next run.
 - Tests: unit tests plus an end-to-end test against a disposable PBS in a VM
   or container, on clean Ubuntu LTS and Linux Mint images.
@@ -54,6 +55,12 @@ Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
   overdue or offline, encryption key backed up yes/no.
 - Read-only from the PBS (Audit role) plus the status report each machine
   uploads with its snapshot; no central service (decision 0003).
+
+## Not planned
+
+- An allowed time window for backups and the desktop keyring as a credential
+  store were listed for v0.1 and are dropped: see
+  `docs/decisions/0020-no-time-window-no-keyring.md`.
 
 ## Decided
 

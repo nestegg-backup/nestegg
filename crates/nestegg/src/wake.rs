@@ -78,8 +78,19 @@ impl std::fmt::Display for WakeEvent<'_> {
 
 /// How often the PBS is probed while waiting for it to wake up.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-/// How often the magic packet is repeated while waiting.
-const RESEND_INTERVAL: Duration = Duration::from_secs(60);
+/// Pause before the magic packet is repeated while waiting: 10 s after the
+/// first packet, then doubling up to one minute (10, 20, 40, 60, 60, ...).
+/// A lost first packet (UDP, or a network card that was not ready yet) is
+/// made up for quickly, and a server that is switched off is not flooded.
+const RESEND_FIRST: Duration = Duration::from_secs(10);
+const RESEND_MAX: Duration = Duration::from_secs(60);
+
+/// Pause before resend number `resends_so_far + 1`.
+fn resend_pause(resends_so_far: u32) -> Duration {
+    RESEND_FIRST
+        .saturating_mul(1u32 << resends_so_far.min(8))
+        .min(RESEND_MAX)
+}
 
 /// Check the PBS; if it is down and Wake-on-LAN is configured, wake it and
 /// poll until it answers or the timeout expires.
@@ -91,13 +102,15 @@ const RESEND_INTERVAL: Duration = Duration::from_secs(60);
 /// is [`Availability::Unreachable`], the same as for a PBS that does not
 /// wake up.
 pub fn ensure_available(config: &Config, on_event: impl FnMut(WakeEvent)) -> Result<Availability> {
-    ensure_available_with(config, send_magic_packet, POLL_INTERVAL, on_event)
+    ensure_available_with(config, send_magic_packet, POLL_INTERVAL, 1, on_event)
 }
 
 fn ensure_available_with(
     config: &Config,
     mut send: impl FnMut(&WakeConfig) -> Result<()>,
     poll_interval: Duration,
+    // Divides the resend pauses (tests run the schedule in milliseconds).
+    speedup: u32,
     mut on_event: impl FnMut(WakeEvent),
 ) -> Result<Availability> {
     let probe = Duration::from_secs(3);
@@ -114,6 +127,7 @@ fn ensure_available_with(
     let mut last_sent = sender
         .send(wake, &mut send, &mut on_event)
         .then(Instant::now);
+    let mut resends = 0u32;
     let start = Instant::now();
     let deadline = Duration::from_secs(wake.timeout_seconds);
     // Sleep in short steps so a cancel request is noticed quickly.
@@ -138,10 +152,11 @@ fn ensure_available_with(
                     last_sent = Some(Instant::now());
                 }
             }
-            Some(sent) if sent.elapsed() > RESEND_INTERVAL => {
+            Some(sent) if sent.elapsed() > resend_pause(resends) / speedup => {
                 on_event(WakeEvent::Info(
                     "still waiting, sending Wake-on-LAN packet again",
                 ));
+                resends += 1;
                 last_sent = sender
                     .send(wake, &mut send, &mut on_event)
                     .then(Instant::now);
@@ -302,6 +317,7 @@ mod tests {
                 Err(offline())
             },
             Duration::from_millis(50),
+            1,
             record(&mut seen),
         )
         .unwrap();
@@ -343,6 +359,7 @@ mod tests {
                 Ok(())
             },
             Duration::from_millis(50),
+            1,
             record(&mut seen),
         )
         .unwrap();
@@ -393,6 +410,7 @@ mod tests {
                 Ok(())
             },
             Duration::from_millis(10),
+            1,
             record(&mut seen),
         )
         .unwrap();
@@ -400,6 +418,56 @@ mod tests {
         assert_eq!(attempts, 0);
         assert!(seen.is_empty(), "{seen:?}");
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn resend_pause_grows_up_to_a_minute() {
+        let secs: Vec<u64> = (0..6).map(|n| resend_pause(n).as_secs()).collect();
+        assert_eq!(secs, [10, 20, 40, 60, 60, 60]);
+        assert_eq!(resend_pause(u32::MAX), RESEND_MAX);
+    }
+
+    #[test]
+    fn packet_is_resent_with_growing_pauses_until_the_pbs_answers() {
+        let port = closed_port();
+        let mut config = config_for(port);
+        config.wake = Some(wake_config(30));
+        // Pauses of 10, 20 and 40 ms instead of seconds; the "PBS" starts
+        // listening when the fourth packet arrives.
+        let mut sent_at = Vec::new();
+        let mut pbs = None;
+        let mut seen = Vec::new();
+        let result = ensure_available_with(
+            &config,
+            |_| {
+                sent_at.push(Instant::now());
+                if sent_at.len() == 4 {
+                    pbs = Some(TcpListener::bind(("127.0.0.1", port)).unwrap());
+                }
+                Ok(())
+            },
+            Duration::from_millis(5),
+            1000,
+            record(&mut seen),
+        )
+        .unwrap();
+        assert!(
+            matches!(result, Availability::ReachableAfterWake { .. }),
+            "{result:?}"
+        );
+        assert_eq!(sent_at.len(), 4, "one packet plus three resends");
+        let gaps: Vec<Duration> = sent_at.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps[0] >= Duration::from_millis(10), "{gaps:?}");
+        assert!(gaps[1] >= Duration::from_millis(20), "{gaps:?}");
+        assert!(gaps[2] >= Duration::from_millis(40), "{gaps:?}");
+        assert_eq!(
+            seen.iter()
+                .filter(
+                    |s| **s == Seen::Info("still waiting, sending Wake-on-LAN packet again".into())
+                )
+                .count(),
+            3
+        );
     }
 
     #[test]

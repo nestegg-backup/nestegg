@@ -27,7 +27,9 @@ updated.
 2. The run keeps waiting until the configured timeout, as documented for
    Wake-on-LAN. While no packet has gone out, it retries the packet at every
    poll (every 5 s), so the packet leaves as soon as the network is back;
-   after a successful packet it repeats it every minute as before.
+   after a successful packet it repeats it with growing pauses (10, 20,
+   40 s, then every minute; before 2026-11-09 a fixed minute), so a lost
+   first packet costs seconds, not a third of the default timeout.
 3. If the PBS is still not reachable at the timeout, the run ends as
    `pbs_unreachable` (exit code 75) and records `pbs_reachable = false`. The
    error message says that sending the wake-up packet failed.
