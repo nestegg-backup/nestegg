@@ -12,8 +12,16 @@
   import { f, t } from "../lib/locale";
   import type { Run } from "../lib/types";
 
-  /** `remote`: rows of another PC, built from what the PBS reports; there is no log to load. */
-  let { rows, loaded, remote = false }: { rows: RunRow[]; loaded: boolean; remote?: boolean } = $props();
+  /**
+   * `remote`: rows of another PC, built from what the PBS reports; there is no log to load.
+   * `emptyText`: replaces the default text of an empty list.
+   */
+  let {
+    rows,
+    loaded,
+    remote = false,
+    emptyText,
+  }: { rows: RunRow[]; loaded: boolean; remote?: boolean; emptyText?: string } = $props();
   let showAll = $state(false);
   const shown = $derived(showAll ? rows : rows.slice(0, 7));
 
@@ -56,7 +64,7 @@
 </script>
 
 {#if !rows.length}
-  {#if loaded}<p class="empty">{t.runs.empty}</p>{/if}
+  {#if loaded}<p class="empty">{emptyText ?? t.runs.empty}</p>{/if}
 {:else}
   <ul class="runs">
     {#each shown as row (row.run.id)}

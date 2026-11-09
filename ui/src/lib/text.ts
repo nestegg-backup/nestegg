@@ -2,7 +2,7 @@
 // can be tested with both languages.
 
 import type { Messages } from "../i18n";
-import { ageOf, errorKind, machineKind, runEnd, selfKind, type MachineKind, type SelfKind } from "./derive";
+import { ageOf, errorKind, machineKind, runEnd, selfKind, type MachineKind, type SelfKind, type ServerBackups } from "./derive";
 import type { Formatter } from "./format";
 import type { Machine, Status } from "./types";
 
@@ -12,21 +12,29 @@ export interface Summary {
   text: string;
 }
 
-/** Status sentence and explanation for this PC. */
-export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date): Summary {
+/**
+ * Status sentence and explanation for this PC.
+ *
+ * `server` is what the PBS holds (null while unknown). The daemon derives
+ * health and last_success from its local state only, which is empty after a
+ * reinstall; the snapshots on the server keep the texts from claiming that
+ * there is no backup at all.
+ */
+export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, server: ServerBackups | null = null): Summary {
   const kind = selfKind(s);
   const m = (iso: string) => f.moment(iso, now);
   const last = s.last_run ?? null;
   const success = s.last_success ?? null;
   // Times shown to the user are start times, like in the run history and the snapshot names.
-  const lastSuccessText = success ? t.self.lastSuccessSentence(m(success.started_at)) : t.self.noSuccessYet;
+  const successAt = success?.started_at ?? server?.latest ?? null;
+  const lastSuccessText = successAt ? t.self.lastSuccessSentence(m(successAt)) : t.self.noSuccessYet;
   switch (kind) {
     case "unconfigured":
       return { kind, lead: t.self.unconfiguredLead, text: t.self.unconfiguredText };
     case "running":
       return { kind, lead: t.self.runningLead, text: t.self.runningText };
     case "key_missing":
-      return { kind, lead: t.self.keyLead, text: success ? `${t.self.keyText} ${lastSuccessText}` : t.self.keyText };
+      return { kind, lead: t.self.keyLead, text: successAt ? `${t.self.keyText} ${lastSuccessText}` : t.self.keyText };
     case "failing": {
       // The contract allows health=failing without run details; then the text stays undated.
       const failed = last && last.state === "failed" ? last : null;
@@ -38,7 +46,7 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date): Su
       };
     }
     case "overdue": {
-      const age = ageOf(success ? runEnd(success) : (last?.started_at ?? now.toISOString()), now);
+      const age = ageOf(success ? runEnd(success) : (successAt ?? last?.started_at ?? now.toISOString()), now);
       const parts = [lastSuccessText];
       if (last?.state === "pbs_unreachable") parts.push(t.self.overduePbs);
       // Every promise of an automatic retry depends on the schedule being switched on.
@@ -48,6 +56,9 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date): Su
     }
     case "never": {
       const parts: string[] = [];
+      // No backup from this installation, but older ones on the server (e.g. after a reinstall).
+      const earlier = server && server.count > 0 && server.latest ? server : null;
+      if (earlier) parts.push(t.self.neverServer(earlier.count, m(earlier.latest!)));
       if (last && last.state !== "succeeded") {
         parts.push(t.self.neverAttempt(m(last.started_at)));
         const ek = errorKind(last);
@@ -56,7 +67,7 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date): Su
       if (s.schedule.enabled && s.schedule.next_run && new Date(s.schedule.next_run) > now)
         parts.push(t.self.neverNext(m(s.schedule.next_run)));
       else parts.push(t.self.neverNow);
-      return { kind, lead: t.self.neverLead, text: parts.join(" ") };
+      return { kind, lead: earlier ? t.self.neverLeadServer : t.self.neverLead, text: parts.join(" ") };
     }
     default: {
       const parts = [t.self.okText];
@@ -70,17 +81,18 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date): Su
       }
       return {
         kind,
-        lead: success ? t.self.okLead(m(success.started_at)) : t.self.neverLead,
+        // health=ok without last_success is allowed by the contract: still backed up, just undated.
+        lead: successAt ? t.self.okLead(m(successAt)) : t.self.okLeadUndated,
         text: parts.join(" "),
       };
     }
   }
 }
 
-/** One short line for the list pane. */
-export function selfRowText(s: Status, t: Messages, f: Formatter, now: Date): string {
+/** One short line for the list pane. `server` as in selfSummary. */
+export function selfRowText(s: Status, t: Messages, f: Formatter, now: Date, server: ServerBackups | null = null): string {
   const kind = selfKind(s);
-  const success = s.last_success ?? null;
+  const successAt = s.last_success?.started_at ?? server?.latest ?? null;
   switch (kind) {
     case "unconfigured":
       return t.row.unconfigured;
@@ -93,11 +105,11 @@ export function selfRowText(s: Status, t: Messages, f: Formatter, now: Date): st
       return failed ? t.row.failing(f.dayMonth(failed.started_at)) : t.row.failingUndated;
     }
     case "overdue":
-      return success ? t.row.overdue(f.dayMonth(success.started_at)) : t.row.never;
+      return successAt ? t.row.overdue(f.dayMonth(successAt)) : t.row.overdueUndated;
     case "never":
-      return t.row.never;
+      return server && server.count > 0 ? t.row.neverServer : t.row.never;
     default:
-      return success ? t.row.ok(f.moment(success.started_at, now), f.dayMonth(success.started_at)) : t.row.never;
+      return successAt ? t.row.ok(f.moment(successAt, now), f.dayMonth(successAt)) : t.row.okUndated;
   }
 }
 

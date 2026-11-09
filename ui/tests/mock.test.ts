@@ -17,6 +17,7 @@ describe("mock API", () => {
       overdue: "overdue",
       failing: "failing",
       never: "never",
+      reinstalled: "never",
       unconfigured: "unconfigured",
       pbs_unreachable: "ok",
       key_not_exported: "never",
@@ -48,6 +49,24 @@ describe("mock API", () => {
     expect(w.handle("GET", "/session", params, null).status).toBe(404);
     const snap = (w.handle("GET", "/snapshots", params, null).body as { snapshots: { time: string }[] }).snapshots[0]!;
     expect(w.handle("GET", `/snapshots/${snap.time}/browse`, new URLSearchParams("archive=home.pxar"), null).status).toBe(501);
+  });
+
+  it("reinstalled: no local history, but the snapshots stay on the server", () => {
+    const t0 = Date.now();
+    const w = new World("reinstalled", "full", t0);
+    const st = w.handle("GET", "/status", params, null, t0).body as Status;
+    expect(st.health).toBe("never");
+    expect(st.last_success).toBeNull();
+    expect(st.pbs.checked_at).toBeNull();
+    expect((w.handle("GET", "/runs", params, null, t0).body as { runs: Run[] }).runs).toEqual([]);
+    const before = (w.handle("GET", "/snapshots", params, null, t0).body as { snapshots: { time: string }[] }).snapshots;
+    expect(before.length).toBeGreaterThan(5);
+    // The first backup of the new installation adds one snapshot and keeps the old ones.
+    w.handle("POST", "/runs", params, null, t0);
+    const after = (w.handle("GET", "/snapshots", params, null, t0 + 25_000).body as { snapshots: { time: string }[] }).snapshots;
+    expect(after.length).toBe(before.length + 1);
+    expect(after.slice(1)).toEqual(before);
+    expect((w.handle("GET", "/status", params, null, t0 + 25_000).body as Status).health).toBe("ok");
   });
 
   it("refuses to restore into an existing folder", () => {

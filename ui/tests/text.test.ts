@@ -80,6 +80,44 @@ describe("status sentence of this PC", () => {
   });
 });
 
+describe("local history empty, backups on the server (e.g. after a reinstall)", () => {
+  const server = { count: 12, latest: "2026-11-05T00:40:00Z" };
+  const fresh = { health: "never" as const, last_run: null, last_success: null };
+
+  it("does not claim that there is no backup at all", () => {
+    const s = selfSummary(status(fresh), de, fde, now, server);
+    expect(s.kind).toBe("never");
+    expect(s.lead).toBe("Von dieser Installation gibt es noch keine Sicherung.");
+    expect(s.text).toContain("Auf dem Server liegen 12 frühere Stände dieses PCs.");
+    expect(s.text).toContain("Der neueste entstand am ");
+    expect(s.text).toContain("Daraus kannst du Dateien wiederherstellen.");
+    const e = selfSummary(status(fresh), en, fen, now, { count: 1, latest: server.latest });
+    expect(e.lead).toBe("No backup from this installation yet.");
+    expect(e.text).toContain("The server holds 1 earlier backup of this computer.");
+    expect(e.text).toContain("You can restore files from it.");
+    expect(selfRowText(status(fresh), de, fde, now, server)).toBe("Frühere Stände auf dem Server");
+    expect(selfRowText(status(fresh), en, fen, now, server)).toBe("Earlier backups on the server");
+  });
+
+  it("keeps the plain 'no backup yet' when the server is empty or not asked yet", () => {
+    for (const srv of [null, { count: 0, latest: null }]) {
+      expect(selfSummary(status(fresh), de, fde, now, srv).lead).toBe("Noch keine Sicherung.");
+      expect(selfRowText(status(fresh), de, fde, now, srv)).toBe("Noch nie gesichert");
+    }
+  });
+
+  it("uses the newest snapshot when /status leaves out last_success", () => {
+    const st = status({ last_run: undefined, last_success: undefined });
+    expect(selfSummary(st, de, fde, now, server).lead).toMatch(/^Am .*5\. November.*01:40 gesichert\.$/);
+    expect(selfSummary(st, en, fen, now, { count: 1, latest: "2026-11-08T00:42:00Z" }).lead).toBe("Backed up today at 01:42.");
+    expect(selfSummary(st, en, fen, now).lead).toBe("Backed up.");
+    expect(selfSummary(status({ health: "failing", last_run: undefined, last_success: undefined }), en, fen, now, server).text).toContain("Last backed up on ");
+    expect(selfRowText(st, en, fen, now)).toBe("Backed up");
+    expect(selfRowText(status({ health: "overdue", last_run: undefined, last_success: undefined }), en, fen, now)).toBe("Overdue");
+    expect(selfRowText(status({ health: "overdue", last_run: undefined, last_success: undefined }), de, fde, now, server)).toBe("Überfällig, zuletzt 5. Nov.");
+  });
+});
+
 describe("other PCs and server", () => {
   it("other PC that failed today", () => {
     const s = machineSummary(

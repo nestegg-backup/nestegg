@@ -23,6 +23,7 @@ export const SCENARIOS = [
   "overdue",
   "failing",
   "never",
+  "reinstalled",
   "unconfigured",
   "pbs_unreachable",
   "key_not_exported",
@@ -223,6 +224,8 @@ export class World {
   keyExported = true;
   configured = true;
   extraSources: { archive: string; path: string }[] = [];
+  /** Snapshots made before the local state was lost (`reinstalled`): on the server, unknown to the daemon. */
+  inherited: Snapshot[] = [];
   faults = new Set<Fault>();
 
   constructor(
@@ -292,6 +295,10 @@ export class World {
       case "never":
         this.reachable = null;
         break;
+      case "reinstalled":
+        // Two weeks of backups, then the system was reinstalled: see below.
+        this.history(now, 13, 1, { skip: [10], pbsNight: 7 });
+        break;
       case "unconfigured":
         this.configured = false;
         this.keyExported = false;
@@ -327,6 +334,14 @@ export class World {
     const checked = this.runs.find((r) => r.state === "succeeded" || r.state === "pbs_unreachable");
     if (checked && this.reachable !== null) this.checkedMs = new Date(checked.started_at).getTime();
     this.rebuildSnapshots(now);
+    if (this.scenario === "reinstalled") {
+      // Like a fresh install with the same backup id: /var/lib/nestegg is empty
+      // (no runs, no last_success, server never checked), the PBS keeps every snapshot.
+      this.inherited = this.snapshots;
+      this.runs = [];
+      this.checkedMs = null;
+      this.reachable = null;
+    }
   }
 
   private rebuildSnapshots(now: number) {
@@ -335,13 +350,11 @@ export class World {
       .map((r) => ({ ms: new Date(r.started_at).getTime(), size: 412 * GB }));
     const oldest = fromRuns.length ? Math.min(...fromRuns.map((s) => s.ms)) : null;
     const older: { ms: number; size: number }[] = [];
-    if (oldest !== null) {
+    if (oldest !== null && !this.inherited.length) {
       for (let w = 1; w <= 3; w++) older.push({ ms: oldest - w * 7 * DAY, size: 405 * GB });
       for (let m = 1; m <= 6; m++) older.push({ ms: oldest - (21 + m * 30) * DAY, size: (398 - m * 6) * GB });
     }
-    this.snapshots = [...fromRuns, ...older]
-      .sort((a, b) => b.ms - a.ms)
-      .map((s) => ({
+    const made: Snapshot[] = [...fromRuns, ...older].map((s) => ({
         time: iso(s.ms),
         snapshot: `host/desktop/${iso(s.ms)}`,
         size_bytes: Math.round(s.size),
@@ -356,6 +369,7 @@ export class World {
         protected: false,
         comment: null,
       }));
+    this.snapshots = [...made, ...this.inherited].sort((a, b) => b.time.localeCompare(a.time));
   }
 
   private beginRun(startMs: number, outcome: ActiveRun["outcome"], trigger: Run["trigger"]) {

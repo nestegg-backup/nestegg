@@ -82,6 +82,9 @@ const en = {
     failingUndated: "Last backup failed",
     overdue: (day: string) => `Overdue, last ${day}`,
     never: "Never backed up",
+    neverServer: "Earlier backups on the server",
+    overdueUndated: "Overdue",
+    okUndated: "Backed up",
     ok: (m: Moment, dayMonth: string) =>
       m.rel === "today"
         ? `Backed up today ${m.time}`
@@ -110,6 +113,7 @@ const en = {
     lastSuccessSentence: (m: Moment) => `Last backed up ${at(m)}.`,
     noSuccessYet: "There is no successful backup yet.",
     okLead: (m: Moment) => `Backed up ${at(m)}.`,
+    okLeadUndated: "Backed up.",
     okText: "Everything is fine.",
     nextRun: (m: Moment) =>
       `The next backup is due ${at(m)}. If the computer is off then, it catches up the next time it is switched on.`,
@@ -124,6 +128,9 @@ const en = {
     overduePbs: "The backup server was not reachable during the last attempts. This computer did nothing wrong.",
     overdueCatchUp: "As long as the computer is on, nestegg catches up by itself.",
     neverLead: "No backup yet.",
+    neverLeadServer: "No backup from this installation yet.",
+    neverServer: (count: number, m: Moment) =>
+      `The server holds ${count} earlier ${plural(count, "backup", "backups")} of this computer. The newest was made ${at(m)}. You can restore files from ${count === 1 ? "it" : "them"}.`,
     neverNext: (m: Moment) => `The first backup is due ${at(m)}. You can also start it now.`,
     neverNow: "You can start the first backup now.",
     neverAttempt: (m: Moment) => `The last attempt ${at(m)} did not work.`,
@@ -196,6 +203,7 @@ const en = {
     showAll: (n: number) => `Show all ${n} entries`,
     showFewer: "Show only the last 7",
     empty: "No backups yet.",
+    emptyHere: "No backup from this installation yet. The earlier ones are on the server.",
   },
   reason: {
     pbs_unreachable: "server not reachable",

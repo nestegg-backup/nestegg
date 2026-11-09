@@ -3,7 +3,7 @@
   import Dot from "./Dot.svelte";
   import { app } from "../lib/store.svelte";
   import { href, type Route } from "../lib/router.svelte";
-  import { machineName, machineTone, machineKind, selfKind, selfTone, sortMachines } from "../lib/derive";
+  import { machineName, machineTone, machineKind, selfKind, selfTone, serverBackups, sortMachines } from "../lib/derive";
   import { machineRowText, selfRowText, serverRow } from "../lib/text";
   import { f, t } from "../lib/locale";
 
@@ -32,7 +32,7 @@
         <li>
           <a class="row" href={href({ view: "self" })} aria-current={selfSelected ? "page" : undefined}>
             <span class="row-name">{status.machine.hostname}</span>
-            <span class="row-status"><Dot tone={selfTone(selfKind(status))} />{selfRowText(status, t, f, app.now)}</span>
+            <span class="row-status"><Dot tone={selfTone(selfKind(status))} />{selfRowText(status, t, f, app.now, serverBackups(app.snapshots))}</span>
           </a>
         </li>
       </ul>

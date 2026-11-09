@@ -6,10 +6,13 @@ import {
   isActive,
   machineKind,
   restorableArchives,
+  restoreOffer,
   runEvents,
   runStep,
   selfKind,
+  serverBackups,
   serverContact,
+  snapshotEvents,
   sortMachines,
 } from "../src/lib/derive";
 import { createFormatter } from "../src/lib/format";
@@ -214,5 +217,33 @@ describe("misc", () => {
   it("lists restorable archives", () => {
     expect(restorableArchives(["home.pxar.didx", "etc.pxar.didx", "index.json.blob", "client.log.blob"])).toEqual(["home.pxar", "etc.pxar"]);
     expect(restorableArchives(undefined)).toEqual([]);
+  });
+});
+
+describe("restore entry and backups on the server", () => {
+  const snaps = (state: "idle" | "loading" | "ok" | "error", times: string[] = []) => ({ state, list: times.map((time) => ({ time })) });
+
+  it("offers restore whenever the PC is set up, independent of the local history", () => {
+    for (const kind of ["never", "ok", "failing", "overdue", "key_missing"] as const) {
+      expect(restoreOffer(kind, snaps("idle"))).toBe("show");
+      expect(restoreOffer(kind, snaps("loading"))).toBe("show");
+      // A failed list is no proof that nothing is there; the restore flow shows the error.
+      expect(restoreOffer(kind, snaps("error"))).toBe("show");
+      expect(restoreOffer(kind, snaps("ok", ["2026-11-01T00:40:00Z"]))).toBe("show");
+      expect(restoreOffer(kind, snaps("ok"))).toBe("empty");
+    }
+    expect(restoreOffer("unconfigured", snaps("ok", ["2026-11-01T00:40:00Z"]))).toBe("none");
+  });
+
+  it("marks days with a snapshot on the server as backed up, also without local runs", () => {
+    const cells = dayStrip(snapshotEvents([{ time: "2026-11-07T00:40:00Z" }, { time: "2026-10-01T00:40:00Z" }]), now, f);
+    expect(cells.filter((c) => c.kind === "ok").map((c) => c.key)).toEqual(["2026-11-07"]);
+  });
+
+  it("summarises only a loaded list", () => {
+    expect(serverBackups(snaps("loading", ["2026-11-01T00:40:00Z"]))).toBeNull();
+    expect(serverBackups(snaps("error"))).toBeNull();
+    expect(serverBackups(snaps("ok"))).toEqual({ count: 0, latest: null });
+    expect(serverBackups(snaps("ok", ["2026-10-01T00:40:00Z", "2026-11-01T00:40:00Z"]))).toEqual({ count: 2, latest: "2026-11-01T00:40:00Z" });
   });
 });

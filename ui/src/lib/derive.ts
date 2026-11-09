@@ -106,6 +106,14 @@ export function runEvents(runs: Run[], current?: Run | null): { at: string; kind
   return out;
 }
 
+/**
+ * Snapshots on the server as successful days of the strip. The local run
+ * history is empty after a reinstall; the server still knows those days.
+ */
+export function snapshotEvents(snapshots: { time: string }[]): { at: string; kind: "ok" }[] {
+  return snapshots.map((s) => ({ at: s.time, kind: "ok" }));
+}
+
 // ---------------------------------------------------------------- run history
 
 export interface RunRow {
@@ -241,6 +249,38 @@ export function machineEvents(m: Machine): { at: string; kind: Exclude<DayKind, 
     out.push({ at: r.run_started_at ?? r.reported_at, kind: r.result === "failed" ? "fail" : "pbs" });
   }
   return out;
+}
+
+// ---------------------------------------------------------------- backups on the server
+
+/** What the PBS holds for this PC, from `/snapshots`. */
+export interface ServerBackups {
+  count: number;
+  /** Time of the newest snapshot (its start time), null when there is none. */
+  latest: string | null;
+}
+
+type SnapshotState = { state: "idle" | "loading" | "ok" | "error"; list: { time: string }[] };
+
+/** Only a loaded list says something; loading or failed lists are no evidence either way. */
+export function serverBackups(snaps: SnapshotState): ServerBackups | null {
+  if (snaps.state !== "ok") return null;
+  const latest = snaps.list.reduce<string | null>((a, s) => (a === null || s.time > a ? s.time : a), null);
+  return { count: snaps.list.length, latest };
+}
+
+/**
+ * Whether "Restore files" is offered on the page of this PC. It depends on
+ * what the server holds, never on the local run history: after a reinstall
+ * the local state is empty, but the snapshots on the PBS are still there.
+ * While the list is loading, or when loading failed (the restore flow shows
+ * the error and a retry), the entry stays visible. Only a loaded, empty list
+ * hides it (`empty`).
+ */
+export function restoreOffer(kind: SelfKind, snaps: SnapshotState): "show" | "empty" | "none" {
+  if (kind === "unconfigured") return "none";
+  if (snaps.state === "ok" && !snaps.list.length) return "empty";
+  return "show";
 }
 
 // ---------------------------------------------------------------- misc

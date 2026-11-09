@@ -9,24 +9,30 @@
   import RunProgress from "./RunProgress.svelte";
   import { app } from "../lib/store.svelte";
   import { href } from "../lib/router.svelte";
-  import { dayStrip, historyRows, runEvents } from "../lib/derive";
+  import { dayStrip, historyRows, restoreOffer, runEvents, serverBackups, snapshotEvents } from "../lib/derive";
   import { selfSummary } from "../lib/text";
   import { f, t } from "../lib/locale";
   import type { Status } from "../lib/types";
 
   let { status }: { status: Status } = $props();
 
-  const summary = $derived(selfSummary(status, t, f, app.now));
-  const cells = $derived(dayStrip(runEvents(app.runs.value, status.current_run), app.now, f));
+  const server = $derived(serverBackups(app.snapshots));
+  const summary = $derived(selfSummary(status, t, f, app.now, server));
+  const cells = $derived(
+    dayStrip([...runEvents(app.runs.value, status.current_run), ...snapshotEvents(app.snapshots.list)], app.now, f),
+  );
   const rows = $derived(historyRows(app.runs.value, f));
   const canRun = $derived(summary.kind !== "unconfigured" && summary.kind !== "key_missing" && summary.kind !== "running");
-  const canRestore = $derived(summary.kind !== "unconfigured" && !!status.last_success);
+  // Based on the snapshots on the server, not on the local history (empty after a reinstall).
+  const offer = $derived(restoreOffer(summary.kind, app.snapshots));
+  const canRestore = $derived(offer === "show");
   const sources = $derived((app.config.value?.sources ?? []).filter((s) => s.archive !== "inventory.pxar"));
   const latest = $derived(app.snapshots.state === "ok" ? (app.snapshots.list[0] ?? null) : null);
 
   $effect(() => {
-    // Size on the server: needs the PBS, so only asked once per page load.
-    if (status.health !== "unconfigured" && status.last_success) untrack(() => void app.loadSnapshots());
+    // What the server holds decides about restoring, also without any local history.
+    // Needs the PBS, so only asked once per page load.
+    if (status.health !== "unconfigured") untrack(() => void app.loadSnapshots());
   });
 </script>
 
@@ -61,6 +67,10 @@
         {/if}
       </div>
     {/if}
+    {#if offer === "empty" && status.last_success}
+      <!-- The local history knows a backup, the server has none: say so instead of a dead end. -->
+      <p class="hint" role="status">{t.restore.noSnapshots}</p>
+    {/if}
   {/if}
   {#if app.startError}
     <p class="hint" class:bad={app.startError.kind !== "conflict"} role="status">
@@ -83,7 +93,7 @@
       <p class="empty" role="status">{t.app.loading}</p>
     {:else}
       <DayStrip {cells} />
-      <RunHistory {rows} loaded />
+      <RunHistory {rows} loaded emptyText={server?.count ? t.runs.emptyHere : undefined} />
     {/if}
   </section>
 

@@ -86,6 +86,7 @@ and resets it:
 | `overdue` | last success 3 days ago, the server has not answered since |
 | `failing` | last run failed (folder not mounted) |
 | `never` | set up, no backup yet |
+| `reinstalled` | set up again after a reinstall: no local history (`never`), older backups still on the server |
 | `unconfigured` | setup not finished (`/config` answers 500 like the daemon) |
 | `pbs_unreachable` | last attempts did not reach the server, still within the threshold |
 | `key_not_exported` | backups blocked until the key export is confirmed |

@@ -84,6 +84,9 @@ const de = {
     failingUndated: "Letzte Sicherung fehlgeschlagen",
     overdue: (day: string) => `Überfällig, zuletzt ${day}`,
     never: "Noch nie gesichert",
+    neverServer: "Frühere Stände auf dem Server",
+    overdueUndated: "Überfällig",
+    okUndated: "Gesichert",
     ok: (m: Moment, dayMonth: string) =>
       m.rel === "today" ? `Heute ${m.time} gesichert` : m.rel === "yesterday" ? `Gestern ${m.time} gesichert` : `${dayMonth} ${m.time} gesichert`,
     serverReachable: (time: string) => `Erreichbar, geprüft um ${time}`,
@@ -109,6 +112,7 @@ const de = {
     noSuccessYet: "Bisher gibt es keine erfolgreiche Sicherung.",
     okLead: (m: Moment) => `${cap(at(m))} gesichert.`,
     okText: "Alles in Ordnung.",
+    okLeadUndated: "Gesichert.",
     nextRun: (m: Moment) =>
       `Die nächste Sicherung ist ${at(m)} fällig. Ist der PC dann aus, wird sie beim nächsten Einschalten nachgeholt.`,
     nextRunDue: "Die nächste Sicherung ist fällig und startet in Kürze.",
@@ -124,6 +128,9 @@ const de = {
       "Bei den letzten Versuchen war der Backup-Server nicht erreichbar. Nicht dieser PC hat einen Fehler gemacht.",
     overdueCatchUp: "Solange der PC eingeschaltet ist, holt nestegg die Sicherung von selbst nach.",
     neverLead: "Noch keine Sicherung.",
+    neverLeadServer: "Von dieser Installation gibt es noch keine Sicherung.",
+    neverServer: (count: number, m: Moment) =>
+      `Auf dem Server ${count === 1 ? "liegt ein früherer Stand" : `liegen ${count} frühere Stände`} dieses PCs. Der neueste entstand ${at(m)}. Daraus kannst du Dateien wiederherstellen.`,
     neverNext: (m: Moment) => `Die erste Sicherung ist ${at(m)} fällig. Du kannst sie auch jetzt starten.`,
     neverNow: "Du kannst die erste Sicherung jetzt starten.",
     neverAttempt: (m: Moment) => `Der letzte Versuch ${at(m)} hat nicht geklappt.`,
@@ -197,6 +204,7 @@ const de = {
     showAll: (n: number) => `Alle ${n} Einträge zeigen`,
     showFewer: "Nur die letzten 7 zeigen",
     empty: "Noch keine Sicherungen.",
+    emptyHere: "Noch keine Sicherung von dieser Installation. Die früheren liegen auf dem Server.",
   },
   reason: {
     pbs_unreachable: "Server nicht erreichbar",
