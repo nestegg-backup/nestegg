@@ -22,7 +22,10 @@ start_pbs() {
   docker network create "$net" >/dev/null
   local attempt up=""
   for attempt in 1 2 3; do
-    docker run -d --tmpfs /run --name "$pbs" --network "$net" --network-alias pbs.e2e.test nestegg-e2e-pbs >/dev/null
+    # Short fixed host name: the PBS certificate CN is built from host name
+    # and DNS search domain and must not exceed 64 characters.
+    docker run -d --tmpfs /run --name "$pbs" --hostname pbs --dns-search e2e.test \
+      --network "$net" --network-alias pbs.e2e.test nestegg-e2e-pbs >/dev/null
     for _ in $(seq 1 60); do
       if on_pbs curl -skf https://127.0.0.1:8007/api2/json/ping >/dev/null 2>&1; then up=1; break; fi
       [[ "$(docker inspect -f '{{.State.Running}}' "$pbs" 2>/dev/null)" == true ]] || break
