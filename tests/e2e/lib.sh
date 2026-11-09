@@ -20,11 +20,20 @@ build_pbs_image() {
 start_pbs() {
   echo "== starting PBS"
   docker network create "$net" >/dev/null
-  docker run -d --tmpfs /run --name "$pbs" --network "$net" --network-alias pbs.e2e.test nestegg-e2e-pbs >/dev/null
-  for _ in $(seq 1 60); do
-    on_pbs curl -skf https://127.0.0.1:8007/api2/json/ping >/dev/null 2>&1 && break
-    sleep 1
+  local attempt up=""
+  for attempt in 1 2 3; do
+    docker run -d --tmpfs /run --name "$pbs" --network "$net" --network-alias pbs.e2e.test nestegg-e2e-pbs >/dev/null
+    for _ in $(seq 1 60); do
+      if on_pbs curl -skf https://127.0.0.1:8007/api2/json/ping >/dev/null 2>&1; then up=1; break; fi
+      [[ "$(docker inspect -f '{{.State.Running}}' "$pbs" 2>/dev/null)" == true ]] || break
+      sleep 1
+    done
+    [[ -n "$up" ]] && break
+    echo "PBS did not come up (attempt $attempt); container log:"
+    docker logs "$pbs" 2>&1 | tail -20 | sed 's/^/    /'
+    docker rm -f "$pbs" >/dev/null 2>&1 || true
   done
+  [[ -n "$up" ]] || { echo "PBS failed to start"; exit 1; }
   on_pbs proxmox-backup-manager versions | head -1
 
   echo "== preparing PBS: datastore, namespace, user, token, ACL"

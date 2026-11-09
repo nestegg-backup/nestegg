@@ -273,8 +273,10 @@ export class World {
       case "failing":
         this.extraSources = [{ archive: "fotos.pxar", path: "/mnt/fotos" }];
         this.history(now, 13, 1, { skip: [10], pbsNight: 7 });
+        // Before 01:31 local time today's attempt has not happened yet:
+        // place the failure two hours ago instead of in the future.
         this.runs.unshift(
-          makeRun(localAt(now, 0, 1, 31), "failed", {
+          makeRun(localAt(now, 0, 1, 31) < now ? localAt(now, 0, 1, 31) : now - 2 * HOUR, "failed", {
             error: { kind: "source_missing", message: "source /mnt/fotos: not a mount point (disk not mounted)" },
           }),
         );
