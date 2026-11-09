@@ -99,12 +99,99 @@ docker run --rm -v "$work:/work" debian:trixie bash -euo pipefail -c '
 '
 encrypt_arg=""
 [[ $luks == 1 ]] && encrypt_arg="--encrypt-passphrase-file /media/t/luks"
+if [[ "${WIZARD:-0}" == 1 ]]; then
+  # Drive the interactive wizard (`nestegg rescue`) like a person would,
+  # including typical mistakes. First pass: cancelled at the final
+  # confirmation (nothing may change). Second pass: complete restore.
+  connection_defaults() {
+    for q in "PBS address" "Port" "Datastore" "Namespace" "User or API token" "MAC address"; do
+      printf 'expect %s 120\nsend\n' "$q"
+    done
+    printf 'expect matches the saved settings 120\n'
+  }
+  encryption_answers() { # $1 = 1: also try mismatching passphrases
+    if [[ $luks == 1 ]]; then
+      printf 'expect Encrypt the restored disk 60\nsend y\n'
+      if [[ $1 == 1 ]]; then
+        printf 'expect New disk passphrase 30\nsendfile %s\nexpect Repeat the passphrase 30\nsend not-the-same\nexpect passphrases differ 30\n' "$work/luks"
+      fi
+      printf 'expect New disk passphrase 30\nsendfile %s\nexpect Repeat the passphrase 30\nsendfile %s\n' "$work/luks" "$work/luks"
+    else
+      printf 'expect Encrypt the restored disk 60\nsend n\n'
+    fi
+  }
+  {
+    echo 'expect root@nestegg-rescue[^#]*# 600'
+    echo 'send mkdir -p /media/t && mount -o ro /dev/vdb /media/t && nestegg rescue; echo WIZARD-EXIT=$?'
+    echo 'expect Found settings in /media/t 120'
+    connection_defaults
+    echo '# Mistake: just Enter at the password prompt -> must ask again'
+    echo 'expect Password or API token secret 120'
+    echo 'send'
+    echo 'expect Please enter a value 30'
+    echo 'expect Password or API token secret 30'
+    echo '# Mistake: wrong secret'
+    echo 'send wrong-secret-for-the-test'
+    echo '# Mistake: key file that does not exist -> must ask again'
+    echo 'expect Exported encryption key file 60'
+    echo 'send /nonexistent/nestegg-key.json'
+    echo 'expect Exported encryption key file 30'
+    echo 'send /media/t/nestegg-key.json'
+    echo 'expect Login or listing failed 300'
+    echo '# The wizard starts over with the connection'
+    connection_defaults
+    echo 'expect Password or API token secret 120'
+    printf 'sendfile %s\n' "$work/password"
+    echo 'expect Exported encryption key file 60'
+    echo 'send /media/t/nestegg-key.json'
+    echo '# Mistake: number out of range'
+    echo 'expect Which computer 300'
+    echo 'send 9'
+    echo 'expect Please enter a number between 30'
+    echo 'expect Which computer 30'
+    echo 'send 1'
+    echo 'expect Which backup 300'
+    echo 'send'
+    echo 'expect 1\) /dev/vda 120'
+    echo 'expect Which disk 60'
+    echo 'send'
+    encryption_answers 1
+    echo '# Mistake: wrong disk name at the final confirmation -> cancel'
+    echo "expect Type 'vda' to erase 900"
+    echo 'send sda'
+    echo 'expect Cancelled, nothing was changed 60'
+    echo 'expect WIZARD-EXIT=1 60'
+    echo '# Second pass: everything right'
+    echo 'send nestegg rescue; echo WIZARD-EXIT=$?'
+    echo 'expect Found settings in /media/t 120'
+    connection_defaults
+    echo 'expect Password or API token secret 120'
+    printf 'sendfile %s\n' "$work/password"
+    echo 'expect Exported encryption key file 60'
+    echo 'send'
+    echo 'expect Which computer 300'
+    echo 'send'
+    echo 'expect Which backup 300'
+    echo 'send'
+    echo 'expect Which disk 120'
+    echo 'send'
+    encryption_answers 0
+    echo "expect Type 'vda' to erase 900"
+    echo 'send vda'
+    echo 'expect Restore finished 2400'
+    echo 'expect Remove the rescue stick and restart now 60'
+    echo 'send n'
+    echo 'expect WIZARD-EXIT=0 60'
+    echo 'send poweroff'
+  } > "$work/rescue.script"
+else
 cat > "$work/rescue.script" <<EOF
 expect root@nestegg-rescue[^#]*# 600
 send mkdir -p /media/t && mount -o ro /dev/vdb /media/t && nestegg rescue restore --settings /media/t/nestegg-rescue.toml --password-file /media/t/password --keyfile /media/t/nestegg-key.json --disk /dev/vda --wipe /dev/vda $encrypt_arg; echo RESTORE-EXIT=\$?
 expect RESTORE-EXIT=[0-9]+ 2400
 send poweroff
 EOF
+fi
 # shellcheck disable=SC2046
 qemu 3600 $(firmware rescue) -cdrom "$iso" -boot d \
   -drive "file=$work/target.img,if=virtio,format=raw" \
@@ -113,7 +200,22 @@ qemu 3600 $(firmware rescue) -cdrom "$iso" -boot d \
 qemu_pids+=($!)
 python3 "$here/console.py" "$work/rescue.sock" "$work/rescue-console.log" "$work/rescue.script" || true
 wait "${qemu_pids[-1]}" || true
-check "rescue restore succeeded" grep -q 'RESTORE-EXIT=0' "$work/rescue-console.log"
+if [[ "${WIZARD:-0}" == 1 ]]; then
+  rlog="$work/rescue-console.log"
+  check "wizard: empty password input asks again" grep -q 'Please enter a value' "$rlog"
+  check "wizard: missing key file asks again" grep -q 'nonexistent/nestegg-key.json' "$rlog"
+  check "wizard: wrong secret starts over" grep -q 'Login or listing failed' "$rlog"
+  check "wizard: invalid number asks again" grep -q 'Please enter a number between' "$rlog"
+  if [[ $luks == 1 ]]; then
+    check "wizard: different passphrases ask again" grep -q 'passphrases differ' "$rlog"
+  fi
+  check "wizard: wrong confirmation cancels" grep -q 'Cancelled, nothing was changed' "$rlog"
+  check "wizard: first pass ended without changes (exit 1)" grep -q 'WIZARD-EXIT=1' "$rlog"
+  check "wizard: second pass succeeded" grep -q 'WIZARD-EXIT=0' "$rlog"
+  check "wizard: token secret never shown" bash -c "! grep -qF \"\$(cat '$work/password')\" '$rlog'"
+else
+  check "rescue restore succeeded" grep -q 'RESTORE-EXIT=0' "$work/rescue-console.log"
+fi
 check "restore finished message" grep -q 'Restore finished' "$work/rescue-console.log"
 stop_on_failure
 
