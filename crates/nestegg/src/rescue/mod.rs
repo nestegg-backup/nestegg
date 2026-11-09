@@ -222,6 +222,10 @@ pub struct Disk {
     pub items: Vec<guard::BlockItem>,
 }
 
+/// Smallest disk offered as restore target (smaller ones cannot hold a
+/// system anyway; the plan checks the real space requirement later).
+const MIN_TARGET_BYTES: u64 = 1024 * 1024 * 1024;
+
 pub fn parse_disks(lsblk_json: &str, busy: &[String]) -> Result<Vec<Disk>> {
     let v: serde_json::Value =
         serde_json::from_str(lsblk_json).context("unexpected lsblk output")?;
@@ -234,14 +238,20 @@ pub fn parse_disks(lsblk_json: &str, busy: &[String]) -> Result<Vec<Disk>> {
             continue;
         }
         let path = d["path"].as_str().unwrap_or_default().to_string();
-        if path.starts_with("/dev/zram") || path.starts_with("/dev/loop") || path.is_empty() {
+        // Floppy drives (QEMU and some firmware show one) and other tiny
+        // devices are never a sensible restore target.
+        if path.starts_with("/dev/zram")
+            || path.starts_with("/dev/loop")
+            || path.starts_with("/dev/fd")
+            || path.is_empty()
+        {
             continue;
         }
         let size = d["size"]
             .as_u64()
             .or_else(|| d["size"].as_str().and_then(|s| s.parse().ok()))
             .unwrap_or(0);
-        if size == 0 || d["ro"].as_bool() == Some(true) {
+        if size < MIN_TARGET_BYTES || d["ro"].as_bool() == Some(true) {
             continue;
         }
         let mut in_use = busy.iter().any(|b| b == &path);
@@ -542,8 +552,8 @@ pub fn ask_secret(prompt: &str) -> Result<Secret> {
     use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
     let stdin = std::io::stdin();
     let tty = nix::unistd::isatty(&stdin).unwrap_or(false);
-    eprint!("{prompt}: ");
-    std::io::stderr().flush()?;
+    // Switch echo off BEFORE showing the prompt: input typed (or pasted)
+    // as soon as the prompt appears must never be echoed.
     let saved = if tty {
         let original = tcgetattr(&stdin)?;
         let mut silent = original.clone();
@@ -553,16 +563,23 @@ pub fn ask_secret(prompt: &str) -> Result<Secret> {
     } else {
         None
     };
+    eprint!("{prompt}: ");
+    std::io::stderr().flush()?;
     let mut line = String::new();
     let r = stdin.lock().read_line(&mut line);
     if let Some(original) = saved {
         let _ = tcsetattr(&stdin, SetArg::TCSANOW, &original);
         eprintln!();
     }
-    r?;
+    let read = r?;
     let v = line.trim_end_matches(['\n', '\r']).to_string();
     if v.is_empty() {
-        bail!("empty input");
+        if read == 0 {
+            bail!("input closed");
+        }
+        // Just Enter: ask again instead of ending the wizard.
+        eprintln!("Please enter a value.");
+        return ask_secret(prompt);
     }
     Ok(Secret::new(v.into_bytes()))
 }
@@ -616,7 +633,9 @@ mod tests {
   "children":[{"path":"/dev/sda1","type":"part","size":1,"mountpoints":["/run/live/medium"]}]},
  {"path":"/dev/nvme0n1","type":"disk","size":512110190592,"model":"Samsung SSD 980 ","tran":"nvme","ro":false,"mountpoints":[null]},
  {"path":"/dev/sr0","type":"rom","size":1073741312,"model":"DVD","tran":"sata","ro":false,"mountpoints":[null]},
- {"path":"/dev/zram0","type":"disk","size":8000000,"model":null,"tran":null,"ro":false,"mountpoints":["[SWAP]"]}
+ {"path":"/dev/zram0","type":"disk","size":8000000,"model":null,"tran":null,"ro":false,"mountpoints":["[SWAP]"]},
+ {"path":"/dev/fd0","type":"disk","size":4096,"model":null,"tran":null,"ro":false,"mountpoints":[null]},
+ {"path":"/dev/sdb","type":"disk","size":16777216,"model":"Tiny","tran":"usb","ro":false,"mountpoints":[null]}
 ]}"#;
         let d = parse_disks(json, &[]).unwrap();
         assert_eq!(d.len(), 2);

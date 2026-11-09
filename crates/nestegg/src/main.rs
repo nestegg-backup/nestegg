@@ -454,13 +454,14 @@ fn read_secret_line(prompt: &str) -> Result<Secret> {
     use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
     let stdin = std::io::stdin();
     let tty = nix::unistd::isatty(&stdin).unwrap_or(false);
+    // Echo off before the prompt is shown (no window for echoed input).
     let saved = if tty {
-        eprint!("{prompt}");
-        let _ = std::io::stderr().flush();
         let original = tcgetattr(&stdin)?;
         let mut silent = original.clone();
         silent.local_flags.remove(LocalFlags::ECHO);
         tcsetattr(&stdin, SetArg::TCSANOW, &silent)?;
+        eprint!("{prompt}");
+        let _ = std::io::stderr().flush();
         Some(original)
     } else {
         None
