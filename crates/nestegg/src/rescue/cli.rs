@@ -134,7 +134,7 @@ fn read_secret_file(path: &Path) -> Result<Secret> {
 }
 
 fn ensure_reachable(session: &Session) -> Result<()> {
-    match crate::wake::ensure_available(&session.config, |m| eprintln!("{m}"))? {
+    match crate::wake::ensure_available(&session.config, |e| eprintln!("{e}"))? {
         crate::wake::Availability::Unreachable => bail!(
             "the PBS {}:{} does not answer",
             session.config.pbs.server,
@@ -426,7 +426,7 @@ fn wizard() -> Result<u8> {
         settings.wake_mac = (mac != "-" && !mac.is_empty()).then_some(mac);
         // Wake a sleeping PBS before asking it for its certificate.
         if let Ok(c) = settings.to_config()
-            && let Err(e) = crate::wake::ensure_available(&c, |m| eprintln!("{m}"))
+            && let Err(e) = crate::wake::ensure_available(&c, |ev| eprintln!("{ev}"))
         {
             eprintln!("Wake-on-LAN failed: {e:#}");
         }

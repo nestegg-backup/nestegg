@@ -297,6 +297,45 @@ fn unreachable_pbs_is_its_own_state() {
 }
 
 #[test]
+fn wake_packet_that_cannot_be_sent_ends_as_unreachable() {
+    let mut env = Env::new();
+    // Port 0: Linux refuses the datagram (EINVAL), a deterministic stand-in
+    // for "Network is unreachable" on a laptop that is offline.
+    let config = env.root().join("etc/config.toml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "\n[wake]\nmac = \"00:00:5e:00:53:01\"\nbroadcast = \"255.255.255.255\"\nport = 0\ntimeout_seconds = 0\n",
+    );
+    fs::write(&config, text).unwrap();
+    env.close_pbs();
+    let out = env.run(&["run", "--trigger", "timer"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code(&out), 75, "stderr: {stderr}");
+    assert!(
+        stderr.contains("warning: could not send the Wake-on-LAN packet"),
+        "stderr: {stderr}"
+    );
+    let state = env.state();
+    assert_eq!(state["last_run"]["state"], "pbs_unreachable");
+    assert_eq!(state["last_run"]["error"]["kind"], "pbs_unreachable");
+    assert!(
+        state["last_run"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sending the wake-up packet failed")
+    );
+    let wake_warnings = state["last_run"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w.as_str().unwrap().contains("Wake-on-LAN"))
+        .count();
+    assert_eq!(wake_warnings, 1, "state: {state}");
+    assert_eq!(state["pbs_reachable"], false);
+    assert!(!env.fake_log().contains("ARGS backup"));
+}
+
+#[test]
 fn authentication_failure_is_classified() {
     let env = Env::new();
     let out = env

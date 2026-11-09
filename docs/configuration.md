@@ -119,6 +119,12 @@ Notes:
 - **Schedule:** the timer checks hourly; a backup runs when the last success
   is older than `interval_hours`. If the PBS is unreachable, the run ends
   with state `pbs_unreachable` and the next hourly check tries again.
+- **Wake-on-LAN:** with `[wake]`, a run that finds the PBS down sends the
+  magic packet, repeats it every minute and waits up to `timeout_seconds`.
+  If the packet cannot be sent at all (for example a laptop that is offline
+  or still reconnecting after sleep), the run logs a warning, keeps trying
+  until the timeout and then also ends as `pbs_unreachable`, not as a
+  failure.
 
 ## Web interface and API permissions
 

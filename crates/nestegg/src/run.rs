@@ -12,7 +12,7 @@ use crate::client::{ArchiveSpec, BackupSpec, Client, snapshot_path};
 use crate::config::{Config, Paths};
 use crate::secrets::{self, SecretStore};
 use crate::state::{ArchiveInfo, ErrorKind, Run, RunError, RunState, Store, Trigger, is_due};
-use crate::wake::{self, Availability};
+use crate::wake::{self, Availability, WakeEvent};
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -508,7 +508,14 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         RunState::WakingPbs,
         &format!("checking PBS {}:{}", config.pbs.server, config.pbs.port),
     );
-    let availability = wake::ensure_available(config, |msg| rep.line(msg))?;
+    let mut wake_send_failed = false;
+    let availability = wake::ensure_available(config, |event| match event {
+        WakeEvent::Info(msg) => rep.line(msg),
+        WakeEvent::SendFailed(msg) => {
+            wake_send_failed = true;
+            rep.warn(msg.to_string());
+        }
+    })?;
     if rep.cancelled() {
         return Ok(());
     }
@@ -521,7 +528,10 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             "PBS reachable after Wake-on-LAN ({waited_seconds} s)"
         )),
         Availability::Unreachable => {
-            let message = if config.wake.is_some() {
+            let message = if wake_send_failed {
+                "PBS did not answer, also not after Wake-on-LAN (sending the wake-up packet \
+                 failed, see the warning above)"
+            } else if config.wake.is_some() {
                 "PBS did not answer, also not after Wake-on-LAN"
             } else {
                 "PBS did not answer"

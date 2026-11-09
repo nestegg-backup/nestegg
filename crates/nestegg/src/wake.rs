@@ -54,9 +54,52 @@ pub enum Availability {
     Unreachable,
 }
 
+/// Progress reported by [`ensure_available`] while it wakes the PBS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeEvent<'a> {
+    /// Normal progress ("sending Wake-on-LAN packet").
+    Info(&'a str),
+    /// The magic packet could not be sent. The wait goes on; a backup run
+    /// records this as a warning. Reported at most once per call.
+    SendFailed(&'a str),
+    /// A packet went out after an earlier attempt had failed.
+    SendRecovered,
+}
+
+impl std::fmt::Display for WakeEvent<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WakeEvent::Info(m) => f.write_str(m),
+            WakeEvent::SendFailed(m) => write!(f, "warning: {m}"),
+            WakeEvent::SendRecovered => f.write_str("Wake-on-LAN packet sent"),
+        }
+    }
+}
+
+/// How often the PBS is probed while waiting for it to wake up.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the magic packet is repeated while waiting.
+const RESEND_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Check the PBS; if it is down and Wake-on-LAN is configured, wake it and
 /// poll until it answers or the timeout expires.
-pub fn ensure_available(config: &Config, mut on_wake: impl FnMut(&str)) -> Result<Availability> {
+///
+/// A magic packet that cannot be sent (for example `Network is unreachable`
+/// on a laptop that is offline or still reconnecting after a resume) is not
+/// an error: it is reported once as [`WakeEvent::SendFailed`], the packet is
+/// retried at every poll until it goes out, and after the timeout the result
+/// is [`Availability::Unreachable`], the same as for a PBS that does not
+/// wake up.
+pub fn ensure_available(config: &Config, on_event: impl FnMut(WakeEvent)) -> Result<Availability> {
+    ensure_available_with(config, send_magic_packet, POLL_INTERVAL, on_event)
+}
+
+fn ensure_available_with(
+    config: &Config,
+    mut send: impl FnMut(&WakeConfig) -> Result<()>,
+    poll_interval: Duration,
+    mut on_event: impl FnMut(WakeEvent),
+) -> Result<Availability> {
     let probe = Duration::from_secs(3);
     if is_reachable(config, probe) {
         return Ok(Availability::Reachable);
@@ -64,30 +107,91 @@ pub fn ensure_available(config: &Config, mut on_wake: impl FnMut(&str)) -> Resul
     let Some(wake) = &config.wake else {
         return Ok(Availability::Unreachable);
     };
-    on_wake("PBS not reachable, sending Wake-on-LAN packet");
-    send_magic_packet(wake)?;
+    on_event(WakeEvent::Info(
+        "PBS not reachable, sending Wake-on-LAN packet",
+    ));
+    let mut sender = PacketSender::default();
+    let mut last_sent = sender
+        .send(wake, &mut send, &mut on_event)
+        .then(Instant::now);
     let start = Instant::now();
     let deadline = Duration::from_secs(wake.timeout_seconds);
-    let mut last_packet = Instant::now();
+    // Sleep in short steps so a cancel request is noticed quickly.
+    let step = poll_interval / 10;
     while start.elapsed() < deadline {
         for _ in 0..10 {
             if crate::cancel::requested() {
                 return Ok(Availability::Unreachable);
             }
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(step);
         }
         if is_reachable(config, probe) {
             return Ok(Availability::ReachableAfterWake {
                 waited_seconds: start.elapsed().as_secs(),
             });
         }
-        if last_packet.elapsed() > Duration::from_secs(60) {
-            on_wake("still waiting, sending Wake-on-LAN packet again");
-            send_magic_packet(wake)?;
-            last_packet = Instant::now();
+        match last_sent {
+            // No packet went out yet, or the last resend failed: try again at
+            // every poll so it leaves as soon as the network is back.
+            None => {
+                if sender.send(wake, &mut send, &mut on_event) {
+                    last_sent = Some(Instant::now());
+                }
+            }
+            Some(sent) if sent.elapsed() > RESEND_INTERVAL => {
+                on_event(WakeEvent::Info(
+                    "still waiting, sending Wake-on-LAN packet again",
+                ));
+                last_sent = sender
+                    .send(wake, &mut send, &mut on_event)
+                    .then(Instant::now);
+            }
+            Some(_) => {}
         }
     }
     Ok(Availability::Unreachable)
+}
+
+/// Sends the magic packet and turns a failure into one clear warning instead
+/// of an error that would abort the run.
+#[derive(Default)]
+struct PacketSender {
+    warned: bool,
+    failing: bool,
+}
+
+impl PacketSender {
+    /// Returns true when the packet went out.
+    fn send(
+        &mut self,
+        wake: &WakeConfig,
+        send: &mut impl FnMut(&WakeConfig) -> Result<()>,
+        on_event: &mut impl FnMut(WakeEvent),
+    ) -> bool {
+        match send(wake) {
+            Ok(()) => {
+                if self.failing {
+                    on_event(WakeEvent::SendRecovered);
+                }
+                self.failing = false;
+                true
+            }
+            Err(e) => {
+                if !self.warned {
+                    on_event(WakeEvent::SendFailed(&format!(
+                        "could not send the Wake-on-LAN packet that wakes the backup server \
+                         ({}). Is this computer connected to the network? Waiting up to \
+                         {} s for the backup server and trying again.",
+                        e.root_cause(),
+                        wake.timeout_seconds
+                    )));
+                    self.warned = true;
+                }
+                self.failing = true;
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -146,5 +250,138 @@ mod tests {
         drop(listener);
         let result = ensure_available(&config_for(port), |_| {}).unwrap();
         assert_eq!(result, Availability::Unreachable);
+    }
+
+    fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn wake_config(timeout_seconds: u64) -> WakeConfig {
+        WakeConfig {
+            mac: "00:00:5e:00:53:01".into(),
+            broadcast: "255.255.255.255".parse().unwrap(),
+            port: 9,
+            timeout_seconds,
+        }
+    }
+
+    fn offline() -> anyhow::Error {
+        anyhow::Error::new(std::io::Error::from_raw_os_error(101))
+            .context("cannot send Wake-on-LAN packet")
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Info(String),
+        Warning(String),
+    }
+
+    fn record(seen: &mut Vec<Seen>) -> impl FnMut(WakeEvent) + '_ {
+        move |e| {
+            seen.push(match e {
+                WakeEvent::Info(m) => Seen::Info(m.into()),
+                WakeEvent::SendFailed(m) => Seen::Warning(m.into()),
+                WakeEvent::SendRecovered => Seen::Info(e.to_string()),
+            })
+        }
+    }
+
+    #[test]
+    fn send_failure_is_a_warning_and_ends_unreachable() {
+        let mut config = config_for(closed_port());
+        config.wake = Some(wake_config(1));
+        let mut attempts = 0;
+        let mut seen = Vec::new();
+        let result = ensure_available_with(
+            &config,
+            |_| {
+                attempts += 1;
+                Err(offline())
+            },
+            Duration::from_millis(50),
+            record(&mut seen),
+        )
+        .unwrap();
+        assert_eq!(result, Availability::Unreachable);
+        assert!(attempts > 1, "the packet is retried, got {attempts}");
+        let warnings: Vec<_> = seen
+            .iter()
+            .filter_map(|s| match s {
+                Seen::Warning(m) => Some(m),
+                Seen::Info(_) => None,
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "warned exactly once: {seen:?}");
+        assert!(
+            warnings[0].contains("Network is unreachable")
+                && warnings[0].contains("connected to the network"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn packet_goes_out_once_the_network_is_back() {
+        let port = closed_port();
+        let mut config = config_for(port);
+        config.wake = Some(wake_config(10));
+        let mut attempts = 0;
+        // The second attempt "works" and the PBS wakes up.
+        let mut pbs = None;
+        let mut seen = Vec::new();
+        let result = ensure_available_with(
+            &config,
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(offline());
+                }
+                pbs = Some(TcpListener::bind(("127.0.0.1", port)).unwrap());
+                Ok(())
+            },
+            Duration::from_millis(50),
+            record(&mut seen),
+        )
+        .unwrap();
+        assert!(
+            matches!(result, Availability::ReachableAfterWake { .. }),
+            "{result:?}"
+        );
+        assert_eq!(attempts, 2);
+        assert!(seen.contains(&Seen::Info("Wake-on-LAN packet sent".into())));
+        assert_eq!(
+            seen.iter()
+                .filter(|s| matches!(s, Seen::Warning(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn real_send_failure_does_not_abort() {
+        // Linux refuses UDP datagrams to port 0 with EINVAL, a deterministic
+        // stand-in for "Network is unreachable".
+        let mut config = config_for(closed_port());
+        let mut wake = wake_config(0);
+        wake.port = 0;
+        config.wake = Some(wake);
+        let mut seen = Vec::new();
+        let result = ensure_available(&config, record(&mut seen)).unwrap();
+        assert_eq!(result, Availability::Unreachable);
+        assert!(
+            seen.iter().any(|s| matches!(s, Seen::Warning(_))),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn warning_display_is_prefixed() {
+        assert_eq!(WakeEvent::Info("x").to_string(), "x");
+        assert_eq!(WakeEvent::SendFailed("x").to_string(), "warning: x");
+        assert_eq!(
+            WakeEvent::SendRecovered.to_string(),
+            "Wake-on-LAN packet sent"
+        );
     }
 }
