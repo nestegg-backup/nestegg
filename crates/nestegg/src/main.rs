@@ -43,6 +43,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Tell logged-in users (and an optional command) about failed,
+    /// overdue, incomplete or damaged backups (root; used by
+    /// nestegg-notify.timer).
+    Notify {
+        /// Send a test message through all configured channels.
+        #[arg(long)]
+        test: bool,
+        /// Print what would be sent; send and record nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show recent backup runs.
     History {
         #[arg(long, default_value_t = 20)]
@@ -285,6 +296,11 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
         Cmd::Rescue { command } => nestegg::rescue::cli::run(command),
         Cmd::Backup => backup_now(paths),
         Cmd::Status { json } => status(paths, json),
+        Cmd::Notify { test, dry_run } => {
+            require_root("nestegg notify")?;
+            nestegg::notify::run(paths, &nestegg::notify::Options { test, dry_run })?;
+            Ok(0)
+        }
         Cmd::History { limit, json } => history(paths, limit, json),
         Cmd::Snapshots { json } => snapshots(paths, json),
         Cmd::Restore {

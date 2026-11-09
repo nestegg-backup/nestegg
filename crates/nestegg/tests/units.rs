@@ -173,6 +173,152 @@ fn daemon_unit_allows_every_restore_target() {
     check_unit("nestegg.service");
 }
 
+/// The health check changes to other users and starts the administrator's
+/// hook command, so beyond the rules above it must not restrict privilege
+/// gain (set-group-ID mail programs) or networking (push-message hooks).
+const NOTIFY_ALSO_FORBIDDEN: &[(&str, &[&str])] = &[
+    ("NoNewPrivileges", OFF),
+    ("PrivateNetwork", OFF),
+    ("RestrictAddressFamilies", &[]),
+    ("IPAddressDeny", &[]),
+    ("IPAddressAllow", &[]),
+];
+
+fn notify_violations(text: &str) -> Vec<String> {
+    let mut out = violations(text);
+    for (key, value) in service_settings(text) {
+        if let Some((_, allowed)) = NOTIFY_ALSO_FORBIDDEN.iter().find(|(k, _)| *k == key)
+            && !allowed.contains(&value.to_ascii_lowercase().as_str())
+        {
+            out.push(format!(
+                "{key}={value} would break the hook command (mail programs, network) \
+                 or the switch to the session user"
+            ));
+        }
+    }
+    out
+}
+
+fn unit_text(unit: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packaging/systemd")
+        .join(unit);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+/// Values of `key` in `[section]` of a unit text.
+fn setting(text: &str, section: &str, key: &str) -> Vec<String> {
+    let mut current = "";
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            current = &line[1..line.len() - 1];
+        } else if current == section
+            && let Some((k, v)) = line.split_once('=')
+            && k.trim() == key
+        {
+            out.push(v.trim().to_string());
+        }
+    }
+    out
+}
+
+#[test]
+fn notify_unit_can_switch_to_users_and_run_any_hook() {
+    let text = unit_text("nestegg-notify.service");
+    let found = notify_violations(&text);
+    assert!(
+        found.is_empty(),
+        "nestegg-notify.service (see the comment in the unit and decision 0017):\n  {}",
+        found.join("\n  ")
+    );
+    assert_eq!(setting(&text, "Service", "Type"), ["oneshot"]);
+    assert_eq!(
+        setting(&text, "Service", "ExecStart"),
+        ["/usr/bin/nestegg notify"]
+    );
+}
+
+#[test]
+fn notify_timer_runs_hourly_and_catches_up() {
+    let text = unit_text("nestegg-notify.timer");
+    assert_eq!(setting(&text, "Timer", "OnCalendar"), ["hourly"]);
+    assert_eq!(setting(&text, "Timer", "Persistent"), ["true"]);
+    assert_eq!(
+        setting(&text, "Timer", "OnBootSec").len(),
+        1,
+        "a check a few minutes after boot"
+    );
+    assert_eq!(setting(&text, "Install", "WantedBy"), ["timers.target"]);
+}
+
+#[test]
+fn backup_unit_reports_its_result_without_calling_an_unreachable_server_a_failure() {
+    let text = unit_text("nestegg-backup.service");
+    assert_eq!(
+        setting(&text, "Unit", "OnSuccess"),
+        ["nestegg-notify.service"]
+    );
+    assert_eq!(
+        setting(&text, "Unit", "OnFailure"),
+        ["nestegg-notify.service"]
+    );
+    // An unreachable server is reported as "overdue", not on every miss.
+    assert_eq!(setting(&text, "Service", "SuccessExitStatus"), ["75"]);
+}
+
+#[test]
+fn the_package_ships_and_enables_the_notify_units() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |p: &str| {
+        std::fs::read_to_string(root.join(p)).unwrap_or_else(|e| panic!("cannot read {p}: {e}"))
+    };
+    let manifest = read("crates/nestegg/Cargo.toml");
+    for unit in ["nestegg-notify.service", "nestegg-notify.timer"] {
+        assert!(
+            manifest.contains(&format!("packaging/systemd/{unit}\"")),
+            "{unit} is not an asset of the package"
+        );
+    }
+    let recommends = manifest
+        .lines()
+        .find(|l| l.starts_with("recommends"))
+        .expect("recommends line");
+    assert!(recommends.contains("libnotify-bin"), "{recommends}");
+    // Enabled by the package, kept across remove and reinstall (decision 0012).
+    assert!(
+        read("packaging/debian/postinst").contains("systemctl enable $now nestegg-notify.timer")
+    );
+    for script in ["postinst", "prerm"] {
+        assert!(
+            read(&format!("packaging/debian/{script}")).contains("nestegg-notify.timer"),
+            "{script} does not handle nestegg-notify.timer"
+        );
+    }
+}
+
+#[test]
+fn the_notify_check_rejects_what_would_break_hooks() {
+    let bad = "[Service]\nNoNewPrivileges=yes\nPrivateNetwork=yes\n\
+        RestrictAddressFamilies=AF_UNIX\nPrivateTmp=yes\n\
+        CapabilityBoundingSet=~CAP_SYS_MODULE\nSystemCallFilter=~@module\n";
+    let found = notify_violations(bad).join("\n");
+    for what in [
+        "NoNewPrivileges=yes",
+        "PrivateNetwork=yes",
+        "RestrictAddressFamilies=AF_UNIX",
+        "PrivateTmp=yes",
+    ] {
+        assert!(found.contains(what), "{what} not reported in:\n{found}");
+    }
+    let ok = "[Service]\nProtectKernelTunables=yes\n\
+        CapabilityBoundingSet=~CAP_SYS_MODULE\nSystemCallFilter=~@module\n";
+    assert!(notify_violations(ok).is_empty());
+}
+
 #[test]
 fn the_check_rejects_the_sandboxing_that_broke_backups_and_restores() {
     let old_backup_unit = "[Service]\nNoNewPrivileges=yes\nPrivateTmp=yes\n\

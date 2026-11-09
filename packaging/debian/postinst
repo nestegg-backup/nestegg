@@ -23,7 +23,7 @@ if [ "$1" = "configure" ]; then
             reenabled=""
             while read -r unit; do
                 case "$unit" in
-                    nestegg.service|nestegg-backup.timer) ;;
+                    nestegg.service|nestegg-backup.timer|nestegg-notify.timer) ;;
                     *) continue ;;
                 esac
                 # Without a running systemd (chroot, image build): enable only.
@@ -38,6 +38,19 @@ if [ "$1" = "configure" ]; then
             fi
         fi
         rm -f "$marker"
+    fi
+    # The health check needs no setup (it does nothing while nestegg is not
+    # configured), so the package turns its timer on once: on a first
+    # installation and on the upgrade from a version that did not have it.
+    # The marker keeps a later decision of the user to switch it off (decision
+    # 0017); it stays on remove and purge, like the rest of the state.
+    notify_marker=/var/lib/nestegg/notify-timer-enabled
+    if [ ! -e "$notify_marker" ] && [ -e /usr/lib/systemd/system/nestegg-notify.timer ]; then
+        now=""
+        [ "$running" = yes ] && now=--now
+        if systemctl enable $now nestegg-notify.timer >/dev/null 2>&1; then
+            : > "$notify_marker" || true
+        fi
     fi
     if [ ! -e /etc/nestegg/config.toml ]; then
         echo "nestegg: run 'sudo nestegg init --help' to set up backups."

@@ -2,7 +2,9 @@
 # Package and service test: install the .deb into a container running
 # systemd, store secrets with systemd-creds, run backups through the timer
 # unit and the daemon, use the CLI and web UI as an unprivileged user and
-# change settings through the API.
+# change settings through the API, and get told about failed, recovered and
+# unwanted states through the health check (hook command and desktop
+# notification, decision 0017).
 #
 # The systemd container needs the host cgroup namespace (--cgroupns=host with
 # a writable /sys/fs/cgroup) and CAP_SYS_ADMIN without seccomp/AppArmor
@@ -47,12 +49,31 @@ check "package installs" on_client bash -c 'DEBIAN_FRONTEND=noninteractive apt-g
 check "group nestegg created" on_client getent group nestegg
 check "runtime dir from tmpfiles" bash -c "[[ \$(docker exec $client stat -c '%a %G' /run/nestegg) == '750 nestegg' ]]"
 check "units installed" on_client systemctl cat nestegg.service nestegg-backup.service nestegg-backup.timer
+check "health check units installed" on_client systemctl cat nestegg-notify.service nestegg-notify.timer
+check "health check timer enabled by the package" on_client systemctl is-enabled --quiet nestegg-notify.timer
+check "health check timer running" on_client systemctl is-active --quiet nestegg-notify.timer
+check "backup unit starts the check after a success" bash -c "docker exec $client systemctl show -p OnSuccess --value nestegg-backup.service | grep -qx nestegg-notify.service"
+check "backup unit starts the check after a failure" bash -c "docker exec $client systemctl show -p OnFailure --value nestegg-backup.service | grep -qx nestegg-notify.service"
+check "health check does nothing before the setup" bash -c "docker exec $client nestegg notify | grep -q 'not configured'"
+check "package recommends libnotify-bin" bash -c "dpkg-deb -f '$deb' Recommends | grep -q libnotify-bin"
 
 echo "== setup"
 # --no-system: the container's overlay root cannot be backed up as
 # system.pxar; system mode would make every backup "incomplete".
 on_client nestegg init --server pbs.e2e.test --datastore store1 --namespace desktops \
   --auth-id 'backup@pbs!desktop' --fingerprint "$fp" --backup-id sd-desktop --no-system >/dev/null
+# The health check reports to a hook command (root-only configuration).
+docker exec -i "$client" tee /usr/local/bin/nestegg-test-hook >/dev/null <<'HOOK'
+#!/bin/sh
+# One line per event: event|host|last success|message from stdin
+printf '%s|%s|%s|%s\n' "$NESTEGG_EVENT" "$NESTEGG_HOSTNAME" "$NESTEGG_LAST_SUCCESS" "$(cat | tr '\n' ' ')" >> /root/hook-events
+HOOK
+on_client chmod 755 /usr/local/bin/nestegg-test-hook
+docker exec -i "$client" tee -a /etc/nestegg/config.toml >/dev/null <<'NOTIFY'
+
+[notify]
+command = ["/usr/local/bin/nestegg-test-hook"]
+NOTIFY
 # Kernel modules must reach timer snapshots: a sandbox option such as
 # ProtectKernelModules=yes hides /usr/lib/modules behind an empty tmpfs.
 # The container's overlay root makes nestegg skip system.pxar, so the
@@ -152,6 +173,7 @@ check "config.toml has the new interval" on_client grep -qx 'interval_hours = 12
 check "config.toml has the new excludes" on_client grep -q '"\*\.iso"' "$cfg"
 check "config.toml keeps the header comment" bash -c "docker exec $client head -1 $cfg | grep -q '^# nestegg configuration'"
 check "config.toml keeps the hand-added source" on_client grep -q 'archive = "e2e-modules"' "$cfg"
+check "config.toml keeps the [notify] section" on_client grep -q 'nestegg-test-hook' "$cfg"
 check "config.toml keeps owner and mode" bash -c "[[ \$(docker exec $client stat -c '%a %U:%G' $cfg) == '644 root:root' ]]"
 check "no temporary files left in /etc/nestegg" no_output on_client find /etc/nestegg -maxdepth 1 -name '.*.tmp'
 check "timer disabled" exits_with 1 on_client systemctl is-enabled --quiet nestegg-backup.timer
@@ -169,6 +191,10 @@ out="$(patch_config as_alice '{"excludes":["**"]}')"
 check "exclude-everything pattern refused" contains "$out" 'would exclude everything'
 out="$(patch_config as_alice '{"wake_on_lan":true}')"
 check "Wake-on-LAN without MAC refused" contains "$out" '\[wake\]'
+out="$(patch_config as_alice '{"command":["/bin/sh","-c","id"]}')"
+check "the notify command cannot be set through the API" test "$(tail -1 <<<"$out")" = 400
+out="$(patch_config as_alice '{"notify":{"desktop":false}}')"
+check "the notify section cannot be set through the API" test "$(tail -1 <<<"$out")" = 400
 check "refused changes leave config.toml alone" test "$(on_client sha256sum "$cfg")" = "$before"
 check "change logged with the caller" bash -c "docker exec $client journalctl -u nestegg.service --no-pager | grep -q 'settings changed by alice (uid [0-9]*): interval_hours: 24 -> 12'"
 check "refusal logged with the caller" bash -c "docker exec $client journalctl -u nestegg.service --no-pager | grep -q 'settings change by alice (uid [0-9]*) refused'"
@@ -180,8 +206,104 @@ check "web UI rejects a cross-origin settings change" bash -c "[[ \$(docker exec
   -d '{\"automatic_backups\":false}' http://127.0.0.1:18080/api/v1/config) == 403 ]]"
 check "timer still enabled after the rejected request" on_client systemctl is-enabled --quiet nestegg-backup.timer
 
+echo "== notifications: hook command and desktop (decision 0017)"
+alice_uid="$(on_client id -u alice)"
+alice_gid="$(on_client id -g alice)"
+nestegg_gid="$(on_client getent group nestegg | cut -d: -f3)"
+hook_events() { on_client cat /root/hook-events 2>/dev/null || true; }
+count_events() { hook_events | grep -c "^$1|" || true; }
+# wait_for_event EVENT N: at least N lines of EVENT in the hook's file.
+wait_for_event() {
+  for _ in $(seq 1 40); do
+    [[ "$(count_events "$1")" -ge "$2" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+notify_invocation() { on_client systemctl show -p InvocationID --value nestegg-notify.service; }
+# wait_new_notify OLD: the check unit ran again since invocation OLD.
+wait_new_notify() {
+  local now
+  for _ in $(seq 1 40); do
+    now="$(notify_invocation)"
+    [[ "$now" != "$1" && "$(on_client systemctl is-active nestegg-notify.service || true)" == inactive ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+desktop_log() { on_client cat /tmp/notify-send.log 2>/dev/null || true; }
+desktop_count() { desktop_log | grep -c '^uid=' || true; }
+# Timer runs only start a backup when the last success is old.
+age_state() { on_client sed -Ei 's/("finished_at": ?")[^"]*"/\12000-01-01T00:00:00Z"/g' /var/lib/nestegg/state.json; }
+
+check "healthy backups so far produced no message" test -z "$(hook_events)"
+check "health check says all is well" bash -c "docker exec $client nestegg notify | grep -q 'everything is fine'"
+
+# A stand-in for alice's desktop session: the bus socket below /run/user/<uid>
+# and a notify-send that records who runs it and with which environment.
+# (No desktop in the container, so no real notification service.)
+on_client install -d -m 755 /run/user
+on_client install -d -m 700 -o alice -g alice "/run/user/$alice_uid"
+check "fake session bus socket" on_client perl -MSocket -e 'socket(S, PF_UNIX, SOCK_STREAM, 0) or die; bind(S, sockaddr_un($ARGV[0])) or die' "/run/user/$alice_uid/bus"
+docker exec -i "$client" tee /usr/local/bin/notify-send >/dev/null <<'STUB'
+#!/bin/sh
+{ echo "uid=$(id -u) gid=$(id -g) groups=$(id -G)"; echo "bus=$DBUS_SESSION_BUS_ADDRESS"; echo "xdg=$XDG_RUNTIME_DIR"; for a in "$@"; do echo "arg=$a"; done; echo "--"; } >> /tmp/notify-send.log
+STUB
+on_client chmod 755 /usr/local/bin/notify-send
+on_client install -m 666 /dev/null /tmp/notify-send.log
+
+out="$(on_client nestegg notify --test)"
+check "test message reaches the desktop of the logged-in user" contains "$out" 'desktop: sent to alice'
+check "test message reaches the hook" contains "$out" 'command: ran successfully'
+check "hook got the test event" test "$(count_events test)" = 1
+check "notify-send runs as alice with her groups" bash -c "docker exec $client grep -Eq '^uid=$alice_uid gid=$alice_gid groups=.*\\b$nestegg_gid\\b' /tmp/notify-send.log"
+check "notify-send gets alice's session bus" on_client grep -qx "bus=unix:path=/run/user/$alice_uid/bus" /tmp/notify-send.log
+check "notify-send gets alice's runtime directory" on_client grep -qx "xdg=/run/user/$alice_uid" /tmp/notify-send.log
+check "notify-send is told the app name" on_client grep -qx 'arg=--app-name=nestegg' /tmp/notify-send.log
+check "users without a session bus get nothing" test "$(desktop_count)" = 1
+out="$(on_client nestegg notify --test --dry-run)"
+check "dry run names the user and sends nothing" contains "$out" 'would notify alice'
+check "dry run changed nothing" bash -c "[[ $(desktop_count) == 1 && $(count_events test) == 1 ]]"
+on_client sh -c 'echo LANG=de_DE.UTF-8 > /etc/default/locale'
+out="$(on_client nestegg notify --test --dry-run)"
+check "texts follow the system language" contains "$out" 'Testnachricht'
+# Ubuntu links /etc/default/locale and /etc/locale.conf; remove both.
+on_client rm -f /etc/default/locale /etc/locale.conf
+
+echo "-- a failed backup is reported at once (OnFailure=), not repeated, and its end is reported"
+on_client cp "$cfg" /root/config.good
+on_client bash -c "printf '\n[[backup.sources]]\narchive = \"e2e-missing\"\npath = \"/nonexistent-dir\"\n' >> $cfg"
+age_state
+before="$(notify_invocation)"
+check "backup unit fails" exits_with 1 on_client systemctl start nestegg-backup.service
+check "the check ran by itself" wait_new_notify "$before"
+check "hook got one failing event" test "$(count_events failing)" = 1
+check "event carries host, last success and the reason" bash -c "docker exec $client grep -Eq '^failing[|][^|]+[|]2000-01-01T00:00:00Z[|].*/nonexistent-dir does not exist.*nestegg ui' /root/hook-events"
+check "desktop got the failure as a critical message" bash -c "[[ \$(docker exec $client grep -c -x 'arg=--urgency=critical' /tmp/notify-send.log) == 1 ]] && docker exec $client grep -qx 'arg=Backup failed' /tmp/notify-send.log"
+before="$(notify_invocation)"
+check "second failure of the same kind: backup unit fails again" exits_with 1 on_client systemctl start nestegg-backup.service
+check "the check ran again" wait_new_notify "$before"
+check "no second failing event within 24 hours" test "$(count_events failing)" = 1
+check "no second desktop message" test "$(desktop_count)" = 2
+on_client systemctl start nestegg-notify.service
+check "the hourly check stays quiet too" bash -c "[[ $(count_events failing) == 1 && $(desktop_count) == 2 ]]"
+check "the check logs why" bash -c "docker exec $client journalctl -u nestegg-notify.service --no-pager | grep -q 'known problems, nothing new'"
+
+on_client bash -c "cat /root/config.good > $cfg"
+before="$(notify_invocation)"
+check "the next backup works" on_client systemctl start nestegg-backup.service
+check "the check ran after the success" wait_new_notify "$before"
+check "hook got the recovered event" test "$(count_events recovered)" = 1
+check "desktop got the good news" bash -c "docker exec $client grep -qx 'arg=Backups work again' /tmp/notify-send.log"
+check "good news is not critical" test "$(on_client grep -c -x 'arg=--urgency=critical' /tmp/notify-send.log)" = 1
+on_client systemctl start nestegg-notify.service
+check "nothing more is sent" bash -c "[[ $(count_events recovered) == 1 && $(count_events failing) == 1 && $(desktop_count) == 3 ]]"
+check "status ok again" bash -c "docker exec -u alice $client nestegg status | grep -q 'Health:       ok'"
+
 echo "== removal keeps credentials"
 check "package removes cleanly" on_client bash -c 'DEBIAN_FRONTEND=noninteractive apt-get remove -y -q nestegg >/tmp/apt-rm.log 2>&1'
+check "health check timer stopped by the removal" bash -c "! docker exec $client systemctl is-active --quiet nestegg-notify.timer"
+check "removal remembers the health check timer" on_client grep -qx nestegg-notify.timer /var/lib/nestegg/enabled-units
 check "key survives removal" on_client test -f /etc/nestegg/credentials/encryption-key.cred
 
 result

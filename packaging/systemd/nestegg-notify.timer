@@ -1,0 +1,16 @@
+[Unit]
+Description=nestegg backup health check (hourly)
+Documentation=file:/usr/share/doc/nestegg/README.md
+
+[Timer]
+# Independent of the backup timer: it also catches a backup timer that was
+# switched off or a computer that has not completed a backup for days. After
+# every backup run nestegg-backup.service starts the check as well
+# (OnSuccess=, OnFailure=), so a failure is reported right away.
+OnBootSec=5min
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

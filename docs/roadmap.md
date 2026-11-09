@@ -34,8 +34,11 @@ Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
 
 ## v0.2 – Desktop integration (API implemented, UI in progress)
 
-- Local web UI (`nestegg ui`): status, run now, history, restore,
-  notifications when a backup is overdue. Contract: `api/openapi.yaml`.
+- Local web UI (`nestegg ui`): status, run now, history, restore.
+  Contract: `api/openapi.yaml`.
+- Notifications when backups fail, are overdue, incomplete or damaged:
+  `nestegg notify` with desktop messages and an optional hook command
+  (decision 0017).
 - `.deb` packages.
 
 ## v0.2.x – Rescue stick (implemented, not released)

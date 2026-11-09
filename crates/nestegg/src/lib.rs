@@ -13,6 +13,7 @@ pub mod keyproof;
 pub mod layout;
 pub mod metadata;
 pub mod mounts;
+pub mod notify;
 pub mod rescue;
 pub mod restore;
 pub mod run;

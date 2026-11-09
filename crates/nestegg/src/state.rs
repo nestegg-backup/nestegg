@@ -511,7 +511,7 @@ pub fn format_time(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-mod rfc3339 {
+pub(crate) mod rfc3339 {
     use chrono::{DateTime, Utc};
     use serde::{Deserialize, Deserializer, Serializer};
 

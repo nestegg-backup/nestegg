@@ -36,6 +36,7 @@ transfer and restore stay in the official client.
 |---|---|---|
 | `nestegg run` | root, started by the timer or the daemon | One backup run: lock, optional Wake-on-LAN, wait for PBS, build system inventory, call `proxmox-backup-client backup`, upload status report, record result. |
 | `nestegg-backup.timer` | systemd | Daily schedule, `Persistent=true` (catch-up after the machine was off), randomized delay. |
+| `nestegg notify` (`nestegg-notify.service`, `.timer`) | root | Hourly health check, also started after every backup run: tells logged-in users (`notify-send`, run as the user) and an optional hook command when backups fail, are overdue, incomplete or damaged, and when they work again. Remembers what it reported in `notify.json` ([decision 0017](decisions/0017-notifications.md)). |
 | `nestegg daemon` (`nestegg.service`) | root | Local JSON API over a Unix socket. Reads state/history, lists snapshots, starts runs (`systemctl start nestegg-backup.service`) and restores, and changes the few settings group members may change (rhythm, overdue threshold, excludes, Wake-on-LAN on/off, timer on/off; [decision 0013](decisions/0013-editable-settings-in-the-web-ui.md)). |
 | `nestegg <command>` | user in group `nestegg`, or root | CLI. Read commands go through the socket; `init`, `credentials` and `key` need root. |
 | `nestegg ui` | user in group `nestegg` | Starts a local HTTP server on `127.0.0.1:<random>` with a one-time token in the URL, opens the browser, serves the embedded web UI from `ui/dist`, and forwards `/api/v1/*` to the socket. |
@@ -44,8 +45,11 @@ Authorization is done by Unix permissions on the socket (group `nestegg`).
 The browser side is protected by the random port, loopback binding and a
 per-session token. Nothing listens on a network interface.
 
-Both units are hardened only with options that restrict privileges
-(`NoNewPrivileges`, no module loading, read-only `/proc/sys` and `/sys`).
+The backup and daemon units are hardened only with options that restrict
+privileges (`NoNewPrivileges`, no module loading, read-only `/proc/sys` and
+`/sys`); the notification unit does the same except `NoNewPrivileges`, which
+would break set-group-ID mail programs in a hook
+([decision 0017](decisions/0017-notifications.md)).
 Options that hide or lock paths (`PrivateTmp`, `ProtectSystem`,
 `ProtectHome`, `ProtectKernelModules`, ...) are not used: the backup unit
 must see the whole file system for `system.pxar`, and API restores run
@@ -95,6 +99,7 @@ directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
 | `/etc/nestegg/credentials/` | Encrypted credentials (`*.cred`, `systemd-creds`) or root-only plain files. |
 | `/var/lib/nestegg/state.json` | Last run, last success, next run. |
 | `/var/lib/nestegg/runs/` | Run history, one JSON file per run, pruned to a configurable count. |
+| `/var/lib/nestegg/notify.json` | What the health check has reported to whom (policy state, can be deleted). |
 | `/var/lib/nestegg/inventory/` | Generated system inventory (backed up). |
 | `/run/nestegg/` | Lock file and API socket; `tmp/` (root only) holds the metadata file of a running backup, read-back copies and cancel notes. |
 

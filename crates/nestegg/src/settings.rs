@@ -70,6 +70,9 @@ const TERMINAL_ONLY: &[&str] = &[
     "rate_limit",
     "keep_runs",
     "overview",
+    "notify",
+    "desktop",
+    "command",
     "password",
     "key",
     "editable",
@@ -698,7 +701,17 @@ interval_hours = 24
         assert_eq!(ok.interval_hours, Some(12));
         let null = SettingsPatch::from_json(serde_json::json!({"interval_hours": null})).unwrap();
         assert_eq!(null, patch());
-        for key in ["server", "sources", "auth_id", "encryption", "backup_id"] {
+        // The notification hook runs as root: never editable through the API.
+        for key in [
+            "server",
+            "sources",
+            "auth_id",
+            "encryption",
+            "backup_id",
+            "notify",
+            "command",
+            "desktop",
+        ] {
             let e = SettingsPatch::from_json(serde_json::json!({ key: "x" })).unwrap_err();
             assert!(
                 e.to_string().contains("cannot be changed here"),
@@ -889,6 +902,34 @@ interval_hours = 24
                 .map(|l| l.to_string())
                 .collect(),
         )
+    }
+
+    #[test]
+    fn rewrite_keeps_the_notify_section() {
+        let text = format!(
+            "{COMMENTED}\n[notify]\n# Hook for push messages.\ndesktop = false\n\
+             command = [\"/usr/local/bin/my-hook\", \"arg\"] # runs as root\n"
+        );
+        let new = rewrite(
+            &text,
+            &SettingsPatch {
+                interval_hours: Some(12),
+                ..patch()
+            },
+        )
+        .unwrap();
+        let (added, removed) = diff(&text, &new);
+        assert_eq!(added, ["interval_hours = 12"]);
+        assert_eq!(removed, ["interval_hours = 24"]);
+        let c = Config::parse(&new).unwrap();
+        assert!(!c.notify.desktop);
+        assert_eq!(
+            c.notify.command,
+            Some(vec![
+                "/usr/local/bin/my-hook".to_string(),
+                "arg".to_string()
+            ])
+        );
     }
 
     #[test]

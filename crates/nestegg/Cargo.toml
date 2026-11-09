@@ -43,13 +43,15 @@ rebuilds and offers a terminal interface and a local web interface."""
 section = "admin"
 priority = "optional"
 depends = "$auto, systemd"
-recommends = "proxmox-backup-client | proxmox-backup-client-static"
+recommends = "proxmox-backup-client | proxmox-backup-client-static, libnotify-bin"
 maintainer-scripts = "../../packaging/debian/"
 assets = [
     ["target/release/nestegg", "usr/bin/", "755"],
     ["../../packaging/systemd/nestegg.service", "usr/lib/systemd/system/", "644"],
     ["../../packaging/systemd/nestegg-backup.service", "usr/lib/systemd/system/", "644"],
     ["../../packaging/systemd/nestegg-backup.timer", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/systemd/nestegg-notify.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/systemd/nestegg-notify.timer", "usr/lib/systemd/system/", "644"],
     ["../../packaging/systemd/nestegg.tmpfiles", "usr/lib/tmpfiles.d/nestegg.conf", "644"],
     ["../../packaging/systemd/nestegg.sysusers", "usr/lib/sysusers.d/nestegg.conf", "644"],
     ["../../README.md", "usr/share/doc/nestegg/README.md", "644"],

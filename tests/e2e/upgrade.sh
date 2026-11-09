@@ -82,6 +82,13 @@ else
   on_client nestegg key confirm-exported >/dev/null
 fi
 check "services enable" on_client systemctl enable --now nestegg.service nestegg-backup.timer
+# The old package (merge base) may predate the health check; then the upgrade
+# has to switch its timer on, otherwise it was enabled by the old package.
+if on_client systemctl cat nestegg-notify.timer >/dev/null 2>&1; then
+  echo "  (the old package already has the health check timer)"
+else
+  ok "old package has no health check timer"
+fi
 check "timer unit run succeeds (old)" on_client systemctl start nestegg-backup.service
 check "unit result success (old)" test "$(on_client systemctl show -p Result --value nestegg-backup.service)" == success
 old_run="$(on_client nestegg history --json | sed -n 's/.*"id": "\([^"]*\)".*/\1/p' | head -1)"
@@ -99,6 +106,10 @@ check "daemon still enabled" on_client systemctl is-enabled --quiet nestegg.serv
 check "timer still enabled" on_client systemctl is-enabled --quiet nestegg-backup.timer
 check "daemon running" on_client systemctl is-active --quiet nestegg.service
 check "timer active" on_client systemctl is-active --quiet nestegg-backup.timer
+check "health check timer enabled after the upgrade" on_client systemctl is-enabled --quiet nestegg-notify.timer
+check "health check timer running after the upgrade" on_client systemctl is-active --quiet nestegg-notify.timer
+check "health check unit installed" on_client systemctl cat nestegg-notify.service
+check "health check does nothing to a healthy setup" bash -c "docker exec $client nestegg notify | grep -q 'everything is fine'"
 next="$(timer_next)"
 check "timer still scheduled ($next)" bash -c "[[ -n '$next' && '$next' != infinity ]]"
 pid_after="$(daemon_pid)"
@@ -150,6 +161,7 @@ check "binary removed" bash -c "! docker exec $client test -e /usr/bin/nestegg"
 check "units removed" bash -c "! docker exec $client test -e /usr/lib/systemd/system/nestegg.service"
 check "daemon stopped" bash -c "! docker exec $client systemctl is-active --quiet nestegg.service"
 check "timer stopped" bash -c "! docker exec $client systemctl is-active --quiet nestegg-backup.timer"
+check "health check timer stopped" bash -c "! docker exec $client systemctl is-active --quiet nestegg-notify.timer"
 check "configuration and credentials kept after remove" test "$(config_sums)" == "$sums_before"
 check "run history kept after remove" on_client test -f "/var/lib/nestegg/runs/$old_run.json"
 
@@ -168,6 +180,8 @@ check "daemon enabled again after reinstall" on_client systemctl is-enabled --qu
 check "timer enabled again after reinstall" on_client systemctl is-enabled --quiet nestegg-backup.timer
 check "daemon running again after reinstall" on_client systemctl is-active --quiet nestegg.service
 check "timer running again after reinstall" on_client systemctl is-active --quiet nestegg-backup.timer
+check "health check timer enabled again after reinstall" on_client systemctl is-enabled --quiet nestegg-notify.timer
+check "health check timer running again after reinstall" on_client systemctl is-active --quiet nestegg-notify.timer
 check "enable marker consumed" absent_in /var/lib/nestegg enabled-units
 check "check passes with the kept setup" on_client nestegg check
 check "history still lists the earlier run" bash -c "docker exec $client nestegg history --json | grep -q '\"id\": \"$old_run\"'"
@@ -175,10 +189,16 @@ check "history still lists the earlier run" bash -c "docker exec $client nestegg
 echo "== a unit disabled before removal stays disabled"
 check "timer disabled by the user" on_client systemctl disable --now nestegg-backup.timer
 check "package removes again" apt_in_client remove -y -q nestegg
-check "marker lists only the daemon" test "$(on_client cat /var/lib/nestegg/enabled-units)" == nestegg.service
+check "marker lists the daemon and the health check, not the backup timer" test "$(on_client cat /var/lib/nestegg/enabled-units)" == $'nestegg.service\nnestegg-notify.timer'
 check "package reinstalls again" apt_in_client install -y -q /tmp/nestegg-new.deb
 check "timer still disabled" test "$(on_client systemctl is-enabled nestegg-backup.timer || true)" == disabled
 check "daemon enabled again" test "$(on_client systemctl is-enabled nestegg.service || true)" == enabled
+check "health check timer enabled again" test "$(on_client systemctl is-enabled nestegg-notify.timer || true)" == enabled
+
+echo "== a health check timer switched off by the user stays off on an upgrade"
+check "health check timer disabled by the user" on_client systemctl disable --now nestegg-notify.timer
+check "same package reinstalls over itself (health check timer)" apt_in_client install -y -q --reinstall /tmp/nestegg-new.deb
+check "health check timer still disabled" test "$(on_client systemctl is-enabled nestegg-notify.timer || true)" == disabled
 
 echo "== a stale marker is ignored on an upgrade"
 # A marker can be left behind, for example when an older package version

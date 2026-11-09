@@ -1,0 +1,26 @@
+[Unit]
+Description=nestegg backup health check (tells users when backups fail or stop)
+Documentation=file:/usr/share/doc/nestegg/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nestegg notify
+Nice=10
+# The command hook gets 60 s, every desktop user 15 s.
+TimeoutStartSec=5min
+
+# Sandboxing. This unit has to change to other users (to run their
+# notify-send on their session bus below /run/user) and starts the
+# administrator's hook command, which may need the network, a mail
+# submission program or any file on the system. So, as for the other units
+# (docs/decisions/0007-systemd-unit-sandboxing.md), no option may hide,
+# replace or lock paths or identities, and in addition none may restrict
+# networking or privilege gain: NoNewPrivileges=yes would switch off the
+# set-group-ID bit of mail programs such as Postfix's sendmail, and
+# PrivateNetwork or RestrictAddressFamilies would break a push-message hook.
+# crates/nestegg/tests/units.rs enforces this.
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=~CAP_SYS_MODULE
+SystemCallFilter=~@module

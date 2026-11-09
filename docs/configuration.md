@@ -81,6 +81,12 @@ excludes = ["**/.cache", "**/node_modules", "**/.local/share/Trash"]
 [schedule]
 interval_hours = 24
 
+# Optional: how problems are reported (see "Notifications"). Root-only; the
+# web UI cannot change it.
+# [notify]
+# desktop = true                          # notification for logged-in users
+# command = ["/usr/local/bin/my-hook"]    # runs as root, no shell
+
 # Optional: read-only token for the overview of all machines in the
 # namespace (role DatastoreAudit or DatastoreReader on the namespace).
 # Store its secret with: sudo nestegg credentials set-password --overview
@@ -167,7 +173,8 @@ The daemon identifies the caller by the socket credentials:
   apply from the next run on.
 - Everything else stays terminal-only (root): server, port, datastore,
   namespace, auth id, fingerprint, backup id, credentials, encryption and
-  the key, sources, the `[wake]` details and the overview credentials.
+  the key, sources, the `[wake]` details, the overview credentials and the
+  `[notify]` section (its command runs as root).
   Anyone who could change these could send the backups of this computer to
   another server ([decision 0013](decisions/0013-editable-settings-in-the-web-ui.md)).
   Edit the file with `sudo`, then run `sudo nestegg check`.
@@ -185,6 +192,94 @@ The daemon identifies the caller by the socket credentials:
 The overview of all machines reads each machine's last snapshot and the
 status report stored in its notes (display only). Without `[overview]` credentials only the
 machine's own backups are visible.
+
+## Notifications
+
+Nobody should have to open a dashboard to learn that backups stopped.
+`nestegg-notify.timer` runs `nestegg notify` every hour (and the backup unit
+runs it right after each backup, so a failure is reported within seconds).
+The package enables the timer; it does nothing while nestegg is not set up.
+Switch it off with `sudo systemctl disable --now nestegg-notify.timer`.
+
+| Message | When | Repeated |
+|---|---|---|
+| `failing` – "Backup failed" | The last backup failed. The message names the reason. | every 24 h |
+| `overdue` – "Backups are overdue" | No successful backup within `overdue_after_hours` (this includes a server that stays unreachable, and a setup that never succeeded). | every 24 h; every 7 days while automatic backups are switched off |
+| `incomplete` – "Backup is incomplete" | The last backup worked but left something out (for example the full system backup was skipped). | every 7 days |
+| `damaged` – "Damaged backups on the server" | The server's own verification reports damaged snapshots of this computer. | every 24 h |
+| `recovered` – "Backups work again" | Everything is fine again after one of the above was reported. | once |
+
+A different problem (another error, another kind) is reported at once. Each
+message goes to every logged-in user and, if configured, to your command;
+someone who logs in later still gets it once. Nothing is reported while a
+backup is running. An unreachable server alone is not reported on every
+attempt, only when it becomes `overdue`.
+A configuration file that cannot be read (a typo, an unknown key) is reported
+as `failing` with the parser's message; the `[notify]` section is still
+honoured in that case, if it is valid.
+
+**Desktop** (`[notify] desktop = true`, the default): every logged-in user
+with a session bus gets a notification (`notify-send` from the package
+`libnotify-bin`, run as that user). `failing`, `overdue` and `damaged` are
+marked critical. The texts are German when the system language is German
+(`LANG=de…` in `/etc/default/locale` or `/etc/locale.conf`), otherwise
+English. No `notify-send`, no session: nothing is sent and the check logs it
+(`journalctl -u nestegg-notify.service`).
+
+**Command** (`[notify] command`, off by default): a program with arguments
+(a list, no shell), run as root with a 60 second limit, for every message:
+
+| Variable | Content |
+|---|---|
+| `NESTEGG_EVENT` | `failing`, `overdue`, `incomplete`, `damaged`, `recovered` or `test` |
+| `NESTEGG_TITLE`, `NESTEGG_MESSAGE` | The short title and the text (also on stdin) |
+| `NESTEGG_HOSTNAME` | Host name of this computer |
+| `NESTEGG_LAST_SUCCESS` | Time of the last successful backup (RFC 3339), or empty |
+
+If the command fails or does not finish, the check logs it and tries again
+an hour later; the desktop message is not held back. Example with a push
+service (ntfy; the host name is a placeholder):
+
+```toml
+[notify]
+command = ["/usr/local/bin/nestegg-ntfy"]
+```
+
+```sh
+#!/bin/sh
+# /usr/local/bin/nestegg-ntfy  (chmod 755)
+case "$NESTEGG_EVENT" in
+  failing|overdue|damaged) priority=high ;;
+  *) priority=default ;;
+esac
+{ printf '%s: %s\n\n' "$NESTEGG_HOSTNAME" "$NESTEGG_TITLE"; cat; } |
+  curl -fsS --max-time 30 -H "Title: nestegg" -H "Priority: $priority" \
+       --data-binary @- https://ntfy.example.com/my-backups
+```
+
+By mail (needs a working `mail` command and a mail setup that delivers
+outside this computer; the address is a placeholder):
+
+```toml
+[notify]
+command = ["/usr/local/bin/nestegg-mail"]
+```
+
+```sh
+#!/bin/sh
+# /usr/local/bin/nestegg-mail  (chmod 755)
+exec mail -s "$NESTEGG_HOSTNAME: $NESTEGG_TITLE" admin@example.com
+```
+
+Try it, and see what would be sent right now, with:
+
+```sh
+sudo nestegg notify --test       # a test message through all channels
+sudo nestegg notify --dry-run    # what the check would send; changes nothing
+```
+
+The command can not be set from the web UI, because it runs as root
+([decision 0017](decisions/0017-notifications.md)).
 
 ## Secrets
 
@@ -304,14 +399,15 @@ made with the current key then need its exported copy to be restored.
 | Path | Content |
 |---|---|
 | `/var/lib/nestegg/state.json` | Last run, last success, key status |
+| `/var/lib/nestegg/notify.json` | What `nestegg notify` has already reported to whom (can be deleted) |
 | `/var/lib/nestegg/runs/` | Run history (`<id>.json`) and logs (`<id>.log`) |
 | `/var/lib/nestegg/inventory/` | Generated inventory, backed up as `inventory.pxar` |
 | `/run/nestegg/api.sock` | Local API (group `nestegg`) |
 
 ## Removing the package
 
-`sudo apt remove nestegg` stops and disables the daemon and the timer and
-removes the program. **`apt purge` does not delete more:** the
+`sudo apt remove nestegg` stops and disables the daemon and the timers
+(backup and notification check) and removes the program. **`apt purge` does not delete more:** the
 configuration and the encryption key in `/etc/nestegg/` and the run history
 in `/var/lib/nestegg/` stay on disk in both cases. Deleting the key would make
 every existing backup unreadable if no exported copy is at hand.

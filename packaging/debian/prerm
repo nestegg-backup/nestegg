@@ -5,7 +5,7 @@ if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
     # Remember which units were enabled, so that installing the package again
     # enables them again (postinst). The state directory is kept on removal.
     enabled=""
-    for unit in nestegg.service nestegg-backup.timer; do
+    for unit in nestegg.service nestegg-backup.timer nestegg-notify.timer; do
         if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
             enabled="$enabled $unit"
         fi
@@ -17,6 +17,6 @@ if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
     else
         rm -f "$marker"
     fi
-    systemctl disable --now nestegg-backup.timer nestegg.service >/dev/null 2>&1 || true
+    systemctl disable --now nestegg-backup.timer nestegg-notify.timer nestegg.service >/dev/null 2>&1 || true
 fi
 exit 0
