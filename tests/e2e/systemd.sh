@@ -32,25 +32,12 @@ as_alice() { docker exec -u alice "$client" "$@"; }
 
 echo "== building images"
 build_pbs_image
-DOCKER_BUILDKIT=0 docker build -q -t nestegg-e2e-client:ubuntu-24.04 -f "$here/client.Dockerfile" "$here" >/dev/null
-DOCKER_BUILDKIT=0 docker build -q -t nestegg-e2e-systemd -f "$here/systemd-client.Dockerfile" "$here" >/dev/null
+build_systemd_images
 
 start_pbs
 
 echo "== starting systemd client and installing $(basename "$deb")"
-# CAP_SYS_ADMIN and no seccomp/AppArmor confinement let systemd create mount
-# namespaces. Without them systemd silently ignores the units' mount
-# sandboxing options, and the sandbox checks below would pass even with
-# options that hide paths (see docs/decisions/0007-systemd-unit-sandboxing.md).
-docker run -d -t --name "$client" --network "$net" --cgroupns=host \
-  --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
-  -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
-  -v "$deb:/tmp/nestegg.deb:ro" nestegg-e2e-systemd >/dev/null
-for _ in $(seq 1 30); do
-  state="$(on_client systemctl is-system-running 2>/dev/null || true)"
-  [[ "$state" == running || "$state" == degraded ]] && break
-  sleep 1
-done
+start_systemd_client -v "$deb:/tmp/nestegg.deb:ro"
 check "systemd enforces mount sandboxing" bash -c "docker exec $client systemd-run --quiet --wait --pipe \
   -p ProtectHome=read-only touch /root/.sandbox-probe 2>&1 | grep -q 'Read-only file system'"
 # shared/ is setgid: restores through the daemon unit must handle the bit.

@@ -99,6 +99,34 @@ start_pbs() {
   done
 }
 
+# Images for the package tests: the Ubuntu client and, on top of it, the
+# same client with systemd as PID 1.
+build_systemd_images() {
+  DOCKER_BUILDKIT=0 docker build -q -t nestegg-e2e-client:ubuntu-24.04 -f "$here/client.Dockerfile" "$here" >/dev/null
+  DOCKER_BUILDKIT=0 docker build -q -t nestegg-e2e-systemd -f "$here/systemd-client.Dockerfile" "$here" >/dev/null
+}
+
+# Start "$client" with systemd as PID 1 and wait until it has booted. It needs
+# the host cgroup namespace (--cgroupns=host, writable /sys/fs/cgroup), so
+# only run this on a disposable test machine. Extra arguments go to
+# `docker run` (e.g. -v mounts for the packages).
+# CAP_SYS_ADMIN and no seccomp/AppArmor confinement let systemd create mount
+# namespaces. Without them systemd silently ignores the units' mount
+# sandboxing options, and sandbox checks would pass even with options that
+# hide paths (see docs/decisions/0007-systemd-unit-sandboxing.md).
+start_systemd_client() {
+  docker run -d -t --name "$client" --network "$net" --cgroupns=host \
+    --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+    -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
+    "$@" nestegg-e2e-systemd >/dev/null
+  local state
+  for _ in $(seq 1 30); do
+    state="$(on_client systemctl is-system-running 2>/dev/null || true)"
+    [[ "$state" == running || "$state" == degraded ]] && break
+    sleep 1
+  done
+}
+
 result() {
   echo
   echo "== result: $pass passed, $fail failed"

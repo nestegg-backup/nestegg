@@ -167,3 +167,6 @@ access. The end-to-end test boots everything in VMs:
 sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso debian-btrfs-uefi
 sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso ubuntu-ext4-bios-luks
 ```
+
+CI runs both variants weekly, on pull requests that touch the rescue code
+(`.github/workflows/rescue.yml`) and before every release.

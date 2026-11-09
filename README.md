@@ -35,13 +35,18 @@ cargo test                                   # unit and integration tests
 cargo clippy --all-targets -- -D warnings
 cargo build && tests/e2e/run.sh              # real PBS + client in containers
 cargo deb -p nestegg && tests/e2e/systemd.sh # package + systemd services
+tests/e2e/upgrade.sh old.deb new.deb         # package upgrade, remove, purge
 ```
 
 The end-to-end scripts start a disposable Proxmox Backup Server from the
 official packages in Docker; nothing outside the containers is touched.
-`systemd.sh` needs the host cgroup namespace and runs its systemd container
-with `CAP_SYS_ADMIN` and without seccomp/AppArmor confinement (so the units'
-sandboxing really applies); only run it on a disposable machine or CI runner. Setup and configuration:
+`systemd.sh` and `upgrade.sh` need the host cgroup namespace and run their
+systemd container with `CAP_SYS_ADMIN` and without seccomp/AppArmor
+confinement (so the units' sandboxing really applies); only run them on a
+disposable machine or CI runner. `upgrade.sh` installs the old package, backs
+up, installs the new one over it and checks that setup and history survive;
+the old package needs a lower version (CI builds it from the merge base with
+`cargo deb --deb-version <version>~base`). Setup and configuration:
 [docs/configuration.md](docs/configuration.md).
 
 "Proxmox" is a registered trademark of Proxmox Server Solutions GmbH. nestegg
