@@ -5,7 +5,7 @@ scratch, the nestegg rescue stick puts the complete system back from the
 Proxmox Backup Server: partitions, files, users, settings, boot loader.
 
 Decision and scope: [decisions/0006](decisions/0006-bare-metal-restore-rescue-stick.md),
-target disk guard: [decisions/0007](decisions/0007-rescue-target-disk-guard.md).
+target disk guard: [decisions/0010](decisions/0010-rescue-target-disk-guard.md).
 
 ## Before you need it
 
@@ -52,8 +52,8 @@ target disk guard: [decisions/0007](decisions/0007-rescue-target-disk-guard.md).
 5. Check the plan and type the disk name (e.g. `nvme0n1`) to start. Only now
    is the disk erased. The plan lists what is currently on the disk. A disk
    that is not empty needs a second confirmation: type `ERASE <name>`
-   (e.g. `ERASE sdb`). Disks that are mounted or in use by active LVM or
-   encryption are refused.
+   (e.g. `ERASE sdb`). Disks that are mounted, used as swap, or in use by
+   active LVM, encryption or RAID are refused.
 6. Remove the stick and restart.
 
 The restored system contains a report of what was changed:

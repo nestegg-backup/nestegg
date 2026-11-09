@@ -515,6 +515,10 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             wake_send_failed = true;
             rep.warn(msg.to_string());
         }
+        WakeEvent::SendRecovered => {
+            wake_send_failed = false;
+            rep.line(&event.to_string());
+        }
     })?;
     if rep.cancelled() {
         return Ok(());

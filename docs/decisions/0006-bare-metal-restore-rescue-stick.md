@@ -1,6 +1,6 @@
 # 0006 – Bare-metal restore with a rescue stick
 
-- Status: accepted
+- Status: accepted (target disk guard, point 5, changed by 0010)
 - Date: 2026-11-08
 - Changes: decision 0003 ("Disk images and bare-metal restore" out of scope)
 

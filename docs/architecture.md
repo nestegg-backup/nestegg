@@ -64,7 +64,7 @@ directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
    `pbs_unreachable` (distinct from failure); the timer retries next time.
    A packet that cannot be sent (no network) is a warning, not an error:
    the run keeps retrying it while it polls and ends the same way
-   (decision 0007).
+   ([decision 0009](decisions/0009-wake-on-lan-send-failure.md)).
 4. Generate the system inventory into `/var/lib/nestegg/inventory/`
    (package selections, manually installed packages, Flatpak/Snap lists,
    enabled units, `lsblk`/`findmnt` output, OS release).

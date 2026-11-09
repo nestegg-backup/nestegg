@@ -156,7 +156,7 @@ Stored in `/etc/nestegg/credentials/` (mode 0700):
 are sealed to this computer's TPM when it has one, plus systemd's host key
 (`/var/lib/systemd/credential.secret`), but not to any PCR: Secure Boot
 changes and firmware updates do not make them unreadable
-([decision 0007](decisions/0007-credentials-without-pcr-binding.md)). If the
+([decision 0008](decisions/0008-credentials-without-pcr-binding.md)). If the
 TPM is present but not usable, the host key alone is used. Without
 `systemd-creds` (e.g. Ubuntu 22.04 / Linux Mint 21 with systemd 249), pass
 `--allow-plain` to store a root-only file instead. Secrets reach

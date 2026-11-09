@@ -567,6 +567,14 @@ fn wizard() -> Result<u8> {
         bail!("no usable disk found (the disk of the rescue stick is not offered)");
     }
     let uefi = booted_uefi();
+    // Problems no disk size can fix (unsupported layout or boot loader, ...)
+    // are reported now, instead of listing every disk as too small.
+    let unlimited = Target {
+        size_bytes: 1 << 60,
+        ..target(&disks[0], uefi, archive_bytes)
+    };
+    make_plan(&inventory.layout, &unlimited, false)
+        .context("this backup cannot be restored onto any disk")?;
     let rated: Vec<(guard::Assessment, bool)> = disks
         .iter()
         .map(|d| {
