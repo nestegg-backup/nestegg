@@ -153,7 +153,7 @@ pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
                 String::new()
             } else {
                 "export the key, then run `nestegg key confirm-exported --file <copy>` \
-                 (or `--paper-code <code>`)"
+                 (or, for a printed paper key, `--paper-code <code> --printed`)"
                     .into()
             },
         );
