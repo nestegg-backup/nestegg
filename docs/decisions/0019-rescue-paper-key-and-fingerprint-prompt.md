@@ -204,3 +204,45 @@ A re-check of the changes above found more:
    a drive 20 seconds to mount.
 6. The warning for a backup that is signed but not encrypted no longer says
    that the key cannot vouch for it (it did verify the signature).
+
+## Amendment: third review (2026-11-10)
+
+1. **Every text from a drive or the server is printed safely.** Besides
+   settings values, the following also pass through the replacement of
+   control characters by `?`: the names of key files found on drives (the
+   list, the copy made for a medium that is unmounted afterwards - a number
+   in the list now selects a file whose name cannot be typed - and error
+   messages that name the file), disk model, serial number and file system
+   labels, the names of computers and backups offered by the server (a
+   name with control characters is not offered at all, a PBS never makes
+   one), and the messages of the client and of file operations (also those
+   that leave `nestegg rescue restore` as its error). Texts nestegg composes
+   itself from such values (plan, warnings, report) are printed with line
+   breaks kept and all other control characters replaced.
+2. **One classification of failures.** `is_key_problem` looked for the bare
+   word "key" and took host names and hints for key trouble. It is gone.
+   `classify_failure` decides from the cause at the bottom of the error
+   (never from the context around it, which contains snapshot and host
+   names) and only by phrases that mean key trouble (`client_blames_the_key`:
+   wrong or missing key, "provided key", signature that cannot be verified or
+   missing, decrypt, base64, wrong or short fingerprint).
+3. **A third class: this backup cannot be used.** `Unusable` is the error of
+   a backup that no key and no second try can cure: the mix of protected and
+   unprotected archives, an archive missing from the manifest, no or invalid
+   disk layout. The wizard says so and pre-selects "Choose another backup"
+   (also after a declined backup); "Try again" stays the default only for
+   network and server errors.
+4. **The weakest crypt mode of an archive counts.** A split archive
+   (`.mpxar`/`.ppxar`) was taken with its first mode that was not `encrypt`,
+   so `sign-only` plus `none` was recorded as `sign-only` and the mixed
+   backup was not refused. Modes are ranked (`none` < `sign-only` and
+   unknown modes < `encrypt`); the order of the files no longer matters.
+5. **Tests.** Unit tests for the four points (file names with escape
+   sequences, table of client messages including names with "key", menu
+   default for an unusable backup, split archives in both orders). The VM
+   test pushes a backup that is only signed with the right key next to the
+   decoy; both are refused by default in the wizard and by `rescue
+   restore`, the signed one is read with `--allow-unprotected-backup`
+   (dry run), and the wizard's menu after a backup without disk layout
+   defaults to another backup. The real client makes one crypt mode per run,
+   so a backup that mixes modes cannot be produced for the VM test.

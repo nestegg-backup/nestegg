@@ -12,9 +12,9 @@ use super::exec::{self, Job, Runner};
 use super::guard;
 use super::plan::{Target, human, make_plan};
 use super::{
-    Disk, FoundSettings, Inventory, Protection, Session, Settings, ask, ask_secret, ask_yes,
-    booted_uefi, choose, fetch_fingerprint, list_disks, paperkey, protection_label, scan_media,
-    work_dir,
+    Disk, FailureKind, FoundSettings, Inventory, Protection, Session, Settings, ask, ask_secret,
+    ask_yes, booted_uefi, choose, classify_failure, fetch_fingerprint, list_disks, paperkey,
+    printable_block, protection_label, scan_media, shown_path, work_dir,
 };
 use crate::client::RestoreKey;
 use crate::secrets::Secret;
@@ -92,10 +92,23 @@ pub struct RestoreArgs {
     pub erase_data_disk: bool,
 }
 
+/// Print a message on the console. Texts that contain names from an attached
+/// drive or words from the backup server must not carry escape sequences
+/// (they could rewrite the lines above).
+fn say(text: impl AsRef<str>) {
+    eprintln!("{}", printable_block(text.as_ref()));
+}
+
+/// An error whose message is safe to print: the messages of the client and of
+/// file operations contain names that come from drives and the server.
+fn printable_error(e: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!("{}", printable_block(&format!("{e:#}")))
+}
+
 pub fn run(cmd: Option<RescueCmd>) -> Result<u8> {
     match cmd.unwrap_or(RescueCmd::Wizard) {
-        RescueCmd::Wizard => wizard(),
-        RescueCmd::Restore(args) => restore(*args),
+        RescueCmd::Wizard => wizard().map_err(printable_error),
+        RescueCmd::Restore(args) => restore(*args).map_err(printable_error),
         RescueCmd::Disks => {
             for d in list_disks()? {
                 let a = guard::assess(&d, &[], &[]);
@@ -153,7 +166,7 @@ fn disk_entry(d: &Disk, a: &guard::Assessment, fits: Option<bool>, backup_time: 
     for l in a.lines(backup_time) {
         s.push_str(&format!("\n        - {l}"));
     }
-    s
+    printable_block(&s)
 }
 
 fn require_root() -> Result<()> {
@@ -174,7 +187,7 @@ fn read_secret_file(path: &Path) -> Result<Secret> {
 }
 
 fn ensure_reachable(session: &Session) -> Result<()> {
-    match crate::wake::ensure_available(&session.config, |e| eprintln!("{e}"))? {
+    match crate::wake::ensure_available(&session.config, |e| say(e.to_string()))? {
         crate::wake::Availability::Unreachable => bail!(
             "the PBS {}:{} does not answer",
             session.config.pbs.server,
@@ -320,19 +333,9 @@ fn restore(a: RestoreArgs) -> Result<u8> {
 fn read_key_file(path: &Path) -> Result<Secret> {
     let key = super::read_key(path)?;
     if let Some(note) = &key.note {
-        eprintln!("{}: {note}", path.display());
+        say(format!("{}: {note}", shown_path(path)));
     }
     Ok(Secret::new(key.json.into_bytes()))
-}
-
-/// Does this error from reading a backup come from the encryption key
-/// (wrong, missing, or not usable)? "error decoding base64 data" is what
-/// the client says about a damaged `data` value.
-fn is_key_problem(e: &anyhow::Error) -> bool {
-    let m = format!("{e:#}").to_lowercase();
-    ["key", "decrypt", "signature", "base64"]
-        .iter()
-        .any(|w| m.contains(w))
 }
 
 /// A certificate fingerprint read from a settings file, with the file it
@@ -470,7 +473,7 @@ fn run_restore(
 ) -> Result<u8> {
     let layout = &inventory.layout;
     let selections = &inventory.selections;
-    eprintln!(
+    say(format!(
         "Backed-up system: {} ({}), {} boot, {}",
         if layout.os_name.is_empty() {
             &layout.os_id
@@ -480,7 +483,7 @@ fn run_restore(
         layout.hostname,
         layout.boot_mode.to_uppercase(),
         human(layout.used_bytes())
-    );
+    ));
     let plan = make_plan(
         layout,
         &target(disk, booted_uefi(), archive_bytes),
@@ -504,16 +507,19 @@ fn run_restore(
         ));
     }
     eprintln!();
-    eprintln!("{}", plan.describe());
+    say(plan.describe());
     if !contents.trim().is_empty() {
-        eprintln!("Current content of {} (will be erased):", plan.disk);
-        eprintln!("{}", contents.trim_end());
+        say(format!(
+            "Current content of {} (will be erased):",
+            plan.disk
+        ));
+        say(contents.trim_end());
     }
     if assessment.holds_data() {
-        eprintln!("{}", guard::warning(disk, assessment, backup_time));
+        say(guard::warning(disk, assessment, backup_time));
     }
     for w in &warnings {
-        eprintln!("Warning: {w}");
+        say(format!("Warning: {w}"));
     }
     if dry_run {
         eprintln!("Dry run: nothing was changed.");
@@ -537,14 +543,14 @@ fn run_restore(
         luks_passphrase: luks,
         dpkg_selections: selections.as_deref(),
     };
-    match exec::execute(&job, &mut runner, &mut |m| eprintln!("{m}")) {
+    match exec::execute(&job, &mut runner, &mut |m| say(m)) {
         Ok(report) => {
             eprintln!();
             for n in &report.notes {
-                eprintln!("  - {n}");
+                say(format!("  - {n}"));
             }
             for w in warnings.iter().chain(&report.warnings) {
-                eprintln!("  Warning: {w}");
+                say(format!("  Warning: {w}"));
             }
             eprintln!();
             eprintln!(
@@ -556,7 +562,7 @@ fn run_restore(
         }
         Err(e) => {
             eprintln!();
-            eprintln!("Restore FAILED: {e:#}");
+            say(format!("Restore FAILED: {e:#}"));
             eprintln!("Details: {}", log_path.display());
             Ok(1)
         }
@@ -591,7 +597,7 @@ fn wizard() -> Result<u8> {
     eprintln!("Looking for settings and keys on the attached drives ...");
     let media = scan_media();
     for note in &media.notes {
-        eprintln!("{note}");
+        say(note);
     }
     let keys = media.keys.clone();
     let chosen = choose_settings(&media.settings)?;
@@ -638,9 +644,9 @@ fn wizard() -> Result<u8> {
         settings.wake_mac = (mac != "-" && !mac.is_empty()).then_some(mac);
         // Wake a sleeping PBS before asking it for its certificate.
         if let Ok(c) = settings.to_config()
-            && let Err(e) = crate::wake::ensure_available(&c, |ev| eprintln!("{ev}"))
+            && let Err(e) = crate::wake::ensure_available(&c, |ev| say(ev.to_string()))
         {
-            eprintln!("Wake-on-LAN failed: {e:#}");
+            say(format!("Wake-on-LAN failed: {e:#}"));
         }
         match fetch_fingerprint(&settings.server, settings.port) {
             Ok(fp) => {
@@ -654,7 +660,7 @@ fn wizard() -> Result<u8> {
                         });
                 trusted = decide_fingerprint(&fp, saved, trusted.as_deref(), &mut ask_yes)?;
             }
-            Err(e) => eprintln!("Could not read the certificate: {e:#}"),
+            Err(e) => say(format!("Could not read the certificate: {e:#}")),
         }
         // Only a confirmed fingerprint is ever pinned (never one taken
         // unconfirmed from a settings file).
@@ -664,12 +670,12 @@ fn wizard() -> Result<u8> {
         let session = match Session::new(&settings, &password, key.as_ref()) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Invalid settings: {e:#}\n");
+                say(format!("Invalid settings: {e:#}\n"));
                 continue;
             }
         };
         if let Err(e) = ensure_reachable(&session) {
-            eprintln!("{e:#}\n");
+            say(format!("{e:#}\n"));
             continue;
         }
         let machines = match session.machines() {
@@ -679,7 +685,7 @@ fn wizard() -> Result<u8> {
                 continue;
             }
             Err(e) => {
-                eprintln!("Login or listing failed: {e:#}");
+                say(format!("Login or listing failed: {e:#}"));
                 if settings.fingerprint.is_none() {
                     eprintln!(
                         "(No certificate was trusted. If the PBS uses its own certificate, \
@@ -749,22 +755,10 @@ fn wizard() -> Result<u8> {
                 Err(f) => f,
             };
             eprintln!();
-            let default = match &failure {
-                Failure::Key(e) => {
-                    eprintln!("{e:#}");
-                    eprintln!("The encryption key does not fit this backup (or none was given).");
-                    0
-                }
-                Failure::Declined => {
-                    eprintln!("This backup is not restored.");
-                    1
-                }
-                Failure::Other(e) => {
-                    eprintln!("{e:#}");
-                    eprintln!("The backup could not be read.");
-                    2
-                }
-            };
+            let default = failure.menu_default();
+            for line in failure.explanation() {
+                say(line);
+            }
             eprintln!("Nothing was changed.");
             let options = [
                 "Enter or select another key".to_string(),
@@ -773,12 +767,12 @@ fn wizard() -> Result<u8> {
                 "Quit without changing anything".to_string(),
             ];
             match choose("What now", &options, Some(default))? {
-                0 => {
+                MENU_OTHER_KEY => {
                     let key = choose_key(&keys)?;
                     session.set_key(key.as_ref())?;
                 }
-                1 => continue 'backup,
-                2 => {}
+                MENU_OTHER_BACKUP => continue 'backup,
+                MENU_RETRY => {}
                 _ => {
                     eprintln!("Stopped, nothing was changed.");
                     return Ok(1);
@@ -834,7 +828,7 @@ fn wizard() -> Result<u8> {
             break (disks[d].clone(), a.clone());
         }
         eprintln!();
-        eprintln!("{}", guard::warning(&disks[d], a, &backup_time));
+        say(guard::warning(&disks[d], a, &backup_time));
         if ask_yes("Use this disk anyway?", false)? {
             break (disks[d].clone(), a.clone());
         }
@@ -902,13 +896,61 @@ fn wizard() -> Result<u8> {
     Ok(code)
 }
 
+/// The answers of the "What now" menu after a backup could not be used.
+const MENU_OTHER_KEY: usize = 0;
+const MENU_OTHER_BACKUP: usize = 1;
+const MENU_RETRY: usize = 2;
+
 /// Why the chosen backup is not restored (yet).
 enum Failure {
     /// The key does not open it, or none was given for an encrypted backup.
     Key(anyhow::Error),
     /// Not protected by the key, and the user did not accept that.
     Declined,
+    /// This backup can never be restored (a mix of protected and unprotected
+    /// archives, an archive or the disk layout missing): no key and no
+    /// second try will change that.
+    Unusable(anyhow::Error),
     Other(anyhow::Error),
+}
+
+impl Failure {
+    /// Sort an error from reading a backup (see [`classify_failure`]).
+    fn from_error(e: anyhow::Error) -> Failure {
+        match classify_failure(&e) {
+            FailureKind::Key => Failure::Key(e),
+            FailureKind::Unusable => Failure::Unusable(e),
+            FailureKind::Other => Failure::Other(e),
+        }
+    }
+
+    /// The answer of the menu that can help (0-based). Never "try again"
+    /// for something a retry cannot cure.
+    fn menu_default(&self) -> usize {
+        match self {
+            Failure::Key(_) => MENU_OTHER_KEY,
+            Failure::Declined | Failure::Unusable(_) => MENU_OTHER_BACKUP,
+            Failure::Other(_) => MENU_RETRY,
+        }
+    }
+
+    /// What to tell the user before the menu.
+    fn explanation(&self) -> Vec<String> {
+        match self {
+            Failure::Key(e) => vec![
+                format!("{e:#}"),
+                "The encryption key does not fit this backup (or none was given).".into(),
+            ],
+            Failure::Declined => vec!["This backup is not restored.".into()],
+            Failure::Unusable(e) => vec![
+                format!("{e:#}"),
+                "This backup cannot be restored, with any key and however often you try. \
+                 Choose another backup."
+                    .into(),
+            ],
+            Failure::Other(e) => vec![format!("{e:#}"), "The backup could not be read.".into()],
+        }
+    }
 }
 
 /// Check the key against `snapshot` (see [`Session::check_key`]), ask before
@@ -918,14 +960,7 @@ fn prepare_backup(
     snapshot: &str,
     yes_no: &mut dyn FnMut(&str, bool) -> Result<bool>,
 ) -> std::result::Result<(Inventory, RestoreKey), Failure> {
-    let classify = |e: anyhow::Error| {
-        if is_key_problem(&e) {
-            Failure::Key(e)
-        } else {
-            Failure::Other(e)
-        }
-    };
-    let protection = session.check_key(snapshot).map_err(classify)?;
+    let protection = session.check_key(snapshot).map_err(Failure::from_error)?;
     if !accept_protection(&protection, yes_no).map_err(Failure::Other)? {
         return Err(if protection == Protection::KeyMissing {
             Failure::Key(anyhow::anyhow!(
@@ -938,7 +973,7 @@ fn prepare_backup(
     let restore_key = protection.restore_key(session.key());
     let inventory = session
         .inventory(snapshot, restore_key.duplicate())
-        .map_err(classify)?;
+        .map_err(Failure::from_error)?;
     Ok((inventory, restore_key))
 }
 
@@ -972,6 +1007,26 @@ fn accept_protection(
     }
 }
 
+/// The list of key files found on the media, numbered. File names come
+/// from the drive: control characters are shown as '?', so a number selects a
+/// file whose name cannot be typed.
+fn key_list(found: &[PathBuf]) -> (&'static str, Vec<String>) {
+    (
+        "Key files and paper keys found on attached media:",
+        found
+            .iter()
+            .enumerate()
+            .map(|(i, k)| format!("  {}) {}", i + 1, shown_path(k)))
+            .collect(),
+    )
+}
+
+/// The file of that number in [`key_list`], if `answer` is one.
+fn key_by_number<'a>(answer: &str, found: &'a [PathBuf]) -> Option<&'a Path> {
+    let n: usize = answer.trim().parse().ok()?;
+    found.get(n.checked_sub(1)?).map(PathBuf::as_path)
+}
+
 /// Where the encryption key comes from: a key file or saved paper key on
 /// attached media or at a given path, or the paper key typed by hand.
 fn choose_key(found: &[PathBuf]) -> Result<Option<Secret>> {
@@ -980,15 +1035,21 @@ fn choose_key(found: &[PathBuf]) -> Result<Option<Secret>> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "type".into());
     if !found.is_empty() {
-        eprintln!("Key files and paper keys found on attached media:");
-        for k in found {
-            eprintln!("  {}", k.display());
+        let (head, lines) = key_list(found);
+        eprintln!("{head}");
+        for l in lines {
+            eprintln!("{l}");
         }
     }
     loop {
         eprintln!(
-            "Encryption key: the path of a key file or a saved paper key, \
-             'type' to type the paper key by hand, '-' if the backup is not encrypted."
+            "Encryption key: the path of a key file or a saved paper key{}, \
+             'type' to type the paper key by hand, '-' if the backup is not encrypted.",
+            if found.is_empty() {
+                ""
+            } else {
+                " (or its number in the list)"
+            }
         );
         let answer = ask("Encryption key", Some(&default))?;
         if answer == "-" {
@@ -1000,10 +1061,13 @@ fn choose_key(found: &[PathBuf]) -> Result<Option<Secret>> {
             }
             continue;
         }
-        match read_key_file(Path::new(&answer)) {
+        let path = key_by_number(&answer, found)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(&answer));
+        match read_key_file(&path) {
             Ok(k) => return Ok(Some(k)),
             Err(e) => {
-                eprintln!("{e:#}");
+                say(format!("{e:#}"));
                 default = "type".into();
             }
         }
@@ -1041,7 +1105,7 @@ fn type_key() -> Result<Option<Secret>> {
                 eprintln!("Key accepted. It is checked against the backup you choose next.");
                 return Ok(Some(Secret::new(k.json.into_bytes())));
             }
-            Err(e) => eprintln!("{e}"),
+            Err(e) => say(e.to_string()),
         }
     }
 }
@@ -1127,7 +1191,8 @@ mod tests {
     }
 
     #[test]
-    fn key_problems_are_recognised() {
+    fn failures_get_the_right_menu_default() {
+        let failure = |e: anyhow::Error| Failure::from_error(e);
         for m in [
             "wrong key - unable to verify signature since manifest's key e4:84 does not match provided key 87:2f",
             "missing key - manifest was created with key e4:84",
@@ -1137,15 +1202,96 @@ mod tests {
             "manifest has no signature, but an encryption key is set - refusing to trust a \
              potentially tampered, unsigned backup",
         ] {
-            assert!(is_key_problem(&anyhow::anyhow!("{m}")), "{m}");
+            let f = failure(anyhow::anyhow!("{m}"));
+            assert!(matches!(f, Failure::Key(_)), "{m}");
+            assert_eq!(f.menu_default(), MENU_OTHER_KEY);
         }
         let wrapped =
             anyhow::anyhow!("wrong key").context("cannot read the inventory of this snapshot");
-        assert!(is_key_problem(&wrapped));
-        assert!(!is_key_problem(&anyhow::anyhow!("connection refused")));
-        assert!(!is_key_problem(&anyhow::anyhow!(
-            "this snapshot has no disk layout (made by an older nestegg)"
-        )));
+        assert!(matches!(failure(wrapped), Failure::Key(_)));
+        // Names that contain the word "key" are not key trouble: a retry.
+        for m in [
+            "connection refused",
+            "no such snapshot host/keyserver/2026-11-08T21:30:12Z",
+            "datastore 'keys' does not exist",
+        ] {
+            let f = failure(anyhow::anyhow!("{m}").context("the key does not open it"));
+            assert!(matches!(f, Failure::Other(_)), "{m}");
+            assert_eq!(f.menu_default(), MENU_RETRY);
+        }
+        // A backup that can never be restored: "choose another backup", not
+        // "try again with the same key".
+        let mixed = crate::rescue::protection_from_manifest(
+            &serde_json::json!({"files": [
+                {"filename": "inventory.pxar.didx", "crypt-mode": "encrypt"},
+                {"filename": "system.mpxar.didx", "crypt-mode": "sign-only"},
+                {"filename": "system.ppxar.didx", "crypt-mode": "none"},
+            ]}),
+            crate::rescue::RESTORED_ARCHIVES,
+        )
+        .unwrap_err();
+        let f = failure(mixed.context("cannot check host/desktop/x"));
+        assert!(matches!(f, Failure::Unusable(_)));
+        assert_eq!(f.menu_default(), MENU_OTHER_BACKUP);
+        let said = f.explanation().join("\n");
+        assert!(
+            said.contains("mixes protected and unprotected") && said.contains("cannot be restored"),
+            "{said}"
+        );
+        let no_layout =
+            failure(crate::rescue::Unusable("this snapshot has no disk layout".into()).into());
+        assert_eq!(no_layout.menu_default(), MENU_OTHER_BACKUP);
+        // A backup the user declined: another backup, too.
+        assert_eq!(Failure::Declined.menu_default(), MENU_OTHER_BACKUP);
+        assert_ne!(MENU_OTHER_BACKUP, MENU_RETRY);
+    }
+
+    #[test]
+    fn text_from_drives_and_the_server_is_printed_safely() {
+        let evil = "k\u{1b}[2K\r!!! all fine\u{7}.json";
+        // Key files found on the media: the list and the numbers.
+        let shown = shown_path(Path::new(&format!("/media/usb/{evil}")));
+        assert_eq!(shown, "/media/usb/k?[2K?!!! all fine?.json");
+        // A disk with firmware text and an erroneous message with a name.
+        let disk = Disk {
+            path: "/dev/sdb".into(),
+            size_bytes: 1 << 40,
+            model: crate::rescue::printable("Evil\u{1b}[2K"),
+            serial: String::new(),
+            transport: "usb".into(),
+            in_use: false,
+            items: vec![],
+        };
+        let a = guard::assess(&disk, &[], &[]);
+        let entry = disk_entry(&disk, &a, None, "");
+        assert!(
+            !entry.chars().any(|c| c.is_control() && c != '\n'),
+            "{entry:?}"
+        );
+        // Errors leave the command as plain text.
+        let e = printable_error(
+            anyhow::anyhow!("client said: \u{1b}[2Kall fine\nsecond line").context("outer"),
+        );
+        assert_eq!(
+            e.to_string(),
+            "outer: client said: ?[2Kall fine\nsecond line"
+        );
+    }
+
+    #[test]
+    fn key_files_are_listed_with_numbers_and_safe_names() {
+        let found = [
+            PathBuf::from("/media/usb/key.json"),
+            PathBuf::from("/media/usb/k\u{1b}[2K.json"),
+        ];
+        let (_, lines) = key_list(&found);
+        assert_eq!(lines[0], "  1) /media/usb/key.json");
+        assert_eq!(lines[1], "  2) /media/usb/k?[2K.json");
+        // A number selects the file even if its name cannot be typed.
+        assert_eq!(key_by_number("2", &found), Some(found[1].as_path()));
+        assert_eq!(key_by_number("3", &found), None);
+        assert_eq!(key_by_number("0", &found), None);
+        assert_eq!(key_by_number("/media/usb/key.json", &found), None);
     }
 
     #[test]

@@ -112,10 +112,11 @@ pub fn normalize_data(raw: &str) -> Result<String, KeyTextError> {
             c.is_ascii_alphanumeric() || c == '+' || c == '/' || (c == '=' && i == s.len() - 1);
         if !ok {
             return Err(KeyTextError::NotAKey(format!(
-                "character {} ('{c}') cannot be part of a key: only letters (upper and lower \
+                "character {} ('{}') cannot be part of a key: only letters (upper and lower \
                  case), digits, + and / are used, and one = at the very end. Check the \
                  keyboard layout of the console (US layout).",
-                i + 1
+                i + 1,
+                super::printable(&c.to_string())
             )));
         }
     }
@@ -253,7 +254,10 @@ fn from_json(v: &Value) -> Result<Key, KeyTextError> {
                 Value::Object(o) => o.keys().next().cloned().unwrap_or_default(),
                 _ => other.to_string(),
             };
-            return Err(KeyTextError::Protected(name.to_lowercase()));
+            // The name comes from the file: shown on the console.
+            return Err(KeyTextError::Protected(super::printable(
+                &name.to_lowercase(),
+            )));
         }
     }
     let data = obj
@@ -799,5 +803,20 @@ mod tests {
                 .unwrap_or_else(|e| panic!("keyproof, {name}: {e:#}"));
             assert_eq!(material.check_code(), keyproof::check_code(DATA), "{name}");
         }
+    }
+
+    #[test]
+    fn messages_do_not_repeat_control_characters_from_the_text() {
+        // A character that cannot be part of a key, taken from a file.
+        let e = from_typed("abc\u{1b}[2Kdef").unwrap_err().to_string();
+        assert!(!e.chars().any(char::is_control), "{e:?}");
+        assert!(e.contains("character 4 ('?')"), "{e}");
+        // The name of a key derivation, taken from a file.
+        let text = format!(
+            "{{\"kdf\":{{\"Evil\\u001b[2K\":{{}}}},\"created\":\"a\",\"modified\":\"b\",\"data\":\"{DATA}\"}}"
+        );
+        let e = from_file_text(&text).unwrap_err().to_string();
+        assert!(!e.chars().any(char::is_control), "{e:?}");
+        assert!(e.contains("evil?[2k"), "{e}");
     }
 }

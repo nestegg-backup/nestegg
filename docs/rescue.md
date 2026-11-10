@@ -98,7 +98,9 @@ configuration files are kept below `/var/lib/nestegg/rescue-backup/`.
 At the question "Encryption key" you can give:
 
 - **A key file or a saved paper key**: the path, or just Enter when the
-  wizard found one on the attached media (it lists them). Both exported key
+  wizard found one on the attached media (it lists them, numbered; the
+  number works as well, e.g. for a file whose name has characters that
+  cannot be typed, which the console shows as `?`). Both exported key
   files (`nestegg key export`) and paper keys saved as text or html
   (`nestegg key paperkey --output …`) work; only the part between `-----BEGIN
   PROXMOX BACKUP KEY-----` and `-----END PROXMOX BACKUP KEY-----` is read, a
@@ -133,8 +135,12 @@ the disk layout. If the key does not fit, it shows the message of the
 client (it names the fingerprint of the key the backup was made with and
 the one you gave), says "Nothing was changed" and offers: enter or select
 another key, choose another backup (an older backup may have been made with
-an older key), try again, or quit. The disk list comes only after this
-check passed. `nestegg rescue restore` does the same check and stops before
+an older key), try again, or quit. The pre-selected answer is the one that
+can help: another key after a key problem, "try again" after a network or
+server error, and "choose another backup" for a backup that can never be
+restored (for example one that mixes encrypted and unencrypted archives, or
+that has no disk layout; the wizard says so) and for a backup you declined.
+The disk list comes only after this check passed. `nestegg rescue restore` does the same check and stops before
 changing anything.
 
 **A backup your key does not protect needs an explicit yes.** When you gave
@@ -147,6 +153,14 @@ system; the wizard pre-selects the newest backup. "Restore this backup
 anyway?" defaults to no; then choose another backup. `nestegg rescue
 restore` refuses such a backup unless `--allow-unprotected-backup` is
 given. Without any key (`-`), unencrypted backups are restored as before.
+A backup that is signed with your key but has an archive that is not even
+signed (neither encrypted nor signed) is refused in every case; of the
+archives of a split `system` archive the weakest one counts.
+
+Names that come from attached drives or from the backup server (file names
+of keys, disk labels and models, messages of the client) are shown with
+control characters replaced by `?`, so they cannot rewrite lines on the
+console.
 
 ### Keyboard layout
 
@@ -276,10 +290,16 @@ saved paper-key file on the media, the second types it in; both first try a
 wrong key (which must be refused with the target disk untouched), check
 that Enter does not trust the certificate even when the settings file on
 the stick has its fingerprint, and that a second settings file with another
-fingerprint is pointed out. Before the rescue VM starts, the test pushes a
-newer, unencrypted "decoy" backup of the same computer to the PBS; it must
-be refused (non-interactive) or declined by default (wizard) while a key is
-given. `WIZARD=0` tests a complete non-interactive `nestegg rescue restore`
+fingerprint is pointed out. Before the rescue VM starts, the test pushes two
+newer backups of the same computer to the PBS: one that is only signed with
+the right key (`--crypt-mode sign-only`, with the real disk layout) and an
+unencrypted "decoy" (the newest). Both must be refused (non-interactive) or
+declined by default (wizard) while a key is given; the signed one is
+restored only with `--allow-unprotected-backup` (the test does a dry run),
+and the wizard must say that a backup without disk layout cannot be restored
+and offer "choose another backup" by default. A backup that mixes crypt modes
+cannot be made with the client (one mode per run); that case is covered by
+unit tests. `WIZARD=0` tests a complete non-interactive `nestegg rescue restore`
 instead.
 
 ```sh

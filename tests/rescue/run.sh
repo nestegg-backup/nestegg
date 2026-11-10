@@ -13,10 +13,15 @@
 # non-interactive `nestegg rescue restore` instead). The encryption key
 # reaches the wizard as a saved paper-key file on the media
 # (debian-btrfs-uefi) or typed in by hand (ubuntu-ext4-bios-luks); a wrong
-# key must be refused before the disk is touched, in both ways. A newer,
-# unencrypted "decoy" backup of the same computer is pushed to the PBS (as
-# someone with write access to it could): with a key at hand it must be
-# refused unless explicitly accepted.
+# key must be refused before the disk is touched, in both ways. Two newer
+# backups of the same computer are pushed to the PBS as someone with write
+# access to it could: an unencrypted "decoy" and one that is only signed with
+# the right key (`--crypt-mode sign-only`, with a copy of the real disk
+# layout). With a key at hand both must be refused unless explicitly
+# accepted; a backup that can never be restored must lead to "choose another
+# backup", not to "try again". (The real client makes one crypt mode per
+# backup run, so a backup that mixes modes cannot be produced here; that case
+# is covered by unit tests.)
 # Needs: root, KVM, Docker, qemu-system-x86, OVMF. Touches nothing outside
 # its temporary directory and the containers/VMs it starts. KEEP=1 keeps
 # the work directory for inspection.
@@ -101,6 +106,19 @@ s = [x for x in json.load(sys.stdin) if x["backup-id"] == "e2e-src"][0]
 t = datetime.datetime.fromtimestamp(s["backup-time"], datetime.timezone.utc)
 print("host/e2e-src/" + t.strftime("%Y-%m-%dT%H:%M:%SZ"))' <<<"$snaps")"
 echo "real backup: $real_snap"
+echo "== pushing a backup that is only signed with the right key"
+# Same disk layout as the real backup (restored from it with the key), but
+# every archive signed instead of encrypted.
+docker cp "$work/nestegg-key.json" "$pbs:/tmp/signkey.json"
+docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$pbs" bash -c "
+  proxmox-backup-client restore $real_snap inventory.pxar /tmp/signed-inventory \
+    --keyfile /tmp/signkey.json --ns desktops --repository admin@pbs@127.0.0.1:store1" >/dev/null
+docker exec -e PBS_PASSWORD="$token_secret" -e PBS_FINGERPRINT="$fp" "$pbs" bash -c '
+  mkdir -p /tmp/signed-system && echo "signed, not encrypted" > /tmp/signed-system/README
+  proxmox-backup-client backup system.pxar:/tmp/signed-system inventory.pxar:/tmp/signed-inventory \
+    --ns desktops --backup-id e2e-src --keyfile /tmp/signkey.json --crypt-mode sign-only \
+    --repository "backup@pbs!desktop@127.0.0.1:store1"' >/dev/null
+sleep 2 # snapshot times have a resolution of one second
 echo "== pushing an unencrypted decoy backup of the same computer"
 docker exec -e PBS_PASSWORD="$token_secret" -e PBS_FINGERPRINT="$fp" "$pbs" bash -c '
   mkdir -p /tmp/decoy && echo "not the backed-up system" > /tmp/decoy/README
@@ -109,12 +127,20 @@ docker exec -e PBS_PASSWORD="$token_secret" -e PBS_FINGERPRINT="$fp" "$pbs" bash
     --repository "backup@pbs!desktop@127.0.0.1:store1"' >/dev/null
 snaps="$(docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$pbs" \
   proxmox-backup-client snapshot list host/e2e-src --ns desktops --repository admin@pbs@127.0.0.1:store1 --output-format json)"
-check "decoy backup is the newest and not encrypted" python3 -c 'import json, sys
+check "decoy is the newest backup and not encrypted; below it the signed one, then the real one" python3 -c 'import json, sys
 s = sorted(json.load(sys.stdin), key=lambda x: -x["backup-time"])
-assert len(s) == 2, s
+assert len(s) == 3, s
 assert all(f["crypt-mode"] == "none" for f in s[0]["files"]), s[0]
-assert any(f["crypt-mode"] == "encrypt" for f in s[1]["files"]), s[1]' <<<"$snaps"
+archives = [f for f in s[1]["files"] if f["filename"] in ("system.pxar.didx", "inventory.pxar.didx")]
+assert len(archives) == 2 and all(f["crypt-mode"] == "sign-only" for f in archives), s[1]
+assert any(f["crypt-mode"] == "encrypt" for f in s[2]["files"]), s[2]' <<<"$snaps"
 stop_on_failure
+# Path of the signed-only backup (the second newest).
+signed_snap="$(python3 -c 'import json, sys, datetime
+s = sorted(json.load(sys.stdin), key=lambda x: -x["backup-time"])[1]
+t = datetime.datetime.fromtimestamp(s["backup-time"], datetime.timezone.utc)
+print("host/e2e-src/" + t.strftime("%Y-%m-%dT%H:%M:%SZ"))' <<<"$snaps")"
+echo "signed-only backup: $signed_snap"
 
 echo "== rescue VM: restore onto an empty disk"
 truncate -s 12G "$work/target.img"
@@ -231,13 +257,31 @@ if [[ "${WIZARD:-1}" == 1 ]]; then
       printf 'expect Encrypt the restored disk 60\nsend n\n'
     fi
   }
-  # Enter at "Which backup" takes the newest, the decoy: it must be
-  # refused by default, then the real one (number 2) is chosen.
+  # The list is: 1 the unencrypted decoy (newest), 2 the signed-only
+  # backup, 3 the real one. Enter at "Which backup" takes the decoy: it must
+  # be refused by default, and the menu then offers another backup.
   decline_decoy() {
     printf 'expect NOT ENCRYPTED 300\nexpect Which backup 30\nsend\n'
     printf 'expect not protected by your key 300\nexpect Restore this backup anyway 30\nsend\n'
     printf 'expect This backup is not restored 30\nexpect Nothing was changed 30\nexpect What now 30\nsend\n'
-    printf 'expect Which backup 30\nsend 2\n'
+    printf 'expect Which backup 30\n'
+  }
+  # With the right key at hand: the signed-only backup is refused by default
+  # as well. Then the real one (number 3) is chosen.
+  decline_unprotected() {
+    decline_decoy
+    printf 'send 2\nexpect signed with your key 300\nexpect Restore this backup anyway 30\nsend\n'
+    printf 'expect This backup is not restored 30\nexpect Nothing was changed 30\nexpect What now 30\nsend\n'
+    printf 'expect Which backup 30\nsend 3\n'
+  }
+  # The decoy has no disk layout: when the user accepts it anyway, the wizard
+  # must say that no key and no second try helps, and the menu must default
+  # to another backup (Enter), not to "try again".
+  accept_decoy_then_leave() {
+    printf 'expect NOT ENCRYPTED 300\nexpect Which backup 30\nsend\n'
+    printf 'expect not protected by your key 300\nexpect Restore this backup anyway 30\nsend y\n'
+    printf 'expect no disk layout 300\nexpect This backup cannot be restored 30\nexpect Nothing was changed 30\nexpect What now 30\nsend\n'
+    printf 'expect Which backup 30\nsend 3\n'
   }
   {
     echo 'expect root@nestegg-rescue[^#]*# 600'
@@ -248,6 +292,11 @@ if [[ "${WIZARD:-1}" == 1 ]]; then
     marked WRONGKEY nestegg rescue restore "$restore_args" --snapshot "$real_snap" --keyfile /media/t/x/y/z/wrong-paperkey.txt
     echo '# The right key, but the newest backup is the unencrypted decoy: refused.'
     marked DECOY nestegg rescue restore "$restore_args" --keyfile /media/t/x/y/z/nestegg-key.json
+    echo '# The right key, and a backup that is only signed with it: refused as well.'
+    marked SIGNED nestegg rescue restore "$restore_args" --snapshot "$signed_snap" --keyfile /media/t/x/y/z/nestegg-key.json
+    echo '# Accepted explicitly (dry run, nothing is changed): the signature is checked'
+    echo '# with the key when the layout is read.'
+    marked SIGNEDOK nestegg rescue restore "$restore_args" --snapshot "$signed_snap" --keyfile /media/t/x/y/z/nestegg-key.json --allow-unprotected-backup --dry-run
     disk_check DISK-DIRTY-BYTES
     echo '# The right key as a plain JSON file, dry run: reads the backup, changes nothing.'
     echo "send nestegg rescue restore $restore_args --snapshot $real_snap --keyfile /media/t/x/y/z/nestegg-key.json --dry-run; echo DRYRUN-EXIT=\$?"
@@ -291,7 +340,7 @@ if [[ "${WIZARD:-1}" == 1 ]]; then
     echo 'expect Which computer 30'
     echo 'send 1'
     echo 'expect Which backup 300'
-    echo 'send 2'
+    echo 'send 3'
     echo 'expect Reading the disk layout 120'
     echo 'expect (wrong key|does not match provided key) 600'
     echo 'expect The encryption key does not fit this backup 30'
@@ -302,7 +351,8 @@ if [[ "${WIZARD:-1}" == 1 ]]; then
     echo 'expect Stopped, nothing was changed 30'
     echo 'expect WIZARD-EXIT=1 60'
     disk_check DISK-AFTER-WRONGKEY
-    echo '# Pass 2, with the settings file whose fingerprint differs.'
+    echo '# Pass 2, with the settings file whose fingerprint differs. The decoy is accepted'
+    echo '# (it has no disk layout), then the wrong key is refused.'
     echo 'send nestegg rescue; echo WIZARD-EXIT=$?'
     settings_choice 2
     connection_defaults y differs
@@ -311,7 +361,7 @@ if [[ "${WIZARD:-1}" == 1 ]]; then
     wrong_key
     echo 'expect Which computer 300'
     echo 'send'
-    decline_decoy
+    accept_decoy_then_leave
     echo 'expect (wrong key|does not match provided key) 600'
     echo 'expect What now 30'
     echo '# Pick another key (the default of this menu after a key problem)'
@@ -329,7 +379,7 @@ if [[ "${WIZARD:-1}" == 1 ]]; then
     echo 'expect Cancelled, nothing was changed 60'
     echo 'expect WIZARD-EXIT=1 60'
     disk_check DISK-AFTER-CANCEL
-    echo '# Pass 3: everything right (the decoy is still declined first)'
+    echo '# Pass 3: everything right (the decoy and the signed-only backup are declined first)'
     echo 'send nestegg rescue; echo WIZARD-EXIT=$?'
     settings_choice ''
     connection_defaults y match
@@ -338,7 +388,7 @@ if [[ "${WIZARD:-1}" == 1 ]]; then
     right_key
     echo 'expect Which computer 300'
     echo 'send'
-    decline_decoy
+    decline_unprotected
     echo 'expect The key fits this backup 600'
     echo 'expect Which disk 120'
     echo 'send'
@@ -361,6 +411,8 @@ else
     echo 'expect MOUNT-EXIT=0 60'
     echo '# The newest backup is the unencrypted decoy: refused, disk untouched.'
     marked DECOY nestegg rescue restore "$restore_args"
+    echo '# The same for the backup that is only signed with the key.'
+    marked SIGNED nestegg rescue restore "$restore_args" --snapshot "$signed_snap"
     disk_check DISK-DIRTY-BYTES
     echo "send nestegg rescue restore $restore_args --snapshot $real_snap; echo RESTORE-EXIT=\$?"
     echo 'expect RESTORE-EXIT=[0-9]+ 2400'
@@ -385,6 +437,12 @@ check "decoy (non-interactive): refused as not protected by the key" \
 check "decoy (non-interactive): nothing read from it" \
   exits_with 1 grep -aq 'Reading the disk layout' <<<"$decoy_part"
 check "decoy (non-interactive): exit code is an error" grep -aq 'DECOY-EXIT=[1-9]' "$rlog"
+signed_part="$(part SIGNED)"
+check "signed-only backup (non-interactive): refused as signed but not encrypted" \
+  grep -aq 'signed with your key (checked), but .*not encrypted' <<<"$signed_part"
+check "signed-only backup (non-interactive): nothing read from it" \
+  exits_with 1 grep -aq 'Reading the disk layout' <<<"$signed_part"
+check "signed-only backup (non-interactive): exit code is an error" grep -aq 'SIGNED-EXIT=[1-9]' "$rlog"
 check "refused restores left the disk untouched" grep -aq 'DISK-DIRTY-BYTES=0' "$rlog"
 if [[ "${WIZARD:-1}" == 1 ]]; then
   wrong_part="$(part WRONGKEY)"
@@ -394,6 +452,12 @@ if [[ "${WIZARD:-1}" == 1 ]]; then
     exits_with 1 grep -aq 'Reading the disk layout' <<<"$wrong_part"
   check "wrong key (non-interactive): exit code is an error" grep -aq 'WRONGKEY-EXIT=[1-9]' "$rlog"
   check "right key as JSON file: dry run works" grep -aq 'DRYRUN-EXIT=0' "$rlog"
+  signedok_part="$(part SIGNEDOK)"
+  check "signed-only backup, explicitly accepted: warns, reads it with the key, changes nothing" \
+    grep -aq 'Restoring it anyway' <<<"$signedok_part"
+  check "signed-only backup, explicitly accepted: dry run changes nothing" \
+    grep -aq 'Dry run: nothing was changed' <<<"$signedok_part"
+  check "signed-only backup, explicitly accepted: exit code is success" grep -aq 'SIGNEDOK-EXIT=0' "$rlog"
   check "wizard: progress line before the media search" grep -aq 'Looking for settings and keys on the attached drives' "$rlog"
   check "wizard: both settings files named" grep -aq 'Found 2 settings files' "$rlog"
   check "wizard: fingerprint from the settings file shown with its source" \
@@ -408,7 +472,13 @@ if [[ "${WIZARD:-1}" == 1 ]]; then
   check "wizard: invalid number asks again" grep -aq 'Please enter a number between' "$rlog"
   check "wizard: backup list shows the unencrypted decoy" grep -aq 'NOT ENCRYPTED' "$rlog"
   check "wizard: backup list shows the encrypted backup" grep -aEq '^ +[0-9]+\) .*  encrypted' "$rlog"
+  check "wizard: backup list shows the signed-only backup" grep -aEq '^ +[0-9]+\) .*  signed, not encrypted' "$rlog"
   check "wizard: unprotected backup declined by default" grep -aq 'This backup is not restored' "$rlog"
+  check "wizard: signed-only backup named as signed with the key, declined by default" \
+    grep -aq 'signed with your key (checked)' "$rlog"
+  check "wizard: a backup that cannot be restored is said to be unusable" \
+    grep -aq 'This backup cannot be restored, with any key' "$rlog"
+  check "wizard: that backup has no disk layout" grep -aq 'no disk layout' "$rlog"
   check "wizard: wrong key refused with a message" grep -aq 'The encryption key does not fit this backup' "$rlog"
   check "wizard: right key accepted" grep -aq 'The key fits this backup' "$rlog"
   # The wrong key is refused before the disk list (Step 3/4) is shown, and
