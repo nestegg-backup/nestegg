@@ -503,7 +503,10 @@ pub fn retry_not_before(
     // retries. The recorded time is not trustworthy, so do not hold the retries
     // back at all.
     let failed_at = last.finished_at.unwrap_or(last.started_at);
-    if failed_at > now {
+    // The same tolerance as for success stamps: a stamp a few minutes ahead
+    // is clock noise and pauses as usual (it cannot hold anything back for
+    // longer than that).
+    if failed_at - now > future_tolerance() {
         return None;
     }
     // Compared by content, not by time: file times and run times have

@@ -105,50 +105,24 @@ pub struct Checked {
     pub wake_sent: bool,
 }
 
-/// Follows the events of [`crate::wake::ensure_available`] to tell whether a
-/// packet was really sent. The first event of a wake attempt is the `Info`
-/// "sending"; a failed first send is reported right after it as
-/// `SendFailed`. Any later event (a resend notice, a recovery, a failure of a
-/// later resend) means a packet went out before, and so does a first send not
-/// followed by `SendFailed`.
+/// Whether a wake packet was really sent, from the event
+/// [`crate::wake::WakeEvent::PacketSent`] that `wake.rs` reports for every
+/// packet that went out (not inferred from the order or wording of the other
+/// events).
 #[derive(Default)]
 struct WakeTracker {
-    attempted: bool,
-    first_pending: bool,
     sent: bool,
 }
 
 impl WakeTracker {
     fn event(&mut self, event: &crate::wake::WakeEvent) {
-        use crate::wake::WakeEvent;
-        match event {
-            WakeEvent::Info(_) if !self.attempted => {
-                self.attempted = true;
-                self.first_pending = true;
-            }
-            WakeEvent::Info(_) => {
-                // A resend notice: only after a packet went out.
-                if self.first_pending {
-                    self.sent = true;
-                }
-                self.first_pending = false;
-            }
-            WakeEvent::SendFailed(_) => {
-                if !self.first_pending && self.attempted {
-                    // A later resend failed; an earlier packet went out.
-                    self.sent = true;
-                }
-                self.first_pending = false;
-            }
-            WakeEvent::SendRecovered => {
-                self.sent = true;
-                self.first_pending = false;
-            }
+        if matches!(event, crate::wake::WakeEvent::PacketSent) {
+            self.sent = true;
         }
     }
 
     fn sent(&self) -> bool {
-        self.sent || self.first_pending
+        self.sent
     }
 }
 
@@ -261,7 +235,7 @@ fn run_items(paths: &Paths, options: &CheckOptions, tracker: &mut WakeTracker) -
                         wake_send_problem = Some(why.to_string())
                     }
                     crate::wake::WakeEvent::SendRecovered => wake_send_problem = None,
-                    crate::wake::WakeEvent::Info(_) => {}
+                    crate::wake::WakeEvent::Info(_) | crate::wake::WakeEvent::PacketSent => {}
                 }
             }),
             Ok(crate::wake::Availability::ReachableAfterWake { .. })
@@ -394,20 +368,26 @@ mod tests {
         };
         // Server answered at once, or Wake-on-LAN off: no events.
         assert!(!sent(&[]));
-        // First packet out, server came up.
-        assert!(sent(&[Info("sending")]));
-        // First packet out, a resend notice later.
-        assert!(sent(&[Info("sending"), Info("again")]));
-        // First send failed and never recovered.
+        // Notices alone are no packet, whatever their number or wording.
+        assert!(!sent(&[Info("sending")]));
+        assert!(!sent(&[Info("waiting"), Info("sending"), Info("again")]));
+        // The send failed and never recovered.
         assert!(!sent(&[Info("sending"), SendFailed("no network")]));
-        // First send failed, a later one went out.
+        // A packet went out.
+        assert!(sent(&[Info("sending"), PacketSent]));
         assert!(sent(&[
             Info("sending"),
             SendFailed("no network"),
+            PacketSent,
             SendRecovered
         ]));
-        // First packet out, a later resend failed: a packet was sent.
-        assert!(sent(&[Info("sending"), Info("again"), SendFailed("x")]));
+        // A later resend failed: the earlier packet still counts.
+        assert!(sent(&[
+            Info("sending"),
+            PacketSent,
+            Info("again"),
+            SendFailed("x")
+        ]));
     }
 
     #[test]

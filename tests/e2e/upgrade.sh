@@ -116,6 +116,13 @@ check "a member can open the old lock files before the upgrade" docker exec -u a
 
 echo "== upgrade to the new package"
 check "new package installs over the old one" apt_in_client install -y -q /tmp/nestegg-new.deb
+# Straight after the installation, before this script runs any nestegg command:
+# the two lock files of the notification check were tightened by the package's
+# postinst (the new binary also tightens a lock file when it opens one; the
+# daemon restarted by the upgrade does not open these two by itself).
+for lf in /var/lib/nestegg/.notify.lock /var/lib/nestegg/.notify-settings.lock; do
+  check "$(basename "$lf") is 0600 right after the installation" bash -c "[[ \$(docker exec $client stat -c '%a' '$lf' 2>/dev/null) == 600 ]]"
+done
 check "new version installed" test "$(installed_version)" == "$new_version"
 check "daemon still enabled" on_client systemctl is-enabled --quiet nestegg.service
 check "timer still enabled" on_client systemctl is-enabled --quiet nestegg-backup.timer

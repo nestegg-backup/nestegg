@@ -64,6 +64,9 @@ pub enum WakeEvent<'a> {
     SendFailed(&'a str),
     /// A packet went out after an earlier attempt had failed.
     SendRecovered,
+    /// A magic packet went out (every time one does). Nothing for the log:
+    /// it lets a caller know that a wake attempt really happened.
+    PacketSent,
 }
 
 impl std::fmt::Display for WakeEvent<'_> {
@@ -72,6 +75,7 @@ impl std::fmt::Display for WakeEvent<'_> {
             WakeEvent::Info(m) => f.write_str(m),
             WakeEvent::SendFailed(m) => write!(f, "warning: {m}"),
             WakeEvent::SendRecovered => f.write_str("Wake-on-LAN packet sent"),
+            WakeEvent::PacketSent => f.write_str("Wake-on-LAN packet went out"),
         }
     }
 }
@@ -185,6 +189,7 @@ impl PacketSender {
     ) -> bool {
         match send(wake) {
             Ok(()) => {
+                on_event(WakeEvent::PacketSent);
                 if self.failing {
                     on_event(WakeEvent::SendRecovered);
                 }
@@ -331,8 +336,54 @@ mod tests {
                 WakeEvent::Info(m) => Seen::Info(m.into()),
                 WakeEvent::SendFailed(m) => Seen::Warning(m.into()),
                 WakeEvent::SendRecovered => Seen::Info(e.to_string()),
+                // Not a log line; counted by the test that is about it.
+                WakeEvent::PacketSent => return,
             })
         }
+    }
+
+    #[test]
+    fn packet_sent_is_reported_for_each_packet_that_went_out_and_only_then() {
+        let closed = ClosedPort::reserve();
+        let mut config = config_for(closed.port);
+        config.wake = Some(wake_config(1));
+        type Send = Box<dyn FnMut(&WakeConfig) -> Result<()>>;
+        let count = |mut send: Send| {
+            let (mut out, mut reported) = (0u32, 0u32);
+            let _ = ensure_available_with(
+                &config,
+                |w| {
+                    let r = send(w);
+                    if r.is_ok() {
+                        out += 1;
+                    }
+                    r
+                },
+                Duration::from_millis(50),
+                1,
+                |e| {
+                    if e == WakeEvent::PacketSent {
+                        reported += 1;
+                    }
+                },
+            )
+            .unwrap();
+            (out, reported)
+        };
+        // Nothing ever goes out: nothing is reported.
+        assert_eq!(count(Box::new(|_| Err(offline()))), (0, 0));
+        // Every send works: each one is reported.
+        let (out, reported) = count(Box::new(|_| Ok(())));
+        assert!(out >= 1);
+        assert_eq!(out, reported);
+        // The first sends fail, later ones go out.
+        let mut n = 0;
+        let (out, reported) = count(Box::new(move |_| {
+            n += 1;
+            if n <= 2 { Err(offline()) } else { Ok(()) }
+        }));
+        assert!(out >= 1, "a later send went out");
+        assert_eq!(out, reported);
     }
 
     #[test]

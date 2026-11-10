@@ -263,10 +263,17 @@ the value as root in `/etc/nestegg/config.toml`.
   5 seconds).
 - **A run lock that cannot be taken although no backup runs is an error.** A
   backup counts as "already running" (exit code 0, nothing recorded) only when
-  `/proc/locks` shows an exclusive lock on the run lock file or a fresh
-  `current.json` of another run exists. Otherwise — a stray shared lock, for
+  somebody holds the run lock exclusively or a fresh `current.json` of another
+  run exists. Whether somebody does is asked of the kernel (a shared
+  non-blocking probe on a second descriptor fails exactly then), not only read
+  from `/proc/locks`: on btrfs the device number listed there is not the one
+  `stat` gives for the file, so a lock that is really held would not be found
+  (checked on a real btrfs file system). `/proc/locks` still serves a group
+  member's status query, who cannot open the file, and names the holders in
+  the message. Otherwise — a stray shared lock, for
   example — the attempt fails with exit code 1 and a message naming the
-  processes `/proc/locks` lists as holders, and it is recorded as a failed run
+  processes `/proc/locks` lists as holders (where it shows them), and it is
+  recorded as a failed run
   like a missing key, so the health becomes `failing` and the notification
   check reports it (and the growing pause of decision 0021 applies). A timer
   run that is not due stays quiet as before. The key commands that take the

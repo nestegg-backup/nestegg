@@ -166,7 +166,12 @@ its cancel message, so it is in the run record and the run log.
   markers make a read-back transient. The transport case still reads the
   client's error output, because `proxmox-backup-client` exits with the same
   code for every error; the list is narrower than the run's general
-  classification (a bare "timed out" does not count).
+  classification (a bare "timed out" does not count), and only the client's
+  own error line is looked at, not what it printed before. A limit that
+  remains: if the server sends an error message containing one of these
+  phrases and the client passes it on in its error line, a real failure is
+  taken for a transport failure. The effect is bounded by the next item (one
+  free attempt), and nothing but a completed read-back resets that count.
 - **Only the first unavailable read-back in a row is free.** A server that
   always falls asleep right after the upload would otherwise cause a full
   upload and a new, never verified snapshot at every hourly check, without

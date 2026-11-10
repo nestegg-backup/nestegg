@@ -130,15 +130,18 @@ fn run_in_progress(paths: &Paths, own_run_id: Option<&str>) -> bool {
 fn blocked_message(paths: &Paths) -> String {
     use std::os::unix::fs::MetadataExt;
     let path = paths.lock_file();
+    let locks = fs::read_to_string("/proc/locks").ok();
     let holders = fs::metadata(&path)
         .ok()
-        .and_then(|meta| {
-            let locks = fs::read_to_string("/proc/locks").ok()?;
-            Some(proc_locks_holders(&locks, meta.dev(), meta.ino()))
-        })
+        .zip(locks.as_deref())
+        .map(|(meta, locks)| proc_locks_holders(locks, meta.dev(), meta.ino()))
         .unwrap_or_default();
-    let who = if holders.is_empty() {
-        "/proc/locks names no holder".to_string()
+    let who = if locks.is_none() {
+        "/proc/locks cannot be read, so the holder is not known".to_string()
+    } else if holders.is_empty() {
+        // Also the case on btrfs, where `/proc/locks` lists the lock under
+        // another device number than the file has.
+        "/proc/locks does not show who holds it".to_string()
     } else {
         let list: Vec<String> = holders
             .iter()
@@ -232,18 +235,34 @@ pub fn active_run(paths: &Paths) -> Result<Option<Run>> {
     }
 }
 
-/// Probe the run lock. Primary method: look the lock up in `/proc/locks` (no
-/// lock is taken, so a status query can never disturb a starting run, and a
-/// group member needs no access to the 0600 lock file itself — only to stat it
-/// through the state directory, decision 0022, item 2). Fallback (only if
-/// `/proc/locks` is unreadable): a shared non-blocking probe, which needs to
-/// open the file and so works only for root. `None` if neither method applies.
+/// Whether a run holds the run lock. First `/proc/locks` (no lock is taken,
+/// and a group member needs no access to the 0600 lock file itself — only to
+/// stat it through the state directory, decision 0022, item 2): a listed
+/// exclusive lock is a run. If it is not listed, or `/proc/locks` cannot be
+/// read, a shared non-blocking probe decides for those who may open the file
+/// (root). `None` if neither method applies.
 fn lock_is_held(paths: &Paths) -> Option<bool> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(paths.lock_file()).ok()?;
-    if let Ok(locks) = fs::read_to_string("/proc/locks") {
-        return Some(proc_locks_has_write_flock(&locks, meta.dev(), meta.ino()));
+    let listed = fs::read_to_string("/proc/locks")
+        .ok()
+        .map(|locks| proc_locks_has_write_flock(&locks, meta.dev(), meta.ino()));
+    if listed == Some(true) {
+        return Some(true);
     }
+    // "Not listed" is not proof: on btrfs the device number in `/proc/locks`
+    // is not the one `stat` gives, so a lock that is really held is not found
+    // there. Whoever may open the file (root: the daemon, a run) asks the
+    // kernel directly; a group member cannot, and keeps the answer above.
+    exclusive_holder_probe(paths).or(listed)
+}
+
+/// Ask the kernel whether somebody holds the run lock exclusively: a shared
+/// non-blocking lock on a second descriptor fails exactly then. It is let go
+/// at once; a run that starts in that instant tries again (see
+/// [`RunLock::try_acquire_for`]). `None` when the file cannot be opened (not
+/// root) or the probe fails for another reason.
+fn exclusive_holder_probe(paths: &Paths) -> Option<bool> {
     let file = File::open(paths.lock_file()).ok()?;
     match Flock::lock(file, FlockArg::LockSharedNonblock) {
         Ok(_shared) => Some(false),
@@ -777,6 +796,7 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             wake_send_failed = false;
             rep.line(&event.to_string());
         }
+        WakeEvent::PacketSent => {}
     })?;
     if rep.cancelled() {
         return Ok(());
@@ -1455,6 +1475,38 @@ mod tests {
         assert_eq!(lock_is_held(&paths), Some(true));
         drop(lock);
         assert_eq!(lock_is_held(&paths), Some(false));
+    }
+
+    #[test]
+    fn the_kernel_is_asked_whether_a_run_holds_the_lock() {
+        // `/proc/locks` cannot be relied on to list a held lock (on btrfs the
+        // device numbers differ), so whoever may open the file asks the
+        // kernel: an exclusive holder makes a shared probe fail, a shared
+        // holder (something that merely blocks backups) does not.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: dir.path().join("c.toml"),
+            credentials_dir: dir.path().join("cred"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+            systemctl: PathBuf::from("systemctl"),
+        };
+        fs::create_dir_all(&paths.runtime_dir).unwrap();
+        assert_eq!(exclusive_holder_probe(&paths), None, "no lock file yet");
+        let lock = RunLock::try_acquire(&paths).unwrap().unwrap();
+        assert_eq!(exclusive_holder_probe(&paths), Some(true));
+        assert_eq!(lock_is_held(&paths), Some(true));
+        drop(lock);
+        assert_eq!(exclusive_holder_probe(&paths), Some(false));
+        let shared = Flock::lock(
+            File::open(paths.lock_file()).unwrap(),
+            FlockArg::LockSharedNonblock,
+        )
+        .map_err(|(_, e)| e)
+        .unwrap();
+        assert_eq!(exclusive_holder_probe(&paths), Some(false));
+        assert_eq!(lock_is_held(&paths), Some(false));
+        drop(shared);
     }
 
     #[test]

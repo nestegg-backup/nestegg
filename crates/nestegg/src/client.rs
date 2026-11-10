@@ -243,7 +243,11 @@ pub fn is_transport_failure(stderr: &str) -> bool {
 /// [`Unreachable`] for a transport failure, a plain error otherwise.
 fn bounded_failure(stderr: &[u8]) -> anyhow::Error {
     let text = String::from_utf8_lossy(stderr).trim().to_string();
-    if is_transport_failure(&text) {
+    // Judged by the client's own error line only, not by everything it
+    // printed before: less room for words that merely pass through.
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let line = last_error_line(&lines).unwrap_or_default();
+    if is_transport_failure(&line) {
         Unreachable(text).into()
     } else {
         anyhow::anyhow!("{text}")
@@ -1100,7 +1104,7 @@ impl<'a> Client<'a> {
                 last_error_line(&tail).unwrap_or_else(|| format!("restore failed with {status}"));
             // Only the bounded restores (read-back) are classified; the others
             // keep their plain error.
-            if timeout.is_some() && is_transport_failure(&tail.join("\n")) {
+            if timeout.is_some() && is_transport_failure(&line) {
                 return Err(Unreachable(line).into());
             }
             bail!("{line}");
@@ -1638,6 +1642,17 @@ mod tests {
             "Error: client error (Connect): Connection timed out (os error 110)"
         ));
         // A bare "timed out" (a server task, a message from the server) is not.
+        // Only the client's error line decides, not what it printed before.
+        assert!(
+            bounded_failure(b"connection reset by peer while reading x\nError: manifest mismatch")
+                .downcast_ref::<Unreachable>()
+                .is_none()
+        );
+        assert!(
+            bounded_failure(b"some notice\nError: error trying to connect: tcp connect error")
+                .downcast_ref::<Unreachable>()
+                .is_some()
+        );
         assert!(!is_transport_failure("Error: task timed out"));
         assert!(!is_transport_failure("Error: manifest mismatch"));
         assert!(
