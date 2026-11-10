@@ -242,19 +242,29 @@ the value as root in `/etc/nestegg/config.toml`.
   `/proc/locks` rather than the lock file. The daemon's wait for the inbox lock
   in the request path is time-bounded, so a stuck lock cannot tie up a worker
   thread forever.
-- **Lock files of an older version.** Earlier versions created these files
-  `0644`, and a group member who opened one before the upgrade keeps a
-  descriptor that tightening the mode does not take away. A root process (and
-  `postinst`, for all four files) therefore replaces a lock file with a too
-  open mode by a fresh `0600` one, unless a root-owned process holds a lock on
-  it according to `/proc/locks`: a backup still running from before the
-  upgrade keeps its lock, and the file is replaced the next time. Every lock
-  is taken through one helper that, after it got the lock, checks that the
-  file at the path is still the one it locked and starts over otherwise, so
-  two processes can never both hold "the" lock across a replacement; and
-  every wait for one of these locks has a time limit (the run lock half a
-  second, `current.json` 30 seconds, the notification check 90 seconds, the
-  inbox 5 seconds).
+- **Lock files of development versions.** Development versions created these
+  files `0644`. There was never a release, tag or package with such files, so
+  they exist only on development and test installations. A lock file with
+  another mode is tightened to `0600` in place: by every root process that
+  opens it, and by `postinst` for all four files (a plain `chmod`, never
+  through a symlink, never aborting the upgrade). A lock file is never unlinked
+  or replaced, and `/proc/locks` is not consulted for this: replacing a lock
+  file can leave two processes each holding a lock on a different inode of "the"
+  lock. A descriptor a group member opened before the upgrade keeps working
+  until that process ends; on a development machine that is accepted. Every
+  wait for one of these locks has a time limit (the run lock half a second,
+  `current.json` 30 seconds, the notification check 90 seconds, the inbox
+  5 seconds).
+- **A run lock that cannot be taken although no backup runs is an error.** A
+  backup counts as "already running" (exit code 0, nothing recorded) only when
+  `/proc/locks` shows an exclusive lock on the run lock file or a fresh
+  `current.json` of another run exists. Otherwise — a stray shared lock, for
+  example — the attempt fails with exit code 1 and a message naming the
+  processes `/proc/locks` lists as holders, and it is recorded as a failed run
+  like a missing key, so the health becomes `failing` and the notification
+  check reports it (and the growing pause of decision 0021 applies). A timer
+  run that is not due stays quiet as before. The key commands that take the
+  run lock give the same message instead of "a backup is running".
 - `postinst` only **tightens** a `config.toml` that is too open (readable,
   writable or executable by others, or writable by the group) or wrongly owned;
   it sets the owner to root, and the mode only after the owner change worked. A
@@ -377,3 +387,17 @@ the value as root in `/etc/nestegg/config.toml`.
   client does not follow links; the wording of "the last step" is made precise
   (the last validation of the request's values); and what a requester can do by
   writing into the child's output is recorded in the limits.
+  The replacement of old `0644` lock files was removed again: it was faulty (a
+  `/proc/locks` line of a process that was gone stopped it for good, two
+  processes could each end up with "the" lock, and the device numbers of
+  `stat` and `/proc/locks` need not match on btrfs), and such files exist only
+  on development installations. Lock files are now only tightened in place,
+  and a blocked run lock without a run is an error instead of a silent
+  "already running" (section 5).
+  A settings announcement now counts as delivered on the desktop only when a
+  member of group `nestegg` got the full text; users who only get the general
+  text do not release it. If no member ever logs in, the wait ends 30 days
+  after the newest change, with one line in the system log, so the record
+  stays small. While the command for a settings announcement keeps failing,
+  every check ends with a non-zero exit code, also during the pause between
+  attempts, so the unit's failed state does not flip (decision 0017).

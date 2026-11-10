@@ -1312,11 +1312,17 @@ fn verify_opens_newest(paths: &Paths, json: String) -> Result<String, (bool, Str
         ));
     }
     // A snapshot that is still being written has no manifest to check.
-    let Ok(Some(_no_run)) = nestegg::run::RunLock::try_acquire(paths) else {
-        return Err((
-            false,
-            "a backup is running; run this again when it has finished".into(),
-        ));
+    // Only a real run is "a backup is running"; a lock blocked without one
+    // says so (with who holds it) instead.
+    let _no_run = match nestegg::run::RunLock::try_acquire(paths) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err((
+                false,
+                "a backup is running; run this again when it has finished".into(),
+            ));
+        }
+        Err(e) => return Err((false, format!("{e:#}"))),
     };
     let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
     let snapshots = client
@@ -1384,16 +1390,26 @@ fn check(paths: &Paths, wake: bool) -> Result<u8> {
     // full check, so the login is really checked — the same way `status` and
     // `backup` reach the daemon. Only if the daemon cannot be reached does the
     // local check with its "needs root" skips remain.
-    let items = if is_root() {
-        nestegg::check::run(paths, &nestegg::check::CheckOptions { wake, login: true })
+    let (items, wake_skipped) = if is_root() {
+        (
+            nestegg::check::run(paths, &nestegg::check::CheckOptions { wake, login: true }),
+            false,
+        )
     } else {
         match daemon_check(paths, wake)? {
-            Some(items) => items,
-            None => {
-                nestegg::check::run(paths, &nestegg::check::CheckOptions { wake, login: false })
-            }
+            Some(answer) => answer,
+            None => (
+                nestegg::check::run(paths, &nestegg::check::CheckOptions { wake, login: false }),
+                false,
+            ),
         }
     };
+    if wake_skipped {
+        println!(
+            "note: the server was not woken again: a wake attempt was made less than a \
+             minute ago. Run this again in a minute to wake it."
+        );
+    }
     for item in &items {
         println!(
             "[{}] {}{}",
@@ -1461,7 +1477,12 @@ fn daemon_request(paths: &Paths, method: &str, path: &str) -> Result<(u16, serde
 /// Run the PBS check through the daemon (non-root path), so the PBS login is
 /// really checked. `Ok(None)` when the daemon socket cannot be reached, so the
 /// caller falls back to the local check that can only report "needs root".
-fn daemon_check(paths: &Paths, wake: bool) -> Result<Option<Vec<nestegg::check::CheckItem>>> {
+/// The second value is the daemon's `wake_skipped`: a wake was asked for but
+/// not made, because one was made less than a minute ago.
+fn daemon_check(
+    paths: &Paths,
+    wake: bool,
+) -> Result<Option<(Vec<nestegg::check::CheckItem>, bool)>> {
     if UnixStream::connect(paths.socket()).is_err() {
         return Ok(None);
     }
@@ -1481,7 +1502,10 @@ fn daemon_check(paths: &Paths, wake: bool) -> Result<Option<Vec<nestegg::check::
     }
     let items: Vec<nestegg::check::CheckItem> = serde_json::from_value(body["checks"].clone())
         .context("unexpected check response from the daemon")?;
-    Ok(Some(items))
+    Ok(Some((
+        items,
+        body["wake_skipped"].as_bool().unwrap_or(false),
+    )))
 }
 
 fn backup_now(paths: &Paths) -> Result<u8> {
@@ -1577,6 +1601,7 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
     if let Some(note) = nestegg::state::health_message(
         &Store::new(paths).load_state()?,
         status.current_run.as_ref(),
+        chrono::Utc::now(),
     ) {
         println!("              note: {note}");
     }
@@ -1766,23 +1791,30 @@ fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
         // by someone without the key, is not verified against the key. The key
         // is never decided by the restore's own second listing. (decision 0015)
         let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
-        let protected = matches!(
-            client
-                .archive_crypt_mode(args.snapshot, args.archive)?
-                .as_deref(),
-            Some("encrypt") | Some("sign-only")
-        );
-        if protected {
-            client.configured_key()?
-        } else {
-            bail!(
+        let files = client.snapshot_files(args.snapshot)?;
+        match client::archive_protection(&files, args.archive) {
+            client::Protection::Protected => client.configured_key()?,
+            client::Protection::NotListed => bail!(
+                "{} is not in {}; `nestegg snapshots` lists the snapshots, and the web UI \
+                 shows the archives of each",
+                args.archive,
+                args.snapshot
+            ),
+            client::Protection::ModeUnknown => bail!(
+                "the server does not say whether {} in {} is protected by the encryption key \
+                 (an older server). Pass the matching exported key with --keyfile <file> to \
+                 verify it, or restore it without verification with --no-key.",
+                args.archive,
+                args.snapshot
+            ),
+            client::Protection::Unprotected => bail!(
                 "{} in {} is not protected by the encryption key (it was made before \
                  encryption was switched on, or by someone without the key), so it cannot be \
                  verified against the key. Restore it anyway with --no-key, or pass the \
                  matching exported key with --keyfile <file>.",
                 args.archive,
                 args.snapshot
-            );
+            ),
         }
     } else {
         client::RestoreKey::Auto

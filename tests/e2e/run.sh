@@ -663,6 +663,26 @@ check "forged unencrypted blob does not let alice restore etc.pxar" \
   -d "{\"snapshot_time\":\"$forged_stime\",\"archive\":\"etc.pxar\",\"paths\":[],\"target_dir\":\"/home/alice/forged-blob\"}" \
   http://localhost/api/v1/restores
 
+# Root restores the unprotected archive through the daemon while encryption is
+# configured: it works, the job warns, and the daemon log names snapshot,
+# archive and requester.
+unprot_resp="$(docker exec "$client" curl -s --unix-socket /run/nestegg/api.sock -X POST -H 'Content-Type: application/json' \
+  -d "{\"snapshot_time\":\"$forged_stime\",\"archive\":\"etc.pxar\",\"paths\":[],\"target_dir\":\"/root/unprotected-restore\"}" \
+  http://localhost/api/v1/restores)"
+unprot_id="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$unprot_resp")"
+check "root restore of an unprotected archive accepted" test -n "$unprot_id"
+for _ in $(seq 1 60); do
+  unprot_job="$(docker exec "$client" curl -s --unix-socket /run/nestegg/api.sock "http://localhost/api/v1/restores/$unprot_id")"
+  grep -q '"state":"running"' <<<"$unprot_job" || break
+  sleep 1
+done
+check "unprotected restore succeeded" grep -q '"state":"succeeded"' <<<"$unprot_job"
+check "unprotected restore: the job warns" grep -q 'not protected by the encryption key' <<<"$unprot_job"
+check "unprotected restore: the daemon log names snapshot, archive and requester" \
+  on_client grep -q "restore of etc.pxar from $forged_snap for root: the archive is not protected" /var/log/nestegg-daemon.log
+check "CLI: an archive that is not in the snapshot has its own message" \
+  fails_with 1 "data.pxar is not in $forged_snap" on_client nestegg restore "$forged_snap" data.pxar /root/not-there
+
 # The same, but signed with a DIFFERENT key than the configured one. The
 # client is handed the configured key, cannot verify the signature, and the
 # snapshot stays closed (an error, never a widened scope).

@@ -145,6 +145,16 @@ was switched on), so they are not refused outright, but the restore now says so:
   message that names `--no-key` (and `--keyfile` for an older key generation).
 - With encryption off the behaviour is unchanged (`Auto`).
 
+### Revision 2026-11-10: a log line, and a missing archive is not "unprotected"
+
+- When the daemon restores an archive that is not protected by the key while
+  encryption is configured, it also writes one line to its log (the journal)
+  with the snapshot, the archive and who asked, besides the warning in the job.
+- An archive that is not in the snapshot's file list at all is no longer called
+  "not protected": the CLI says that the archive is not in the snapshot, and
+  the daemon's restore job fails with that message. An archive that is listed
+  without a crypt mode (an older server) gets its own message in the CLI too.
+
 ## Alternatives rejected
 
 - **Keep using notes, sign them with a key on this computer:** another key

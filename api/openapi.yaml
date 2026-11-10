@@ -177,10 +177,14 @@ paths:
         Wake-on-LAN, a server that does not answer is `failed`.
 
         Only one check runs at a time: a request made while one is running is
-        refused with 409 `already_checking`. There is also a minimum interval
-        between wake attempts, so a wake asked for very soon after a previous
-        one is skipped (`wake_skipped: true`) and the check runs without
-        sending another wake-up burst.
+        refused with 409 `already_checking`; a check whose caller went away
+        still finishes, and counts as running until it has. There is also a
+        minimum interval between wake attempts: a wake asked for less than a
+        minute after a check that really sent a wake-up packet is skipped
+        (`wake_skipped: true`) and the check runs without sending another
+        wake-up burst. A check in which no packet was sent (the server
+        answered at once, Wake-on-LAN off or not configured, every send
+        failed) does not start that minute.
       parameters:
         - name: wake
           in: query
@@ -198,7 +202,7 @@ paths:
                   checked_at: { type: string, format: date-time }
                   wake_skipped:
                     type: boolean
-                    description: A wake was asked for but skipped because one was sent very recently (minimum interval between wake attempts).
+                    description: A wake was asked for but skipped because a wake-up packet was sent less than a minute ago (minimum interval between wake attempts).
                   checks:
                     type: array
                     items:
@@ -526,7 +530,10 @@ components:
             Summary for the dashboard.
             `ok` – last success within the overdue threshold;
             `running` – a run is in progress;
-            `overdue` – no success within the threshold;
+            `overdue` – no success within the threshold, or the time of the
+            last success lies more than five minutes in the future (the
+            clock was wrong when it was recorded; a backup is then due at
+            once and `schedule.next_run` is now);
             `failing` – the last run failed;
             `incomplete` – the last backup succeeded, but it does not contain
             everything the configuration asks for (see `last_success.incomplete`);
@@ -594,7 +601,9 @@ components:
             not a persistent fault (the server was unreachable or stopped
             answering during the read-back, so the snapshot may exist but
             nothing was proven). Reported as `verification_failed`, but, like
-            `pbs_unreachable`, it does not pause the automatic retries. Absent
+            `pbs_unreachable`, it does not pause the automatic retries. Only
+            the first such failure in a row is transient; the next one
+            directly after it is an ordinary failure (decision 0015). Absent
             (false) otherwise and in records of older versions.
         error:
           oneOf:
@@ -606,7 +615,7 @@ components:
       properties:
         kind:
           type: string
-          description: "`verification_failed`: the upload finished, but reading the snapshot back from the server failed or did not match. `unknown`: a kind written by a newer version this one does not recognise (forward compatibility)."
+          description: "`verification_failed`: the upload finished, but reading the snapshot back from the server failed or did not match. `already_running`: the run did not start because another backup run held the run lock (state `cancelled`). `internal` also covers a run lock that could not be taken although no backup was running (the message names the holders). `unknown`: a kind written by a newer version this one does not recognise (forward compatibility)."
           enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, credentials_unreadable, verification_failed, cancelled, internal, unknown]
         message: { type: string }
     RunDetail:

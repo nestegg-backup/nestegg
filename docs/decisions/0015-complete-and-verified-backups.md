@@ -152,6 +152,34 @@ its cancel message, so it is in the run record and the run log.
   client's own "unreachable" classification) is transient; a content mismatch
   comes back as a plain verification failure.
 
+## Update 2026-11-10 (c): transient is decided by type, and only once in a row
+
+- **By type, not by words.** Whether a failed read-back is transient was
+  decided by looking for "timed out" anywhere in the error text, so an error
+  message from the server that happened to contain these words made a real
+  failure transient. Now the time limits nestegg imposes on its bounded client
+  calls carry a typed marker in the error chain, and so does a bounded call
+  whose client reported a transport failure (the connection could not be made
+  or broke: "connection refused", "no route to host", "network is
+  unreachable", "failed to lookup address", "error trying to connect",
+  "connection timed out", "connection reset", "broken pipe"). Only these two
+  markers make a read-back transient. The transport case still reads the
+  client's error output, because `proxmox-backup-client` exits with the same
+  code for every error; the list is narrower than the run's general
+  classification (a bare "timed out" does not count).
+- **Only the first unavailable read-back in a row is free.** A server that
+  always falls asleep right after the upload would otherwise cause a full
+  upload and a new, never verified snapshot at every hourly check, without
+  pause, for ever. `state.json` counts the read-backs in a row that the server's
+  unavailability stopped. The first one is transient as above; the next one
+  directly after it counts like any other failure (the counter of failures in a
+  row and the growing pause of decision 0021 apply), and its message says that
+  the server was unavailable again. Every completed read-back (verified or
+  mismatched) resets the count; a run that ends before the read-back (server
+  unreachable, a missing source, ...) and a cancelled read-back leave it as it
+  is, so a server that is sometimes not woken up does not make every asleep-
+  after-upload failure free again.
+
 ## Alternatives rejected
 
 - **Restore and compare every data archive:** as expensive as the backup.

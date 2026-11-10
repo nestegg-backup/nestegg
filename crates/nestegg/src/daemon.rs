@@ -1087,11 +1087,12 @@ fn restore_key_and_warning(
     if !config.backup.encryption {
         return Ok((crate::client::RestoreKey::Auto, None));
     }
-    let protected = matches!(
-        client.archive_crypt_mode(snapshot, archive)?.as_deref(),
-        Some("encrypt") | Some("sign-only")
-    );
-    if protected {
+    let files = client.snapshot_files(snapshot)?;
+    let protection = crate::client::archive_protection(&files, archive);
+    if protection == crate::client::Protection::NotListed {
+        anyhow::bail!("{archive} is not in {snapshot}");
+    }
+    if protection == crate::client::Protection::Protected {
         Ok((client.configured_key()?, None))
     } else {
         Ok((
@@ -1103,6 +1104,88 @@ fn restore_key_and_warning(
             )),
         ))
     }
+}
+
+/// Copies the progress of one archive restore into the job once a second.
+/// Dropping it stops the thread and waits for it, so the thread can never
+/// outlive the restore of its archive, whichever way that ends.
+struct ProgressMonitor {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressMonitor {
+    fn start(
+        done_before: u64,
+        src: Arc<std::sync::atomic::AtomicU64>,
+        dst: Arc<std::sync::atomic::AtomicU64>,
+        jobs: Arc<Mutex<HashMap<String, RestoreJob>>>,
+        id: &str,
+    ) -> ProgressMonitor {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let id = id.to_string();
+        let thread = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let now = done_before + src.load(Ordering::Relaxed);
+                    dst.store(now, Ordering::Relaxed);
+                    if let Some(j) = jobs.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+                        j.restored_bytes = now;
+                    }
+                    // Short steps, so a stop is noticed quickly.
+                    for _ in 0..10 {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            })
+        };
+        ProgressMonitor {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for ProgressMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// One line in the daemon's log (the journal) when an archive that is not
+/// protected by the configured encryption key is restored, besides the
+/// warning in the job: who restored what, without verification by the key.
+fn log_unprotected_restore(snapshot: &str, archive: &str, requester: &crate::restore::Requester) {
+    eprintln!("{}", unprotected_restore_line(snapshot, archive, requester));
+}
+
+fn unprotected_restore_line(
+    snapshot: &str,
+    archive: &str,
+    requester: &crate::restore::Requester,
+) -> String {
+    let name = |uid: u32| match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+        Ok(Some(user)) => format!("{} (uid {uid})", user.name),
+        _ => format!("uid {uid}"),
+    };
+    let who = match requester {
+        crate::restore::Requester::User(u) => name(u.uid),
+        crate::restore::Requester::Root { sudo: Some(u) } => {
+            format!("root (sudo by {})", name(u.uid))
+        }
+        crate::restore::Requester::Root { sudo: None } => "root".to_string(),
+    };
+    format!(
+        "warning: restore of {archive} from {snapshot} for {who}: the archive is not protected \
+         by the encryption key; it is restored without verifying it against the key"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1149,29 +1232,22 @@ fn run_restore_job(
         } else {
             target.to_path_buf()
         };
-        let progress = crate::restore::Progress::default();
-        let monitor_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let monitor = {
-            let stop = monitor_stop.clone();
-            let src = progress.restored_bytes.clone();
-            let dst = restored.clone();
-            let jobs = jobs.clone();
-            let id = id.to_string();
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let now = done_before + src.load(Ordering::Relaxed);
-                    dst.store(now, Ordering::Relaxed);
-                    if let Some(j) = jobs.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
-                        j.restored_bytes = now;
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
-            })
-        };
+        // The fallible lookups come before the progress monitor starts, and the
+        // monitor is a guard that stops and joins its thread when dropped, so
+        // no early return can leave a thread behind writing into the job.
         let (key, key_warning) = restore_key_and_warning(&client, config, snapshot, &sel.archive)?;
         if let Some(w) = key_warning {
+            log_unprotected_restore(snapshot, &sel.archive, requester);
             warnings.push(w);
         }
+        let progress = crate::restore::Progress::default();
+        let monitor = ProgressMonitor::start(
+            done_before,
+            progress.restored_bytes.clone(),
+            restored.clone(),
+            jobs.clone(),
+            id,
+        );
         let mut log = Vec::new();
         let result = crate::restore::execute(
             paths,
@@ -1188,8 +1264,7 @@ fn run_restore_job(
             &progress,
             &mut log,
         );
-        monitor_stop.store(true, Ordering::Relaxed);
-        let _ = monitor.join();
+        drop(monitor);
         done_before += progress.restored_bytes.load(Ordering::Relaxed);
         restored.store(done_before, Ordering::Relaxed);
         warnings.extend(
@@ -1343,12 +1418,33 @@ async fn pbs_check(
     AxState(app): AxState<App>,
     Query(q): Query<WakeQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let wake = q.wake.unwrap_or(false);
+    pbs_check_with(app, q.wake.unwrap_or(false), |paths, options| {
+        crate::check::run_reporting(paths, options)
+    })
+    .await
+}
+
+/// Whether a wake attempt may be made now: none was sent within
+/// [`MIN_WAKE_INTERVAL`] (counted from the end of the check that sent it), so
+/// group members cannot make the daemon spam Wake-on-LAN.
+fn wake_allowed(last_sent: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_sent.is_none_or(|t| now.saturating_duration_since(t) >= MIN_WAKE_INTERVAL)
+}
+
+/// `POST /pbs/check` with the check itself passed in (tests use a double).
+async fn pbs_check_with(
+    app: App,
+    wake: bool,
+    check: impl FnOnce(&Paths, &crate::check::CheckOptions) -> crate::check::Checked + Send + 'static,
+) -> ApiResult<Json<serde_json::Value>> {
     // Only one check at a time: a login, a reachability probe and possibly a
     // Wake-on-LAN burst can take minutes, and any group member can ask for one.
     // A second request while one runs is refused with a clear message rather
-    // than piling on more work and more wake-ups.
-    let Ok(_gate) = app.check_gate.try_lock() else {
+    // than piling on more work and more wake-ups. The gate is an owned guard
+    // that moves into the blocking task below: if the caller goes away and this
+    // future is dropped, the check goes on, and so does the gate until the
+    // check has finished.
+    let Ok(gate) = app.check_gate.clone().try_lock_owned() else {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "already_checking",
@@ -1356,40 +1452,44 @@ async fn pbs_check(
         ));
     };
     // Keep a minimum interval between wake attempts: if one was sent very
-    // recently, check without sending another wake-up burst.
-    let effective_wake = if wake {
-        let mut last = app.last_wake.lock().unwrap_or_else(|e| e.into_inner());
-        let now = std::time::Instant::now();
-        let recent = last.is_some_and(|t| now.duration_since(t) < MIN_WAKE_INTERVAL);
-        if !recent {
-            *last = Some(now);
-        }
-        !recent
-    } else {
-        false
-    };
+    // recently, check without sending another wake-up burst. Only a check that
+    // really sent a packet starts the interval (not one where the server
+    // answered at once, or Wake-on-LAN is off or not configured).
+    let effective_wake = wake
+        && wake_allowed(
+            *app.last_wake.lock().unwrap_or_else(|e| e.into_inner()),
+            std::time::Instant::now(),
+        );
     let paths = app.paths.clone();
-    let checks = blocking(move || {
-        Ok(crate::check::run(
+    let last_wake = app.last_wake.clone();
+    let last_check = app.last_check.clone();
+    let (checks, checked_at) = blocking(move || {
+        let _gate = gate;
+        let checked = check(
             &paths,
             &crate::check::CheckOptions {
                 wake: effective_wake,
                 login: true,
             },
-        ))
+        );
+        if checked.wake_sent {
+            *last_wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+        }
+        let checked_at = Utc::now();
+        // The server answered, or it did not (failed, or asleep and not woken):
+        // either way that is now the newest thing known about it. No such item
+        // (the configuration could not be read): nothing was learned.
+        if let Some(item) = checked
+            .items
+            .iter()
+            .find(|i| i.name == crate::check::REACHABLE_ITEM)
+        {
+            let reachable = item.status == crate::check::CheckStatus::Passed;
+            *last_check.lock().unwrap_or_else(|e| e.into_inner()) = Some((reachable, checked_at));
+        }
+        Ok((checked.items, checked_at))
     })
     .await?;
-    let checked_at = Utc::now();
-    // The server answered, or it did not (failed, or asleep and not woken):
-    // either way that is now the newest thing known about it. No such item
-    // (the configuration could not be read): nothing was learned.
-    if let Some(item) = checks
-        .iter()
-        .find(|i| i.name == crate::check::REACHABLE_ITEM)
-    {
-        let reachable = item.status == crate::check::CheckStatus::Passed;
-        *app.last_check.lock().unwrap_or_else(|e| e.into_inner()) = Some((reachable, checked_at));
-    }
     Ok(Json(json!({
         "checks": checks,
         "checked_at": crate::state::format_time(checked_at),
@@ -1824,6 +1924,174 @@ mod tests {
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert_eq!(err.code, "already_checking");
         drop(held);
+    }
+
+    #[test]
+    fn a_restore_whose_key_lookup_fails_leaves_no_monitor_thread_behind() {
+        // Encryption on and no credentials stored: the crypt-mode lookup of
+        // the archive fails before any client runs (no password). The job must
+        // end with that error, and no progress thread may stay behind writing
+        // into the job (it would hold a clone of `jobs` for ever).
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir_all(&p.credentials_dir).unwrap();
+        let config = crate::config::example("pbs.example.com", "backups", "backup@pbs!desktop");
+        assert!(config.backup.encryption);
+        let jobs: Arc<Mutex<HashMap<String, RestoreJob>>> = Default::default();
+        let restored = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let selections = vec![ArchivePaths {
+            archive: "home.pxar".into(),
+            paths: Vec::new(),
+        }];
+        let result = run_restore_job(
+            &p,
+            &config,
+            SNAPSHOT,
+            &selections,
+            &dir.path().join("target"),
+            &crate::restore::Requester::Root { sudo: None },
+            &restored,
+            &jobs,
+            "job",
+        );
+        assert!(result.is_err(), "the key lookup must fail");
+        assert_eq!(
+            Arc::strong_count(&jobs),
+            1,
+            "a monitor thread still holds the job table"
+        );
+        assert_eq!(Arc::strong_count(&restored), 1);
+    }
+
+    #[test]
+    fn the_progress_monitor_stops_when_dropped() {
+        let jobs: Arc<Mutex<HashMap<String, RestoreJob>>> = Default::default();
+        let src = Arc::new(std::sync::atomic::AtomicU64::new(7));
+        let dst = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let monitor = ProgressMonitor::start(5, src.clone(), dst.clone(), jobs.clone(), "x");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while dst.load(Ordering::Relaxed) != 12 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(dst.load(Ordering::Relaxed), 12);
+        let started = std::time::Instant::now();
+        drop(monitor);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(Arc::strong_count(&jobs), 1);
+        assert_eq!(Arc::strong_count(&src), 1);
+    }
+
+    #[test]
+    fn an_unprotected_restore_is_logged_with_snapshot_archive_and_requester() {
+        let line = unprotected_restore_line(
+            SNAPSHOT,
+            "home.pxar",
+            &crate::restore::Requester::Root { sudo: None },
+        );
+        assert!(line.contains(SNAPSHOT), "{line}");
+        assert!(line.contains("home.pxar"), "{line}");
+        assert!(line.contains("for root"), "{line}");
+        assert!(line.contains("not protected"), "{line}");
+    }
+
+    #[test]
+    fn a_wake_is_allowed_once_a_minute() {
+        let now = std::time::Instant::now();
+        assert!(wake_allowed(None, now));
+        let later = |secs| now + std::time::Duration::from_secs(secs);
+        assert!(!wake_allowed(Some(now), now));
+        assert!(!wake_allowed(Some(now), later(59)));
+        assert!(wake_allowed(Some(now), later(60)));
+        // A stamp "after" now (cannot happen with a monotonic clock) is not
+        // an underflow.
+        assert!(!wake_allowed(Some(later(5)), now));
+    }
+
+    fn checked(wake_sent: bool) -> crate::check::Checked {
+        crate::check::Checked {
+            items: Vec::new(),
+            wake_sent,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_wake_that_was_really_sent_starts_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        // Asked to wake, but nothing was sent (the server answered at once):
+        // the next request may still wake.
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let record = |sent: bool| {
+            let asked = asked.clone();
+            move |_: &Paths, o: &crate::check::CheckOptions| {
+                asked.lock().unwrap().push(o.wake);
+                checked(sent)
+            }
+        };
+        let r = pbs_check_with(app.clone(), true, record(false))
+            .await
+            .ok()
+            .expect("the check answers");
+        assert_eq!(r.0["wake_skipped"], false);
+        assert!(app.last_wake.lock().unwrap().is_none());
+        // This one sends a packet.
+        let r = pbs_check_with(app.clone(), true, record(true))
+            .await
+            .ok()
+            .expect("the check answers");
+        assert_eq!(r.0["wake_skipped"], false);
+        assert!(app.last_wake.lock().unwrap().is_some());
+        // Within the minute: checked without waking, and the caller is told.
+        let r = pbs_check_with(app.clone(), true, record(false))
+            .await
+            .ok()
+            .expect("the check answers");
+        assert_eq!(r.0["wake_skipped"], true);
+        // Not asked to wake: never "skipped".
+        let r = pbs_check_with(app.clone(), false, record(false))
+            .await
+            .ok()
+            .expect("the check answers");
+        assert_eq!(r.0["wake_skipped"], false);
+        assert_eq!(*asked.lock().unwrap(), vec![true, true, false, false]);
+    }
+
+    #[tokio::test]
+    async fn the_check_gate_is_held_until_the_check_ends_even_if_the_caller_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let request = tokio::spawn(pbs_check_with(app.clone(), false, move |_, _| {
+            started_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            checked(false)
+        }));
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        // The caller goes away: the request future is dropped.
+        request.abort();
+        assert!(request.await.err().expect("aborted").is_cancelled());
+        // The check is still running, so the gate is still closed.
+        let err = pbs_check_with(app.clone(), false, |_, _| checked(false))
+            .await
+            .expect_err("the gate must stay closed while the check runs");
+        assert_eq!(err.code, "already_checking");
+        // The check ends: the gate opens.
+        go_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.check_gate.try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the gate never opened"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

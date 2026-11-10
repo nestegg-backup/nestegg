@@ -52,17 +52,46 @@ pub struct RunLock {
     _lock: Flock<File>,
 }
 
+/// The run lock could not be taken, but nothing recognisable holds it: no
+/// exclusive lock on the file according to `/proc/locks` and no fresh record of
+/// a running backup. Something else (a stray shared lock, for example) keeps
+/// backups from starting. This is an error, not "already running": reported
+/// with exit code 1 and recorded as a failed run, so it does not go unnoticed.
+#[derive(Debug)]
+pub struct LockBlocked {
+    pub message: String,
+}
+
+impl std::fmt::Display for LockBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LockBlocked {}
+
 impl RunLock {
+    /// Take the run lock. `Ok(None)` only when a backup run (or another
+    /// command that takes the run lock, such as a key command) really holds
+    /// it; a lock that cannot be taken although nothing of that kind is
+    /// recognisable is an error of type [`LockBlocked`].
     pub fn try_acquire(paths: &Paths) -> Result<Option<RunLock>> {
+        Self::try_acquire_for(paths, None)
+    }
+
+    /// Like [`RunLock::try_acquire`] for the run with ID `own_run_id`: the
+    /// daemon's reservation of this very run in `current.json` is not taken
+    /// for another run in progress.
+    pub fn try_acquire_for(paths: &Paths, own_run_id: Option<&str>) -> Result<Option<RunLock>> {
         fs::create_dir_all(&paths.runtime_dir)
             .with_context(|| format!("cannot create {}", paths.runtime_dir.display()))?;
         // 0600, not 0644: a group member must not be able to open the lock
         // read-only and hold a shared `flock` on it, which would make the
         // exclusive lock below block and so keep backups from starting. Status
-        // queries no longer need to open it — they read `/proc/locks` instead
+        // queries do not need to open it — they read `/proc/locks` instead
         // (decision 0022, item 2).
-        // A short retry: a reader that briefly holds a shared lock (older
-        // versions, fallback probe) must not make a start fail.
+        // A short retry: a reader that briefly holds a shared lock (fallback
+        // probe) must not make a start fail.
         for attempt in 0..10 {
             let one_try = std::time::Duration::ZERO;
             if let Some(lock) = crate::state::lock_private(&paths.lock_file(), one_try)
@@ -70,13 +99,113 @@ impl RunLock {
             {
                 return Ok(Some(RunLock { _lock: lock }));
             }
-            if attempt == 9 || lock_is_held(paths) == Some(true) {
+            if lock_is_held(paths) == Some(true) {
                 return Ok(None);
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            if attempt < 9 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
-        Ok(None)
+        if run_in_progress(paths, own_run_id) {
+            return Ok(None);
+        }
+        Err(LockBlocked {
+            message: blocked_message(paths),
+        }
+        .into())
     }
+}
+
+/// Whether a backup run is recognisable: an exclusive lock on the run lock
+/// file, or a fresh `current.json` of another run.
+fn run_in_progress(paths: &Paths, own_run_id: Option<&str>) -> bool {
+    if lock_is_held(paths) == Some(true) {
+        return true;
+    }
+    matches!(active_run(paths), Ok(Some(run)) if Some(run.id.as_str()) != own_run_id)
+}
+
+/// The message for a run lock that is blocked without a recognisable run,
+/// naming the holders `/proc/locks` lists.
+fn blocked_message(paths: &Paths) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let path = paths.lock_file();
+    let holders = fs::metadata(&path)
+        .ok()
+        .and_then(|meta| {
+            let locks = fs::read_to_string("/proc/locks").ok()?;
+            Some(proc_locks_holders(&locks, meta.dev(), meta.ino()))
+        })
+        .unwrap_or_default();
+    let who = if holders.is_empty() {
+        "/proc/locks names no holder".to_string()
+    } else {
+        let list: Vec<String> = holders
+            .iter()
+            .map(|(pid, kind)| match process_name(*pid) {
+                Some(name) => format!("pid {pid} ({name}, {kind} lock)"),
+                None => format!("pid {pid} ({kind} lock)"),
+            })
+            .collect();
+        format!("held by {}", list.join(", "))
+    };
+    format!(
+        "the run lock {} cannot be taken although no backup is running ({who}); no backup \
+         can start until that lock is released (end the process holding it)",
+        path.display()
+    )
+}
+
+/// Short command name of a process, for messages.
+fn process_name(pid: u32) -> Option<String> {
+    let name = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let name: String = name
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The processes holding a `flock` (read or write) on the file with
+/// `dev`/`ino` according to `/proc/locks`, with the kind of lock. Blocked
+/// waiters (`->`) are not holders. Only used for messages.
+pub fn proc_locks_holders(locks: &str, dev: u64, ino: u64) -> Vec<(u32, &'static str)> {
+    let major = nix::sys::stat::major(dev);
+    let minor = nix::sys::stat::minor(dev);
+    let mut holders = Vec::new();
+    for line in locks.lines() {
+        if line.contains("->") {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 || fields[1] != "FLOCK" {
+            continue;
+        }
+        let mut id = fields[5].split(':');
+        let (Some(ma), Some(mi), Some(i)) = (id.next(), id.next(), id.next()) else {
+            continue;
+        };
+        if u64::from_str_radix(ma, 16).ok() != Some(major)
+            || u64::from_str_radix(mi, 16).ok() != Some(minor)
+            || i.parse::<u64>().ok() != Some(ino)
+        {
+            continue;
+        }
+        let Ok(pid) = fields[4].parse::<u32>() else {
+            continue;
+        };
+        let kind = if fields[3] == "WRITE" {
+            "exclusive"
+        } else {
+            "shared"
+        };
+        if !holders.contains(&(pid, kind)) {
+            holders.push((pid, kind));
+        }
+    }
+    holders
 }
 
 /// The run currently in progress, if any. A leftover `current.json` without
@@ -86,7 +215,11 @@ pub fn active_run(paths: &Paths) -> Result<Option<Run>> {
     let Some(current) = store.load_current()? else {
         return Ok(None);
     };
-    let young = Utc::now() - current.started_at <= Duration::seconds(60);
+    // A start time in the future (the clock was ahead when it was written)
+    // says nothing about the age: such a leftover is not "young", or it would
+    // count as a run in progress until real time caught up.
+    let age = Utc::now() - current.started_at;
+    let young = age <= Duration::seconds(60) && age >= -crate::state::future_tolerance();
     match lock_is_held(paths) {
         // A run holds the lock.
         Some(true) => Ok(Some(current)),
@@ -228,28 +361,35 @@ impl Reporter<'_> {
 }
 
 pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
-    let Some(_lock) = RunLock::try_acquire(paths)? else {
-        eprintln!("another backup run is in progress");
-        // A run promised by the daemon (pre-assigned ID) gets a final record
-        // so it does not stay "starting" forever. state.json belongs to the
-        // run holding the lock and is not touched.
-        if let Some(id) = options
-            .run_id
-            .as_deref()
-            .filter(|id| crate::state::is_valid_run_id(id))
-        {
-            let store = Store::new(paths);
-            let mut run = Run::new(options.trigger, Utc::now());
-            run.id = id.to_string();
-            run.error = Some(RunError {
-                kind: ErrorKind::AlreadyRunning,
-                message: "another backup run was already in progress".into(),
-            });
-            run.finish(RunState::Cancelled, Utc::now());
-            store.record_run_only(&run)?;
-            store.clear_current_if(id)?;
+    let _lock = match RunLock::try_acquire_for(paths, options.run_id.as_deref()) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!("another backup run is in progress");
+            // A run promised by the daemon (pre-assigned ID) gets a final record
+            // so it does not stay "starting" forever. state.json belongs to the
+            // run holding the lock and is not touched.
+            if let Some(id) = options
+                .run_id
+                .as_deref()
+                .filter(|id| crate::state::is_valid_run_id(id))
+            {
+                let store = Store::new(paths);
+                let mut run = Run::new(options.trigger, Utc::now());
+                run.id = id.to_string();
+                run.error = Some(RunError {
+                    kind: ErrorKind::AlreadyRunning,
+                    message: "another backup run was already in progress".into(),
+                });
+                run.finish(RunState::Cancelled, Utc::now());
+                store.record_run_only(&run)?;
+                store.clear_current_if(id)?;
+            }
+            return Ok(RunExit::AlreadyRunning);
         }
-        return Ok(RunExit::AlreadyRunning);
+        Err(e) => match e.downcast_ref::<LockBlocked>() {
+            Some(blocked) => return record_blocked(paths, options, &blocked.message),
+            None => return Err(e),
+        },
     };
     crate::cancel::install_handler();
     let store = Store::new(paths);
@@ -258,34 +398,9 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     let config = Config::load(&paths.config_file);
     let state = store.load_state()?;
 
-    if let (Ok(cfg), Trigger::Timer, false) = (&config, options.trigger, options.force)
-        && !is_due(&state, cfg.schedule.interval_hours, Utc::now())
-    {
-        eprintln!(
-            "not due yet (last success within {} h)",
-            cfg.schedule.interval_hours
-        );
+    if let Some(reason) = timer_skip(&config, &state, config_stamp.as_deref(), options) {
+        eprintln!("{reason}");
         return Ok(RunExit::NotDue);
-    }
-    // After failures in a row the timer pauses longer and longer; manual
-    // runs and a changed configuration are not held back.
-    if let (Ok(cfg), Trigger::Timer, false) = (&config, options.trigger, options.force) {
-        let now = Utc::now();
-        if let Some(not_before) = crate::state::retry_not_before(
-            &state,
-            cfg.schedule.interval_hours,
-            config_stamp.as_deref(),
-            now,
-        ) && now < not_before
-        {
-            eprintln!(
-                "not retrying yet: {} failed runs in a row, next automatic attempt after {} \
-                 (start one now with `nestegg backup`)",
-                state.consecutive_failures,
-                crate::state::format_time(not_before)
-            );
-            return Ok(RunExit::NotDue);
-        }
     }
 
     let mut run = Run::new(options.trigger, Utc::now());
@@ -378,6 +493,85 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
         RunState::Cancelled => RunExit::Cancelled,
         _ => RunExit::Failed,
     })
+}
+
+/// Why a timer run does not start now (not due yet, or the growing pause
+/// after failures in a row), `None` when it starts. Manual and CLI runs and
+/// forced runs always start.
+fn timer_skip(
+    config: &Result<Config>,
+    state: &crate::state::State,
+    config_stamp: Option<&str>,
+    options: &RunOptions,
+) -> Option<String> {
+    let (Ok(cfg), Trigger::Timer, false) = (config, options.trigger, options.force) else {
+        return None;
+    };
+    let now = Utc::now();
+    if !is_due(state, cfg.schedule.interval_hours, now) {
+        return Some(format!(
+            "not due yet (last success within {} h)",
+            cfg.schedule.interval_hours
+        ));
+    }
+    // After failures in a row the timer pauses longer and longer; manual
+    // runs and a changed configuration are not held back.
+    if let Some(not_before) =
+        crate::state::retry_not_before(state, cfg.schedule.interval_hours, config_stamp, now)
+        && now < not_before
+    {
+        return Some(format!(
+            "not retrying yet: {} failed runs in a row, next automatic attempt after {} \
+             (start one now with `nestegg backup`)",
+            state.consecutive_failures,
+            crate::state::format_time(not_before)
+        ));
+    }
+    None
+}
+
+/// The run lock is blocked although no backup runs ([`LockBlocked`]). A timer
+/// run that would not have started anyway stays quiet; otherwise the attempt is
+/// recorded as a failed run (like a missing key), so the health becomes
+/// `failing` and the notification check reports it, and the exit code is 1.
+/// No run holds the lock, so updating `state.json` here races with nobody.
+fn record_blocked(paths: &Paths, options: &RunOptions, message: &str) -> Result<RunExit> {
+    let store = Store::new(paths);
+    let config_stamp = crate::state::config_stamp(&paths.config_file);
+    let config = Config::load(&paths.config_file);
+    let state = store.load_state()?;
+    if let Some(reason) = timer_skip(&config, &state, config_stamp.as_deref(), options) {
+        eprintln!("{reason}");
+        return Ok(RunExit::NotDue);
+    }
+    let mut run = Run::new(options.trigger, Utc::now());
+    if let Some(id) = &options.run_id
+        && crate::state::is_valid_run_id(id)
+    {
+        run.id = id.clone();
+    }
+    eprintln!("error: {message}");
+    fs::create_dir_all(paths.runs_dir())?;
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store.log_path(&run.id))
+    {
+        let _ = writeln!(
+            log,
+            "[{}] error: {message}",
+            crate::state::format_time(Utc::now())
+        );
+    }
+    run.error = Some(RunError {
+        kind: ErrorKind::Internal,
+        message: message.to_string(),
+    });
+    run.finish(RunState::Failed, Utc::now());
+    let keep = config.as_ref().map(|c| c.backup.keep_runs).unwrap_or(200);
+    store.record_finished_with_config(&run, keep, config_stamp)?;
+    store.clear_current_if(&run.id)?;
+    Ok(RunExit::Failed)
 }
 
 fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()> {
@@ -778,6 +972,12 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         }
     };
     drop(meta_file);
+    // Only the first read-back in a row that the server's unavailability
+    // stopped is free (transient); the next one directly after it counts like
+    // any other failure, so a server that always falls asleep right after the
+    // upload does not cause a full upload at every hourly check forever
+    // (decision 0015, amendment 2026-11-10; decision 0021).
+    let unavailable_before = note_readback(rep, &verification);
     match verification {
         crate::verify::Outcome::Verified => {
             rep.run.verified = true;
@@ -810,9 +1010,19 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         crate::verify::Outcome::Unavailable(message) => {
             record_server_verification(rep, &client, &backup_id);
             // Reported as a verification failure (the snapshot may exist,
-            // nothing was proven), but only a server-availability problem: it
-            // does not pause the retries (decisions 0015, 0021).
-            rep.run.transient = true;
+            // nothing was proven), but only a server-availability problem: the
+            // first one in a row does not pause the retries (decisions 0015,
+            // 0021); the next one directly after it counts.
+            rep.run.transient = unavailable_before == 0;
+            let message = if rep.run.transient {
+                message
+            } else {
+                format!(
+                    "{message}; the server was unavailable during the read-back again \
+                     ({} times in a row), so this counts as a failure",
+                    unavailable_before + 1
+                )
+            };
             rep.fail(
                 RunState::Failed,
                 RunError {
@@ -884,6 +1094,30 @@ fn backup_metadata(
         system_mode: config.backup.system,
         incomplete: run.incomplete.clone(),
     }
+}
+
+/// Update `State::readback_unavailable_in_a_row` for the outcome of the
+/// read-back and return its value from before. A cancelled read-back changes
+/// nothing.
+fn note_readback(rep: &mut Reporter<'_>, outcome: &crate::verify::Outcome) -> u32 {
+    let mut before = 0;
+    let saved = rep.store.load_state().and_then(|mut state| {
+        before = state.readback_unavailable_in_a_row;
+        let next = match outcome {
+            crate::verify::Outcome::Unavailable(_) => before.saturating_add(1),
+            crate::verify::Outcome::Cancelled => before,
+            crate::verify::Outcome::Verified | crate::verify::Outcome::Failed(_) => 0,
+        };
+        if next != before {
+            state.readback_unavailable_in_a_row = next;
+            rep.store.save_state(&state)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = saved {
+        rep.warn(format!("cannot update state: {e:#}"));
+    }
+    before
 }
 
 /// Store the snapshots of this machine that the server's own verification
@@ -1137,6 +1371,74 @@ mod tests {
             dev,
             5678
         ));
+    }
+
+    #[test]
+    fn proc_locks_holders_names_every_holder_but_not_waiters() {
+        let dev = nix::sys::stat::makedev(0, 0x19);
+        let text = "1: FLOCK  ADVISORY  READ 1234 00:19:5678 0 EOF\n\
+                    1: -> FLOCK  ADVISORY  WRITE 99 00:19:5678 0 EOF\n\
+                    2: FLOCK  ADVISORY  WRITE 42 00:19:5678 0 EOF\n\
+                    3: FLOCK  ADVISORY  READ 7 00:19:1 0 EOF\n\
+                    4: POSIX  ADVISORY  WRITE 8 00:19:5678 0 EOF\n";
+        assert_eq!(
+            proc_locks_holders(text, dev, 5678),
+            vec![(1234, "shared"), (42, "exclusive")]
+        );
+        assert!(proc_locks_holders(text, dev, 2).is_empty());
+    }
+
+    #[test]
+    fn a_shared_lock_without_a_run_is_an_error_not_already_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: dir.path().join("c.toml"),
+            credentials_dir: dir.path().join("cred"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+            systemctl: PathBuf::from("systemctl"),
+        };
+        fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let file = File::open({
+            drop(crate::state::open_private_lock(&paths.lock_file()).unwrap());
+            paths.lock_file()
+        })
+        .unwrap();
+        let shared = Flock::lock(file, FlockArg::LockSharedNonblock).unwrap();
+        let err = match RunLock::try_acquire(&paths) {
+            Err(e) => e,
+            Ok(lock) => panic!("expected an error, got {}", lock.is_some()),
+        };
+        let blocked = err.downcast_ref::<LockBlocked>().expect("typed");
+        assert!(
+            blocked.message.contains("no backup is running"),
+            "{}",
+            blocked.message
+        );
+        if fs::read_to_string("/proc/locks").is_ok() {
+            assert!(
+                blocked
+                    .message
+                    .contains(&format!("pid {}", std::process::id())),
+                "{}",
+                blocked.message
+            );
+        }
+        // A fresh record of another run: that run is starting, not an error.
+        let store = Store::new(&paths);
+        let other = Run::new(Trigger::Manual, Utc::now());
+        store.save_current(&other).unwrap();
+        assert!(RunLock::try_acquire(&paths).unwrap().is_none());
+        // The daemon's reservation of this very run is not "another run".
+        assert!(RunLock::try_acquire_for(&paths, Some(&other.id)).is_err());
+        // A leftover whose start lies in the future is no run in progress.
+        let mut future = Run::new(Trigger::Manual, Utc::now() + Duration::hours(3));
+        future.id = "20990101T000000Z-manual-0001".into();
+        store.save_current(&future).unwrap();
+        assert!(active_run(&paths).unwrap().is_none());
+        assert!(RunLock::try_acquire(&paths).is_err());
+        drop(shared);
+        assert!(RunLock::try_acquire(&paths).unwrap().is_some());
     }
 
     #[test]

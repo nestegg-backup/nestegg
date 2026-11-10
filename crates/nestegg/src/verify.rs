@@ -157,12 +157,13 @@ pub fn read_back(
 
 /// Whether a read-back error is a server-availability problem (the server
 /// stopped answering, a connection failed, or a time limit was hit) rather than
-/// a real fault. Reuses the client's own transport-error classification plus the
-/// bounded calls' "timed out" wording.
+/// a real fault. Decided by type, not by the words of the message: the time
+/// limits nestegg imposes on the bounded client calls carry
+/// [`crate::client::TimedOut`], and a bounded call whose client reported a
+/// transport failure carries [`crate::client::Unreachable`]. An error text from
+/// the server that happens to say "timed out" is a real failure.
 fn is_unavailable(e: &anyhow::Error) -> bool {
-    let text = format!("{e:#}");
-    text.to_lowercase().contains("timed out")
-        || crate::client::classify_failure(&[text]) == crate::state::ErrorKind::PbsUnreachable
+    crate::client::is_unavailable_error(e)
 }
 
 fn read_back_steps(
@@ -248,6 +249,23 @@ fn read_back_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailability_is_decided_by_type_not_by_text() {
+        use crate::client::{TimedOut, Unreachable};
+        // nestegg's own time limit, also below added context.
+        let timeout = anyhow::Error::from(TimedOut("listing timed out after 5s".into()))
+            .context("restoring inventory.pxar failed");
+        assert!(is_unavailable(&timeout));
+        let transport = anyhow::Error::from(Unreachable("connection refused".into()));
+        assert!(is_unavailable(&transport));
+        // Words in an error from the server are not a type.
+        let server_text = anyhow::anyhow!("Error: verification task timed out on the server")
+            .context("restoring inventory.pxar failed");
+        assert!(!is_unavailable(&server_text));
+        let refused_text = anyhow::anyhow!("connection refused");
+        assert!(!is_unavailable(&refused_text));
+    }
 
     #[test]
     fn listing_detects_missing_and_unencrypted_archives() {

@@ -180,6 +180,76 @@ pub fn parse_size(s: &str) -> Option<u64> {
     Some((number * factor).round() as u64)
 }
 
+/// A time limit that nestegg itself imposed on a client call (the `*_bounded`
+/// calls) was hit. Carried in the error chain so callers decide by type, not
+/// by the words of a message (decision 0015).
+#[derive(Debug)]
+pub struct TimedOut(pub String);
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// A bounded client call failed because the server could not be reached (the
+/// client's own transport errors, see [`is_transport_failure`]). Carried in
+/// the error chain like [`TimedOut`].
+#[derive(Debug)]
+pub struct Unreachable(pub String);
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// Whether an error chain carries [`TimedOut`] or [`Unreachable`]: the server
+/// stopped answering, not a fault of the snapshot.
+pub fn is_unavailable_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<TimedOut>().is_some() || c.downcast_ref::<Unreachable>().is_some()
+    })
+}
+
+/// Whether the error output of a failed client call is a transport failure:
+/// the connection to the server could not be made or broke. Narrower than
+/// [`classify_failure`]: a bare "timed out" is not enough (a server task or
+/// an error message from the server may contain these words); only the
+/// connection-level phrases of the client and the OS count. The client exits
+/// with the same code for every error, so its words are all there is to go
+/// by.
+pub fn is_transport_failure(stderr: &str) -> bool {
+    let text = stderr.to_lowercase();
+    [
+        "connection refused",
+        "no route to host",
+        "network is unreachable",
+        "failed to lookup address",
+        "error trying to connect",
+        "connection timed out",
+        "connection reset",
+        "broken pipe",
+    ]
+    .iter()
+    .any(|p| text.contains(p))
+}
+
+/// The error of a bounded client call that exited unsuccessfully: typed as
+/// [`Unreachable`] for a transport failure, a plain error otherwise.
+fn bounded_failure(stderr: &[u8]) -> anyhow::Error {
+    let text = String::from_utf8_lossy(stderr).trim().to_string();
+    if is_transport_failure(&text) {
+        Unreachable(text).into()
+    } else {
+        anyhow::anyhow!("{text}")
+    }
+}
+
 /// Map client output to an error category.
 pub fn classify_failure(output_tail: &[String]) -> ErrorKind {
     let text = output_tail.join("\n").to_lowercase();
@@ -392,6 +462,48 @@ pub fn crypt_mode_for_archive(json: &str, archive: &str) -> Option<String> {
         }
     }
     modes.into_iter().next()
+}
+
+/// Whether an archive of a snapshot is protected by the encryption key, as
+/// the JSON of `snapshot files` lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protection {
+    /// Encrypted or signed.
+    Protected,
+    /// Listed with crypt mode `none`.
+    Unprotected,
+    /// Listed, but without a crypt mode (an older server).
+    ModeUnknown,
+    /// Not in the snapshot at all.
+    NotListed,
+}
+
+/// [`Protection`] of `archive` in the JSON of `snapshot files`.
+pub fn archive_protection(json: &str, archive: &str) -> Protection {
+    match crypt_mode_for_archive(json, archive).as_deref() {
+        Some("encrypt") | Some("sign-only") => Protection::Protected,
+        Some(_) => Protection::Unprotected,
+        None => {
+            let candidates = archive_candidates(archive);
+            let listed = serde_json::from_str::<Value>(json)
+                .ok()
+                .and_then(|v| {
+                    v.as_array().map(|files| {
+                        files.iter().any(|f| {
+                            f["filename"]
+                                .as_str()
+                                .is_some_and(|n| candidates.iter().any(|c| c == n))
+                        })
+                    })
+                })
+                .unwrap_or(false);
+            if listed {
+                Protection::ModeUnknown
+            } else {
+                Protection::NotListed
+            }
+        }
+    }
 }
 
 /// Whether an [`RestoreKey::Auto`] restore of an archive must pass the key.
@@ -726,15 +838,18 @@ impl<'a> Client<'a> {
         fds.apply(&mut cmd);
         let cap = run_capturing(&mut cmd, Some(timeout))?;
         match cap.stopped {
-            Stopped::TimedOut => bail!(
-                "listing the snapshots timed out after {}s",
-                timeout.as_secs()
-            ),
+            Stopped::TimedOut => {
+                return Err(TimedOut(format!(
+                    "listing the snapshots timed out after {}s",
+                    timeout.as_secs()
+                ))
+                .into());
+            }
             Stopped::Cancelled => bail!("listing the snapshots was cancelled"),
             Stopped::No => {}
         }
         if !cap.status.success() {
-            bail!("{}", String::from_utf8_lossy(&cap.stderr).trim());
+            return Err(bounded_failure(&cap.stderr));
         }
         parse_snapshot_list(&String::from_utf8_lossy(&cap.stdout))
     }
@@ -754,15 +869,18 @@ impl<'a> Client<'a> {
         fds.apply(&mut cmd);
         let cap = run_capturing(&mut cmd, Some(timeout))?;
         match cap.stopped {
-            Stopped::TimedOut => bail!(
-                "writing the snapshot notes timed out after {}s",
-                timeout.as_secs()
-            ),
+            Stopped::TimedOut => {
+                return Err(TimedOut(format!(
+                    "writing the snapshot notes timed out after {}s",
+                    timeout.as_secs()
+                ))
+                .into());
+            }
             Stopped::Cancelled => bail!("writing the snapshot notes was cancelled"),
             Stopped::No => {}
         }
         if !cap.status.success() {
-            bail!("{}", String::from_utf8_lossy(&cap.stderr).trim());
+            return Err(bounded_failure(&cap.stderr));
         }
         Ok(())
     }
@@ -824,15 +942,18 @@ impl<'a> Client<'a> {
         fds.apply(&mut cmd);
         let cap = run_capturing(&mut cmd, Some(timeout))?;
         match cap.stopped {
-            Stopped::TimedOut => bail!(
-                "listing the files of {snapshot} timed out after {}s",
-                timeout.as_secs()
-            ),
+            Stopped::TimedOut => {
+                return Err(TimedOut(format!(
+                    "listing the files of {snapshot} timed out after {}s",
+                    timeout.as_secs()
+                ))
+                .into());
+            }
             Stopped::Cancelled => bail!("listing the files of {snapshot} was cancelled"),
             Stopped::No => {}
         }
         if !cap.status.success() {
-            bail!("{}", String::from_utf8_lossy(&cap.stderr).trim());
+            return Err(bounded_failure(&cap.stderr));
         }
         Ok(String::from_utf8_lossy(&cap.stdout).into_owned())
     }
@@ -975,18 +1096,23 @@ impl<'a> Client<'a> {
         fds.apply(&mut cmd);
         let (status, tail, stopped) = run_streaming_cancellable(&mut cmd, log, |_| {}, timeout)?;
         if stopped == Stopped::TimedOut {
-            bail!(
+            return Err(TimedOut(format!(
                 "restoring {} from {} timed out after {}s",
                 request.archive,
                 request.snapshot,
                 timeout.map(|t| t.as_secs()).unwrap_or(0)
-            );
+            ))
+            .into());
         }
         if !status.success() {
-            bail!(
-                "{}",
-                last_error_line(&tail).unwrap_or_else(|| format!("restore failed with {status}"))
-            );
+            let line =
+                last_error_line(&tail).unwrap_or_else(|| format!("restore failed with {status}"));
+            // Only the bounded restores (read-back) are classified; the others
+            // keep their plain error.
+            if timeout.is_some() && is_transport_failure(&tail.join("\n")) {
+                return Err(Unreachable(line).into());
+            }
+            bail!("{line}");
         }
         Ok(())
     }
@@ -1491,6 +1617,48 @@ mod tests {
         // Genuinely absent.
         assert_eq!(auto_key_decision(enc, "etc.pxar"), AutoKey::Missing);
         assert_eq!(auto_key_decision("[]", "home.pxar"), AutoKey::Missing);
+    }
+
+    #[test]
+    fn archive_protection_separates_unlisted_from_unprotected() {
+        let json = r#"[
+          {"filename":"home.pxar.didx","crypt-mode":"encrypt","size":10},
+          {"filename":"etc.pxar.didx","crypt-mode":"none","size":10},
+          {"filename":"old.pxar.didx","size":10}
+        ]"#;
+        assert_eq!(archive_protection(json, "home.pxar"), Protection::Protected);
+        assert_eq!(
+            archive_protection(json, "etc.pxar"),
+            Protection::Unprotected
+        );
+        assert_eq!(
+            archive_protection(json, "old.pxar"),
+            Protection::ModeUnknown
+        );
+        assert_eq!(archive_protection(json, "data.pxar"), Protection::NotListed);
+    }
+
+    #[test]
+    fn transport_failures_are_recognised_narrowly() {
+        assert!(is_transport_failure(
+            "Error: error trying to connect: tcp connect error: Connection refused (os error 111)"
+        ));
+        assert!(is_transport_failure(
+            "Error: client error (Connect): Connection timed out (os error 110)"
+        ));
+        // A bare "timed out" (a server task, a message from the server) is not.
+        assert!(!is_transport_failure("Error: task timed out"));
+        assert!(!is_transport_failure("Error: manifest mismatch"));
+        assert!(
+            bounded_failure(b"Error: no route to host")
+                .downcast_ref::<Unreachable>()
+                .is_some()
+        );
+        assert!(
+            bounded_failure(b"Error: task timed out")
+                .downcast_ref::<Unreachable>()
+                .is_none()
+        );
     }
 
     #[test]

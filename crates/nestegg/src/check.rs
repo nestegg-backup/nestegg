@@ -95,8 +95,80 @@ pub struct CheckOptions {
 const LOGIN_ITEM: &str = "PBS login and datastore access";
 const OVERVIEW_ITEM: &str = "overview access";
 
+/// Result of [`run_reporting`]: the items, and whether a Wake-on-LAN packet
+/// really left this computer.
+pub struct Checked {
+    pub items: Vec<CheckItem>,
+    /// True only when at least one magic packet was sent. False when the
+    /// server answered at once, Wake-on-LAN is off or not configured, no wake
+    /// was asked for, or every send failed.
+    pub wake_sent: bool,
+}
+
+/// Follows the events of [`crate::wake::ensure_available`] to tell whether a
+/// packet was really sent. The first event of a wake attempt is the `Info`
+/// "sending"; a failed first send is reported right after it as
+/// `SendFailed`. Any later event (a resend notice, a recovery, a failure of a
+/// later resend) means a packet went out before, and so does a first send not
+/// followed by `SendFailed`.
+#[derive(Default)]
+struct WakeTracker {
+    attempted: bool,
+    first_pending: bool,
+    sent: bool,
+}
+
+impl WakeTracker {
+    fn event(&mut self, event: &crate::wake::WakeEvent) {
+        use crate::wake::WakeEvent;
+        match event {
+            WakeEvent::Info(_) if !self.attempted => {
+                self.attempted = true;
+                self.first_pending = true;
+            }
+            WakeEvent::Info(_) => {
+                // A resend notice: only after a packet went out.
+                if self.first_pending {
+                    self.sent = true;
+                }
+                self.first_pending = false;
+            }
+            WakeEvent::SendFailed(_) => {
+                if !self.first_pending && self.attempted {
+                    // A later resend failed; an earlier packet went out.
+                    self.sent = true;
+                }
+                self.first_pending = false;
+            }
+            WakeEvent::SendRecovered => {
+                self.sent = true;
+                self.first_pending = false;
+            }
+        }
+    }
+
+    fn sent(&self) -> bool {
+        self.sent || self.first_pending
+    }
+}
+
 /// Run all checks. Never fails; problems become failed items.
 pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
+    run_reporting(paths, options).items
+}
+
+/// Like [`run`], and also say whether a wake-up packet was really sent (the
+/// daemon's minimum interval between wake attempts counts only those).
+pub fn run_reporting(paths: &Paths, options: &CheckOptions) -> Checked {
+    let mut wake = WakeTracker::default();
+    let items = run_items(paths, options, &mut wake);
+    Checked {
+        items,
+        wake_sent: wake.sent(),
+    }
+}
+
+fn run_items(paths: &Paths, options: &CheckOptions, tracker: &mut WakeTracker) -> Vec<CheckItem> {
     let mut r = Report(Vec::new());
     let cfg = match Config::load(&paths.config_file) {
         Ok(c) => {
@@ -182,12 +254,15 @@ pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
     if !reachable && options.wake && wake_on {
         wake_tried = true;
         reachable = matches!(
-            crate::wake::ensure_available(&cfg, |event| match event {
-                crate::wake::WakeEvent::SendFailed(why) => {
-                    wake_send_problem = Some(why.to_string())
+            crate::wake::ensure_available(&cfg, |event| {
+                tracker.event(&event);
+                match event {
+                    crate::wake::WakeEvent::SendFailed(why) => {
+                        wake_send_problem = Some(why.to_string())
+                    }
+                    crate::wake::WakeEvent::SendRecovered => wake_send_problem = None,
+                    crate::wake::WakeEvent::Info(_) => {}
                 }
-                crate::wake::WakeEvent::SendRecovered => wake_send_problem = None,
-                crate::wake::WakeEvent::Info(_) => {}
             }),
             Ok(crate::wake::Availability::ReachableAfterWake { .. })
                 | Ok(crate::wake::Availability::Reachable)
@@ -308,6 +383,34 @@ mod tests {
     }
 
     #[test]
+    fn a_wake_packet_counts_only_when_it_was_really_sent() {
+        use crate::wake::WakeEvent::*;
+        let sent = |events: &[crate::wake::WakeEvent]| {
+            let mut t = WakeTracker::default();
+            for e in events {
+                t.event(e);
+            }
+            t.sent()
+        };
+        // Server answered at once, or Wake-on-LAN off: no events.
+        assert!(!sent(&[]));
+        // First packet out, server came up.
+        assert!(sent(&[Info("sending")]));
+        // First packet out, a resend notice later.
+        assert!(sent(&[Info("sending"), Info("again")]));
+        // First send failed and never recovered.
+        assert!(!sent(&[Info("sending"), SendFailed("no network")]));
+        // First send failed, a later one went out.
+        assert!(sent(&[
+            Info("sending"),
+            SendFailed("no network"),
+            SendRecovered
+        ]));
+        // First packet out, a later resend failed: a packet was sent.
+        assert!(sent(&[Info("sending"), Info("again"), SendFailed("x")]));
+    }
+
+    #[test]
     fn serialises_status_and_keeps_ok_false_for_not_checked() {
         let v = serde_json::to_value(item(CheckStatus::NotChecked)).unwrap();
         assert_eq!(v["status"], "not_checked");
@@ -406,6 +509,39 @@ mod run_tests {
             assert_eq!(item(&items, REACHABLE_ITEM).status, CheckStatus::Failed);
             assert_eq!(item(&items, LOGIN_ITEM).status, CheckStatus::NotChecked);
         }
+    }
+
+    #[test]
+    fn check_reports_whether_a_wake_packet_was_sent() {
+        let opts = |wake| CheckOptions { wake, login: false };
+        // Not configured: nothing is sent, even when asked.
+        let (_dir, paths) = setup(false);
+        assert!(!run_reporting(&paths, &opts(true)).wake_sent);
+        // Configured, but not asked for.
+        let (_dir, paths) = setup(true);
+        assert!(!run_reporting(&paths, &opts(false)).wake_sent);
+        // Configured and asked for, the server does not answer: sent (to the
+        // loopback address).
+        assert!(run_reporting(&paths, &opts(true)).wake_sent);
+        // The server answers at once: no packet.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let text = std::fs::read_to_string(&paths.config_file).unwrap();
+        // Only the server's port (before the [wake] section) changes.
+        let (pbs, wake) = text.split_once("[wake]").unwrap();
+        let pbs: Vec<String> = pbs
+            .lines()
+            .map(|l| {
+                if l.starts_with("port = ") {
+                    format!("port = {port}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        let text = format!("{}\n[wake]{wake}", pbs.join("\n"));
+        std::fs::write(&paths.config_file, text).unwrap();
+        assert!(!run_reporting(&paths, &opts(true)).wake_sent);
     }
 
     #[test]

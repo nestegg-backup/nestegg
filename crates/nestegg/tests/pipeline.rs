@@ -90,6 +90,11 @@ case "$1" in
         # once (a plain `sleep` child would be orphaned and hold them open).
         exec sleep 30
       fi
+      # A test can make the listing fail with an error text of its choice.
+      if [ -n "$FAKE_FILES_ERROR" ]; then
+        echo "$FAKE_FILES_ERROR" >&2
+        exit 255
+      fi
       # A test may dictate the file list; otherwise what "backup" stored.
       if [ -f "$FAKE_FILES_FILE" ]; then
         cat "$FAKE_FILES_FILE"
@@ -2633,4 +2638,258 @@ fn wake_on_lan_cannot_be_switched_on_without_a_mac() {
         r#"{"wake_on_lan":false}"#,
     );
     assert_eq!(code, 200);
+}
+
+#[test]
+fn a_run_lock_blocked_without_a_run_is_an_error_and_recorded() {
+    // Something that is not a backup run holds a shared lock on the run lock
+    // file. That must not be a silent "already running" with exit 0: the timer
+    // run fails, says who holds the lock, is recorded (health failing) and
+    // uploads nothing.
+    let env = Env::new();
+    // An earlier success, long ago: a timer backup is due.
+    assert_eq!(code(&env.run(&["run", "--trigger", "cli"])), 0);
+    let old = "2000-01-01T00:00:00Z";
+    let mut state = env.state();
+    state["last_success"]["finished_at"] = serde_json::json!(old);
+    state["last_run"]["finished_at"] = serde_json::json!(old);
+    fs::write(env.root().join("state/state.json"), state.to_string()).unwrap();
+    let lock_path = env.root().join("run/run.lock");
+    let holder = fs::File::open(&lock_path).unwrap();
+    let shared = nix::fcntl::Flock::lock(holder, nix::fcntl::FlockArg::LockShared).unwrap();
+    let out = env.run(&["run", "--trigger", "timer"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(code(&out), 1, "{err}");
+    assert!(err.contains("no backup is running"), "{err}");
+    if fs::read_to_string("/proc/locks").is_ok() {
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "names the holder: {err}"
+        );
+    }
+    assert_eq!(env.fake_log().matches("ARGS backup").count(), 1);
+    let state = env.state();
+    assert_eq!(state["last_run"]["state"], "failed", "{state}");
+    assert!(
+        state["last_run"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("run lock"),
+        "{state}"
+    );
+    let out = env.run(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["health"], "failing");
+    // A run the daemon promised gets its final record under its own ID; its
+    // own reservation in current.json is not taken for another run.
+    let id = "20261108T120000Z-manual-beef";
+    fs::write(
+        env.root().join("state/current.json"),
+        serde_json::json!({"id": id, "trigger": "manual", "state": "starting",
+                           "started_at": nestegg::state::format_time(chrono::Utc::now())})
+        .to_string(),
+    )
+    .unwrap();
+    let out = env.run(&["run", "--trigger", "manual", "--run-id", id]);
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    let record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(env.root().join(format!("state/runs/{id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["state"], "failed");
+    assert!(!env.root().join("state/current.json").exists());
+    drop(shared);
+
+    // A real run holds the lock exclusively: still "already running", exit 0,
+    // nothing recorded.
+    let holder = fs::File::open(&lock_path).unwrap();
+    let exclusive = nix::fcntl::Flock::lock(holder, nix::fcntl::FlockArg::LockExclusive).unwrap();
+    let before = env.state()["last_run"]["id"].clone();
+    let out = env.run(&["run", "--trigger", "timer"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("in progress"));
+    assert_eq!(env.state()["last_run"]["id"], before);
+    drop(exclusive);
+
+    // Two blocked attempts are two failures in a row, so the timer pauses
+    // like after any other repeated failure (decision 0021); a backup started
+    // by hand runs at once now that the lock is free.
+    assert_eq!(env.state()["consecutive_failures"], 2);
+    let out = env.run(&["run", "--trigger", "timer"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not retrying yet"));
+    let out = env.run(&["run", "--trigger", "cli"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.fake_log().matches("ARGS backup").count(), 2);
+}
+
+#[test]
+fn a_success_stamp_in_the_future_makes_the_timer_back_up_at_once() {
+    let env = Env::new();
+    let timer = ["run", "--trigger", "timer"];
+    assert_eq!(code(&env.run(&timer)), 0);
+    assert_eq!(env.fake_log().matches("ARGS backup").count(), 1);
+    // The clock was ahead when that backup finished, and was corrected.
+    let future = "2099-01-01T00:00:00Z";
+    let mut state = env.state();
+    for run in ["last_success", "last_run"] {
+        state[run]["started_at"] = serde_json::json!(future);
+        state[run]["finished_at"] = serde_json::json!(future);
+    }
+    fs::write(env.root().join("state/state.json"), state.to_string()).unwrap();
+    // Not "ok" on the strength of that stamp, with the reason.
+    let out = env.run(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["health"], "overdue");
+    let out = env.run(&["status"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("lies in the future"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // The timer backs up at once and records a correct stamp.
+    let out = env.run(&timer);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.fake_log().matches("ARGS backup").count(), 2);
+    let state = env.state();
+    assert_eq!(state["last_success"]["state"], "succeeded");
+    assert!(
+        !state["last_success"]["finished_at"]
+            .as_str()
+            .unwrap()
+            .starts_with("2099"),
+        "{state}"
+    );
+    let out = env.run(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // (The harness config has an optional source that does not exist, so a
+    // good backup here is "incomplete".)
+    assert_eq!(status["health"], "incomplete");
+}
+
+#[test]
+fn only_the_first_unavailable_read_back_in_a_row_is_free() {
+    // A server that always falls asleep right after the upload must not cause
+    // a full upload at every hourly check forever: the first unavailable
+    // read-back is transient, the next one directly after it counts.
+    let env = Env::new();
+    let sentinel = env.root().join("readback-started");
+    let hanging = || {
+        env.command(&["run", "--trigger", "cli"])
+            .env("FAKE_READBACK_BLOCK", &sentinel)
+            .env("NESTEGG_READBACK_TIMEOUT_SECS", "1")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(code(&hanging()), 1);
+    let state = env.state();
+    assert_eq!(state["last_run"]["transient"], true, "{state}");
+    assert_eq!(state["consecutive_failures"], 0, "{state}");
+    assert_eq!(state["readback_unavailable_in_a_row"], 1, "{state}");
+
+    let out = hanging();
+    assert_eq!(code(&out), 1);
+    let state = env.state();
+    assert_eq!(state["last_run"]["error"]["kind"], "verification_failed");
+    assert_eq!(
+        state["last_run"]["transient"],
+        serde_json::Value::Null,
+        "{state}"
+    );
+    assert_eq!(state["consecutive_failures"], 1, "{state}");
+    assert!(
+        state["last_run"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("again"),
+        "{state}"
+    );
+
+    // A completed read-back resets it: the next unavailable one is free again.
+    assert_eq!(code(&env.run(&["run", "--trigger", "cli"])), 0);
+    assert_eq!(
+        env.state()["readback_unavailable_in_a_row"],
+        serde_json::Value::Null
+    );
+    assert_eq!(code(&hanging()), 1);
+    assert_eq!(env.state()["last_run"]["transient"], true);
+}
+
+#[test]
+fn a_server_error_that_says_timed_out_is_a_real_read_back_failure() {
+    // The words "timed out" in an error from the server do not make a failed
+    // read-back transient: only nestegg's own time limits and transport
+    // failures of the client do (decided by type).
+    let env = Env::new();
+    let out = env
+        .command(&["run", "--trigger", "cli"])
+        // The upload's own listing is not affected (FAKE_FILES_ERROR only
+        // hits `snapshot files`, which the read-back calls first).
+        .env(
+            "FAKE_FILES_ERROR",
+            "Error: verification task timed out on the server",
+        )
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    let state = env.state();
+    assert_eq!(state["last_run"]["error"]["kind"], "verification_failed");
+    assert_eq!(
+        state["last_run"]["transient"],
+        serde_json::Value::Null,
+        "{state}"
+    );
+    assert_eq!(state["consecutive_failures"], 1, "{state}");
+
+    // A transport failure of the client is an unavailable server.
+    let out = env
+        .command(&["run", "--trigger", "cli"])
+        .env(
+            "FAKE_FILES_ERROR",
+            "Error: error trying to connect: tcp connect error: Connection refused (os error 111)",
+        )
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1);
+    assert_eq!(env.state()["last_run"]["transient"], true);
+}
+
+#[test]
+fn cli_restore_of_an_archive_that_is_not_in_the_snapshot_says_so() {
+    let env = Env::new();
+    env.set_files(r#"[{"filename":"etc.pxar.didx","crypt-mode":"encrypt","size":10}]"#);
+    let target = env.root().join("restore-out");
+    let snapshot = "host/test/2026-11-06T21:20:00Z";
+    let out = env.root_cmd(&["restore", snapshot, "home.pxar", target.to_str().unwrap()]);
+    assert_eq!(code(&out), 1);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!("home.pxar is not in {snapshot}")),
+        "{err}"
+    );
+    assert!(!err.contains("not protected"), "{err}");
+    assert!(!target.exists());
+}
+
+#[test]
+fn check_says_when_the_server_was_not_woken_again() {
+    // Through the daemon (the test does not run as root): a wake attempt that
+    // really sent a packet starts the one-minute interval; the next `check
+    // --wake` within it says the server was not woken again.
+    let mut env = Env::new();
+    env.close_pbs();
+    let config = env.root().join("etc/config.toml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "\n[wake]\nmac = \"00:00:5e:00:53:01\"\nbroadcast = \"127.0.0.1\"\nport = 9\n\
+         timeout_seconds = 1\n",
+    );
+    fs::write(&config, text).unwrap();
+    let _daemon = start_daemon(&env);
+    let out = env.run(&["check", "--wake"]);
+    let first = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!first.contains("not woken again"), "{first}");
+    assert!(first.contains("Wake-on-LAN"), "{first}");
+    let out = env.run(&["check", "--wake"]);
+    let second = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(second.contains("was not woken again"), "{second}");
 }

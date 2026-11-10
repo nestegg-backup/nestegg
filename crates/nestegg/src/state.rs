@@ -263,6 +263,17 @@ pub struct State {
     /// is still that one.
     #[serde(default)]
     pub failed_config: Option<String>,
+    /// Read-backs in a row that could not be completed because the server was
+    /// unavailable (decision 0015, amendment 2026-11-10). Only the first one is
+    /// a transient failure; the next one directly after it counts like any
+    /// other failure. Reset by every read-back that is completed (verified or
+    /// not); runs that end before the read-back leave it alone.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub readback_unavailable_in_a_row: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A paper key file written by `key paperkey --output`.
@@ -374,6 +385,14 @@ pub fn health(
     {
         return Health::Failing;
     }
+    // A success stamp in the future says nothing about how old the backup is
+    // (the clock was ahead when it was recorded): not `ok` on its strength.
+    // The next timer check runs a backup at once (`is_due`), which records a
+    // correct stamp; until then it is overdue, with the reason in
+    // `health_message`.
+    if success_in_future(success, now) {
+        return Health::Overdue;
+    }
     let finished = success.finished_at.unwrap_or(success.started_at);
     if now - finished > Duration::hours(i64::from(overdue_after_hours)) {
         return Health::Overdue;
@@ -385,10 +404,11 @@ pub fn health(
 }
 
 /// An explanatory note for the dashboard and `nestegg status` when the health
-/// needs one. Currently only the last run having a state this version does not
-/// understand: it is mapped to `failing`, and the note says why and that
-/// nestegg should be updated. `None` when nothing needs explaining.
-pub fn health_message(state: &State, current: Option<&Run>) -> Option<String> {
+/// needs one: the last run having a state this version does not understand
+/// (mapped to `failing`; the note says why and that nestegg should be
+/// updated), or the last success having a time in the future (mapped to
+/// `overdue`). `None` when nothing needs explaining.
+pub fn health_message(state: &State, current: Option<&Run>, now: DateTime<Utc>) -> Option<String> {
     let unknown = |run: Option<&Run>| run.is_some_and(|r| r.state == RunState::Unknown);
     if unknown(current) || unknown(state.last_run.as_ref()) {
         return Some(
@@ -397,13 +417,42 @@ pub fn health_message(state: &State, current: Option<&Run>) -> Option<String> {
                 .to_string(),
         );
     }
+    if let Some(success) = &state.last_success
+        && success_in_future(success, now)
+    {
+        return Some(format!(
+            "the time of the last backup ({}) lies in the future; the clock of this computer \
+             was wrong when it was recorded. The next timer check makes a new backup at once.",
+            format_time(success.finished_at.unwrap_or(success.started_at))
+        ));
+    }
     None
 }
 
-/// A run is due when there was no success within the interval.
+/// How far a stored time may lie in the future before it is taken for the
+/// mark of a wrong clock. Clock adjustments of a few seconds (NTP steps after a
+/// resume) must not change anything, so this is generous.
+pub const FUTURE_TOLERANCE_MINUTES: i64 = 5;
+
+/// [`FUTURE_TOLERANCE_MINUTES`] as a duration.
+pub fn future_tolerance() -> Duration {
+    Duration::minutes(FUTURE_TOLERANCE_MINUTES)
+}
+
+/// Whether the success stamp of `run` lies in the future by more than the
+/// tolerance: the clock was ahead when the run finished and was corrected
+/// afterwards. Such a stamp says nothing about how old the backup is.
+pub fn success_in_future(run: &Run, now: DateTime<Utc>) -> bool {
+    run.finished_at.unwrap_or(run.started_at) > now + future_tolerance()
+}
+
+/// A run is due when there was no success within the interval. A success
+/// stamp in the future ([`success_in_future`]) does not count: a backup is
+/// due at once, and the successful run then records a correct stamp.
 pub fn is_due(state: &State, interval_hours: u32, now: DateTime<Utc>) -> bool {
     match &state.last_success {
         None => true,
+        Some(run) if success_in_future(run, now) => true,
         Some(run) => {
             let finished = run.finished_at.unwrap_or(run.started_at);
             // Small tolerance so an hourly timer with random delay does not
@@ -484,6 +533,8 @@ pub fn config_stamp(path: &Path) -> Option<String> {
 pub fn next_due(state: &State, interval_hours: u32, now: DateTime<Utc>) -> DateTime<Utc> {
     match &state.last_success {
         None => now,
+        // Due at once (see `is_due`), not interval hours after a wrong stamp.
+        Some(run) if success_in_future(run, now) => now,
         Some(run) => {
             let due = run.finished_at.unwrap_or(run.started_at)
                 + Duration::hours(i64::from(interval_hours));
@@ -706,45 +757,26 @@ impl Store {
 /// mode 0600 and no symlink following. The caller takes the `flock` on the
 /// returned file.
 ///
-/// A lock file left 0644 by an older version lets a group member open it
-/// read-only and hold a shared `flock`, which blocks the root process that
-/// wants the exclusive lock (decision 0022, item 2). Tightening the mode alone
-/// does not help after an upgrade: a group member that opened the old 0644 file
-/// before the upgrade keeps a valid descriptor and can still hold the lock. So
-/// a lock file with the wrong mode is replaced by a fresh 0600 file, which
-/// leaves that stale descriptor pointing at the now-unlinked old inode where it
-/// can no longer block anything. The file is only replaced when no root-owned
-/// process holds a lock on it according to `/proc/locks`: a backup run started
-/// before the upgrade legitimately holds the run lock, and replacing the file
-/// under it would allow two runs at once; such a lock is only tightened in
-/// place (a non-root reader cannot share an inode with the root run's exclusive
-/// lock anyway).
+/// A group member must not be able to open a lock file and hold a shared
+/// `flock` on it, which would block the root process that wants the exclusive
+/// lock (decision 0022, item 2), so a new lock file is created 0600. An existing
+/// file with another mode (development versions created them 0644) is
+/// tightened to 0600 in place. It is never unlinked or replaced: replacing a
+/// lock file can leave two processes each holding a lock on a different inode
+/// "of the same lock". A non-root caller that cannot change the mode leaves it.
 pub fn open_private_lock(path: &Path) -> Result<fs::File> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let file = open_lock_file(path)?;
     let meta = file
         .metadata()
         .with_context(|| format!("cannot stat lock file {}", path.display()))?;
-    if meta.mode() & 0o777 == 0o600 {
-        return Ok(file);
+    if meta.mode() & 0o7777 != 0o600 {
+        // fchmod on the open descriptor: no path lookup, so no symlink race.
+        let tightened = file.set_permissions(fs::Permissions::from_mode(0o600));
+        if nix::unistd::geteuid().is_root() {
+            tightened.with_context(|| format!("cannot set mode of {}", path.display()))?;
+        }
     }
-    // Wrong (too open) mode: an old lock file. Only the root daemon or a root
-    // backup run replaces it (the hardening protects those root processes from
-    // a group member's stale shared lock); a non-root caller only tightens the
-    // mode. Replace it when no root-owned process holds a lock on it, so a
-    // running backup's lock is never pulled out from under it.
-    if nix::unistd::geteuid().is_root() && !root_holds_flock(meta.dev(), meta.ino()) {
-        // Unlink the old inode and create a fresh 0600 one. O_NOFOLLOW on the
-        // reopen guards against a symlink planted in between.
-        let _ = fs::remove_file(path);
-        let fresh = open_lock_file(path)?;
-        fresh
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("cannot set mode of {}", path.display()))?;
-        return Ok(fresh);
-    }
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("cannot set mode of {}", path.display()))?;
     Ok(file)
 }
 
@@ -754,37 +786,15 @@ const CURRENT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30
 /// Take the exclusive lock on the private lock file at `path`, waiting at most
 /// `wait` (zero: one attempt). `None` when another process still holds it at
 /// the deadline.
-///
-/// After the lock is taken the path is looked up again: [`open_private_lock`]
-/// and the package's `postinst` may replace an old lock file, and a lock on an
-/// inode that is no longer at the path excludes nobody. In that case the
-/// attempt starts over with the file that is there now, so two processes can
-/// never both believe they hold the lock.
 pub fn lock_private(
     path: &Path,
     wait: std::time::Duration,
 ) -> Result<Option<nix::fcntl::Flock<fs::File>>> {
-    use std::os::unix::fs::MetadataExt;
     let deadline = std::time::Instant::now() + wait;
     let mut file = open_private_lock(path)?;
     loop {
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => {
-                let mine = lock
-                    .metadata()
-                    .with_context(|| format!("cannot stat lock file {}", path.display()))?;
-                let same = fs::symlink_metadata(path)
-                    .is_ok_and(|at| at.dev() == mine.dev() && at.ino() == mine.ino());
-                if same {
-                    return Ok(Some(lock));
-                }
-                // Replaced while this process opened or waited for it.
-                drop(lock);
-                if std::time::Instant::now() >= deadline {
-                    return Ok(None);
-                }
-                file = open_private_lock(path)?;
-            }
+            Ok(lock) => return Ok(Some(lock)),
             Err((f, nix::errno::Errno::EWOULDBLOCK)) => {
                 if std::time::Instant::now() >= deadline {
                     return Ok(None);
@@ -810,54 +820,6 @@ fn open_lock_file(path: &Path) -> Result<fs::File> {
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("cannot open lock file {}", path.display()))
-}
-
-/// Whether any process owned by root currently holds a lock (read or write) on
-/// the file with `dev`/`ino`, according to `/proc/locks`. Blocked waiters (`->`)
-/// are not holders. When `/proc/locks` cannot be read the answer is a
-/// conservative `true`, so a lock file is never replaced while a root process
-/// might hold it.
-pub fn root_holds_flock(dev: u64, ino: u64) -> bool {
-    let Ok(locks) = fs::read_to_string("/proc/locks") else {
-        return true;
-    };
-    let major = nix::sys::stat::major(dev);
-    let minor = nix::sys::stat::minor(dev);
-    for line in locks.lines() {
-        if line.contains("->") {
-            continue; // a blocked waiter, not a holder
-        }
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        // `1: FLOCK  ADVISORY  WRITE 1234 00:19:5678 0 EOF`
-        if fields.len() < 6 || fields[1] != "FLOCK" {
-            continue;
-        }
-        let mut id = fields[5].split(':');
-        let (Some(ma), Some(mi), Some(i)) = (id.next(), id.next(), id.next()) else {
-            continue;
-        };
-        if u64::from_str_radix(ma, 16).ok() != Some(major)
-            || u64::from_str_radix(mi, 16).ok() != Some(minor)
-            || i.parse::<u64>().ok() != Some(ino)
-        {
-            continue;
-        }
-        let Ok(pid) = fields[4].parse::<u32>() else {
-            continue;
-        };
-        if process_is_root(pid) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Whether `/proc/<pid>` is owned by root (the process runs as uid 0).
-fn process_is_root(pid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    fs::metadata(format!("/proc/{pid}"))
-        .map(|m| m.uid() == 0)
-        .unwrap_or(false)
 }
 
 pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -979,34 +941,29 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_on_a_replaced_file_is_not_taken_for_the_lock() {
-        use std::os::unix::fs::MetadataExt;
-        // A waiter has the old file open; the file is replaced (as an upgrade
-        // does with an old lock file) and the old holder lets go. The waiter
-        // must end up with the lock on the file that is at the path now, not
-        // on the old inode that nobody else will ever look at again.
+    fn an_old_open_lock_file_is_tightened_in_place_never_replaced() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // A lock file a development version left 0644: opening it tightens the
+        // mode on the same inode; the file is never unlinked or replaced.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".x.lock");
-        let old = lock_private(&path, std::time::Duration::ZERO)
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let ino = fs::metadata(&path).unwrap().ino();
+        let lock = lock_private(&path, std::time::Duration::ZERO)
             .unwrap()
             .expect("free lock");
-        let old_ino = old.metadata().unwrap().ino();
-        let waiter = {
-            let path = path.clone();
-            std::thread::spawn(move || {
-                lock_private(&path, std::time::Duration::from_secs(20)).unwrap()
-            })
-        };
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        // Keep the old inode alive (so the new file cannot reuse its number).
-        fs::remove_file(&path).unwrap();
-        let fresh = open_lock_file(&path).unwrap();
-        let fresh_ino = fresh.metadata().unwrap().ino();
-        assert_ne!(old_ino, fresh_ino);
-        drop(fresh);
-        drop(old);
-        let got = waiter.join().unwrap().expect("the waiter gets the lock");
-        assert_eq!(got.metadata().unwrap().ino(), fresh_ino);
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        assert_eq!(meta.ino(), ino, "the same file, not a replacement");
+        assert_eq!(lock.metadata().unwrap().ino(), ino);
+        // A new lock file is created 0600.
+        let fresh = dir.path().join(".y.lock");
+        drop(open_private_lock(&fresh).unwrap());
+        assert_eq!(fs::metadata(&fresh).unwrap().mode() & 0o777, 0o600);
+        // A symlink in its place is not followed.
+        std::os::unix::fs::symlink(&path, dir.path().join(".z.lock")).unwrap();
+        assert!(open_private_lock(&dir.path().join(".z.lock")).is_err());
     }
     use chrono::TimeZone;
 
@@ -1071,7 +1028,7 @@ mod tests {
         // A last run whose state this version does not understand (written by a
         // newer version) is not read as a success: it is `failing` with a note
         // that nestegg should be updated.
-        assert_eq!(health_message(&state, None), None);
+        assert_eq!(health_message(&state, None, t(12)), None);
         state.last_run = Some(finished(RunState::Unknown, t(11)));
         assert_eq!(health(true, &state, None, 36, t(12)), Health::Failing);
         // Also without any earlier success: not "never backed up".
@@ -1083,7 +1040,11 @@ mod tests {
             health(true, &only_unknown, None, 36, t(12)),
             Health::Failing
         );
-        assert!(health_message(&state, None).unwrap().contains("Update"));
+        assert!(
+            health_message(&state, None, t(12))
+                .unwrap()
+                .contains("Update")
+        );
         // Never read as ok even with a very long overdue window.
         assert_eq!(health(true, &state, None, 1000, t(12)), Health::Failing);
     }
@@ -1097,6 +1058,41 @@ mod tests {
         assert!(!is_due(&state, 12, t(12)));
         assert!(is_due(&state, 11, t(12)));
         assert_eq!(next_due(&state, 24, t(12)), t(1) + Duration::hours(24));
+    }
+
+    #[test]
+    fn a_success_stamp_in_the_future_is_due_and_not_ok() {
+        // The clock was ahead when the last backup finished and was corrected
+        // afterwards: the stamp says nothing about the age of the backup.
+        let now = t(2);
+        let mut state = State::default();
+        let ahead = finished(RunState::Succeeded, t(12));
+        state.last_success = Some(ahead.clone());
+        state.last_run = Some(ahead);
+        assert!(is_due(&state, 24, now), "due at once");
+        assert_eq!(next_due(&state, 24, now), now);
+        assert_eq!(health(true, &state, None, 36, now), Health::Overdue);
+        let note = health_message(&state, None, now).unwrap();
+        assert!(note.contains("lies in the future"), "{note}");
+        assert!(note.contains("clock"), "{note}");
+
+        // Within the tolerance nothing changes: a clock step of seconds or a
+        // few minutes is not a wrong clock.
+        let near = finished(
+            RunState::Succeeded,
+            now + Duration::minutes(FUTURE_TOLERANCE_MINUTES) - Duration::seconds(1),
+        );
+        state.last_success = Some(near.clone());
+        state.last_run = Some(near);
+        assert!(!is_due(&state, 24, now));
+        assert_eq!(health(true, &state, None, 36, now), Health::Ok);
+        assert_eq!(health_message(&state, None, now), None);
+        assert!(next_due(&state, 24, now) > now + Duration::hours(23));
+
+        // A failure after a future success is still `failing`.
+        state.last_success = Some(finished(RunState::Succeeded, t(12)));
+        state.last_run = Some(finished(RunState::Failed, t(1)));
+        assert_eq!(health(true, &state, None, 36, now), Health::Failing);
     }
 
     #[test]

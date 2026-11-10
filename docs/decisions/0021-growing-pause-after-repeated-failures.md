@@ -80,6 +80,26 @@ count and does not reset, and `retry_not_before` never pauses on it. The next
 hourly check tries again. A read-back *mismatch* (content differs, an archive
 is missing) is a real failure and counts as before.
 
+### Revision 2026-11-10: a repeated transient read-back failure counts
+
+Only the first transient read-back failure in a row is free; the next one
+directly after it is an ordinary failure that counts and pauses (decision 0015,
+update (c)). A run lock that is blocked although no backup runs is an ordinary
+failure too (decision 0022, section 5).
+
+### A success stamp in the future is not a recent backup
+
+The same wrong-clock problem exists for the last **success**: with its time in
+the future, "now minus finished" is negative, so nothing was due, nothing was
+overdue and nobody was told until real time passed the wrong stamp. A success
+stamp that lies more than five minutes in the future (clock steps of seconds
+change nothing) now says nothing about the age of the backup: a timer backup is
+due at once (the successful run then records a correct stamp), the next backup
+shown by the status is "now", and until then the health is `overdue` with a note
+that the time of the last backup lies in the future because the clock was
+wrong. The same tolerance applies to a leftover `current.json` whose start lies
+in the future: it no longer counts as a run that is still starting.
+
 ## Alternatives rejected
 
 - **Pausing only for failures after the server was contacted.** Local
