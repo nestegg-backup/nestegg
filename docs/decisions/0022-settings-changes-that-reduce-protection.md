@@ -124,10 +124,22 @@ thus reported calmly (weekly), but from the start, not only after weeks.
   archives what it points to, so the guard reads through that link too. (The
   `pxar create` command line tool refuses a link as the archive root; the
   client does not, which an earlier version of this record got wrong.) The
-  protected folders are not resolved by the daemon before the read: resolving
-  would run as root and could depend on what the requester cannot see; the
-  link is followed by the reader's child, with the requester's permissions. For a folder with more than 4096 entries the
-  first 4096 decide, so such a list can be refused although a later entry would
+  daemon does not resolve paths itself: as root it could follow links through
+  folders the requester may not enter, and it could hang on a dead file
+  system; links are followed by the child, with the requester's permissions.
+  **Which archive a home directory is in** is decided twice: by its path as
+  the account database gives it, and by where it really is. The second is
+  needed when the written path is a link into another source (`/home/alice`
+  pointing to `/srv/homes/alice`, with `/srv/homes` as the source): the home
+  is then `/alice` in that archive, which the written paths do not show, and
+  an exclude `/alice` would leave the whole home out. So the real location of
+  every home directory and of every source is found out, again by a child
+  with the requester's identity (`readlink -f`, part of the required
+  `coreutils`) under the same time budget and bounds as the reads, and a home
+  is also protected in the archive that really contains it (in system mode
+  also at its real place in the system archive). What the requester cannot
+  resolve is taken as written; that is the limit that remains. For a folder
+  with more than 4096 entries the first 4096 decide, so such a list can be refused although a later entry would
   stay; that errs on the side of the guard. When the real names are not known
   (the folder is empty, the requester cannot read it, it does not answer in
   time, or the requester is not known on the code path) made-up names are used
@@ -422,3 +434,8 @@ the value as root in `/etc/nestegg/config.toml`.
   stays small. While the command for a settings announcement keeps failing,
   every check ends with a non-zero exit code, also during the pause between
   attempts, so the unit's failed state does not flip (decision 0017).
+- **Review at the pull request (2026-11-10).** Which archive a home directory
+  is in was decided by comparing written paths only, so a home whose path is a
+  link into another source was in no archive for the guard and an exclude of
+  its real folder passed. Homes and sources are now also compared by their
+  real locations, found out with the requester's identity (item 3).

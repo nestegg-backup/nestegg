@@ -344,3 +344,17 @@ record from a newer version, a stuck lock, and a many-user desktop.
   hook paths (problem and recovery messages) try at every check and already
   ended non-zero each time, so they agree. Switching the hook off ends the
   pending failure (counter and pause are reset); a later switch-on starts fresh.
+
+## Amendment 2026-11-10 (review at the pull request): who hears "works again"
+
+- When the text of an active problem changes, the problem is announced anew
+  and the counters that steer the announcement (which wording each user and
+  the command have received) start over. Until now the list of recipients
+  started over with them: a user who got the first message and logged out
+  before the wording changed, or a command whose next call failed, was no
+  longer known as "told" and never got the promised message that backups work
+  again. Who was told an earlier wording is now kept apart from those
+  counters (`told_users`, `told_command` in the record of the active problem)
+  and carried into the recovery message together with the recipients of the
+  current wording. Records written before this have neither field and are
+  read as before.

@@ -314,14 +314,10 @@ pub fn validate(
     home_dirs: &[PathBuf],
     identity: Option<PeerIdentity>,
 ) -> Result<(), SettingsError> {
-    let reader: Box<FolderReader> = match identity {
-        Some(id) => Box::new(with_shared_deadline(
-            GUARD_READ_BUDGET,
-            move |folder, until| real_children(folder, id, until),
-        )),
-        None => Box::new(|_: &Path| Vec::new()),
-    };
-    validate_with_reader(patch, current, home_dirs, reader.as_ref())
+    match identity {
+        Some(id) => validate_with_reader(patch, current, home_dirs, &RequesterProbe::new(id)),
+        None => validate_with_reader(patch, current, home_dirs, &NoProbe),
+    }
 }
 
 /// The body of [`validate`] with the folder reader injected, so tests can
@@ -331,7 +327,7 @@ fn validate_with_reader(
     patch: &SettingsPatch,
     current: &Config,
     home_dirs: &[PathBuf],
-    read_children: &FolderReader,
+    read_children: &dyn FolderProbe,
 ) -> Result<(), SettingsError> {
     if let Some(h) = patch.interval_hours
         && !INTERVAL_HOURS.contains(&h)
@@ -662,9 +658,70 @@ pub struct PeerIdentity {
     pub gid: u32,
 }
 
-/// Returns a folder's real top-level entries (name, whether a directory).
-/// Injected so tests can supply entries or a reader that must not be called.
-type FolderReader = dyn Fn(&Path) -> Vec<(String, bool)>;
+/// What the exclude guard may find out about the file system. In the daemon
+/// both questions are answered by a child process with the requester's
+/// identity ([`RequesterProbe`]), never as root. Injected so tests can supply
+/// entries and links, or a probe that must not be called.
+trait FolderProbe {
+    /// A folder's real top-level entries (name, whether a directory); empty
+    /// when they are not known.
+    fn children(&self, folder: &Path) -> Vec<(String, bool)>;
+    /// Where `path` really is, with every symbolic link in it resolved.
+    /// `None` when that is not known; the path is then taken as written.
+    fn real_path(&self, _path: &Path) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// A plain reader of folder entries is a probe that resolves nothing.
+impl<F: Fn(&Path) -> Vec<(String, bool)>> FolderProbe for F {
+    fn children(&self, folder: &Path) -> Vec<(String, bool)> {
+        self(folder)
+    }
+}
+
+/// The probe of a request: reads and resolves with the requester's identity,
+/// and all of it within one time budget that starts with the first question
+/// ([`GUARD_READ_BUDGET`]); what is not answered by then is unknown.
+struct RequesterProbe {
+    identity: PeerIdentity,
+    until: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+impl RequesterProbe {
+    fn new(identity: PeerIdentity) -> Self {
+        RequesterProbe {
+            identity,
+            until: std::cell::Cell::new(None),
+        }
+    }
+
+    fn deadline(&self) -> std::time::Instant {
+        self.until.get().unwrap_or_else(|| {
+            let until = std::time::Instant::now() + GUARD_READ_BUDGET;
+            self.until.set(Some(until));
+            until
+        })
+    }
+}
+
+impl FolderProbe for RequesterProbe {
+    fn children(&self, folder: &Path) -> Vec<(String, bool)> {
+        real_children(folder, self.identity, self.deadline())
+    }
+    fn real_path(&self, path: &Path) -> Option<PathBuf> {
+        real_path_as(path, self.identity, self.deadline())
+    }
+}
+
+/// Nothing is known: the requester's identity is missing.
+struct NoProbe;
+
+impl FolderProbe for NoProbe {
+    fn children(&self, _folder: &Path) -> Vec<(String, bool)> {
+        Vec::new()
+    }
+}
 
 /// The final match decision of the whole exclude list for one archive-relative
 /// path, exactly as the client applies it: the *last* entry whose pattern
@@ -757,15 +814,14 @@ fn archive_rel(root: &Path, folder: &Path) -> Option<String> {
     ))
 }
 
-/// The deepest configured source that strictly contains `folder`, if any.
-fn deepest_source<'a>(
+/// The deepest of `roots` that strictly contains `folder`, if any.
+fn deepest_containing<'a>(
     folder: &Path,
-    sources: &'a [crate::config::Source],
-) -> Option<&'a crate::config::Source> {
-    sources
-        .iter()
-        .filter(|s| folder != s.path && folder.starts_with(&s.path))
-        .max_by_key(|s| s.path.as_os_str().len())
+    roots: impl Iterator<Item = &'a Path>,
+) -> Option<&'a Path> {
+    roots
+        .filter(|root| folder != *root && folder.starts_with(root))
+        .max_by_key(|root| root.as_os_str().len())
 }
 
 /// The (archive root, protected folder) pairs for the archives the
@@ -777,13 +833,28 @@ fn deepest_source<'a>(
 /// directories and the home directories are tested there by their full path
 /// (`/home` and `/home/alice` in `system.pxar`), and a source that keeps its
 /// own archive (a data disk that must be its own mount) is tested separately.
+///
+/// A home directory is looked for in the archives twice: by its path as the
+/// account database gives it, and by where it really is (`resolve`, every
+/// symbolic link resolved, also for the sources). The account database may
+/// say `/home/alice` while that is a link to `/srv/homes/alice` and the
+/// source is `/srv/homes`: the home is then `/alice` in that archive, which a
+/// comparison of the written paths cannot see. Without an answer from
+/// `resolve` a path is taken as written.
 fn protected_folders(
     sources: &[crate::config::Source],
     home_dirs: &[PathBuf],
     system: bool,
+    resolve: &dyn Fn(&Path) -> Option<PathBuf>,
 ) -> Vec<(PathBuf, PathBuf)> {
     let root = PathBuf::from("/");
     let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // The sources that are archives of their own.
+    let own: Vec<&crate::config::Source> = if system {
+        sources.iter().filter(|s| s.require_mount).collect()
+    } else {
+        sources.iter().collect()
+    };
     if system {
         for d in SYSTEM_DIRS {
             out.push((root.clone(), PathBuf::from(d)));
@@ -791,26 +862,38 @@ fn protected_folders(
         for h in home_dirs {
             out.push((root.clone(), h.clone()));
         }
-        let own: Vec<crate::config::Source> = sources
-            .iter()
-            .filter(|s| s.require_mount)
-            .cloned()
-            .collect();
-        for s in &own {
-            out.push((s.path.clone(), s.path.clone()));
+    }
+    for s in &own {
+        out.push((s.path.clone(), s.path.clone()));
+    }
+    for h in home_dirs {
+        if let Some(src) = deepest_containing(h, own.iter().map(|s| s.path.as_path())) {
+            out.push((src.to_path_buf(), h.clone()));
         }
-        for h in home_dirs {
-            if let Some(src) = deepest_source(h, &own) {
-                out.push((src.path.clone(), h.clone()));
-            }
+    }
+    // The same by the real locations, where they differ from the written ones.
+    if home_dirs.is_empty() {
+        return out;
+    }
+    let real = |path: &Path| {
+        resolve(path)
+            .filter(|r| r.is_absolute())
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    let real_sources: Vec<PathBuf> = own.iter().map(|s| real(&s.path)).collect();
+    for h in home_dirs {
+        let real_home = real(h);
+        let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
+        if system && real_home != Path::new("/") {
+            found.push((root.clone(), real_home.clone()));
         }
-    } else {
-        for s in sources {
-            out.push((s.path.clone(), s.path.clone()));
+        if let Some(src) = deepest_containing(&real_home, real_sources.iter().map(PathBuf::as_path))
+        {
+            found.push((src.to_path_buf(), real_home.clone()));
         }
-        for h in home_dirs {
-            if let Some(src) = deepest_source(h, sources) {
-                out.push((src.path.clone(), h.clone()));
+        for pair in found {
+            if !out.contains(&pair) {
+                out.push(pair);
             }
         }
     }
@@ -847,25 +930,6 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         READS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// Wraps a folder reader that takes a deadline into one that does not: the
-/// clock starts with the first read and every later read gets the SAME
-/// deadline, so all reads of one request together stay within `budget` and a
-/// folder not read by then is unknown (an expired deadline reads nothing).
-fn with_shared_deadline(
-    budget: std::time::Duration,
-    read: impl Fn(&Path, std::time::Instant) -> Vec<(String, bool)>,
-) -> impl Fn(&Path) -> Vec<(String, bool)> {
-    let started: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
-    move |folder: &Path| {
-        let until = started.get().unwrap_or_else(|| {
-            let until = std::time::Instant::now() + budget;
-            started.set(Some(until));
-            until
-        });
-        read(folder, until)
     }
 }
 
@@ -936,24 +1000,82 @@ const FIND_PATHS: [&str; 2] = ["/usr/bin/find", "/bin/find"];
 /// to): the caller passes such a path with a trailing slash, see
 /// [`through_a_link`] (decision 0022, item 3).
 fn spawn_find(folder: &Path, identity: PeerIdentity) -> std::io::Result<std::process::Child> {
+    // Only the direct children, printed as `<type><name>\0`: the type is one
+    // byte (`d` for a directory) and the NUL separates records, so a name with
+    // spaces or newlines cannot confuse the parse.
+    let mut args = vec![folder.as_os_str().to_os_string()];
+    args.extend(
+        ["-maxdepth", "1", "-mindepth", "1", "-printf", "%y%f\\0"]
+            .iter()
+            .map(std::ffi::OsString::from),
+    );
+    spawn_as(&FIND_PATHS, &args, identity)
+}
+
+/// Where `readlink` (package `coreutils`) is installed on Debian and Ubuntu.
+const READLINK_PATHS: [&str; 2] = ["/usr/bin/readlink", "/bin/readlink"];
+
+/// Where `path` really is, every symbolic link in it resolved, found out
+/// with the requester's identity in a child process (`readlink -f`), within
+/// `deadline` and under the same bounds as a folder read. `None` when the
+/// requester cannot resolve it, it does not exist, the time is over, the tool
+/// is missing, or the answer is not an absolute path. The daemon does not
+/// resolve paths itself: as root it could follow links through folders the
+/// requester may not enter (and it could hang on a dead file system).
+fn real_path_as(
+    path: &Path,
+    identity: PeerIdentity,
+    deadline: std::time::Instant,
+) -> Option<PathBuf> {
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let guard = InFlightGuard::acquire()?;
+    let args = [
+        "-f".into(),
+        "-z".into(),
+        "--".into(),
+        path.as_os_str().to_os_string(),
+    ];
+    let child = spawn_as(&READLINK_PATHS, &args, identity).ok()?;
+    let raw = collect_raw(child, guard, deadline)?;
+    parse_real_path(&raw)
+}
+
+/// The answer of `readlink -f -z`: one absolute path, ended by a NUL. Anything
+/// else (nothing, no NUL, a relative path, more than a path can be long) is
+/// no answer.
+fn parse_real_path(raw: &[u8]) -> Option<PathBuf> {
+    let end = raw.iter().position(|b| *b == 0)?;
+    let bytes = &raw[..end];
+    if bytes.is_empty() || bytes.len() > nix::libc::PATH_MAX as usize || bytes[0] != b'/' {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+/// Start one of the standard tools at `programs` (the first that is
+/// installed) with `args`, as `identity`: see [`spawn_find`] for how the
+/// identity is dropped and what happens without root.
+fn spawn_as(
+    programs: &[&str],
+    args: &[std::ffi::OsString],
+    identity: PeerIdentity,
+) -> std::io::Result<std::process::Child> {
     // A fixed path, not a lookup in the daemon's `PATH`: whether the guard
     // can read real entries must not depend on the environment the daemon
     // happened to be started with.
-    let find = FIND_PATHS
+    let program = programs
         .iter()
         .map(Path::new)
         .find(|p| p.is_file())
         .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "find is not installed")
+            std::io::Error::new(std::io::ErrorKind::NotFound, "the tool is not installed")
         })?;
     #[cfg(test)]
     FIND_SPAWNS.fetch_add(1, Ordering::SeqCst);
-    let mut cmd = Command::new(find);
-    // Only the direct children, printed as `<type><name>\0`: the type is one
-    // byte (`d` for a directory) and the NUL separates records, so a name with
-    // spaces or newlines cannot confuse the parse.
-    cmd.arg(folder)
-        .args(["-maxdepth", "1", "-mindepth", "1", "-printf", "%y%f\\0"])
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -1002,10 +1124,22 @@ fn max_find_bytes() -> usize {
 /// reaped, so such stuck reads cannot pile up beyond [`MAX_READS_IN_FLIGHT`].
 /// A read that does not finish in time yields nothing (unknown).
 fn collect_with_timeout(
-    mut child: std::process::Child,
+    child: std::process::Child,
     guard: InFlightGuard,
     deadline: std::time::Instant,
 ) -> Vec<(String, bool)> {
+    collect_raw(child, guard, deadline)
+        .map(|raw| parse_find_output(&raw[..]))
+        .unwrap_or_default()
+}
+
+/// The output of a spawned child as [`collect_with_timeout`] describes it,
+/// unparsed; `None` when it did not end in time.
+fn collect_raw(
+    mut child: std::process::Child,
+    guard: InFlightGuard,
+    deadline: std::time::Instant,
+) -> Option<Vec<u8>> {
     let deadline = deadline.min(std::time::Instant::now() + PROBE_READ_TIMEOUT);
     let raw = child
         .stdout
@@ -1015,8 +1149,7 @@ fn collect_with_timeout(
     // `/proc/<pid>/fd/1` (the child runs as the requester, who may open it)
     // gets EPIPE instead of keeping this read open (decision 0022).
     stop_and_reap(child, guard, deadline);
-    raw.map(|raw| parse_find_output(&raw[..]))
-        .unwrap_or_default()
+    raw
 }
 
 /// Raw bytes from `out` up to end of file or [`max_find_bytes`], or `None`
@@ -1170,19 +1303,20 @@ fn excludes_reduce_protection(
     sources: &[crate::config::Source],
     home_dirs: &[PathBuf],
     system: bool,
-    read_children: &FolderReader,
+    probe: &dyn FolderProbe,
 ) -> Option<String> {
     let old = match_entries(old_list);
     let new = match_entries(new_list);
-    for (archive_root, folder) in protected_folders(sources, home_dirs, system) {
+    let resolve = |path: &Path| probe.real_path(path);
+    for (archive_root, folder) in protected_folders(sources, home_dirs, system, &resolve) {
         // A source that is itself a symbolic link is followed by the backup
         // client (its content is what gets archived), so the guard reads
         // through the link too; a folder *inside* a source that is a link is
         // stored as a link with nothing below it and stays unread.
         let children = if folder == archive_root {
-            read_children(&through_a_link(&folder))
+            probe.children(&through_a_link(&folder))
         } else {
-            read_children(&folder)
+            probe.children(&folder)
         };
         if !list_empties_folder(&new, &archive_root, &folder, &children) {
             continue;
@@ -2447,21 +2581,14 @@ interval_hours = 24
     #[test]
     fn all_reads_of_a_request_share_one_deadline() {
         let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // The wrapper hands every read of a request the same deadline, started
-        // with the first read, however many folders are read.
-        let seen: RefCell<Vec<std::time::Instant>> = RefCell::new(Vec::new());
+        // Every question of a request gets the same deadline, started with the
+        // first one, however many folders are read or paths resolved.
         let before = std::time::Instant::now();
-        let read = with_shared_deadline(std::time::Duration::from_millis(400), |_, until| {
-            seen.borrow_mut().push(until);
-            Vec::new()
-        });
-        for folder in ["/home/alice", "/home/bob", "/etc"] {
-            read(Path::new(folder));
-        }
-        let seen = seen.borrow();
-        assert_eq!(seen.len(), 3);
+        let probe = RequesterProbe::new(current_ids());
+        let seen = [probe.deadline(), probe.deadline(), probe.deadline()];
         assert!(seen.iter().all(|d| *d == seen[0]), "one deadline for all");
-        assert!(seen[0] >= before + std::time::Duration::from_millis(400));
+        assert!(seen[0] >= before + GUARD_READ_BUDGET);
+        assert!(seen[0] <= std::time::Instant::now() + GUARD_READ_BUDGET);
 
         // The real reader: a first folder that hangs uses the whole budget
         // (cut off at the deadline, unknown); the next folder, which could be
@@ -2588,6 +2715,187 @@ interval_hours = 24
         let through = real_children(&through_a_link(&link), current_ids(), soon());
         assert_eq!(through, vec![("Documents".to_string(), true)]);
         assert_eq!(through_a_link(Path::new("/a/")), PathBuf::from("/a/"));
+    }
+
+    /// A probe with given links (written path, real path) and no entries.
+    struct Linked(Vec<(&'static str, &'static str)>);
+
+    impl FolderProbe for Linked {
+        fn children(&self, _folder: &Path) -> Vec<(String, bool)> {
+            Vec::new()
+        }
+        fn real_path(&self, path: &Path) -> Option<PathBuf> {
+            self.0
+                .iter()
+                .find(|(written, _)| Path::new(written) == path)
+                .map(|(_, real)| PathBuf::from(real))
+        }
+    }
+
+    fn source(archive: &str, path: &str) -> crate::config::Source {
+        crate::config::Source {
+            archive: archive.into(),
+            path: PathBuf::from(path),
+            optional: false,
+            require_mount: false,
+        }
+    }
+
+    #[test]
+    fn a_home_that_is_a_link_into_another_source_is_protected_there() {
+        // The account database says /home/alice; that is a link to
+        // /srv/homes/alice, and the source is /srv/homes. In that archive the
+        // home is /alice: excluding it leaves the whole home out, which a
+        // comparison of the written paths does not see.
+        let sources = vec![source("homes", "/srv/homes")];
+        let homes = vec![PathBuf::from("/home/alice")];
+        let links = Linked(vec![("/home/alice", "/srv/homes/alice")]);
+        let why =
+            excludes_reduce_protection(&[], &["/alice".into()], &sources, &homes, false, &links)
+                .expect("the whole home would be left out");
+        assert!(why.contains("/srv/homes/alice"), "{why}");
+        // A folder inside the home is an ordinary exclude.
+        assert!(
+            excludes_reduce_protection(
+                &[],
+                &["/alice/Downloads".into()],
+                &sources,
+                &homes,
+                false,
+                &links
+            )
+            .is_none()
+        );
+        // Without an answer about the real location the path is taken as
+        // written and the home is in no archive (the limit that remains when
+        // the requester cannot resolve it).
+        let unknown = Linked(Vec::new());
+        assert!(
+            excludes_reduce_protection(&[], &["/alice".into()], &sources, &homes, false, &unknown)
+                .is_none()
+        );
+        // With both /home and /srv/homes as sources the written and the real
+        // place are both looked at, each once.
+        let both = vec![source("home", "/home"), source("homes", "/srv/homes")];
+        let pairs = protected_folders(&both, &homes, false, &|p| links.real_path(p));
+        let home_pairs: Vec<_> = pairs.iter().filter(|(_, f)| f.ends_with("alice")).collect();
+        assert_eq!(
+            home_pairs,
+            [
+                &(PathBuf::from("/home"), PathBuf::from("/home/alice")),
+                &(
+                    PathBuf::from("/srv/homes"),
+                    PathBuf::from("/srv/homes/alice")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_home_below_a_source_that_is_a_link_is_protected_too() {
+        // The source is written /data and is a link to /mnt/disk/data; the
+        // account database gives the home by its real path.
+        let sources = vec![source("data", "/data")];
+        let homes = vec![PathBuf::from("/mnt/disk/data/alice")];
+        let links = Linked(vec![("/data", "/mnt/disk/data")]);
+        assert!(
+            excludes_reduce_protection(&[], &["/alice".into()], &sources, &homes, false, &links)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn nothing_changes_where_no_path_is_a_link() {
+        // The real location equals the written one: the same pairs as before,
+        // none twice.
+        let sources = vec![source("home", "/home"), source("etc", "/etc")];
+        let homes = vec![PathBuf::from("/home/alice"), PathBuf::from("/home/bob")];
+        let same = |p: &Path| Some(p.to_path_buf());
+        let none = |_: &Path| None;
+        let with = protected_folders(&sources, &homes, false, &same);
+        assert_eq!(with, protected_folders(&sources, &homes, false, &none));
+        let mut unique = with.clone();
+        unique.dedup();
+        assert_eq!(with.len(), unique.len());
+        // No home directories (the exclude list did not change): nothing is
+        // resolved at all.
+        let panics = |_: &Path| -> Option<PathBuf> { panic!("resolved without need") };
+        let _ = protected_folders(&sources, &[], false, &panics);
+    }
+
+    #[test]
+    fn in_system_mode_a_linked_home_is_protected_at_its_real_place_in_the_system_archive() {
+        let homes = vec![PathBuf::from("/home/alice")];
+        let links = Linked(vec![("/home/alice", "/srv/homes/alice")]);
+        let pairs = protected_folders(&[], &homes, true, &|p| links.real_path(p));
+        let root = PathBuf::from("/");
+        assert!(pairs.contains(&(root.clone(), PathBuf::from("/home/alice"))));
+        assert!(pairs.contains(&(root, PathBuf::from("/srv/homes/alice"))));
+        assert!(
+            excludes_reduce_protection(
+                &[],
+                &["/srv/homes/alice".into()],
+                &[],
+                &homes,
+                true,
+                &links
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn the_real_path_is_found_out_by_a_child_within_the_bounds() {
+        let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !READLINK_PATHS.iter().any(|p| Path::new(p).is_file()) {
+            eprintln!("skipping: `readlink` (coreutils) is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let real = base.join("srv").join("alice");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir(base.join("home")).unwrap();
+        let link = base.join("home").join("alice");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            real_path_as(&link, current_ids(), soon()),
+            Some(real.clone())
+        );
+        assert_eq!(
+            real_path_as(&real, current_ids(), soon()),
+            Some(real.clone())
+        );
+        // Nothing there, or no time left: no answer (and no child for the
+        // latter).
+        let missing = base.join("nowhere").join("deeper").join("alice");
+        assert_eq!(real_path_as(&missing, current_ids(), soon()), None);
+        let over = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let before = FIND_SPAWNS.load(Ordering::SeqCst);
+        assert_eq!(real_path_as(&link, current_ids(), over), None);
+        assert_eq!(FIND_SPAWNS.load(Ordering::SeqCst), before);
+        wait_for_free_slots();
+    }
+
+    #[test]
+    fn only_one_absolute_path_is_an_answer() {
+        assert_eq!(
+            parse_real_path(b"/srv/homes/alice\0"),
+            Some(PathBuf::from("/srv/homes/alice"))
+        );
+        // What comes after the first NUL is ignored (a second record written
+        // into the pipe).
+        assert_eq!(parse_real_path(b"/a\0/b\0"), Some(PathBuf::from("/a")));
+        for bad in [&b""[..], b"\0", b"/no/terminator", b"relative/path\0"] {
+            assert_eq!(parse_real_path(bad), None, "{bad:?}");
+        }
+        let long = [
+            b"/".to_vec(),
+            vec![b'a'; nix::libc::PATH_MAX as usize + 1],
+            vec![0],
+        ]
+        .concat();
+        assert_eq!(parse_real_path(&long), None);
     }
 
     #[test]
@@ -2725,8 +3033,17 @@ interval_hours = 24
         // (decision 0022, item 2). So a refusal never leaks whether a name
         // exists, and the probing-with-a-second-failing-change trick leaves no
         // content-dependent trace.
-        let panicking =
-            |_: &Path| -> Vec<(String, bool)> { panic!("the folder guard must not run here") };
+        // Neither question may be asked: no folder read, no path resolved.
+        struct MustNotAsk;
+        impl FolderProbe for MustNotAsk {
+            fn children(&self, _folder: &Path) -> Vec<(String, bool)> {
+                panic!("the folder guard must not read here")
+            }
+            fn real_path(&self, _path: &Path) -> Option<PathBuf> {
+                panic!("the folder guard must not resolve here")
+            }
+        }
+        let panicking = MustNotAsk;
         let c = current();
         let homes = [PathBuf::from("/home/alice")];
         // Wake-on-LAN without a [wake] section: refused before any read, even

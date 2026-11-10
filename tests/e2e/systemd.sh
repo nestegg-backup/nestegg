@@ -370,6 +370,24 @@ check "a missing entry re-included in the own home is refused" test "$(tail -1 <
 check "so the two own-home answers differ" bash -c "[[ \"\$(tail -1 <<<'$keep')\" != \"\$(tail -1 <<<'$drop')\" ]]"
 # Undo the accepted change so the rest of the run starts from the good config.
 on_client bash -c "cat /root/config.good > $cfg"
+
+echo "-- a home directory that is a link into another source is protected there"
+# The account database gives carol's home as /home/carol; that is a link to
+# /srv/homes/carol-data, and /srv/homes is a source of its own. In that
+# archive her home is /carol-data: excluding it would leave her whole home
+# out, which the written paths alone do not show. The daemon finds the real
+# place with the requester's identity (alice may follow the link, she need not
+# be able to enter the home), so the change is refused.
+on_client bash -c 'mkdir -p /srv/homes/carol-data && useradd -M -d /home/carol carol && ln -s /srv/homes/carol-data /home/carol && echo x > /srv/homes/carol-data/file && chown -R carol: /srv/homes/carol-data && chmod 700 /srv/homes/carol-data'
+on_client bash -c "printf '\n[[backup.sources]]\narchive = \"e2e-homes\"\npath = \"/srv/homes\"\n' >> $cfg"
+linked="$(patch_config as_alice '{"excludes":["/carol-data"]}')"
+check "excluding the real place of a linked home is refused" test "$(tail -1 <<<"$linked")" = 400
+check "the refusal names the real place of the home" contains "$linked" '/srv/homes/carol-data'
+# (That an exclude inside such a home passes is covered by the unit tests; an
+# accepted change here would start a notification run in the middle of the
+# sections below.)
+on_client bash -c "cat /root/config.good > $cfg"
+on_client bash -c 'userdel carol; rm -rf /srv/homes /home/carol'
 # The accepted change above is a reported reduction: it starts a health check
 # with a short quiet period. Wait for that check to finish and clear the
 # settings inbox, so it cannot overlap the failing-hook test further below.
