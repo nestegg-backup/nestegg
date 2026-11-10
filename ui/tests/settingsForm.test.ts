@@ -210,6 +210,23 @@ describe("failed saves", () => {
       text: p.excludeEverything,
       detail: null,
     });
+    // The daemon's messages as they are since the whole list is judged together.
+    expect(
+      saveFailure(
+        f(
+          "bad_request",
+          400,
+          "this exclude list would leave out the whole folder /home/alice from the backup; an administrator can still set it as root in /etc/nestegg/config.toml.",
+        ),
+        de,
+      ),
+    ).toEqual({ text: p.excludeFolder("/home/alice"), detail: null });
+    for (const message of [
+      "exclude pattern `[abc` is malformed (an unclosed `[`…`]` character class or a dangling `\\`, for example) and would break every backup run",
+      "exclude pattern `foo\\` is not a valid pattern (trailing backslash); the backup client would reject it",
+    ]) {
+      expect(saveFailure(f("bad_request", 400, message), de)).toEqual({ text: p.excludeMalformed, detail: null });
+    }
   });
 
   it("shows the daemon's own message when the reason is unknown", () => {

@@ -67,6 +67,8 @@ export function problemText(message: string, t: Messages): string | null {
   if (/must not start or end with spaces/.test(message)) return p.excludeSpaces;
   if (/must not start with `-`/.test(message)) return p.excludeDash;
   if (/would exclude everything/.test(message)) return p.excludeEverything;
+  // A pattern the backup program cannot read (an unclosed [ ... ], a backslash at the end).
+  if (/is not a valid pattern|is malformed/.test(message)) return p.excludeMalformed;
   // The pattern can contain backticks itself: the folder is what stands between "folder" and "from the backup".
   if ((m = /would leave out the whole folder (.+) from the backup; an administrator can still set it/s.exec(message))) return p.excludeFolder(m[1]!);
   if (/is listed twice/.test(message)) return p.excludeDuplicate;

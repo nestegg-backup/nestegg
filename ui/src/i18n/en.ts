@@ -565,6 +565,8 @@ const en = {
       excludeSpaces: "The pattern must not start or end with a space.",
       excludeDash: "The pattern must not start with a minus sign.",
       excludeEverything: "Nothing would be backed up any more. Please choose a narrower pattern.",
+      excludeMalformed:
+        "The backup program cannot read this pattern, and every backup would fail with it. Check the brackets [ ] and that it does not end with a backslash.",
       excludeFolder: (folder: string) =>
         `That would leave the whole folder “${folder}” out of the backup. nestegg does not allow that here. An administrator can still set it in /etc/nestegg/config.toml.`,
       excludeDuplicate: "This pattern is already in the list.",

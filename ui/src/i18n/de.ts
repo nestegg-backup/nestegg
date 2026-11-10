@@ -572,6 +572,8 @@ const de = {
       excludeSpaces: "Das Muster darf nicht mit einem Leerzeichen beginnen oder enden.",
       excludeDash: "Das Muster darf nicht mit einem Minuszeichen beginnen.",
       excludeEverything: "Damit würde nichts mehr gesichert. Bitte ein engeres Muster wählen.",
+      excludeMalformed:
+        "Dieses Muster kann das Backup-Programm nicht lesen, jede Sicherung würde daran scheitern. Prüfe die eckigen Klammern [ ] und dass am Ende kein Backslash steht.",
       excludeFolder: (folder: string) =>
         `Damit würde der ganze Ordner „${folder}“ aus der Sicherung fallen. Das lässt nestegg hier nicht zu. Ein Administrator kann es in /etc/nestegg/config.toml trotzdem festlegen.`,
       excludeDuplicate: "Dieses Muster ist schon in der Liste.",

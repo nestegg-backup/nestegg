@@ -422,15 +422,22 @@ describe("PATCH /config limits (decision 0022)", () => {
       ["alice", "/home/alice"],
       ["**/alice", "/home/alice"],
       ["/[a-z]*", "/home/alice"],
-      ["/home", "/home"],
-      ["/etc/**", "/etc"],
-      ["/usr/local", "/usr/local"],
     ] as const) {
       const r = patch(w, { excludes: [...(w.config()!.excludes ?? []), bad] });
       expect(r.status, bad).toBe(400);
       expect(message(r), bad).toBe(
-        `exclude pattern \`${bad}\` would leave out the whole folder ${folder} from the backup; an administrator can still set it as root in /etc/nestegg/config.toml.`,
+        `this exclude list would leave out the whole folder ${folder} from the backup; an administrator can still set it as root in /etc/nestegg/config.toml.`,
       );
+    }
+    // Patterns are relative to each archive: these match nothing there.
+    for (const fine of ["/home", "/etc/**", "/usr/local"]) {
+      expect(patch(new World("ok", "full"), { excludes: [fine] }).status, fine).toBe(200);
+    }
+    // What the backup client cannot parse is refused with the daemon's words.
+    for (const bad of ["[abc", "x[a-]", "foo\\"]) {
+      const r = patch(new World("ok", "full"), { excludes: [bad] });
+      expect(r.status, bad).toBe(400);
+      expect(message(r), bad).toMatch(/is malformed|is not a valid pattern/);
     }
   });
 

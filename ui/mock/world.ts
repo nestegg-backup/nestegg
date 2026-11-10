@@ -23,7 +23,7 @@ import type {
   Status,
 } from "../src/lib/types.ts";
 import { DEFAULT_LIMITS, OVERDUE_BASE_HOURS, OVERDUE_INTERVAL_EXTRA_HOURS, SETTING_KEYS, overdueCap, settingsProblem } from "../src/lib/settings.ts";
-import { wholeFolderProblem } from "./folderRule.ts";
+import { malformedProblem, wholeFolderProblem } from "./folderRule.ts";
 
 /** An item of the connection check, as `check::run` of the daemon builds it. */
 function item(name: string, status: CheckStatus, detail: string): PbsCheckItem {
@@ -759,7 +759,7 @@ export class World {
         excludes: this.excludes,
       },
       current.limits,
-      (pattern) => wholeFolderProblem(pattern, sources),
+      (pattern) => malformedProblem(pattern) ?? wholeFolderProblem(pattern, sources),
     );
     if (problem) return err(400, "bad_request", problem);
     const change = body as SettingsChange;
