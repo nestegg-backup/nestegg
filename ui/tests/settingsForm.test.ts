@@ -4,7 +4,7 @@ import de from "../src/i18n/de";
 import en from "../src/i18n/en";
 import { ApiFailure } from "../src/lib/api";
 import { DEFAULT_LIMITS, overdueCap, settingsProblem } from "../src/lib/settings";
-import { INTERVAL_CHOICES, intervalOptions, intervalReachable, overdueFor, parseHours, problemText, saveFailure } from "../src/lib/settingsForm";
+import { INTERVAL_CHOICES, intervalOptions, intervalReachable, overdueFor, parseHours, problemText, saveFailure, serialListEdits } from "../src/lib/settingsForm";
 import type { SettingsLimits } from "../src/lib/types";
 
 const current = { interval_hours: 24, overdue_after_hours: 36, wake_on_lan_configured: false };
@@ -232,5 +232,62 @@ describe("failed saves", () => {
   it("shows the daemon's own message when the reason is unknown", () => {
     expect(saveFailure(f("bad_request", 400, "brand new rule"), de)).toEqual({ text: de.settings.problem.other, detail: "brand new rule" });
     expect(saveFailure(f("other", 500, "disk full"), de)).toEqual({ text: de.settings.problem.other, detail: "disk full" });
+  });
+});
+
+describe("edits of the exclude list run one after the other", () => {
+  /** A daemon that answers after a moment, like the real one. */
+  function daemon(initial: string[]) {
+    const state = { list: [...initial], saves: [] as string[][] };
+    const later = <T>(v: T) => new Promise<T>((r) => setTimeout(() => r(v), 5));
+    return {
+      state,
+      load: () => later([...state.list]),
+      save: async (list: string[]) => {
+        await later(null);
+        state.list = [...list];
+        state.saves.push([...list]);
+        return true;
+      },
+    };
+  }
+
+  it("two removals started together remove both (the second starts from the first one's result)", async () => {
+    const d = daemon(["A", "B"]);
+    const busy: boolean[] = [];
+    const edit = serialListEdits(d.load, (on) => busy.push(on));
+    const remove = (p: string) => edit((list) => d.save(list.filter((x) => x !== p)));
+    // Not awaited one by one: both are under way before the first has loaded anything.
+    const both = Promise.all([remove("A"), remove("B")]);
+    expect(busy).toEqual([true, true]);
+    expect(await both).toEqual([true, true]);
+    expect(d.state.saves).toEqual([["B"], []]);
+    expect(d.state.list).toEqual([]);
+    // Busy the whole time, also between the two saves, and free at the end.
+    expect(busy).toEqual([true, true, true, false]);
+  });
+
+  it("an addition and a removal started together both take effect", async () => {
+    const d = daemon(["A"]);
+    const edit = serialListEdits(d.load, () => {});
+    await Promise.all([
+      edit((list) => d.save([...list, "C"])),
+      edit((list) => d.save(list.filter((x) => x !== "A"))),
+    ]);
+    expect(d.state.list).toEqual(["C"]);
+  });
+
+  it("an edit that fails does not hold up the next one", async () => {
+    const d = daemon(["A", "B"]);
+    const busy: boolean[] = [];
+    const edit = serialListEdits(d.load, (on) => busy.push(on));
+    const failing = edit(async () => {
+      throw new Error("no answer");
+    });
+    const next = edit((list) => d.save(list.filter((x) => x !== "B")));
+    await expect(failing).rejects.toThrow("no answer");
+    expect(await next).toBe(true);
+    expect(d.state.list).toEqual(["A"]);
+    expect(busy.at(-1)).toBe(false);
   });
 });

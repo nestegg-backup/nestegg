@@ -10,7 +10,7 @@
   import { ApiFailure } from "../lib/api";
   import { scheduleHours } from "../lib/derive";
   import { DEFAULT_LIMITS, settingsProblem } from "../lib/settings";
-  import { intervalOptions, overdueFor, parseHours, problemText, saveFailure } from "../lib/settingsForm";
+  import { intervalOptions, overdueFor, parseHours, problemText, saveFailure, serialListEdits } from "../lib/settingsForm";
   import { f, t } from "../lib/locale";
   import type { SettingKey, SettingsChange, Status } from "../lib/types";
 
@@ -165,15 +165,23 @@
     return app.config.value?.excludes ?? excludes;
   }
 
+  // Every change of the list is built from the daemon's current one, not a copy loaded long ago (it
+  // may have changed in another tab or in the terminal), and the changes run one after the other:
+  // two removals started close together would otherwise both start from the same list, and the
+  // second save would bring back what the first removed. The row is busy from the click on.
+  const editExcludes = serialListEdits(freshExcludes, (on) => (pending.excludes = on));
+
   async function addPattern(e: SubmitEvent) {
     e.preventDefault();
     const p = pattern.trim();
     if (!p) return refuse("excludes", { text: s.problem.excludeEmpty, detail: null });
-    // Build the list from the daemon's current one, not a copy loaded long ago:
-    // it may have changed in another tab or in the terminal.
-    const list = await freshExcludes();
-    if (list.includes(p)) return refuse("excludes", { text: s.problem.excludeDuplicate, detail: null });
-    const ok = await save("excludes", { excludes: [...list, p] }, s.sumExcludeAdded(p));
+    const ok = await editExcludes(async (list) => {
+      if (list.includes(p)) {
+        refuse("excludes", { text: s.problem.excludeDuplicate, detail: null });
+        return false;
+      }
+      return save("excludes", { excludes: [...list, p] }, s.sumExcludeAdded(p));
+    });
     // Keep whatever was typed meanwhile.
     if (ok && pattern.trim() === p) pattern = "";
   }
@@ -181,8 +189,11 @@
   async function removePattern(p: string) {
     // The button goes away with the pattern: keep the keyboard in the list.
     patternInput?.focus();
-    const list = await freshExcludes();
-    await save("excludes", { excludes: list.filter((x) => x !== p) }, s.sumExcludeRemoved(p));
+    await editExcludes(async (list) => {
+      // Already gone (removed in another tab, or by the edit before this one): nothing to save.
+      if (!list.includes(p)) return false;
+      return save("excludes", { excludes: list.filter((x) => x !== p) }, s.sumExcludeRemoved(p));
+    });
   }
 
   const describe = (...ids: (string | false | null | undefined)[]) => ids.filter(Boolean).join(" ") || undefined;

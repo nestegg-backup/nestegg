@@ -101,3 +101,35 @@ export function saveFailure(f: ApiFailure, t: Messages): { text: string; detail:
   if (f.status === 500 && /config(uration|\.toml)/.test(f.message)) return { text: p.configBroken, detail };
   return { text: p.other, detail };
 }
+
+/**
+ * Edits of a list the daemon keeps (the exclude patterns), one after the other.
+ *
+ * Every edit is "load the current list, change it, save it". Two edits started close together must
+ * not both load the same list: the second save would then undo the first ("remove A" and "remove
+ * B" from [A, B] would send [B] and then [A]). So each edit waits for the ones before it and only
+ * then loads the list it works on. `busy(true)` is reported at once, before anything is loaded,
+ * and `busy(false)` when no edit is left; an edit that fails does not hold up the next one.
+ */
+export function serialListEdits(
+  load: () => Promise<string[]>,
+  busy: (on: boolean) => void,
+): <T>(edit: (list: string[]) => Promise<T>) => Promise<T> {
+  let tail: Promise<unknown> = Promise.resolve();
+  let open = 0;
+  return <T>(edit: (list: string[]) => Promise<T>): Promise<T> => {
+    open += 1;
+    busy(true);
+    const run = tail.then(async () => {
+      try {
+        return await edit(await load());
+      } finally {
+        open -= 1;
+        // Also after a save, which clears the row's own "saving" mark: more edits are waiting.
+        busy(open > 0);
+      }
+    });
+    tail = run.catch(() => undefined);
+    return run;
+  };
+}
