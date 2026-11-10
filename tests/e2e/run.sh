@@ -80,7 +80,7 @@ check "backup refused while key not exported" \
   fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
 export_out="$(on_client nestegg key export /root/nestegg-key.json 2>&1)"
 check "export reads the file back" grep -q 'read back' <<<"$export_out"
-check "export on the internal disk warns" grep -q 'lost together with this disk' <<<"$export_out"
+check "export on the internal disk warns" grep -q 'lost together with this computer' <<<"$export_out"
 check "export alone does not unlock backups" \
   fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
 check "confirm without proof is refused" \
@@ -107,13 +107,23 @@ check "paper key keeps the client's key block" bash -c "docker exec $client grep
 check "the check code is not shown when the file is written" bash -c "! grep -q '$paper_code' <<<'$paper_out'"
 check "paper key is not enough by itself" \
   fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
-check "wrong paper code is refused" \
-  fails_with 1 'does not belong to the key' on_client nestegg key confirm-exported --paper-code 0000-0000
+check "wrong paper code is refused, statement or not" \
+  fails_with 1 'does not belong to the key' on_client nestegg key confirm-exported --paper-code 0000-0000 --printed
 check "malformed paper code is refused" \
-  fails_with 1 'not a check code' on_client nestegg key confirm-exported --paper-code nonsense
+  fails_with 1 'not a check code' on_client nestegg key confirm-exported --paper-code nonsense --printed
+# The shortcut: write the paper key to a file, read the code off the file.
+# No sheet of paper exists. nestegg remembers the file it wrote.
+check "shortcut: the code read from the file on this computer is refused" \
+  fails_with 1 'paper key file /root/paper\.' on_client nestegg key confirm-exported --paper-code "$paper_code" --printed
+check "shortcut: the message says what to do" \
+  fails_with 1 'delete the file or move it to a USB stick' on_client nestegg key confirm-exported --paper-code "$paper_code" --printed
+# After printing, the files are deleted or moved away.
+on_client bash -c 'mkdir -p /root/printed && mv /root/paper.txt /root/paper.html /root/printed/'
+check "without the statement the right code is not enough" \
+  fails_with 1 'State that with --printed' on_client nestegg key confirm-exported --paper-code "$paper_code"
 check "nothing was recorded by the failed attempts" \
   fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
-check "paper code of the printed key confirms" on_client nestegg key confirm-exported --paper-code "$paper_code"
+check "paper code of the printed key with the statement confirms" on_client nestegg key confirm-exported --paper-code "$paper_code" --printed
 check "config contains no secret" exits_with 1 on_client grep -qF "$token_secret" /etc/nestegg/config.toml
 on_client nestegg check || true
 # This container has no systemd, so the timer check always fails; with a
@@ -154,8 +164,8 @@ check "restore with plain client and exported key" docker exec -e PBS_PASSWORD="
 
 echo "== key verify"
 check "verify: the exported file opens the newest backup" bash -c "docker exec $client nestegg key verify /root/nestegg-key.json | grep -q 'opens the newest backup: yes'"
-check "verify: a saved paper key (HTML) opens it too" on_client nestegg key verify /root/paper.html
-check "verify: a saved paper key (text) opens it too" on_client nestegg key verify /root/paper.txt
+check "verify: a saved paper key (HTML) opens it too" on_client nestegg key verify /root/printed/paper.html
+check "verify: a saved paper key (text) opens it too" on_client nestegg key verify /root/printed/paper.txt
 check "verify: another key fails" fails_with 1 'matches the stored key:  NO' on_client nestegg key verify /root/other-key.json
 check "verify: a file that is no key fails" fails_with 1 'matches the stored key:  NO' on_client nestegg key verify /etc/hostname
 
@@ -220,7 +230,7 @@ check "the old key's file does not confirm the new key" \
   fails_with 1 'does not contain the key' \
   on_client nestegg key confirm-exported --file /root/nestegg-key.json --accept-local-copy
 check "the old paper key does not confirm the new key" \
-  fails_with 1 'does not belong to the key' on_client nestegg key confirm-exported --paper-code "$paper_code"
+  fails_with 1 'does not belong to the key' on_client nestegg key confirm-exported --paper-code "$paper_code" --printed
 on_client nestegg key export /root/nestegg-key-2.json >/dev/null
 # With a terminal the user is asked; `script` gives the command one.
 check "interactive: anything but yes refuses" bash -c "! printf 'no\n' | docker exec -i $client script -qec 'nestegg key confirm-exported --file /root/nestegg-key-2.json' /dev/null >/dev/null 2>&1"
@@ -240,6 +250,15 @@ on_client nestegg key create --force --allow-plain >/dev/null
 on_client nestegg key export /root/nestegg-key-3.json >/dev/null
 check "verify: the copy matches the new key but not the newest snapshot" \
   fails_with 1 'opens the newest backup: NO' on_client nestegg key verify /root/nestegg-key-3.json
+# The paper code asks for the statement at a terminal, too.
+on_client nestegg key paperkey --output /root/paper-3.txt >/dev/null
+paper_code_3="$(on_client sed -n 's/^Check code: *//p' /root/paper-3.txt)"
+on_client mv /root/paper-3.txt /root/printed/paper-3.txt
+check "interactive: anything but yes refuses the paper code" bash -c "! printf 'no\n' | docker exec -i $client script -qec 'nestegg key confirm-exported --paper-code $paper_code_3' /dev/null >/dev/null 2>&1"
+check "still not confirmed after answering no to the paper statement" \
+  fails_with 1 'encryption key has not been exported yet' on_client nestegg backup
+check "interactive: yes confirms the paper code" bash -c "printf 'yes\n' | docker exec -i $client script -qec 'nestegg key confirm-exported --paper-code $paper_code_3' /dev/null >/dev/null 2>&1"
+check "the interactive paper confirmation is recorded" bash -c "docker exec $client nestegg key show | grep -q 'exported: *yes'"
 on_client nestegg key confirm-exported --file /root/nestegg-key-3.json --accept-local-copy >/dev/null
 
 echo "== second backup and timer behaviour"

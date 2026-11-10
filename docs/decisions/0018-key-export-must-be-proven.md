@@ -131,3 +131,100 @@ no manifest yet.
 - **Check the copy against the PBS at confirmation time.** The server may be
   asleep or unreachable during setup, and before the first backup there is
   nothing to open. That is why `key verify` exists as a separate check.
+
+## Amendment 2026-11-10: the paper code and "removable" must not claim more than they prove
+
+A review of the confirmation found two statements that were taken as proof
+and are not.
+
+### The check code does not prove a printed sheet
+
+`nestegg key paperkey --output ~/key.html`, opening the file on the screen
+and typing the code (or `key paperkey | less`) was enough for `--paper-code`.
+The code proves that the user saw the paper key, not where it is. A real
+proof of "printed" is impossible, so the code is now treated like a local
+file: it needs an explicit statement, and the one way that obviously
+contradicts the statement is closed.
+
+- **Statement.** `confirm-exported --paper-code` asks, at a terminal, to type
+  `yes` to state that the sheet is printed and stored away from this
+  computer. Without a terminal the flag `--printed` is required. No statement:
+  nothing is recorded, and the message says why. (`--printed` is only valid
+  with `--paper-code`; `--accept-local-copy` stays for `--file`.)
+- **Remembered files.** `key paperkey --output <file>` records the canonical
+  path of the file in the state (`paperkey_files`, with the digest of the key
+  the sheet was made from; at most 50 entries, entries for other keys are
+  dropped). The path is not secret. `confirm-exported --paper-code` is refused
+  while one of these files still exists at a place that needs a statement
+  (same rule as for `--file`: a disk of this computer, an unclassifiable
+  place, or inside the backup). The message names the file and says to delete
+  it after printing or to move it to a USB stick. A file that is gone, or
+  lies on removable media, does not block. A wrong code is reported before
+  this check. A paper key written to stdout leaves nothing to remember; the
+  statement covers that case.
+- **Message.** After writing, `key paperkey` says: print it, then delete the
+  file (or move it to a stick); confirming is refused while the file lies on
+  this computer.
+
+What this does not catch: a copy of the file that the user made by hand
+elsewhere on the same computer. That is the case the statement is for.
+
+### "Removable" excludes what the backup contains
+
+`DeviceFacts::is_external` only looks at the device. An external disk that is
+itself a configured source, or any path inside what the backup contains,
+exists only together with the data it protects, and inside the backup it is
+encrypted with the very key it contains. New rule, for `key export`,
+`key import` and `confirm-exported` alike: a path inside a configured source
+(`backup.sources` and `backup.include_dev`, canonical paths) counts as on this
+computer whatever the device is (`Location::InBackup`). In system mode this
+also holds for everything on the file systems that go into `system.pxar`
+(the root file system, the system mounts of the disk layout and bind mounts
+of them; the deepest mount point above the path decides, so a stick mounted
+below `/media` or a data disk with its own mount does not count as inside).
+`key export` warns accordingly, `key import` of a new key from such a place
+does not count as exported, and `confirm-exported --file` needs the statement.
+
+The file is resolved (symlinks) before the comparison with the sources, so a
+link on a USB stick to a file inside a source is recognised by where the data
+really is. (`findmnt -T` already follows links when it finds the device; only
+the comparison with the source paths needed the resolved path.) If the
+configuration exists but cannot be read, or the
+disk layout cannot be read in system mode, nestegg cannot tell whether a
+removable copy lies inside the backup; it is then treated as not classifiable
+(statement needed). No configuration at all means nothing is backed up, so
+nothing is inside it.
+
+### The limit: a stick that stays plugged in
+
+A card or stick that simply stays in the computer cannot be told apart from
+one that was removed after the copy was made, and it is lost or damaged
+together with the computer. nestegg cannot fix that. After a successful
+confirmation with a copy on removable media (a file, or a remembered paper
+key file on a stick) it says plainly: now unplug it and keep it away from this
+computer. The same sentence follows a `key import` that counts as exported.
+The confirmation therefore means "a copy of exactly this key was on removable
+media outside the backup when it was confirmed", not "it is somewhere safe
+now".
+
+### Other ways to "confirmed"
+
+All code paths that can set `key_exported_digest` were checked: `key create`
+and `key import` clear it, `key import` of the stored key keeps an earlier
+confirmation only, `confirm-exported` is the only place that sets it
+otherwise, and neither the daemon nor the web UI writes it. Closed in this
+change: a link to a file inside a source (it would have passed a comparison
+of path names); a copy on a removable medium
+that is part of the backup (all three commands, including the `key import`
+shortcut of a new key); `include_dev` paths (a backup content, not only
+`backup.sources`); an unreadable configuration. Left as it is, on purpose:
+`--file <paper key file> --accept-local-copy` (an explicit statement, like the
+new one for the paper code).
+
+### Consequences
+
+- Scripts that confirmed with `--paper-code` and no terminal must add
+  `--printed`, and must have deleted or moved the paper key file first.
+  Scripts that use `--file` are unchanged.
+- The state has one new field, `paperkey_files`; older state files load
+  without it.

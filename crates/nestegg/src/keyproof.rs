@@ -8,12 +8,15 @@
 //! on a disk that belongs to this computer. See
 //! `docs/decisions/0018-key-export-must-be-proven.md`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use crate::layout::{Layout, MountRole};
+use crate::state::PaperKeyFile;
 
 /// The block `proxmox-backup-client key paperkey` writes around the key.
 /// Everything we add to a paper key stays outside these two lines, because
@@ -171,8 +174,9 @@ const HOW_TO: [&str; 3] = [
     "Then give that file to the restore: `nestegg restore ... --keyfile key.json`, \
      or to the rescue stick when it asks for the key. The rescue stick also lets you \
      type the \"data\" line by hand.",
-    "Keep this sheet away from this computer. The check code proves you hold it: \
-     `nestegg key confirm-exported --paper-code <code>`.",
+    "Keep this sheet away from this computer and delete the file it was printed from. \
+     Typing the check code with `nestegg key confirm-exported --paper-code <code>` states \
+     that the sheet is printed and stored there.",
 ];
 
 /// Header in front of a text paper key: plain lines, then a blank line.
@@ -276,6 +280,12 @@ pub enum Location {
     /// `findmnt`/`lsblk`). Treated like [`Location::Internal`]: the user
     /// has to state that another copy exists elsewhere.
     Unknown(String),
+    /// Inside what the backup contains (a configured source, or a file
+    /// system that goes into `system.pxar`), whatever the device is. A copy
+    /// there exists only together with the data it protects, and inside the
+    /// backup it is encrypted with the key it contains. Treated like
+    /// [`Location::Internal`].
+    InBackup(String),
 }
 
 impl Location {
@@ -284,6 +294,150 @@ impl Location {
     pub fn needs_statement(&self) -> bool {
         !matches!(self, Location::Removable)
     }
+
+    /// Where the file is, as a phrase that follows "the file": `lies on ...`.
+    pub fn describe(&self) -> String {
+        match self {
+            Location::Removable => "lies on a removable medium".into(),
+            Location::Internal => "lies on a disk of this computer".into(),
+            Location::Unknown(why) => {
+                format!("lies in a place that nestegg cannot classify ({why})")
+            }
+            Location::InBackup(why) => format!("lies {why}"),
+        }
+    }
+}
+
+/// The system file systems of a [`Layout`], split by whether their content
+/// goes into `system.pxar`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SystemMounts {
+    /// Mount points of the root file system, the separate system file
+    /// systems and bind mounts of them.
+    pub inside: Vec<PathBuf>,
+    /// Every other mount point (data disks, removable media, network, ...).
+    pub outside: Vec<PathBuf>,
+}
+
+impl SystemMounts {
+    pub fn from_layout(layout: &Layout) -> SystemMounts {
+        let mut out = SystemMounts::default();
+        for m in &layout.mounts {
+            let inside = matches!(layout.role(m), MountRole::Root | MountRole::System)
+                || crate::layout::system_bind(layout, m);
+            let point = PathBuf::from(&m.point);
+            if inside {
+                out.inside.push(point);
+            } else {
+                out.outside.push(point);
+            }
+        }
+        for point in &layout.all_points {
+            let point = PathBuf::from(point);
+            if !out.inside.contains(&point) && !out.outside.contains(&point) {
+                out.outside.push(point);
+            }
+        }
+        out
+    }
+
+    /// The mount point of the system file system `path` lies on, if its
+    /// content goes into `system.pxar`: the deepest mount point above the
+    /// path decides.
+    fn system_mount_of(&self, path: &Path) -> Option<&Path> {
+        fn deepest<'a>(points: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+            points
+                .iter()
+                .filter(|p| path.starts_with(p))
+                .max_by_key(|p| p.components().count())
+        }
+        let inside = deepest(&self.inside, path)?;
+        match deepest(&self.outside, path) {
+            Some(outside) if outside.components().count() > inside.components().count() => None,
+            _ => Some(inside.as_path()),
+        }
+    }
+}
+
+/// What the backup contains, as far as it matters for a copy of the key:
+/// the configured sources, and in system mode the system file systems.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackupScope {
+    /// Canonical paths of `backup.sources` and `backup.include_dev`.
+    pub roots: Vec<PathBuf>,
+    /// System mode: the mounts of the running system.
+    pub system: Option<SystemMounts>,
+    /// Set when the scope could not be determined (unreadable configuration,
+    /// no disk layout in system mode): a copy on removable media can then
+    /// not be told apart from one inside the backup.
+    pub unknown: Option<String>,
+}
+
+impl BackupScope {
+    /// The scope of a configuration, with the paths resolved on this system.
+    /// `layout` is the disk layout and is only needed in system mode.
+    pub fn for_config(config: &crate::config::Config, layout: Option<&Layout>) -> BackupScope {
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let roots = config
+            .backup
+            .sources
+            .iter()
+            .map(|s| canonical(&s.path))
+            .chain(config.backup.include_dev.iter().map(|p| canonical(p)))
+            .collect();
+        let mut scope = BackupScope {
+            roots,
+            ..BackupScope::default()
+        };
+        if config.backup.system {
+            match layout {
+                Some(layout) => scope.system = Some(SystemMounts::from_layout(layout)),
+                None => scope.unknown = Some("the disk layout cannot be read".into()),
+            }
+        }
+        scope
+    }
+
+    /// Why `path` (canonical) lies inside the backup, if it does.
+    pub fn contains(&self, path: &Path) -> Option<String> {
+        if let Some(root) = self.roots.iter().find(|r| path.starts_with(r)) {
+            return Some(format!(
+                "inside {}, which is part of the backup, so the copy exists only together \
+                 with the data it protects",
+                root.display()
+            ));
+        }
+        let system = self.system.as_ref()?;
+        let point = system.system_mount_of(path)?;
+        Some(format!(
+            "on the file system mounted at {}, which goes into the system backup, so the \
+             copy exists only together with the data it protects",
+            point.display()
+        ))
+    }
+}
+
+/// Fold the backup scope into the location found for the device: a path
+/// inside the backup counts as on this computer whatever the device is.
+/// `real` is the canonical path of the file.
+pub fn apply_scope(device: Location, real: &Path, scope: &BackupScope) -> Location {
+    if let Some(why) = scope.contains(real) {
+        return Location::InBackup(why);
+    }
+    match (&device, &scope.unknown) {
+        (Location::Removable, Some(why)) => Location::Unknown(format!(
+            "it could not be checked whether the file lies inside the backup: {why}"
+        )),
+        _ => device,
+    }
+}
+
+/// [`locate`] for a copy of the key, with the backup scope applied. The path
+/// is resolved first, so a link on a USB stick to a file on the disk of this
+/// computer does not count as removable.
+pub fn locate_in(path: &Path, scope: &BackupScope) -> Location {
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    apply_scope(locate(&real), &real, scope)
 }
 
 /// Decide from the layers behind a file. Only the whole disks at the bottom
@@ -405,6 +559,55 @@ pub fn decide_local_copy(location: &Location, accept_flag: bool, terminal: bool)
     } else {
         LocalCopy::Refuse
     }
+}
+
+/// What `confirm-exported --paper-code` does about the statement that the
+/// sheet is printed and stored away from this computer. A printed sheet
+/// cannot be proven, so the user has to say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Statement {
+    /// Given with `--printed`.
+    Given,
+    /// A terminal is available: explain and ask for `yes`.
+    Ask,
+    /// No terminal and no `--printed`: nothing is recorded.
+    Missing,
+}
+
+pub fn decide_paper_statement(printed_flag: bool, terminal: bool) -> Statement {
+    if printed_flag {
+        Statement::Given
+    } else if terminal {
+        Statement::Ask
+    } else {
+        Statement::Missing
+    }
+}
+
+/// The paper key files remembered for the key with `key_digest` that still
+/// exist, with the place they lie on. `exists` and `locate` are injected.
+pub fn existing_paperkey_files(
+    files: &[PaperKeyFile],
+    key_digest: &str,
+    exists: impl Fn(&Path) -> bool,
+    locate: impl Fn(&Path) -> Location,
+) -> Vec<(PathBuf, Location)> {
+    files
+        .iter()
+        .filter(|f| f.key_digest == key_digest && exists(&f.path))
+        .map(|f| (f.path.clone(), locate(&f.path)))
+        .collect()
+}
+
+/// The paper key files that stand in the way of `--paper-code`: they still
+/// exist on this computer's disk (or inside the backup), so reading the code
+/// off the screen would be possible.
+pub fn paperkey_files_in_the_way(existing: &[(PathBuf, Location)]) -> Vec<&Path> {
+    existing
+        .iter()
+        .filter(|(_, location)| location.needs_statement())
+        .map(|(path, _)| path.as_path())
+        .collect()
 }
 
 #[cfg(test)]
@@ -703,5 +906,238 @@ mod tests {
         assert_eq!(decide_local_copy(&unknown, false, false), LocalCopy::Refuse);
         assert_eq!(decide_local_copy(&unknown, false, true), LocalCopy::Ask);
         assert_eq!(decide_local_copy(&unknown, true, false), LocalCopy::Accept);
+    }
+
+    // ---- decision "paper code and removable are not proof enough" ----
+
+    #[test]
+    fn the_paper_code_needs_the_users_statement() {
+        assert_eq!(decide_paper_statement(true, false), Statement::Given);
+        assert_eq!(decide_paper_statement(true, true), Statement::Given);
+        assert_eq!(decide_paper_statement(false, true), Statement::Ask);
+        // No terminal and no flag: nothing is recorded.
+        assert_eq!(decide_paper_statement(false, false), Statement::Missing);
+    }
+
+    fn remembered(path: &str, digest: &str) -> PaperKeyFile {
+        PaperKeyFile {
+            path: PathBuf::from(path),
+            key_digest: digest.into(),
+        }
+    }
+
+    #[test]
+    fn a_remembered_paper_key_file_on_this_computer_is_in_the_way() {
+        let files = [remembered("/home/alice/key.html", "d1")];
+        let there = |_: &Path| true;
+        let internal = |_: &Path| Location::Internal;
+        let existing = existing_paperkey_files(&files, "d1", there, internal);
+        assert_eq!(existing.len(), 1);
+        assert_eq!(
+            paperkey_files_in_the_way(&existing),
+            vec![Path::new("/home/alice/key.html")]
+        );
+        // Not classifiable counts as on this computer, so does a place inside
+        // the backup.
+        for location in [
+            Location::Unknown("overlay".into()),
+            Location::InBackup("inside /srv".into()),
+        ] {
+            let existing = existing_paperkey_files(&files, "d1", there, |_| location.clone());
+            assert_eq!(
+                paperkey_files_in_the_way(&existing).len(),
+                1,
+                "{location:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_paper_key_file_that_is_gone_on_a_stick_or_for_another_key_is_no_obstacle() {
+        let files = [remembered("/media/alice/STICK/key.html", "d1")];
+        // On removable media: found, but not in the way.
+        let existing = existing_paperkey_files(&files, "d1", |_| true, |_| Location::Removable);
+        assert_eq!(existing.len(), 1);
+        assert!(paperkey_files_in_the_way(&existing).is_empty());
+        // Deleted (or the stick is not plugged in).
+        let existing = existing_paperkey_files(&files, "d1", |_| false, |_| Location::Internal);
+        assert!(existing.is_empty());
+        assert!(paperkey_files_in_the_way(&existing).is_empty());
+        // Made from an older key: the key was replaced since.
+        let existing = existing_paperkey_files(&files, "d2", |_| true, |_| Location::Internal);
+        assert!(existing.is_empty());
+        // Nothing remembered (output piped to a printer).
+        assert!(existing_paperkey_files(&[], "d1", |_| true, |_| Location::Internal).is_empty());
+    }
+
+    #[test]
+    fn paper_key_files_are_remembered_per_key_without_duplicates() {
+        let mut state = crate::state::State::default();
+        state.remember_paperkey_file(PathBuf::from("/a/key.html"), "d1");
+        state.remember_paperkey_file(PathBuf::from("/a/key.html"), "d1");
+        state.remember_paperkey_file(PathBuf::from("/a/key.txt"), "d1");
+        assert_eq!(state.paperkey_files.len(), 2);
+        // A new key forgets the files of the old one.
+        state.remember_paperkey_file(PathBuf::from("/b/key.html"), "d2");
+        assert_eq!(state.paperkey_files, vec![remembered("/b/key.html", "d2")]);
+        // The list stays bounded.
+        for i in 0..80 {
+            state.remember_paperkey_file(PathBuf::from(format!("/c/{i}.html")), "d2");
+        }
+        assert_eq!(state.paperkey_files.len(), 50);
+        assert_eq!(
+            state.paperkey_files.last().unwrap().path,
+            Path::new("/c/79.html")
+        );
+        // It survives a round trip through the state file.
+        let json = serde_json::to_string(&state).unwrap();
+        let back: crate::state::State = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.paperkey_files, state.paperkey_files);
+        // An old state file without the field still loads.
+        let old: crate::state::State = serde_json::from_str("{}").unwrap();
+        assert!(old.paperkey_files.is_empty());
+    }
+
+    fn scope_with(roots: &[&str], system: Option<SystemMounts>) -> BackupScope {
+        BackupScope {
+            roots: roots.iter().map(PathBuf::from).collect(),
+            system,
+            unknown: None,
+        }
+    }
+
+    #[test]
+    fn a_path_inside_a_backup_source_is_on_this_computer_whatever_the_device_is() {
+        // An external disk that is itself a source (mounted below /mnt).
+        let scope = scope_with(&["/home", "/mnt/data"], None);
+        for path in [
+            "/mnt/data/keys/key.json",
+            "/mnt/data",
+            "/home/alice/key.json",
+        ] {
+            let found = apply_scope(Location::Removable, Path::new(path), &scope);
+            assert!(matches!(found, Location::InBackup(_)), "{path}: {found:?}");
+            assert!(found.needs_statement(), "{path}");
+        }
+        // Next to a source, but not inside it (component-wise, not by prefix).
+        for path in [
+            "/mnt/data2/key.json",
+            "/mnt/key.json",
+            "/media/alice/STICK/key.json",
+        ] {
+            assert_eq!(
+                apply_scope(Location::Removable, Path::new(path), &scope),
+                Location::Removable,
+                "{path}"
+            );
+        }
+        // What the device says is kept when the path is outside the backup.
+        assert_eq!(
+            apply_scope(Location::Internal, Path::new("/srv/key.json"), &scope),
+            Location::Internal
+        );
+        let message = Location::InBackup("inside /mnt/data, which is part of the backup".into());
+        assert!(message.describe().starts_with("lies inside /mnt/data"));
+    }
+
+    #[test]
+    fn the_system_backup_covers_the_system_file_systems_but_not_other_mounts() {
+        let layout = crate::layout::tests::btrfs_layout();
+        let system = SystemMounts::from_layout(&layout);
+        let scope = scope_with(&[], Some(system));
+        let inside = |p: &str| scope.contains(Path::new(p)).is_some();
+        // Root, /home (a system mount) and the EFI partition are in system.pxar.
+        assert!(inside("/etc/key.json"));
+        assert!(inside("/home/alice/key.json"));
+        assert!(inside("/boot/efi/key.json"));
+        // A data disk, a stick and the snapshots are mounts of their own.
+        assert!(!inside("/srv/data/key.json"));
+        assert!(!inside("/media/alice/USB/key.json"));
+        assert!(!inside("/.snapshots/1/key.json"));
+        // A mount below a system mount is its own file system as well.
+        let mut layout = layout;
+        layout.all_points = vec!["/home/alice/nfs".into()];
+        let scope = scope_with(&[], Some(SystemMounts::from_layout(&layout)));
+        assert!(
+            scope
+                .contains(Path::new("/home/alice/nfs/key.json"))
+                .is_none()
+        );
+        assert!(scope.contains(Path::new("/home/alice/key.json")).is_some());
+        // Without system mode only the sources count.
+        assert!(
+            scope_with(&[], None)
+                .contains(Path::new("/etc/key.json"))
+                .is_none()
+        );
+        // The reason names the mount point.
+        assert!(
+            scope
+                .contains(Path::new("/home/alice/key.json"))
+                .unwrap()
+                .contains("/home")
+        );
+    }
+
+    #[test]
+    fn an_unknown_scope_makes_a_removable_copy_uncertain() {
+        let scope = BackupScope {
+            unknown: Some("the configuration cannot be read".into()),
+            ..BackupScope::default()
+        };
+        let found = apply_scope(
+            Location::Removable,
+            Path::new("/media/alice/STICK/k"),
+            &scope,
+        );
+        assert!(matches!(found, Location::Unknown(_)));
+        assert!(found.needs_statement());
+        // Internal stays internal.
+        assert_eq!(
+            apply_scope(Location::Internal, Path::new("/srv/k"), &scope),
+            Location::Internal
+        );
+    }
+
+    #[test]
+    fn the_scope_comes_from_the_configuration_and_a_link_is_resolved_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("data");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(source.join("keys")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let config = crate::config::Config::parse(&format!(
+            "[pbs]\nserver = \"pbs.example.com\"\ndatastore = \"backups\"\n\
+             auth_id = \"backup@pbs!desktop\"\n[backup]\n\
+             sources = [{{ archive = \"data\", path = \"{}\" }}]\n",
+            source.display()
+        ))
+        .unwrap();
+        let scope = BackupScope::for_config(&config, None);
+        assert_eq!(scope.roots, vec![std::fs::canonicalize(&source).unwrap()]);
+        assert!(scope.system.is_none() && scope.unknown.is_none());
+
+        // A file in the source counts, one beside it does not ...
+        let inside = source.join("keys/key.json");
+        std::fs::write(&inside, "{}").unwrap();
+        let beside = elsewhere.join("key.json");
+        std::fs::write(&beside, "{}").unwrap();
+        assert!(matches!(locate_in(&inside, &scope), Location::InBackup(_)));
+        assert!(!matches!(locate_in(&beside, &scope), Location::InBackup(_)));
+        // ... and a link beside the source to a file inside it counts too.
+        let link = elsewhere.join("link.json");
+        std::os::unix::fs::symlink(&inside, &link).unwrap();
+        assert!(matches!(locate_in(&link, &scope), Location::InBackup(_)));
+
+        // System mode without a layout: the scope is unknown.
+        let system = crate::config::Config::parse(
+            "[pbs]\nserver = \"pbs.example.com\"\ndatastore = \"backups\"\n\
+             auth_id = \"backup@pbs!desktop\"\n[backup]\nsystem = true\n",
+        )
+        .unwrap();
+        assert!(BackupScope::for_config(&system, None).unknown.is_some());
+        let layout = crate::layout::tests::btrfs_layout();
+        let with_layout = BackupScope::for_config(&system, Some(&layout));
+        assert!(with_layout.system.is_some() && with_layout.unknown.is_none());
     }
 }

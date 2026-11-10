@@ -25,7 +25,7 @@ sudo nestegg credentials set-password     # paste the token secret
 sudo nestegg key create                   # reinstalling? keep the old key: sudo nestegg key import <file>
 sudo nestegg key paperkey --format html --output key.html   # print it, then delete the file
                                           # - or: sudo nestegg key export /media/usb/nestegg-key.json
-sudo nestegg key confirm-exported --paper-code <code on the paper>
+sudo nestegg key confirm-exported --paper-code <code on the paper> --printed
                                           # - or: --file /media/usb/nestegg-key.json
 sudo nestegg check
 sudo systemctl enable --now nestegg.service nestegg-backup.timer nestegg-notify.timer
@@ -408,7 +408,9 @@ proof that a copy exists (below). The reasoning is in
 Two ways to keep a copy; use at least one, better both:
 
 - **Paper key:** `sudo nestegg key paperkey --format html --output key.html`,
-  print the file, delete it. The sheet shows the computer, date, server,
+  print the file, then delete it (or move it to a USB stick). nestegg
+  remembers where it wrote the file; confirming with the check code is refused
+  while that file still lies on this computer (see below). The sheet shows the computer, date, server,
   datastore, the key fingerprint, a **check code** (`XXXX-XXXX`) and how to
   restore with it, then the key and a QR code. Without `--output` the command
   refuses to write into a terminal; piping to a printer
@@ -418,12 +420,13 @@ Two ways to keep a copy; use at least one, better both:
   file is read back and compared with the key. If it lies on a disk of this
   computer you get a warning: that copy is lost together with the disk and
   useless inside its own backup (which is encrypted with this key). Move it to
-  a USB stick or a password manager.
+  a USB stick or a password manager. The same warning applies to a file inside
+  what the backup contains (see below).
 
 Then prove it. `confirm-exported` needs exactly one of:
 
 ```sh
-sudo nestegg key confirm-exported --paper-code 1A2B-3C4D    # from the sheet
+sudo nestegg key confirm-exported --paper-code 1A2B-3C4D --printed   # from the sheet
 sudo nestegg key confirm-exported --file /media/usb/nestegg-key.json
 ```
 
@@ -431,9 +434,39 @@ sudo nestegg key confirm-exported --file /media/usb/nestegg-key.json
 material is compared, not the bytes. A file on a disk of this computer is
 only accepted after you state that another copy exists outside it: type `yes`
 when asked, or pass `--accept-local-copy` without a terminal. A file on
-removable media needs neither. With a terminal and no option the command asks
-what you have. A wrong file or code is an error and nothing is recorded.
-Keys confirmed by an earlier version stay confirmed.
+removable media needs neither.
+
+`--paper-code` proves that the code is right, not that a sheet of paper
+exists: the code can be read off a file or the screen. So it needs your
+statement that the sheet is printed and stored away from this computer: type
+`yes` when asked, or pass `--printed` without a terminal. Without the
+statement nothing is recorded. In addition, the command is refused while a
+file written by `key paperkey --output` still exists on a disk of this
+computer; the message names the file. Delete it after printing, or move it to
+a USB stick. A file that is gone or lies on removable media does not block.
+A paper key piped to a printer leaves no file; the statement covers that
+case. (A copy of the file made by hand elsewhere cannot be found; the
+statement is where you promise there is none.)
+
+With a terminal and no option the command asks what you have. A wrong file or
+code is an error and nothing is recorded. Keys confirmed by an earlier
+version stay confirmed.
+
+**What counts as "removable".** A USB stick or card (see decision 0018 for the
+rules). Not if it is part of the backup: a path inside a configured source
+(`backup.sources`, `backup.include_dev`) counts as on this computer whatever
+the device is, because the copy then exists only together with the data it
+protects, and inside the backup it is encrypted with the key it contains. In
+system mode this includes everything on the file systems that go into
+`system.pxar`. `key export` warns about such a place; `key import` and
+`confirm-exported` treat it like a disk of this computer. If the
+configuration cannot be read, a removable copy cannot be told apart from one
+inside the backup and is treated the same way.
+
+**Unplug the stick.** A stick or card that simply stays plugged in cannot be
+told apart from one that was taken away, and it is lost or damaged together
+with the computer. After a successful confirmation with a copy on removable
+media nestegg says so: unplug it and keep it away from this computer.
 
 Check a copy again at any time, for example after a year:
 
@@ -461,8 +494,9 @@ sudo nestegg key import /media/usb/nestegg-key.json    # the exported key file
 
 `nestegg key import` checks the file with `proxmox-backup-client key show`
 and stores it like `key create` does. A key imported from a USB stick or
-another removable medium counts as exported, because you hold that copy. A
-file on this computer's own disk does not: confirm it afterwards with
+another removable medium counts as exported, because you hold that copy, as
+long as the medium is not part of the backup. A
+file on this computer's own disk (or inside the backup) does not: confirm it afterwards with
 `sudo nestegg key confirm-exported` like any other copy. Importing the key
 that is already stored (new hardware) keeps the confirmation you gave
 before. It only accepts keys without a password (as written

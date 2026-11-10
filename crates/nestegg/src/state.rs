@@ -230,6 +230,11 @@ pub struct State {
     /// (decision 0018).
     #[serde(default)]
     pub key_last_exported_digest: Option<String>,
+    /// Files that `key paperkey --output` wrote for the current key. Their
+    /// paths are not secret. `key confirm-exported --paper-code` is refused
+    /// while one of them still lies on this computer's disk (decision 0018).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paperkey_files: Vec<PaperKeyFile>,
     /// Snapshots of this machine (`host/<id>/<time>`) that the server's own
     /// verification marked as failed, as seen at the end of the last run.
     #[serde(default)]
@@ -247,9 +252,36 @@ pub struct State {
     pub failed_config: Option<String>,
 }
 
+/// A paper key file written by `key paperkey --output`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaperKeyFile {
+    /// Canonical absolute path at the time of writing.
+    pub path: PathBuf,
+    /// SHA-256 of the key the paper key was made from. A file made from an
+    /// older key is no longer of interest once the key was replaced.
+    pub key_digest: String,
+}
+
+/// At most this many paper key files are remembered for the current key.
+const MAX_PAPERKEY_FILES: usize = 50;
+
 impl State {
     pub fn key_exported(&self) -> bool {
         self.key_digest.is_some() && self.key_digest == self.key_exported_digest
+    }
+
+    /// Remember a paper key file written for the key with `key_digest`.
+    /// Entries for other keys are dropped.
+    pub fn remember_paperkey_file(&mut self, path: PathBuf, key_digest: &str) {
+        self.paperkey_files.retain(|f| f.key_digest == key_digest);
+        if !self.paperkey_files.iter().any(|f| f.path == path) {
+            self.paperkey_files.push(PaperKeyFile {
+                path,
+                key_digest: key_digest.to_string(),
+            });
+        }
+        let excess = self.paperkey_files.len().saturating_sub(MAX_PAPERKEY_FILES);
+        self.paperkey_files.drain(..excess);
     }
 }
 

@@ -899,6 +899,61 @@ fn confirmation_needs_proof_of_the_current_key() {
 }
 
 #[test]
+fn a_copy_inside_a_backup_source_counts_as_on_this_computer() {
+    // Whatever disk it lies on (an external disk that is itself a source
+    // looks removable), a copy inside what the backup contains exists only
+    // together with the data and, in the backup, encrypted with itself.
+    let env = Env::new();
+    env.set_key_exported(false);
+    let stderr = |out: &Output| String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = |out: &Output| String::from_utf8_lossy(&out.stdout).into_owned();
+    let inside = env.root().join("src/home/alice/key-copy.json");
+    let inside = inside.to_str().unwrap();
+
+    // Export says so.
+    let out = env.root_cmd(&["key", "export", inside]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("part of the backup"),
+        "{}",
+        stdout(&out)
+    );
+    // A link to the copy from outside the sources does not hide it.
+    let link = env.root().join("link.json");
+    std::os::unix::fs::symlink(inside, &link).unwrap();
+    // Confirming needs the statement, and the message names the reason.
+    for file in [inside, link.to_str().unwrap()] {
+        let out = env.root_cmd(&["key", "confirm-exported", "--file", file]);
+        assert_eq!(code(&out), 1, "{file}");
+        assert!(
+            stderr(&out).contains("part of the backup"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains("--accept-local-copy"),
+            "{}",
+            stderr(&out)
+        );
+    }
+    assert!(env.state()["key_exported_digest"].is_null());
+    // Import of the same file does not count as exported either.
+    env.set_state("key_fingerprint", serde_json::json!("aa:01"));
+    let out = env.root_cmd(&["key", "import", inside]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(env.state()["key_exported_digest"].is_null());
+    // The statement still works.
+    let out = env.root_cmd(&[
+        "key",
+        "confirm-exported",
+        "--file",
+        inside,
+        "--accept-local-copy",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+}
+
+#[test]
 fn paper_key_has_our_header_outside_the_key_block_and_its_code_proves_the_sheet() {
     let env = Env::new();
     env.set_key_exported(false);
@@ -959,28 +1014,32 @@ fn paper_key_has_our_header_outside_the_key_block_and_its_code_proves_the_sheet(
     );
     assert!(html_text.contains(&code_of));
 
-    // Saved paper keys are proof, as files and by their code.
+    // The files are remembered (their paths are not secret); a paper key
+    // piped to another program leaves nothing to remember.
+    let remembered = || -> Vec<String> {
+        env.state()["paperkey_files"]
+            .as_array()
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|f| f["path"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        remembered(),
+        vec![canonical_name(&txt), canonical_name(&html)]
+    );
+    assert!(env.root_cmd(&["key", "paperkey"]).status.success());
+    assert_eq!(remembered().len(), 2);
+
+    // Saved paper keys are proof, as files ...
     for file in [&txt, &html] {
         let out = env.root_cmd(&["key", "verify", file.to_str().unwrap()]);
         assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stdout));
     }
-    let wrong = if code_of == "0000-0000" {
-        "1111-1111"
-    } else {
-        "0000-0000"
-    };
-    let out = env.root_cmd(&["key", "confirm-exported", "--paper-code", wrong]);
-    assert_eq!(code(&out), 1);
-    assert!(env.state()["key_exported_digest"].is_null());
-    assert_eq!(code(&env.run(&["run"])), 1);
-    // Lower case and a missing hyphen are fine.
-    let typed = code_of.replace('-', "").to_lowercase();
-    let out = env.root_cmd(&["key", "confirm-exported", "--paper-code", &typed]);
-    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(code(&env.run(&["run"])), 0);
-
-    // A saved paper key also confirms (on this disk: needs the statement).
-    env.set_key_exported(false);
+    // ... also as the statement-backed confirmation (on this disk).
     let out = env.root_cmd(&[
         "key",
         "confirm-exported",
@@ -990,6 +1049,90 @@ fn paper_key_has_our_header_outside_the_key_block_and_its_code_proves_the_sheet(
     ]);
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(code(&env.run(&["run"])), 0);
+    env.set_key_exported(false);
+    let stderr = |out: &Output| String::from_utf8_lossy(&out.stderr).into_owned();
+
+    // The shortcut: the paper key was written to a file on this computer,
+    // the code is read off the file, and no paper was ever printed. This
+    // exact way is refused, with or without the statement, and the message
+    // names the file and says what to do.
+    let typed = code_of.replace('-', "").to_lowercase();
+    for extra in [&[][..], &["--printed"][..]] {
+        let mut args = vec!["key", "confirm-exported", "--paper-code", code_of.as_str()];
+        args.extend_from_slice(extra);
+        let out = env.root_cmd(&args);
+        assert_eq!(code(&out), 1, "{extra:?}");
+        let message = stderr(&out);
+        assert!(
+            message.contains(&canonical_name(&txt)) || message.contains(&canonical_name(&html)),
+            "the message names the file: {message}"
+        );
+        assert!(
+            message.contains("delete the file or move it to a USB stick"),
+            "{message}"
+        );
+        assert!(message.contains("Nothing was recorded"), "{message}");
+        assert!(env.state()["key_exported_digest"].is_null());
+        assert_eq!(code(&env.run(&["run"])), 1);
+    }
+
+    // One of two files gone is not enough ...
+    fs::remove_file(&txt).unwrap();
+    let out = env.root_cmd(&[
+        "key",
+        "confirm-exported",
+        "--paper-code",
+        &typed,
+        "--printed",
+    ]);
+    assert_eq!(code(&out), 1);
+    assert!(
+        stderr(&out).contains(&canonical_name(&html)),
+        "{}",
+        stderr(&out)
+    );
+    // ... after printing, the files are deleted. Now the statement decides.
+    fs::remove_file(&html).unwrap();
+    // No statement (no terminal, no --printed): nothing is recorded, and the
+    // message says why.
+    let out = env.root_cmd(&["key", "confirm-exported", "--paper-code", &typed]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("--printed"), "{}", stderr(&out));
+    assert!(env.state()["key_exported_digest"].is_null());
+    assert_eq!(code(&env.run(&["run"])), 1);
+    // A wrong or malformed code fails even with the statement.
+    let wrong = if code_of == "0000-0000" {
+        "1111-1111"
+    } else {
+        "0000-0000"
+    };
+    for bad in [wrong, "nonsense"] {
+        let out = env.root_cmd(&["key", "confirm-exported", "--paper-code", bad, "--printed"]);
+        assert_eq!(code(&out), 1, "{bad}");
+    }
+    assert!(env.state()["key_exported_digest"].is_null());
+    assert_eq!(code(&env.run(&["run"])), 1);
+    // --printed belongs to --paper-code only.
+    let out = env.root_cmd(&["key", "confirm-exported", "--printed"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    // The statement and the right code (lower case, no hyphen) confirm.
+    let out = env.root_cmd(&[
+        "key",
+        "confirm-exported",
+        "--paper-code",
+        &typed,
+        "--printed",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(code(&env.run(&["run"])), 0);
+}
+
+fn canonical_name(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 #[test]

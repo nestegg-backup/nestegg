@@ -212,8 +212,9 @@ enum KeyCmd {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Store an exported key file again (e.g. after new hardware). It counts
-    /// as exported, because you already have the file.
+    /// Store an exported key file again (e.g. after new hardware). A new key
+    /// counts as exported only when the file comes from a removable medium
+    /// that is not part of the backup.
     Import {
         /// The key file written by `nestegg key export` (no password).
         file: PathBuf,
@@ -253,6 +254,11 @@ struct ConfirmArgs {
     /// without a terminal that another copy exists outside this computer.
     #[arg(long, requires = "file")]
     accept_local_copy: bool,
+    /// The paper key given with --paper-code is printed and stored away
+    /// from this computer. Needed without a terminal, because nestegg
+    /// cannot see a sheet of paper.
+    #[arg(long, requires = "paper_code")]
+    printed: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -462,7 +468,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
             "     sudo nestegg key paperkey --output key.html   # print it - or: sudo nestegg key export <file> (USB stick)"
         );
         println!(
-            "     sudo nestegg key confirm-exported --file <copy>   # or: --paper-code <code on the paper key>"
+            "     sudo nestegg key confirm-exported --file <copy>   # or: --paper-code <code on the paper key> (add --printed without a terminal)"
         );
     }
     println!("  3. sudo nestegg check");
@@ -635,7 +641,9 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             );
             println!(
                 "Then prove you hold a copy: sudo nestegg key confirm-exported --file <copy>\n\
-                 \x20                      or: sudo nestegg key confirm-exported --paper-code <code on the paper key>"
+                 \x20                      or: sudo nestegg key confirm-exported --paper-code <code on the paper key>\n\
+                 \x20                      (the paper key needs your statement that the sheet is printed and\n\
+                 \x20                      stored away from this computer; without a terminal add --printed)"
             );
         }
         KeyCmd::Import {
@@ -679,7 +687,7 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             // stays, none is created. For a new key the file counts when it
             // comes from a removable medium; a file on this computer's own
             // disk needs `key confirm-exported` like any other copy.
-            let location = nestegg::keyproof::locate(&path);
+            let location = nestegg::keyproof::locate_in(&path, &backup_scope(paths));
             let counts_as_exported = if same_key {
                 state.key_exported_digest.as_deref() == Some(digest.as_str())
             } else {
@@ -708,15 +716,20 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             );
             if counts_as_exported {
                 println!(
-                    "It counts as exported: you hold a copy outside this computer. Keep it safe."
+                    "It counts as exported: you hold a copy on a removable medium. Now unplug it \
+                     and keep it away from this computer."
                 );
             } else {
                 println!(
-                    "It does NOT count as exported yet: {} lies on a disk of this computer, and                      a copy that is lost together with the computer is no protection.",
-                    path.display()
+                    "It does NOT count as exported yet: {} {}, and a copy that is lost together \
+                     with the computer is no protection.",
+                    path.display(),
+                    location.describe()
                 );
                 println!(
-                    "Backups start after: sudo nestegg key confirm-exported --file <copy on a USB                      stick>   (or --paper-code <code on the paper key>)"
+                    "Backups start after: sudo nestegg key confirm-exported --file <copy on a USB \
+                     stick>   (or --paper-code <code on the paper key>, with your statement that \
+                     the sheet is printed and stored away from this computer)"
                 );
             }
         }
@@ -757,12 +770,22 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             match output {
                 Some(file) => {
                     write_user_file(&file, &data)?;
+                    // Remember where it is: confirming with the check code is
+                    // refused while this file lies on this computer's disk.
+                    let written = absolute_user_path(&file)?;
+                    let written = std::fs::canonicalize(&written).unwrap_or(written);
+                    let mut state = store.load_state()?;
+                    state.remember_paperkey_file(written, &secrets::digest(&key));
+                    store.save_state(&state)?;
                     // The check code stays on the paper: it is not shown here.
                     println!(
-                        "Paper key written to {}. Print it and keep the paper away from this \
-                         computer, then delete the file.\n\
-                         Then prove you hold it: sudo nestegg key confirm-exported --paper-code \
-                         <check code at the top of the paper>",
+                        "Paper key written to {}.\n\
+                         Print it, then delete the file (or move it to a USB stick). Confirming \
+                         with the check code is refused while the file lies on this computer.\n\
+                         Then: sudo nestegg key confirm-exported --paper-code <check code at the \
+                         top of the paper>\n\
+                         You will be asked to state that the sheet is printed and stored away \
+                         from this computer (without a terminal: add --printed).",
                         file.display()
                     );
                 }
@@ -793,23 +816,20 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                 "Key written to {} and read back: the file matches the stored key.",
                 path.display()
             );
-            match nestegg::keyproof::locate(&path) {
+            match nestegg::keyproof::locate_in(&path, &backup_scope(paths)) {
                 nestegg::keyproof::Location::Removable => println!(
                     "It is on a removable medium. Keep that medium somewhere safe, away from \
-                     this computer."
+                     this computer, and unplug it when you are done."
                 ),
                 other => {
                     println!();
                     println!("WARNING: this copy is not safe yet.");
-                    if let nestegg::keyproof::Location::Unknown(why) = &other {
-                        println!("It could not be determined where the file lies ({why}).");
-                    } else {
-                        println!("The file is on a disk that belongs to this computer.");
-                    }
+                    println!("The file {}.", other.describe());
                     println!(
-                        "It is lost together with this disk, and it is useless inside the \
+                        "It is lost together with this computer, and it is useless inside the \
                          backup, because the backup is encrypted with this very key.\n\
-                         Move it to a USB stick or into a password manager, then run:\n\
+                         Move it to a USB stick (not one that is part of the backup) or into a \
+                         password manager, then run:\n\
                          \x20 sudo nestegg key confirm-exported --file <the copy>"
                     );
                 }
@@ -900,17 +920,50 @@ fn expand_home(input: &str) -> PathBuf {
     }
 }
 
+/// What the backup contains, for judging where a copy of the key lies. A
+/// missing configuration means nothing is configured to be backed up; one
+/// that cannot be read makes the scope unknown.
+fn backup_scope(paths: &Paths) -> nestegg::keyproof::BackupScope {
+    use nestegg::keyproof::BackupScope;
+    if !paths.config_file.exists() {
+        return BackupScope::default();
+    }
+    match Config::load(&paths.config_file) {
+        Ok(cfg) => {
+            // Touch the sources first: that triggers automounts, so the
+            // mount table read by capture() shows them (as in a run).
+            for s in &cfg.backup.sources {
+                let _ = std::fs::canonicalize(&s.path);
+            }
+            let layout = if cfg.backup.system {
+                nestegg::layout::capture().ok()
+            } else {
+                None
+            };
+            BackupScope::for_config(&cfg, layout.as_ref())
+        }
+        Err(e) => BackupScope {
+            unknown: Some(format!("the configuration cannot be read: {e:#}")),
+            ..BackupScope::default()
+        },
+    }
+}
+
 /// `nestegg key confirm-exported`: record that the key is safe outside this
-/// computer, but only against proof (see docs/decisions/0018).
+/// computer, but only against proof and, where proof is impossible, the
+/// user's statement (see docs/decisions/0018).
 fn confirm_exported(
     paths: &Paths,
     store: &Store,
     secrets_store: &SecretStore,
     args: ConfirmArgs,
 ) -> Result<()> {
-    use nestegg::keyproof::{self, LocalCopy};
+    use nestegg::keyproof::{self, LocalCopy, Statement};
     let (key, stored) = stored_key_material(secrets_store)?;
     let terminal = stdin_is_terminal();
+    let scope = backup_scope(paths);
+    // The copy is on a removable medium that may still be plugged in.
+    let mut on_removable = false;
     let (file, code) = match (args.file, args.paper_code) {
         (Some(file), _) => (Some(file), None),
         (None, Some(code)) => (None, Some(code)),
@@ -930,7 +983,7 @@ fn confirm_exported(
         }
         (None, None) => bail!(
             "proof needed: give a copy of the key with --file <path> (the exported file or a saved \
-             paper key), or the check code of the paper key with --paper-code <XXXX-XXXX>"
+             paper key), or the check code of the paper key with --paper-code <XXXX-XXXX> --printed"
         ),
     };
     if let Some(file) = file {
@@ -941,7 +994,8 @@ fn confirm_exported(
             let own = std::fs::canonicalize(own).unwrap_or_else(|_| own.clone());
             if resolved.starts_with(&own) {
                 bail!(
-                    "{} is where nestegg itself stores the key, not a copy of it; nothing was                      recorded. Export a copy: sudo nestegg key export <file>",
+                    "{} is where nestegg itself stores the key, not a copy of it; nothing was \
+                     recorded. Export a copy: sudo nestegg key export <file>",
                     path.display()
                 );
             }
@@ -953,13 +1007,14 @@ fn confirm_exported(
                 path.display()
             );
         }
-        let location = keyproof::locate(&path);
+        let location = keyproof::locate_in(&path, &scope);
+        on_removable = matches!(location, keyproof::Location::Removable);
         match keyproof::decide_local_copy(&location, args.accept_local_copy, terminal) {
             LocalCopy::Accept => {}
             LocalCopy::Ask => {
-                eprintln!("The file matches the key, but it lies on a disk of this computer.");
-                eprintln!("If this disk fails or is stolen, that copy is gone with it, and the");
-                eprintln!("backup cannot help: it is encrypted with this very key.");
+                eprintln!("The file matches the key, but it {}.", location.describe());
+                eprintln!("A copy that is lost together with this computer, or that exists only");
+                eprintln!("inside the backup (encrypted with this very key), is no protection.");
                 let answer = prompt_line(
                     "Type yes if another copy exists outside this computer (USB stick, \
                      password manager, paper): ",
@@ -969,15 +1024,12 @@ fn confirm_exported(
                 }
             }
             LocalCopy::Refuse => bail!(
-                "{} lies on a disk of this computer ({}). A copy that is lost together with \
-                 the computer is no protection. Move it to a USB stick or a password manager and \
-                 give that file, or, if another copy exists outside this computer, add \
-                 --accept-local-copy. Nothing was recorded.",
+                "{} {}. A copy that is lost together with the computer, or that exists only \
+                 inside the backup, is no protection. Move it to a USB stick (not one that is \
+                 part of the backup) or a password manager and give that file, or, if another \
+                 copy exists outside this computer, add --accept-local-copy. Nothing was recorded.",
                 path.display(),
-                match &location {
-                    keyproof::Location::Unknown(why) => why.as_str(),
-                    _ => "internal disk",
-                }
+                location.describe()
             ),
         }
     } else if let Some(code) = code {
@@ -990,6 +1042,53 @@ fn confirm_exported(
                 "this check code does not belong to the key stored on this computer; nothing was \
                  recorded. Print a new paper key and use its code."
             );
+        }
+        // The code proves nothing about where the paper key is: `key paperkey
+        // --output` writes it to a file, and anyone can read it off the
+        // screen. A file written by nestegg that still lies on this
+        // computer's disk is in the way ...
+        let digest = secrets::digest(&key);
+        let remembered = store.load_state()?.paperkey_files;
+        let existing = keyproof::existing_paperkey_files(
+            &remembered,
+            &digest,
+            |p| p.symlink_metadata().is_ok(),
+            |p| keyproof::locate_in(p, &scope),
+        );
+        let in_the_way = keyproof::paperkey_files_in_the_way(&existing);
+        if let Some(first) = in_the_way.first() {
+            bail!(
+                "the paper key file {}{} still exists on this computer, so the check code could \
+                 have been read from the screen. Print it, then delete the file or move it to a \
+                 USB stick, and run this again. Nothing was recorded.",
+                first.display(),
+                match in_the_way.len() {
+                    1 => String::new(),
+                    n => format!(" (and {} more)", n - 1),
+                }
+            );
+        }
+        on_removable = !existing.is_empty();
+        // ... and then the user has to say that the sheet exists.
+        match keyproof::decide_paper_statement(args.printed, terminal) {
+            Statement::Given => {}
+            Statement::Ask => {
+                eprintln!("The check code is right. nestegg cannot see a sheet of paper, so it");
+                eprintln!("needs your word that the paper key is printed and kept away from this");
+                eprintln!("computer (not only shown on its screen or saved on its disk).");
+                let answer = prompt_line(
+                    "Type yes to state that the sheet is printed and stored away from this \
+                     computer: ",
+                )?;
+                if answer != "yes" {
+                    bail!("not confirmed; nothing was recorded");
+                }
+            }
+            Statement::Missing => bail!(
+                "the check code is right, but it does not prove that the paper key is printed \
+                 and kept away from this computer. State that with --printed (or run this at a \
+                 terminal, where you are asked). Nothing was recorded."
+            ),
         }
     }
     // Key changes and backup runs exclude each other. Take the lock only
@@ -1008,6 +1107,13 @@ fn confirm_exported(
     state.consecutive_failures = 0;
     store.save_state(&state)?;
     println!("Confirmed: your copy is the stored key. Backups can run now.");
+    if on_removable {
+        println!(
+            "The copy is on a removable medium. Now unplug it and keep it away from this \
+             computer: nestegg cannot tell a medium that stays plugged in from one that was \
+             removed, and one that stays is lost or damaged together with this computer."
+        );
+    }
     println!("Check it again at any time: sudo nestegg key verify <copy>");
     Ok(())
 }

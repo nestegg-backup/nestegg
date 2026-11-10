@@ -23,9 +23,10 @@ paper key and certificate question: [decisions/0019](decisions/0019-rescue-paper
    ```
 
    A printed paper key (`sudo nestegg key paperkey --format html --output
-   key.html`) is the second copy to keep at home; its check code
-   (`XXXX-XXXX`, top of the sheet) is what `confirm-exported --paper-code`
-   asks for. Check the copies from time to time with
+   key.html`; print it, then delete the file) is the second copy to keep at
+   home; its check code (`XXXX-XXXX`, top of the sheet) is what
+   `confirm-exported --paper-code <code> --printed` asks for, together with
+   your statement that the sheet is printed and stored away from the computer. Check the copies from time to time with
    `sudo nestegg key verify <copy>`. See
    [configuration](configuration.md#exporting-and-proving-the-key).
 
