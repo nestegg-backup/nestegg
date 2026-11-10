@@ -238,3 +238,66 @@ machinery delivers and protects itself (full detail in
   `.notify-settings.lock` (like `.current.lock` and the run lock) are now `0600`
   and tightened on open, so a group member cannot hold a shared `flock` that
   would block the daemon. The daemon's wait for the inbox lock is time-bounded.
+
+## Update 2026-11-10 (third review): robustness of the health check
+
+A third review of `nestegg notify` fixed five edge cases. None changes the
+policy above; they make it hold up against undelivered reports, a wrong clock, a
+record from a newer version, a stuck lock, and a many-user desktop.
+
+- **A settings announcement is never lost.** It used to be dropped three days
+  after its time whether or not it had reached anyone (nobody logged in over a
+  long weekend, the hook kept failing), and a fresh change merged into an older
+  entry inherited the older time and could expire within minutes. Now an
+  announcement leaves the record only after it has been delivered on **every
+  channel that is switched on** — the hook (if configured) has succeeded, and
+  the desktop message (if the desktop channel is on) has reached at least one
+  user — and only then is it kept for the keep window (three days), counted from
+  the **newest** change in a merged entry. Time alone never removes an
+  undelivered announcement; a channel that is switched off holds nothing back;
+  the record stays bounded by combining per user as before. A hook that keeps
+  failing is retried for ever but with a growing, bounded pause (doubling from
+  five minutes up to six hours), so it is not hammered at every run.
+
+- **Times in the future are clamped.** If the clock was ahead when an entry was
+  written and was then corrected, a stored time could lie in the future and
+  (depending on where it was compared) silence the repeat of a problem, hold a
+  rate limit open until the clock caught up, keep an "intent in flight" window
+  from ever ending, or push the debounce past the unit's `TimeoutStartSec`. Every
+  stored "when it happened" time is now pulled back to now where the state and
+  the inbox are read (and written back); the rate-limit and retry stamps, which
+  are meant to lie ahead, are instead bounded where they are used so a future
+  value can never suppress a message or hold one back for longer than the
+  backoff cap; and the settings debounce is bounded by real elapsed time
+  regardless of what the stored times say.
+
+- **An unknown last-run state is reported, not ignored.** A run record written by
+  a newer nestegg (`RunState::Unknown`) was neither a success nor a failure to
+  the places that only looked for `failing`, so it could pass silently. It is now
+  its own event, **`outdated`** ("nestegg needs an update"), announced once like
+  a failure (it suppresses the quieter overdue/incomplete just as a real failure
+  does) with a text that says this version does not understand the last record
+  and nestegg should be updated. It is detected from the run state directly, so
+  it is correct whether or not `state::health` already classifies an unknown
+  state as `failing`. `outdated` is another hook event (`NESTEGG_EVENT`); it
+  carries no private path, so every logged-in user sees the same text.
+
+- **The notification lock wait is bounded.** Taking `.notify.lock` used to block
+  for ever if another process held it (or the run-state lock the check takes
+  through `nestegg status`), so the unit would hang until systemd killed it at
+  `TimeoutStartSec`. The wait is now time-bounded (90 s, comfortably longer than
+  one check holds the lock but well below the unit's limit even after the
+  settings debounce); on timeout the check ends with a clear message and a
+  non-zero exit, and the timer tries again. (The `.current.lock` wait inside
+  `nestegg status` / `state.rs` is a separate code path and still blocks; bounding
+  it is out of this change's scope.)
+
+- **Desktop message text is visible in the process list (accepted limit).** The
+  title and body are passed to `notify-send` as command-line arguments, so on a
+  multi-user computer another local user can read them — including the
+  full-detail version a group member sees — for the moment the message is shown;
+  `hidepid` systems are unaffected. Avoiding this would mean calling
+  `org.freedesktop.Notifications.Notify` over D-Bus, but no D-Bus library is in
+  the dependency tree and the decision above keeps `notify-send` rather than add
+  one. The limit is documented in `docs/configuration.md` and accepted; it is not
+  changed here.

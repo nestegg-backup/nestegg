@@ -353,12 +353,20 @@ marked critical. The texts are German when the system language is German
 English. No `notify-send`, no session: nothing is sent and the check logs it
 (`journalctl -u nestegg-notify.service`).
 
+On a computer with several local users, the title and text of a desktop
+notification are passed to `notify-send` as command-line arguments, so another
+local user can read them from the process list for the moment it is shown —
+including the full-detail version a group member sees. Systems that hide other
+users' processes (`hidepid`) are not affected. nestegg uses `notify-send`
+rather than talking to the notification service over D-Bus, which would avoid
+this, to keep its dependencies small (decision 0017).
+
 **Command** (`[notify] command`, off by default): a program with arguments
 (a list, no shell), run as root with a 60 second limit, for every message:
 
 | Variable | Content |
 |---|---|
-| `NESTEGG_EVENT` | `failing`, `overdue`, `automatic_off`, `incomplete`, `damaged`, `settings`, `recovered` or `test` |
+| `NESTEGG_EVENT` | `failing`, `overdue`, `automatic_off`, `incomplete`, `damaged`, `settings`, `outdated`, `recovered` or `test` |
 | `NESTEGG_TITLE`, `NESTEGG_MESSAGE` | The short title and the text (also on stdin) |
 | `NESTEGG_HOSTNAME` | Host name of this computer |
 | `NESTEGG_LAST_SUCCESS` | Time of the last successful backup (RFC 3339), or empty |

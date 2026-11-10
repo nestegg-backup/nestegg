@@ -71,6 +71,12 @@ const SETTINGS_MAX_WAIT: Duration = Duration::seconds(120);
 /// cannot notify anyone more than once every few minutes (decision 0022,
 /// item 3). The first message after a quiet spell is sent at once.
 const SETTINGS_RATE_LIMIT: Duration = Duration::minutes(5);
+/// A settings hook that keeps failing is retried with a growing pause instead
+/// of at every run (decision 0017, R3 item 1): the wait doubles from
+/// [`SETTINGS_RATE_LIMIT`] up to this cap, so an endlessly failing hook is
+/// still retried for ever — nothing is dropped — but at most a few times an
+/// hour, not on every check and not several times within one run.
+const SETTINGS_COMMAND_MAX_BACKOFF: Duration = Duration::hours(6);
 /// Regular (non-system) accounts: from `UID_MIN` of `/etc/login.defs`
 /// (default 1000) up to the end of the systemd-homed range. Above that come
 /// container, dynamic-service and `nobody` ids.
@@ -113,6 +119,10 @@ pub enum Event {
     Recovered,
     /// A group member lowered the protection through the API (decision 0022).
     Settings,
+    /// The last run carries a state this version does not understand (a record
+    /// written by a newer nestegg): nestegg should be updated (decision 0017,
+    /// R3 item 3).
+    Outdated,
     Test,
 }
 
@@ -126,6 +136,7 @@ impl Event {
             Event::Damaged => "damaged",
             Event::Recovered => "recovered",
             Event::Settings => "settings",
+            Event::Outdated => "outdated",
             Event::Test => "test",
         }
     }
@@ -134,7 +145,11 @@ impl Event {
     pub fn urgent(self) -> bool {
         matches!(
             self,
-            Event::Failing | Event::Overdue | Event::AutomaticOff | Event::Damaged
+            Event::Failing
+                | Event::Overdue
+                | Event::AutomaticOff
+                | Event::Damaged
+                | Event::Outdated
         )
     }
 }
@@ -222,6 +237,19 @@ pub fn evaluate(
         .last_run
         .as_ref()
         .filter(|run| run.state == RunState::Failed);
+    // The last run carries a state this version does not understand (a record
+    // written by a newer nestegg). It must never pass for a success or for
+    // "nothing happened": it is reported like a failure, and it suppresses the
+    // quieter overdue/incomplete just as a real failure does. Detected from the
+    // run state directly, so it is right whether or not `state::health` already
+    // reports `failing` for an unknown state (decision 0017, R3 item 3).
+    let last_unknown = status
+        .last_run
+        .as_ref()
+        .is_some_and(|run| run.state == RunState::Unknown);
+    if last_unknown {
+        conditions.push(unknown_run_condition());
+    }
 
     if let Some(run) = failed {
         let error = run
@@ -261,10 +289,11 @@ pub fn evaluate(
         c.timer_off = true;
         conditions.push(c);
     }
-    // Overdue and incomplete are only judged when the last run did not fail (a
-    // failure is the louder message), and overdue only while the timer is on; a
-    // switched-off timer is covered by `automatic_off` above.
-    if failed.is_none() {
+    // Overdue and incomplete are only judged when the last run did not fail and
+    // is not an unknown state (either is the louder message), and overdue only
+    // while the timer is on; a switched-off timer is covered by `automatic_off`
+    // above.
+    if failed.is_none() && !last_unknown {
         let overdue_limit = Duration::hours(i64::from(status.overdue_after_hours));
         let never_and_old = status.health == Health::Never
             && unbacked_since.is_some_and(|since| now - since > overdue_limit);
@@ -317,6 +346,13 @@ pub fn state_problem(error: &str) -> Condition {
     let mut c = Condition::new(Event::Failing, format!("state|{error}"));
     c.error = Some(format!("the backup status cannot be read ({error})"));
     c
+}
+
+/// The last run has a state this version does not understand (a record written
+/// by a newer nestegg). A stable key, so it is announced once and then only
+/// repeated at the usual pace, never at every check (decision 0017, R3 item 3).
+pub fn unknown_run_condition() -> Condition {
+    Condition::new(Event::Outdated, "unknown-run-state".to_string())
 }
 
 /// The `[notify]` section of a configuration file that is otherwise invalid,
@@ -510,7 +546,9 @@ fn generic_body(lang: Lang, event: Event) -> Option<String> {
             "The backup protection settings of this computer were changed.",
             "Die Schutzeinstellungen der Datensicherung dieses Computers wurden geändert.",
         ),
-        Event::Damaged | Event::Recovered | Event::Test => return None,
+        // These carry no private path or name, so the generic version equals
+        // the full one.
+        Event::Damaged | Event::Recovered | Event::Outdated | Event::Test => return None,
     };
     Some(format!("{kind} {}", tell_admin(lang)))
 }
@@ -686,6 +724,22 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>, detail: 
                  Overview: \"nestegg ui\".",
                 "Alles in Ordnung: Dieser Computer wird wieder wie geplant gesichert. \
                  Übersicht: \"nestegg ui\".",
+            ),
+        ),
+        Event::Outdated => (
+            tr(
+                lang,
+                "nestegg needs an update",
+                "nestegg muss aktualisiert werden",
+            ),
+            tr(
+                lang,
+                "This version of nestegg does not understand the last backup record on \
+                 this computer, so it cannot tell whether the backup worked. Please update \
+                 nestegg. Details: \"nestegg ui\".",
+                "Diese Version von nestegg versteht den letzten Sicherungseintrag dieses \
+                 Computers nicht und kann daher nicht sagen, ob die Sicherung geklappt hat. \
+                 Bitte nestegg aktualisieren. Mehr dazu: \"nestegg ui\".",
             ),
         ),
         Event::Test => (
@@ -946,6 +1000,20 @@ pub struct SettingsAnnouncement {
     pub provisional: bool,
 }
 
+impl SettingsAnnouncement {
+    /// Whether this announcement has reached every channel that is switched on
+    /// (R3 item 1): the hook, if one is configured, has run; the desktop
+    /// message, if the desktop channel is on, has reached at least one user. A
+    /// switched-off channel holds nothing back. Only once this is true may the
+    /// keep window (counted from `at`, the newest change in a merged entry)
+    /// remove it; before that, time alone never drops it.
+    fn delivered(&self, desktop_on: bool, command_on: bool) -> bool {
+        let desktop_ok = !desktop_on || !self.users_done.is_empty();
+        let command_ok = !command_on || self.command_done;
+        desktop_ok && command_ok
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NotifyState {
     #[serde(default)]
@@ -965,6 +1033,74 @@ pub struct NotifyState {
     /// When the hook last received a settings message.
     #[serde(default, with = "crate::state::rfc3339_opt")]
     pub settings_sent_command: Option<DateTime<Utc>>,
+    /// How many times in a row the settings hook has failed, and the earliest
+    /// time it should be retried: a hook that keeps failing is retried with a
+    /// growing, bounded pause instead of at every run (R3 item 1). Cleared on a
+    /// success. `settings_command_retry_after` is a deadline in the future by
+    /// design, so it is *not* clamped like the other stamps; its hold is bounded
+    /// at the point of use instead (R3 item 2).
+    #[serde(default)]
+    pub settings_command_failures: u32,
+    #[serde(default, with = "crate::state::rfc3339_opt")]
+    pub settings_command_retry_after: Option<DateTime<Utc>>,
+}
+
+impl NotifyState {
+    /// Clamp every stored "when it happened" time to `now`: a time later than
+    /// now (the clock was ahead when it was written and has since been
+    /// corrected) is treated as now, so a future stamp cannot silence repeats,
+    /// keep an announcement from ever expiring, or make an "in flight" window
+    /// run forever (R3 item 2). Returns whether anything changed.
+    ///
+    /// The rate-limit stamps (`settings_sent_*`) and the retry deadline
+    /// (`settings_command_retry_after`) are deliberately left out: a future
+    /// value there must not hold anything back, which clamping to now would not
+    /// achieve, so those are bounded where they are read instead.
+    fn clamp_future_times(&mut self, now: DateTime<Utc>) -> bool {
+        let mut changed = false;
+        for a in self.active.values_mut() {
+            changed |= clamp_future(&mut a.since, now);
+            changed |= clamp_future(&mut a.announced_at, now);
+        }
+        if let Some(r) = &mut self.recovery {
+            changed |= clamp_future(&mut r.since, now);
+        }
+        if let Some(t) = &mut self.unbacked_since {
+            changed |= clamp_future(t, now);
+        }
+        for a in &mut self.settings {
+            changed |= clamp_future(&mut a.at, now);
+        }
+        changed
+    }
+}
+
+/// Pull a stored time back to `now` if it is in the future (a corrected clock).
+fn clamp_future(t: &mut DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    if *t > now {
+        *t = now;
+        true
+    } else {
+        false
+    }
+}
+
+/// A stored "last sent at" stamp holds a recipient back only when it lies in
+/// the past and within `window`. A stamp in the future (a clock that was ahead)
+/// is ignored, so it can never suppress a message (R3 item 2).
+fn within_rate_limit(sent_at: DateTime<Utc>, now: DateTime<Utc>, window: Duration) -> bool {
+    sent_at <= now && now - sent_at < window
+}
+
+/// The pause before the settings hook is retried after `failures` failures in a
+/// row: it doubles from [`SETTINGS_RATE_LIMIT`] and is capped at
+/// [`SETTINGS_COMMAND_MAX_BACKOFF`] (R3 item 1).
+fn settings_command_backoff(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    let secs = SETTINGS_RATE_LIMIT
+        .num_seconds()
+        .saturating_mul(1i64 << shift);
+    Duration::seconds(secs).min(SETTINGS_COMMAND_MAX_BACKOFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1137,10 @@ pub enum Delivery {
 pub trait Channels {
     /// Users to notify; empty when the desktop channel is off.
     fn sessions(&mut self) -> Vec<Session>;
+    /// Whether the desktop channel is switched on at all (`[notify] desktop`).
+    /// Distinct from "nobody is logged in right now": an announcement is held
+    /// for a late login only while this channel is on (R3 item 1).
+    fn desktop_enabled(&self) -> bool;
     fn command_enabled(&self) -> bool;
     fn send_desktop(&mut self, session: &Session, message: &Message) -> Result<Delivery>;
     fn send_command(&mut self, message: &Message) -> Result<()>;
@@ -1310,7 +1450,10 @@ fn cap_settings(settings: &mut Vec<SettingsAnnouncement>) {
                     m.reductions.push(r);
                 }
             }
-            m.at = m.at.min(a.at);
+            // Keep the newest change's time: the keep window must count from the
+            // newest change merged in, so a fresh change folded into an old
+            // entry does not expire early (R3 item 1).
+            m.at = m.at.max(a.at);
             m.users_done = m.users_done.intersection(&a.users_done).copied().collect();
             m.command_done &= a.command_done;
         } else {
@@ -1350,6 +1493,7 @@ pub fn deliver_settings(
         return ApplyOutcome { log, hook_failed };
     }
     let sessions = channels.sessions();
+    let desktop_on = channels.desktop_enabled();
     let command = channels.command_enabled();
     for session in &sessions {
         let pending: Vec<usize> = (0..state.settings.len())
@@ -1359,12 +1503,13 @@ pub fn deliver_settings(
             continue;
         }
         // Rate limit across runs, bypassed for a recipient this run already
-        // notified (so a mid-run arrival still goes out).
+        // notified (so a mid-run arrival still goes out). A stamp in the future
+        // (a corrected clock) is ignored, never held against the recipient.
         if !delivered_users.contains(&session.uid)
             && state
                 .settings_sent_users
                 .get(&session.uid)
-                .is_some_and(|t| now - *t < SETTINGS_RATE_LIMIT)
+                .is_some_and(|t| within_rate_limit(*t, now, SETTINGS_RATE_LIMIT))
         {
             log.push(format!(
                 "settings: holding back {} (one message per few minutes)",
@@ -1401,11 +1546,19 @@ pub fn deliver_settings(
         let pending: Vec<usize> = (0..state.settings.len())
             .filter(|&i| !state.settings[i].command_done)
             .collect();
-        let throttled = !*delivered_cmd
-            && state
-                .settings_sent_command
-                .is_some_and(|t| now - t < SETTINGS_RATE_LIMIT);
-        if !pending.is_empty() && throttled {
+        // Across runs, after the first message the hook is held to the rate
+        // limit; after repeated failures it is held to a growing, bounded
+        // backoff so an endlessly failing hook is not hammered at every check.
+        // Both are bypassed for a run that already delivered to the hook (a
+        // mid-run arrival still goes out). A future stamp is ignored, and the
+        // backoff deadline is capped so even a future one cannot hold forever.
+        let rate_hold = state
+            .settings_sent_command
+            .is_some_and(|t| within_rate_limit(t, now, SETTINGS_RATE_LIMIT));
+        let backoff_hold = state
+            .settings_command_retry_after
+            .is_some_and(|t| now < t && t - now <= SETTINGS_COMMAND_MAX_BACKOFF);
+        if !pending.is_empty() && !*delivered_cmd && (rate_hold || backoff_hold) {
             log.push("settings: holding back the hook (one call per few minutes)".to_string());
         } else if !pending.is_empty() {
             let groups = combine_reductions(&state.settings, &pending);
@@ -1416,23 +1569,37 @@ pub fn deliver_settings(
                         state.settings[i].command_done = true;
                     }
                     state.settings_sent_command = Some(now);
+                    state.settings_command_failures = 0;
+                    state.settings_command_retry_after = None;
                     *delivered_cmd = true;
                     save(state);
                     log.push("settings: command ran".to_string());
                 }
                 Err(e) => {
                     hook_failed = true;
+                    state.settings_command_failures =
+                        state.settings_command_failures.saturating_add(1);
+                    state.settings_command_retry_after =
+                        Some(now + settings_command_backoff(state.settings_command_failures));
+                    // Persist the backoff so the pause survives a restart and a
+                    // settings change that starts a fresh run moments later.
+                    save(state);
                     log.push(format!(
-                        "settings: command failed, trying again at the next check: {e:#}"
+                        "settings: command failed, backing off before the next try: {e:#}"
                     ));
                 }
             }
         }
     }
-    // Stop after a few days: a late login is caught within the keep window,
-    // and a hook that keeps failing is not retried forever.
+    // An announcement leaves the state only after it has reached every channel
+    // that is switched on; then it is kept for the keep window (counted from its
+    // newest change) so a late login still gets it. Time alone never drops an
+    // announcement that has not yet been delivered on an enabled channel (R3
+    // item 1). A future `at` was clamped to now on read, so the window is honest.
     let before = state.settings.len();
-    state.settings.retain(|a| now - a.at <= RECOVERY_KEEP);
+    state
+        .settings
+        .retain(|a| !a.delivered(desktop_on, command) || now - a.at <= RECOVERY_KEEP);
     if state.settings.len() != before {
         save(state);
     }
@@ -1671,6 +1838,10 @@ impl Channels for SystemChannels<'_> {
         )
     }
 
+    fn desktop_enabled(&self) -> bool {
+        self.config.desktop
+    }
+
     fn command_enabled(&self) -> bool {
         self.config.command.is_some()
     }
@@ -1740,6 +1911,9 @@ impl Channels for DryChannels<'_> {
     fn sessions(&mut self) -> Vec<Session> {
         self.inner.sessions()
     }
+    fn desktop_enabled(&self) -> bool {
+        self.inner.desktop_enabled()
+    }
     fn command_enabled(&self) -> bool {
         self.inner.command_enabled()
     }
@@ -1781,14 +1955,44 @@ pub struct Options {
     pub dry_run: bool,
 }
 
+/// Longest the check waits for the notification lock before giving up (R3
+/// item 4). Comfortably longer than one check holds it (a 60 s hook plus a few
+/// desktop users) so a waiting check still gets its turn, but well below the
+/// unit's `TimeoutStartSec=5min`, even after the settings debounce, so a stuck
+/// lock can never make the unit hang until systemd kills it.
+const LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(90);
+
 /// Serialises concurrent checks (timer, `OnSuccess=`, by hand). 0600 so a group
-/// member cannot hold a shared lock on it (decision 0022, item 2).
+/// member cannot hold a shared lock on it (decision 0022, item 2). The wait is
+/// time-bounded: if another check (or anything else) holds the lock past the
+/// deadline, this one gives up with an error rather than hanging until the unit
+/// times out — the caller then exits non-zero and the timer tries again
+/// (R3 item 4).
 fn lock(paths: &Paths) -> Result<nix::fcntl::Flock<fs::File>> {
+    lock_with_timeout(paths, LOCK_TIMEOUT)
+}
+
+fn lock_with_timeout(paths: &Paths, timeout: StdDuration) -> Result<nix::fcntl::Flock<fs::File>> {
     fs::create_dir_all(&paths.state_dir)?;
-    let file = crate::state::open_private_lock(&paths.state_dir.join(".notify.lock"))?;
-    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
-        .map_err(|(_, e)| e)
-        .context("cannot lock the notification state")
+    let mut file = crate::state::open_private_lock(&paths.state_dir.join(".notify.lock"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(lock),
+            Err((f, nix::errno::Errno::EWOULDBLOCK)) => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "the notification state is locked by another nestegg notify \
+                         (waited {} s); the timer will try again",
+                        timeout.as_secs()
+                    );
+                }
+                file = f;
+                std::thread::sleep(StdDuration::from_millis(100));
+            }
+            Err((_, e)) => return Err(e).context("cannot lock the notification state"),
+        }
+    }
 }
 
 fn load_state(paths: &Paths) -> NotifyState {
@@ -1870,6 +2074,12 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
     }
 
     let mut state = load_state(paths);
+    // Pull any stored time that lies in the future (the clock was ahead when it
+    // was written and has since been corrected) back to now, so a future stamp
+    // cannot silence repeats, hold a rate limit open or keep an announcement
+    // from ever expiring (R3 item 2). This is the one place the loaded state is
+    // read; the correction is written back by the saves that follow.
+    state.clamp_future_times(now);
     // Fold in the settings changes the daemon wrote to the inbox (its own short
     // lock) since the last check. The inbox is the durable record written
     // before the HTTP answer; draining it here, under this check's lock, is
@@ -1891,7 +2101,11 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
     let unbacked_since = match (modified, state.unbacked_since) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
-    };
+    }
+    // The configuration file's mtime can also be in the future (a corrected
+    // clock); treat it as now so "configured but never backed up" is not
+    // pushed forward (R3 item 2).
+    .map(|t| t.min(now));
     let mut save = |state: &NotifyState| {
         if options.dry_run {
             return;
@@ -2066,7 +2280,11 @@ fn inbox_entry_times(paths: &Paths) -> Vec<DateTime<Utc>> {
 /// the oldest, and zero when the inbox is empty or already quiet (decision
 /// 0022, item 3). Pure, so the pacing is tested without sleeping.
 fn settings_debounce_wait(times: &[DateTime<Utc>], now: DateTime<Utc>) -> Duration {
-    let (Some(newest), Some(oldest)) = (times.iter().max(), times.iter().min()) else {
+    // A time in the future (a clock that was ahead and has been corrected) is
+    // treated as now, so it can never ask for a wait longer than the quiet
+    // period (R3 item 2).
+    let clamped: Vec<DateTime<Utc>> = times.iter().map(|t| (*t).min(now)).collect();
+    let (Some(newest), Some(oldest)) = (clamped.iter().max(), clamped.iter().min()) else {
         return Duration::zero();
     };
     let deadline = (*newest + SETTINGS_QUIET).min(*oldest + SETTINGS_MAX_WAIT);
@@ -2082,9 +2300,17 @@ fn settings_debounce(
     now_fn: impl Fn() -> DateTime<Utc>,
     sleep_fn: impl Fn(StdDuration),
 ) {
-    // Bounded: the deadline never exceeds oldest + SETTINGS_MAX_WAIT, and each
-    // step is at most two seconds, so this cannot spin.
+    // Bounded two ways: the clock deadline never exceeds oldest +
+    // SETTINGS_MAX_WAIT, and a hard monotonic deadline caps the real time spent
+    // here regardless of what the stored times say (a corrupt or future stamp),
+    // so the whole debounce stays well below the unit's TimeoutStartSec
+    // (R3 item 2).
+    let start = Instant::now();
+    let hard_deadline = StdDuration::from_secs(SETTINGS_MAX_WAIT.num_seconds().max(0) as u64);
     for _ in 0..200 {
+        if start.elapsed() >= hard_deadline {
+            return;
+        }
         let wait = settings_debounce_wait(&inbox_entry_times(paths), now_fn());
         if wait <= Duration::zero() {
             return;
@@ -2327,7 +2553,15 @@ fn drain_settings_inbox_at(paths: &Paths, state: &mut NotifyState, now: DateTime
     };
     // A damaged inbox comes back with a notice in it (a generic settings
     // message without a user; the detail is in the journal).
-    let inbox = load_inbox_noting_damage(paths);
+    let mut inbox = load_inbox_noting_damage(paths);
+    // Clamp a time written while the clock was ahead to now, so an "in flight"
+    // window measured below cannot run forever and the keep window counts from
+    // an honest time (R3 item 2). The clamp is written back below so the
+    // correction is durable.
+    let mut clamped_any = false;
+    for a in &mut inbox {
+        clamped_any |= clamp_future(&mut a.at, now);
+    }
     // An intent whose request is still being handled stays in the inbox: the
     // daemon completes or cancels it in a moment. Only when it is older (the
     // daemon crashed in between) is it delivered as it is.
@@ -2338,6 +2572,13 @@ fn drain_settings_inbox_at(paths: &Paths, state: &mut NotifyState, now: DateTime
     if moved == 0 {
         if in_flight.is_empty() {
             let _ = fs::remove_file(&file);
+        } else if clamped_any {
+            // Nothing is ready yet, but a future stamp was pulled back to now;
+            // persist it so the in-flight window ends instead of running forever
+            // on the original future time (R3 item 2).
+            if let Err(e) = write_json_atomic(&file, &in_flight) {
+                eprintln!("warning: cannot update the settings inbox: {e:#}");
+            }
         }
         return 0;
     }
@@ -2451,6 +2692,9 @@ mod tests {
         command: bool,
         command_fails: bool,
         desktop_unavailable: bool,
+        /// Whether the desktop channel is switched on (`[notify] desktop`),
+        /// distinct from whether anyone is logged in (`sessions`).
+        desktop_on: bool,
         desktop: Vec<(u32, Event)>,
         hook: Vec<Event>,
         bodies: Vec<String>,
@@ -2471,6 +2715,7 @@ mod tests {
                 command,
                 command_fails: false,
                 desktop_unavailable: false,
+                desktop_on: true,
                 desktop: Vec::new(),
                 hook: Vec::new(),
                 bodies: Vec::new(),
@@ -2505,6 +2750,9 @@ mod tests {
     impl Channels for Fake {
         fn sessions(&mut self) -> Vec<Session> {
             self.sessions.clone()
+        }
+        fn desktop_enabled(&self) -> bool {
+            self.desktop_on
         }
         fn command_enabled(&self) -> bool {
             self.command
@@ -4213,5 +4461,339 @@ mod tests {
             assert!(recorded.contains(&format!("arg={}", message.title)));
             assert!(recorded.contains(&format!("arg={}", message.body)));
         }
+    }
+
+    // --- R3: settings announcements must not get lost (item 1) ----------------
+
+    #[test]
+    fn an_undelivered_settings_announcement_is_never_dropped_by_time() {
+        use crate::settings::Reduction;
+        // Desktop on but nobody logged in, no hook: nothing can be delivered,
+        // so time alone must never drop the announcement (R3 item 1).
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], hours(0)));
+        let mut ch = Fake::new(&[], false);
+        deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        assert!(ch.desktop.is_empty());
+        // Far past the keep window it is still there (never delivered).
+        deliver(&mut state, hours(24 * 9), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(
+            state.settings.len(),
+            1,
+            "undelivered: kept regardless of time"
+        );
+        // A user logs in long after and still gets it; delivery happens before
+        // the expiry check, so the late login is served.
+        ch.login(1000, "alice");
+        deliver(
+            &mut state,
+            hours(24 * 9 + 1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert_eq!(ch.desktop, [(1000, Event::Settings)]);
+    }
+
+    #[test]
+    fn a_delivered_settings_announcement_is_kept_for_the_keep_window() {
+        use crate::settings::Reduction;
+        // Exact boundary: delivered, then kept until the keep window from its
+        // (newest) change time is over, not a second longer (R3 items 1, 6).
+        let at = hours(0);
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], at));
+        let mut ch = Fake::new(&[(1000, "alice")], true);
+        deliver(&mut state, at, Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(ch.desktop.len(), 1);
+        // Exactly at the boundary: still kept.
+        deliver(
+            &mut state,
+            at + RECOVERY_KEEP,
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert_eq!(state.settings.len(), 1, "kept at the boundary");
+        // One second past: dropped.
+        deliver(
+            &mut state,
+            at + RECOVERY_KEEP + Duration::seconds(1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(state.settings.is_empty(), "dropped just past the window");
+    }
+
+    #[test]
+    fn a_failing_settings_hook_is_retried_past_the_keep_window_then_delivers() {
+        use crate::settings::Reduction;
+        // Only the hook is enabled, and it keeps failing for longer than the
+        // keep window: the announcement is never dropped, and a later success
+        // still delivers it (R3 item 1).
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], hours(0)));
+        let mut ch = Fake::new(&[], true);
+        ch.desktop_on = false; // only the hook holds this announcement back
+        ch.command_fails = true;
+        // A failing attempt roughly once a day, spaced past the backoff.
+        for day in 0..6 {
+            deliver(&mut state, hours(24 * day), Lang::En, &mut ch, &mut |_| {});
+        }
+        assert_eq!(state.settings.len(), 1, "undelivered hook message is kept");
+        assert!(!state.settings[0].command_done);
+        // The hook recovers; the message finally goes out.
+        ch.command_fails = false;
+        ch.clear();
+        let out = deliver(&mut state, hours(24 * 7), Lang::En, &mut ch, &mut |_| {});
+        assert!(!out.hook_failed);
+        assert_eq!(ch.hook, [Event::Settings]);
+    }
+
+    #[test]
+    fn the_newest_change_in_a_merged_entry_sets_the_keep_window() {
+        use crate::settings::Reduction;
+        // 60 changes from one user within an hour are merged into one entry
+        // whose time is the newest, so the fresh change does not expire minutes
+        // after the oldest (R3 item 1).
+        let mut v: Vec<SettingsAnnouncement> = Vec::new();
+        for i in 0..60 {
+            v.push(announce(
+                "alice",
+                vec![Reduction::WakeOnLanOff],
+                hours(0) + Duration::minutes(i),
+            ));
+        }
+        assert!(v.len() > MAX_SETTINGS);
+        cap_settings(&mut v);
+        assert_eq!(v.len(), 1, "combined into one entry per user");
+        assert_eq!(
+            v[0].at,
+            hours(0) + Duration::minutes(59),
+            "the merged entry keeps the newest change's time"
+        );
+    }
+
+    #[test]
+    fn a_failing_settings_hook_backs_off_instead_of_retrying_every_run() {
+        use crate::settings::Reduction;
+        // A hook that keeps failing is not retried at every run: after a failure
+        // the next try is held back until a growing, bounded backoff is over
+        // (R3 item 1).
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], t0()));
+        let mut ch = Fake::new(&[], true);
+        ch.desktop_on = false;
+        ch.command_fails = true;
+        let out = deliver(&mut state, t0(), Lang::En, &mut ch, &mut |_| {});
+        assert!(out.hook_failed);
+        assert_eq!(state.settings_command_failures, 1);
+        assert!(state.settings_command_retry_after.is_some());
+        // A run seconds later is held back, not retried.
+        ch.clear();
+        let out = deliver(
+            &mut state,
+            t0() + Duration::seconds(30),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(!out.hook_failed, "held back within the backoff");
+        assert!(ch.hook.is_empty());
+        assert_eq!(
+            state.settings_command_failures, 1,
+            "no new failure recorded"
+        );
+        // Past the backoff it is tried again (and fails again, growing it).
+        ch.clear();
+        let out = deliver(
+            &mut state,
+            t0() + SETTINGS_RATE_LIMIT + Duration::seconds(1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(out.hook_failed);
+        assert_eq!(state.settings_command_failures, 2);
+        // Backoff is bounded.
+        assert!(settings_command_backoff(100) <= SETTINGS_COMMAND_MAX_BACKOFF);
+    }
+
+    // --- R3: times in the future (item 2) ------------------------------------
+
+    #[test]
+    fn clamp_future_times_pulls_future_stamps_to_now() {
+        let now = t0();
+        let mut state = NotifyState {
+            unbacked_since: Some(now + Duration::days(365)),
+            ..Default::default()
+        };
+        state.settings.push(announce(
+            "alice",
+            vec![crate::settings::Reduction::WakeOnLanOff],
+            now + Duration::days(365),
+        ));
+        state.active.insert(
+            Event::Failing,
+            Active {
+                condition: failing("x"),
+                since: now + Duration::days(10),
+                announced_at: now + Duration::days(10),
+                seq: 1,
+                command_seq: 0,
+                users: BTreeMap::new(),
+            },
+        );
+        assert!(state.clamp_future_times(now));
+        assert_eq!(state.unbacked_since, Some(now));
+        assert_eq!(state.settings[0].at, now);
+        assert_eq!(state.active[&Event::Failing].announced_at, now);
+        // Nothing to do a second time.
+        assert!(!state.clamp_future_times(now));
+    }
+
+    #[test]
+    fn a_future_settings_stamp_does_not_hold_a_recipient_back() {
+        use crate::settings::Reduction;
+        // A rate-limit stamp left in the future (a clock that was ahead) must not
+        // suppress delivery through the real delivery function (R3 items 2, 6).
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], t0()));
+        state
+            .settings_sent_users
+            .insert(1000, t0() + Duration::days(365));
+        state.settings_sent_command = Some(t0() + Duration::days(365));
+        let mut ch = Fake::new(&[(1000, "carol")], true);
+        let out = deliver(&mut state, t0(), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(
+            ch.desktop,
+            [(1000, Event::Settings)],
+            "future user stamp ignored"
+        );
+        assert_eq!(ch.hook, [Event::Settings], "future hook stamp ignored");
+        assert!(!out.hook_failed);
+    }
+
+    #[test]
+    fn a_future_intent_time_does_not_stay_in_flight_forever() {
+        // A provisional intent whose time is far in the future (a clock that was
+        // ahead) is pulled back to now on the first drain and written back, so
+        // its in-flight window ends instead of running forever (R3 items 2, 6).
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let inbox = vec![SettingsAnnouncement {
+            user: "alice".into(),
+            reductions: Vec::new(),
+            at: Utc::now() + Duration::days(365),
+            users_done: BTreeSet::new(),
+            command_done: false,
+            id: 42,
+            provisional: true,
+        }];
+        write_json_atomic(&settings_inbox_file(&paths), &inbox).unwrap();
+        let mut state = NotifyState::default();
+        let now = Utc::now();
+        // Just created (clamped to now): still in flight, nothing moved, but the
+        // corrected time is persisted.
+        assert_eq!(drain_settings_inbox_at(&paths, &mut state, now), 0);
+        assert!(state.settings.is_empty());
+        // Two minutes later (past the in-flight window): delivered.
+        assert_eq!(
+            drain_settings_inbox_at(&paths, &mut state, now + Duration::minutes(2)),
+            1
+        );
+        assert_eq!(state.settings.len(), 1);
+        assert!(state.settings[0].at <= now + Duration::minutes(2));
+    }
+
+    #[test]
+    fn the_debounce_wait_is_bounded_for_a_future_stamp() {
+        let now = t0();
+        // A stamp in the future asks for at most the quiet period, never the
+        // hundreds of seconds a naive subtraction would give (R3 item 2).
+        let wait = settings_debounce_wait(&[now + Duration::days(365)], now);
+        assert!(wait <= SETTINGS_QUIET, "{wait:?}");
+    }
+
+    // --- R3: an unknown last run state (item 3) ------------------------------
+
+    #[test]
+    fn an_unknown_last_run_state_is_reported_like_a_failure() {
+        // A run state this version does not understand is announced once as an
+        // "update nestegg" message, not treated as success or as nothing
+        // happening, and independent of how `health` is computed (R3 item 3).
+        let ok = run_with(RunState::Succeeded, hours(-2));
+        let unknown = run_with(RunState::Unknown, hours(-1));
+        // `health` is deliberately passed as Ok here: detection must not rely on
+        // it (a parallel change may make it Failing instead — either way works).
+        let s = status(Health::Ok, Some(unknown), Some(ok), &[]);
+        let (list, settled) = checked(evaluate(&s, true, None, t0()));
+        assert!(!settled, "an unknown last run is not a confirmed success");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].kind, Event::Outdated);
+        // The message asks for an update, in both languages, same for everyone.
+        for lang in [Lang::En, Lang::De] {
+            let full = compose(lang, Event::Outdated, Some(&list[0]), Detail::Full);
+            let generic = compose(lang, Event::Outdated, Some(&list[0]), Detail::Generic);
+            assert_eq!(full.body, generic.body, "no private detail to hide");
+            assert!(full.body.contains("nestegg ui"));
+        }
+        // Announced once, then quiet at the next check, not repeated every time.
+        let mut state = NotifyState::default();
+        let mut ch = Fake::new(&[(1000, "alice")], true);
+        step(&mut state, &list, hours(0), &mut ch);
+        assert_eq!(ch.desktop, [(1000, Event::Outdated)]);
+        assert_eq!(ch.hook, [Event::Outdated]);
+        step(&mut state, &list, hours(1), &mut ch);
+        assert!(ch.desktop.is_empty() && ch.hook.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_last_run_suppresses_the_quieter_overdue() {
+        // Like a failure, an unknown last run hides overdue/incomplete, and it
+        // coexists with the independent automatic_off condition.
+        let old = run_with(RunState::Succeeded, hours(-50));
+        let unknown = run_with(RunState::Unknown, hours(-1));
+        let s = status(Health::Overdue, Some(unknown), Some(old), &[]);
+        let (list, _) = checked(evaluate(&s, true, None, t0()));
+        let kinds: Vec<Event> = list.iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&Event::Outdated), "{kinds:?}");
+        assert!(!kinds.contains(&Event::Overdue), "{kinds:?}");
+        // Timer off: automatic_off is independent and still reported alongside.
+        let (off, _) = checked(evaluate(&s, false, None, t0()));
+        let off_kinds: Vec<Event> = off.iter().map(|c| c.kind).collect();
+        assert!(off_kinds.contains(&Event::Outdated) && off_kinds.contains(&Event::AutomaticOff));
+    }
+
+    // --- R3: the lock wait is bounded (item 4) -------------------------------
+
+    #[test]
+    fn the_notify_lock_wait_is_bounded() {
+        // When another descriptor holds the notification lock, the check does
+        // not hang: it gives up after the timeout with an error, so the caller
+        // exits non-zero and the timer tries again (R3 item 4).
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let held = lock_with_timeout(&paths, StdDuration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        let err = lock_with_timeout(&paths, StdDuration::from_millis(200)).unwrap_err();
+        assert!(start.elapsed() < StdDuration::from_secs(5), "did not hang");
+        assert!(err.to_string().contains("locked by another"), "{err:#}");
+        drop(held);
+        // With the lock free again it succeeds.
+        assert!(lock_with_timeout(&paths, StdDuration::from_millis(200)).is_ok());
     }
 }
