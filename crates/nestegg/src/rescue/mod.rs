@@ -211,6 +211,13 @@ impl Session {
             Err(e) if classify_failure(&e) == FailureKind::Key => {
                 Err(e.context(format!("the key does not open {snapshot}")))
             }
+            // Right key, wrong signature: the table of contents is not the
+            // one the backup was made with.
+            Err(e) if format!("{e:#}").to_lowercase().contains("wrong signature") => Err(e
+                .context(format!(
+                    "the table of contents of {snapshot} was changed after the backup was made \
+                     (its signature does not match your key); do not restore this backup"
+                ))),
             Err(e) => Err(e.context(format!(
                 "cannot read the table of contents of {snapshot} from the backup server"
             ))),
@@ -235,10 +242,22 @@ impl Session {
                 &mut sink,
             )
             .context("cannot read the inventory of this snapshot")?;
-        let layout: Layout =
-            serde_json::from_slice(&fs::read(base.join(LAYOUT_FILE)).map_err(|_| {
-                Unusable("this snapshot has no disk layout (made by an older nestegg)".into())
-            })?)
+        // Only a layout that is not in the backup makes the backup unusable;
+        // a local read error (disk, permissions) is reported as what it is.
+        let layout_bytes = match fs::read(base.join(LAYOUT_FILE)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Unusable(
+                    "this snapshot has no disk layout (made by an older nestegg)".into(),
+                )
+                .into());
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context("cannot read the disk layout restored from this snapshot"));
+            }
+        };
+        let layout: Layout = serde_json::from_slice(&layout_bytes)
             .map_err(|e| Unusable(format!("invalid layout.json: {e}")))?;
         let read = |name: &str| fs::read_to_string(base.join(name)).ok();
         Ok(Inventory {
@@ -297,15 +316,36 @@ pub fn client_blames_the_key(message: &str) -> bool {
         "provided key",
         "unable to verify signature",
         "has no signature",
-        "decrypt",
+        // Phrases, not the bare word: a snapshot path in the client's own
+        // message may contain a host called `decrypt-box`.
+        "unable to decrypt",
+        "failed to decrypt",
+        "could not decrypt",
+        "decryption failed",
         "error decoding base64",
         "wrong fingerprint",
         "fingerprint too short",
         "key file is protected",
         "pass the exported key",
+        // A key file the client cannot parse.
+        "parse data as keyconfig",
+        "error reading encryption key",
     ]
     .iter()
     .any(|w| m.contains(w))
+}
+
+/// Whether a message of the client says that the backup itself is damaged
+/// or gone, so that neither another key nor trying again can help:
+/// - `wrong signature in manifest`: the key is the right one (its
+///   fingerprint matches), but the table of contents was changed after the
+///   backup was made;
+/// - the snapshot was removed in the meantime.
+pub fn client_reports_unusable(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("wrong signature")
+        || m.contains("enoent")
+        || (m.contains("snapshot") && m.contains("does not exist"))
 }
 
 /// A backup that can never be restored, whatever key is given and however
@@ -337,17 +377,28 @@ pub enum FailureKind {
 /// bottom of the error decides, not the wording of the context around it
 /// (that contains snapshot and host names).
 pub fn classify_failure(e: &anyhow::Error) -> FailureKind {
-    if e.downcast_ref::<Unusable>().is_some() {
+    let cause = e.root_cause().to_string();
+    if e.downcast_ref::<Unusable>().is_some() || client_reports_unusable(&cause) {
         FailureKind::Unusable
-    } else if client_blames_the_key(&e.root_cause().to_string()) {
+    } else if client_blames_the_key(&cause) {
         FailureKind::Key
     } else {
         FailureKind::Other
     }
 }
 
+/// Control characters, and the invisible Unicode format characters that
+/// reorder or hide text in a terminal (bidirectional overrides, zero-width
+/// characters).
+fn unprintable(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}' | '\u{feff}')
+}
+
 fn has_control_chars(text: &str) -> bool {
-    text.chars().any(char::is_control)
+    text.chars().any(unprintable)
 }
 
 /// Text from an attached drive, a settings file or the server, safe to print
@@ -355,7 +406,7 @@ fn has_control_chars(text: &str) -> bool {
 /// lines with the certificate fingerprint or a warning) become `?`.
 pub fn printable(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| if unprintable(c) { '?' } else { c })
         .collect()
 }
 
@@ -364,7 +415,7 @@ pub fn printable(text: &str) -> String {
 pub fn printable_block(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' {
+            if unprintable(c) && c != '\n' && c != '\t' {
                 '?'
             } else {
                 c
@@ -1472,6 +1523,32 @@ mod tests {
         let network = anyhow::anyhow!("Connection refused (os error 111)")
             .context("cannot read the table of contents of host/decrypt-key/2026 from the server");
         assert_eq!(kind(network), FailureKind::Other);
+        // The client's own message can carry a host name too.
+        let named = anyhow::anyhow!(
+            "snapshot \"ns/desktops/host/decrypt-box/2020-01-01T00:00:00Z\" does not exist."
+        );
+        assert_eq!(kind(named), FailureKind::Unusable);
+        assert_eq!(
+            kind(anyhow::anyhow!("Error: ENOENT: No such file or directory")),
+            FailureKind::Unusable
+        );
+        // Right key, changed manifest: no other key and no retry helps.
+        let tampered = anyhow::anyhow!("Error: wrong signature in manifest")
+            .context("the table of contents of host/desktop/2026 was changed");
+        assert_eq!(kind(tampered), FailureKind::Unusable);
+        // A key file the client cannot parse is a key problem.
+        for m in [
+            "Couldn't parse data as KeyConfig",
+            "error reading encryption key from fd",
+            "unable to decrypt chunk",
+        ] {
+            assert_eq!(kind(anyhow::anyhow!(m)), FailureKind::Key, "{m}");
+        }
+        // Other things that do not exist are not this backup's fault.
+        assert_eq!(
+            kind(anyhow::anyhow!("datastore 'keys' does not exist")),
+            FailureKind::Other
+        );
         let unusable: anyhow::Error = Unusable("this backup mixes protected".into()).into();
         assert_eq!(
             kind(unusable.context("cannot read host/desktop/x")),
@@ -1552,6 +1629,15 @@ mod tests {
     }
 
     #[test]
+    fn invisible_format_characters_are_replaced_too() {
+        // Right-to-left override and zero-width space.
+        assert_eq!(printable("a\u{202e}b\u{200b}c"), "a?b?c");
+        assert_eq!(printable_block("x\u{2066}y\nz\tw"), "x?y\nz\tw");
+        assert!(has_control_chars("host\u{202e}"));
+        assert!(!has_control_chars("host-01.example.com"));
+    }
+
+    #[test]
     fn text_from_a_drive_cannot_rewrite_the_console() {
         assert_eq!(printable("pbs.example.com"), "pbs.example.com");
         assert_eq!(
@@ -1593,6 +1679,8 @@ mod tests {
             &mut scan,
         );
         assert_eq!(scan.keys.len(), 2, "{:?}", scan.keys);
+        // Two different copies, not one written twice.
+        assert_ne!(scan.keys[0], scan.keys[1], "{:?}", scan.keys);
         for k in &scan.keys {
             assert!(k.starts_with(&copies));
             let name = k.file_name().unwrap().to_string_lossy();

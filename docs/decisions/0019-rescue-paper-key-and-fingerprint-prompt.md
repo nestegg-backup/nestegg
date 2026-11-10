@@ -246,3 +246,21 @@ A re-check of the changes above found more:
    (dry run), and the wizard's menu after a backup without disk layout
    defaults to another backup. The real client makes one crypt mode per run,
    so a backup that mixes modes cannot be produced for the VM test.
+
+## Amendment: check of the third review's fixes (2026-11-10)
+
+1. `wrong signature in manifest` is what the client says when the key is
+   the right one but the table of contents was changed on the server. It is
+   classified as "this backup cannot be used" (default: choose another
+   backup) with a message that says so; the patterns for key trouble had
+   lost it, so it looked like a network error with "try again".
+2. A snapshot that no longer exists is "cannot be used" as well. Key
+   trouble is recognised by phrases only ("unable to decrypt", not the bare
+   "decrypt"): the client's own message contains the snapshot path, and a
+   host may be called `decrypt-box`. A key file the client cannot parse is
+   key trouble.
+3. Only a `layout.json` that is missing from the backup makes the backup
+   unusable; a local read error is reported as that.
+4. Invisible Unicode format characters (bidirectional overrides, zero-width
+   characters) are replaced like control characters; the warning about an
+   unprotected backup goes through the same filter.

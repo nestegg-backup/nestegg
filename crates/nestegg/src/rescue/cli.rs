@@ -993,7 +993,7 @@ fn accept_protection(
         other => {
             let concern = other.concern().unwrap_or_default();
             eprintln!();
-            eprintln!("!!! WARNING: {concern}");
+            eprintln!("!!! WARNING: {}", super::printable(&concern));
             eprintln!(
                 "!!! Restore it only if you know that this backup was made this way.{}",
                 if matches!(other, Protection::Unsigned) {
