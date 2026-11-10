@@ -252,12 +252,12 @@ struct ConfirmArgs {
     paper_code: Option<String>,
     /// The copy given with --file lies on a disk of this computer; state
     /// without a terminal that another copy exists outside this computer.
-    #[arg(long, requires = "file")]
+    #[arg(long, requires = "file", conflicts_with = "paper_code")]
     accept_local_copy: bool,
     /// The paper key given with --paper-code is printed and stored away
     /// from this computer. Needed without a terminal, because nestegg
     /// cannot see a sheet of paper.
-    #[arg(long, requires = "paper_code")]
+    #[arg(long, requires = "paper_code", conflicts_with = "file")]
     printed: bool,
 }
 
@@ -688,11 +688,11 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             // comes from a removable medium; a file on this computer's own
             // disk needs `key confirm-exported` like any other copy.
             let location = nestegg::keyproof::locate_in(&path, &backup_scope(paths));
-            let counts_as_exported = if same_key {
-                state.key_exported_digest.as_deref() == Some(digest.as_str())
-            } else {
-                !location.needs_statement()
-            };
+            let counts_as_exported = nestegg::keyproof::import_counts_as_exported(
+                same_key,
+                state.key_exported_digest.as_deref() == Some(digest.as_str()),
+                &location,
+            );
             // Same order as `key create`: no confirmation may survive for a
             // key that is about to be replaced.
             state.key_exported_digest = None;
@@ -769,6 +769,14 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             };
             match output {
                 Some(file) => {
+                    // The path is remembered in the state (text): refuse a
+                    // name that cannot be stored before anything is written.
+                    if absolute_user_path(&file)?.to_str().is_none() {
+                        bail!(
+                            "the name of the output file contains characters that are not valid \
+                             UTF-8; choose another name"
+                        );
+                    }
                     write_user_file(&file, &data)?;
                     // Remember where it is: confirming with the check code is
                     // refused while this file lies on this computer's disk.
@@ -789,7 +797,23 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                         file.display()
                     );
                 }
-                None => std::io::stdout().write_all(&data)?,
+                None => {
+                    std::io::stdout().write_all(&data)?;
+                    // `nestegg key paperkey > file` writes a file just like
+                    // --output does: remember it the same way.
+                    if let Some(written) = stdout_regular_file() {
+                        let mut state = store.load_state()?;
+                        state.remember_paperkey_file(written.clone(), &secrets::digest(&key));
+                        store.save_state(&state)?;
+                        eprintln!(
+                            "Paper key written to {}.\n\
+                             Print it, then delete the file (or move it to a USB stick). \
+                             Confirming with the check code is refused while the file lies on \
+                             this computer.",
+                            written.display()
+                        );
+                    }
+                }
             }
             record_export(&store, &key)?;
         }
@@ -949,6 +973,21 @@ fn backup_scope(paths: &Paths) -> nestegg::keyproof::BackupScope {
     }
 }
 
+/// The file standard output is redirected to (`nestegg ... > file`), if it is
+/// a regular file whose path can be told.
+fn stdout_regular_file() -> Option<PathBuf> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = std::fs::metadata("/proc/self/fd/1").ok()?;
+    let kind = meta.file_type();
+    if !meta.is_file() || kind.is_fifo() || kind.is_char_device() {
+        return None;
+    }
+    let path = std::fs::read_link("/proc/self/fd/1").ok()?;
+    // A deleted file shows as "... (deleted)"; a path that is not UTF-8
+    // cannot be kept in the state.
+    (path.is_absolute() && path.exists() && path.to_str().is_some()).then_some(path)
+}
+
 /// `nestegg key confirm-exported`: record that the key is safe outside this
 /// computer, but only against proof and, where proof is impossible, the
 /// user's statement (see docs/decisions/0018).
@@ -961,7 +1000,9 @@ fn confirm_exported(
     use nestegg::keyproof::{self, LocalCopy, Statement};
     let (key, stored) = stored_key_material(secrets_store)?;
     let terminal = stdin_is_terminal();
-    let scope = backup_scope(paths);
+    // The backup scope (what the backup contains, which mounts exist) is
+    // read where it is used, after the questions: a stick plugged in while
+    // the prompt waits must be seen.
     // The copy is on a removable medium that may still be plugged in.
     let mut on_removable = false;
     let (file, code) = match (args.file, args.paper_code) {
@@ -1007,7 +1048,7 @@ fn confirm_exported(
                 path.display()
             );
         }
-        let location = keyproof::locate_in(&path, &scope);
+        let location = keyproof::locate_in(&path, &backup_scope(paths));
         on_removable = matches!(location, keyproof::Location::Removable);
         match keyproof::decide_local_copy(&location, args.accept_local_copy, terminal) {
             LocalCopy::Accept => {}
@@ -1053,7 +1094,7 @@ fn confirm_exported(
             &remembered,
             &digest,
             |p| p.symlink_metadata().is_ok(),
-            |p| keyproof::locate_in(p, &scope),
+            |p| keyproof::locate_in(p, &backup_scope(paths)),
         );
         let in_the_way = keyproof::paperkey_files_in_the_way(&existing);
         if let Some(first) = in_the_way.first() {

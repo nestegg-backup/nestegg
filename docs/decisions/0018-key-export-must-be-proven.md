@@ -107,8 +107,9 @@ no manifest yet.
 ## Consequences
 
 - A confirmation means that a copy of exactly this key was shown to the
-  program, or that the user could read the check code off a sheet of paper
-  made from it.
+  program, or that the user knows the check code of a paper key made from
+  it and states that the sheet is printed and stored away from the computer
+  (see the amendment of 2026-11-10: the code alone proves no sheet).
 - The check code protects against a wrong or outdated sheet, not against
   someone who can read the stored key; it is not a secret and no
   authentication.
@@ -228,3 +229,22 @@ new one for the paper code).
   Scripts that use `--file` are unchanged.
 - The state has one new field, `paperkey_files`; older state files load
   without it.
+
+### After review (2026-11-10)
+
+- `nestegg key paperkey > file` (output redirected to a file) is remembered
+  like `--output file`; only output that goes to another program leaves
+  nothing to check.
+- What the remembered file can and cannot show: the check is "does the file
+  still exist at the path it was written to". A file that was renamed,
+  moved or hard-linked elsewhere on the same disk is not found. That is the
+  same limit as for a copy made by hand, and the reason the statement is
+  required in every case; the check only catches the common case of a file
+  that was simply left where it was written.
+- A paper key file whose name is not valid UTF-8 is refused before it is
+  written (the path could not be kept in the state).
+- `confirm-exported` looks at what the backup contains and which drives are
+  mounted after the questions, so a stick that is plugged in while the
+  prompt waits is seen.
+- `--printed` cannot be combined with `--file`, nor `--accept-local-copy`
+  with `--paper-code`.

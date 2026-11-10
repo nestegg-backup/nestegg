@@ -288,6 +288,23 @@ pub enum Location {
     InBackup(String),
 }
 
+/// Whether `key import` may record the key as exported. Importing the key
+/// that is already stored proves nothing new (it could be the file `key
+/// export` just wrote): only a confirmation given for it before stays. A
+/// new key counts when the file comes from a removable medium outside the
+/// backup; everything else needs `key confirm-exported`.
+pub fn import_counts_as_exported(
+    same_key: bool,
+    same_key_was_confirmed: bool,
+    location: &Location,
+) -> bool {
+    if same_key {
+        same_key_was_confirmed
+    } else {
+        !location.needs_statement()
+    }
+}
+
 impl Location {
     /// A copy here can be lost together with this computer (or is not known
     /// to be safe), so it needs the user's statement.
@@ -631,6 +648,28 @@ mod tests {
             fingerprint: "ff:ed:94".into(),
             check_code: "ABCD-0123".into(),
         }
+    }
+
+    #[test]
+    fn import_only_confirms_a_new_key_from_removable_media() {
+        let stick = Location::Removable;
+        let disk = Location::Internal;
+        let in_backup = Location::InBackup("inside /srv".into());
+        let unknown = Location::Unknown("no findmnt".into());
+        // A new key: only a file on removable media outside the backup.
+        assert!(import_counts_as_exported(false, false, &stick));
+        for place in [&disk, &in_backup, &unknown] {
+            assert!(!import_counts_as_exported(false, false, place), "{place:?}");
+        }
+        // The key that is already stored: the place proves nothing (it may
+        // be the file `key export` just wrote, even on a stick); only an
+        // earlier confirmation stays.
+        for place in [&stick, &disk, &in_backup, &unknown] {
+            assert!(!import_counts_as_exported(true, false, place), "{place:?}");
+            assert!(import_counts_as_exported(true, true, place), "{place:?}");
+        }
+        // A new key never inherits the old key's confirmation.
+        assert!(!import_counts_as_exported(false, true, &disk));
     }
 
     #[test]

@@ -1316,6 +1316,78 @@ fn a_file_listing_without_crypt_modes_still_passes_the_read_back() {
 }
 
 #[test]
+fn a_paper_key_redirected_into_a_file_is_remembered_like_an_output_file() {
+    // `nestegg key paperkey > key.txt` instead of `--output key.txt`.
+    let env = Env::new();
+    env.set_key_exported(false);
+    let file = env.root().join("redirected-paper-key.txt");
+    let out = env
+        .command(&["key", "paperkey"])
+        .env("NESTEGG_ALLOW_NON_ROOT", "1")
+        .env_remove("SUDO_UID")
+        .stdout(fs::File::create(&file).unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let text = fs::read_to_string(&file).unwrap();
+    let check_code = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Check code:"))
+        .expect("the paper key has a check code")
+        .trim()
+        .to_string();
+    let remembered: Vec<String> = env.state()["paperkey_files"]
+        .as_array()
+        .expect("the redirected file is remembered")
+        .iter()
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        remembered,
+        vec![
+            fs::canonicalize(&file)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        ]
+    );
+
+    // Reading the code off that file is the shortcut: refused while the
+    // file lies here, also with the statement.
+    let confirm = || {
+        env.root_cmd(&[
+            "key",
+            "confirm-exported",
+            "--paper-code",
+            &check_code,
+            "--printed",
+        ])
+    };
+    let out = confirm();
+    assert_eq!(code(&out), 1);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("redirected-paper-key.txt"), "{err}");
+    assert!(env.state()["key_exported_digest"].is_null());
+    // With the file gone the statement counts.
+    fs::remove_file(&file).unwrap();
+    let out = confirm();
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+
+    // The two statements cannot be mixed up.
+    let out = env.root_cmd(&["key", "confirm-exported", "--file", "x", "--printed"]);
+    assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+    let out = env.root_cmd(&[
+        "key",
+        "confirm-exported",
+        "--paper-code",
+        &check_code,
+        "--accept-local-copy",
+    ]);
+    assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
 fn repeated_failures_pause_the_timer_but_not_manual_runs() {
     let env = Env::new();
     let failing = |args: &[&str]| {

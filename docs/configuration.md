@@ -25,7 +25,7 @@ sudo nestegg credentials set-password     # paste the token secret
 sudo nestegg key create                   # reinstalling? keep the old key: sudo nestegg key import <file>
 sudo nestegg key paperkey --format html --output key.html   # print it, then delete the file
                                           # - or: sudo nestegg key export /media/usb/nestegg-key.json
-sudo nestegg key confirm-exported --paper-code <code on the paper> --printed
+sudo nestegg key confirm-exported --paper-code <code on the paper>   # asks you to state that it is printed
                                           # - or: --file /media/usb/nestegg-key.json
 sudo nestegg check
 sudo systemctl enable --now nestegg.service nestegg-backup.timer nestegg-notify.timer
