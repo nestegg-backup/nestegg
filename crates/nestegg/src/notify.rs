@@ -1338,8 +1338,21 @@ pub fn apply(
             );
         }
     }
-    if !conditions.is_empty() {
-        state.recovery = None;
+    // Who is owed the "works again" message must not get lost while some
+    // problem goes on. That message is only sent once nothing is wrong any
+    // more, so until then the debt is kept with a problem that is still
+    // active: the recipients of a kind that has just ended while another one
+    // remains, and those of a pending "works again" that a new problem
+    // cancels before it reached them.
+    if !conditions.is_empty()
+        && let Some(pending) = state.recovery.take()
+    {
+        told_users.extend(pending.users.difference(&pending.users_done).copied());
+        told_command |= pending.command;
+    }
+    if let Some(entry) = state.active.values_mut().next() {
+        entry.told_users.append(&mut told_users);
+        entry.told_command |= std::mem::take(&mut told_command);
     }
 
     // Deliver what has not reached its audience yet (a user who logs in
@@ -3101,6 +3114,67 @@ mod tests {
         step(&mut state, &[], hours(6), &mut ch);
         assert_eq!(ch.desktop, [(1000, Event::Recovered)]);
         assert!(state.recovery.is_none());
+    }
+
+    #[test]
+    fn who_was_told_of_a_problem_that_ended_while_another_goes_on_still_hears_the_end() {
+        // Alice hears of the failure and logs out. The backup becomes overdue
+        // as well; then the failure ends while "overdue" remains, and at last
+        // that ends too. Alice was told there was a problem and gets the one
+        // "works again" once everything is fine.
+        let mut state = NotifyState::default();
+        let mut ch = Fake::new(&[(1000, "alice")], true);
+        step(&mut state, &[failing("disk full")], hours(0), &mut ch);
+        ch.sessions.clear();
+        ch.command_fails = true;
+        let overdue = overdue(false, Some(30));
+        step(
+            &mut state,
+            &[failing("disk full"), overdue.clone()],
+            hours(1),
+            &mut ch,
+        );
+        step(
+            &mut state,
+            std::slice::from_ref(&overdue),
+            hours(2),
+            &mut ch,
+        );
+        assert_eq!(state.active.len(), 1);
+        assert!(ch.desktop.is_empty(), "no works-again while overdue");
+        ch.command_fails = false;
+        step(&mut state, &[], hours(3), &mut ch);
+        assert!(state.recovery.is_some(), "kept for alice");
+        ch.login(1000, "alice");
+        step(&mut state, &[], hours(4), &mut ch);
+        assert_eq!(ch.desktop, [(1000, Event::Recovered)]);
+        // Once, not again.
+        step(&mut state, &[], hours(5), &mut ch);
+        assert!(ch.desktop.is_empty());
+    }
+
+    #[test]
+    fn a_works_again_that_a_new_problem_cancels_is_still_owed() {
+        // Alice was told, logged out, and the problem ended: "works again"
+        // waits for her. A new problem cancels that message (it would be
+        // wrong now), but when that one ends too she hears it, although she
+        // never saw the second problem. Bob, who got the first "works again",
+        // is owed nothing more.
+        let mut state = NotifyState::default();
+        let mut ch = Fake::new(&[(1000, "alice"), (1001, "bob")], false);
+        step(&mut state, &[failing("x")], hours(0), &mut ch);
+        ch.sessions.retain(|s| s.uid == 1001);
+        step(&mut state, &[], hours(1), &mut ch);
+        assert_eq!(ch.desktop, [(1001, Event::Recovered)]);
+        assert!(state.recovery.is_some(), "still open for alice");
+        ch.sessions.clear();
+        step(&mut state, &[failing("again")], hours(2), &mut ch);
+        assert!(state.recovery.is_none());
+        step(&mut state, &[], hours(3), &mut ch);
+        ch.login(1000, "alice");
+        ch.login(1001, "bob");
+        step(&mut state, &[], hours(4), &mut ch);
+        assert_eq!(ch.desktop, [(1000, Event::Recovered)]);
     }
 
     #[test]

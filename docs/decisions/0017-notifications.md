@@ -358,3 +358,11 @@ record from a newer version, a stuck lock, and a many-user desktop.
   and carried into the recovery message together with the recipients of the
   current wording. Records written before this have neither field and are
   read as before.
+- The same debt is kept in two more cases, because "works again" is only sent
+  once nothing is wrong any more. A kind of problem ends while another one
+  goes on (the failure is gone, the backup is still overdue): who was told of
+  the ended one is noted with a problem that is still active. And a new
+  problem cancels a "works again" that has not reached everybody yet: those
+  it had not reached are noted with the new problem. In both cases they get
+  the one message when everything is fine again, also if they never saw the
+  later problem; who already got "works again" is owed nothing more.

@@ -132,8 +132,9 @@ thus reported calmly (weekly), but from the start, not only after weeks.
   needed when the written path is a link into another source (`/home/alice`
   pointing to `/srv/homes/alice`, with `/srv/homes` as the source): the home
   is then `/alice` in that archive, which the written paths do not show, and
-  an exclude `/alice` would leave the whole home out. So the real location of
-  every home directory and of every source is found out, again by a child
+  an exclude `/alice` would leave the whole home out. So, after the places by
+  the written paths were judged and none of them refused, the real location
+  of every home directory and of every source is found out, again by a child
   with the requester's identity (`readlink -f`, part of the required
   `coreutils`) under the same time budget and bounds as the reads, and a home
   is also protected in the archive that really contains it (in system mode

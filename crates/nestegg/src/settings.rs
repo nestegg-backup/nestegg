@@ -834,27 +834,17 @@ fn deepest_containing<'a>(
 /// (`/home` and `/home/alice` in `system.pxar`), and a source that keeps its
 /// own archive (a data disk that must be its own mount) is tested separately.
 ///
-/// A home directory is looked for in the archives twice: by its path as the
-/// account database gives it, and by where it really is (`resolve`, every
-/// symbolic link resolved, also for the sources). The account database may
-/// say `/home/alice` while that is a link to `/srv/homes/alice` and the
-/// source is `/srv/homes`: the home is then `/alice` in that archive, which a
-/// comparison of the written paths cannot see. Without an answer from
-/// `resolve` a path is taken as written.
+/// These are the places by the paths as written (in the configuration and
+/// in the account database); see [`real_location_pairs`] for a home whose
+/// path is a link.
 fn protected_folders(
     sources: &[crate::config::Source],
     home_dirs: &[PathBuf],
     system: bool,
-    resolve: &dyn Fn(&Path) -> Option<PathBuf>,
 ) -> Vec<(PathBuf, PathBuf)> {
     let root = PathBuf::from("/");
     let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
-    // The sources that are archives of their own.
-    let own: Vec<&crate::config::Source> = if system {
-        sources.iter().filter(|s| s.require_mount).collect()
-    } else {
-        sources.iter().collect()
-    };
+    let own = own_archives(sources, system);
     if system {
         for d in SYSTEM_DIRS {
             out.push((root.clone(), PathBuf::from(d)));
@@ -871,20 +861,50 @@ fn protected_folders(
             out.push((src.to_path_buf(), h.clone()));
         }
     }
-    // The same by the real locations, where they differ from the written ones.
+    out
+}
+
+/// The sources that are archives of their own: all of them in normal mode,
+/// in system mode those that must be their own mount (the rest is part of
+/// the system archive).
+fn own_archives(sources: &[crate::config::Source], system: bool) -> Vec<&crate::config::Source> {
+    if system {
+        sources.iter().filter(|s| s.require_mount).collect()
+    } else {
+        sources.iter().collect()
+    }
+}
+
+/// The (archive root, home directory) pairs by where the home directories and
+/// the sources really are (`resolve`: every symbolic link resolved), as far
+/// as they differ from `written`, the pairs by the written paths. The account
+/// database may say `/home/alice` while that is a link to `/srv/homes/alice`
+/// and the source is `/srv/homes`: the home is then `/alice` in that archive,
+/// which a comparison of the written paths cannot see. Without an answer from
+/// `resolve` a path is taken as written. Asked for only after the written
+/// pairs were judged, because each answer costs a child process.
+fn real_location_pairs(
+    sources: &[crate::config::Source],
+    home_dirs: &[PathBuf],
+    system: bool,
+    resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+    written: &[(PathBuf, PathBuf)],
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
     if home_dirs.is_empty() {
         return out;
     }
-    let real = |path: &Path| {
-        resolve(path)
-            .filter(|r| r.is_absolute())
-            .unwrap_or_else(|| path.to_path_buf())
-    };
-    let real_sources: Vec<PathBuf> = own.iter().map(|s| real(&s.path)).collect();
+    let root = PathBuf::from("/");
+    let real = |path: &Path| resolve(path).unwrap_or_else(|| path.to_path_buf());
+    let real_sources: Vec<PathBuf> = own_archives(sources, system)
+        .iter()
+        .map(|s| real(&s.path))
+        .collect();
     for h in home_dirs {
         let real_home = real(h);
         let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
-        if system && real_home != Path::new("/") {
+        // (A home that resolves to `/` itself is no folder in an archive.)
+        if system && real_home != root {
             found.push((root.clone(), real_home.clone()));
         }
         if let Some(src) = deepest_containing(&real_home, real_sources.iter().map(PathBuf::as_path))
@@ -892,7 +912,7 @@ fn protected_folders(
             found.push((src.to_path_buf(), real_home.clone()));
         }
         for pair in found {
-            if !out.contains(&pair) {
+            if !written.contains(&pair) && !out.contains(&pair) {
                 out.push(pair);
             }
         }
@@ -1307,8 +1327,27 @@ fn excludes_reduce_protection(
 ) -> Option<String> {
     let old = match_entries(old_list);
     let new = match_entries(new_list);
-    let resolve = |path: &Path| probe.real_path(path);
-    for (archive_root, folder) in protected_folders(sources, home_dirs, system, &resolve) {
+    // First the places by the written paths, as always; only if none of
+    // them refuses, the real locations are found out (a child process per
+    // path) and judged the same way.
+    let written = protected_folders(sources, home_dirs, system);
+    let mut real: Option<Vec<(PathBuf, PathBuf)>> = None;
+    let mut index = 0;
+    loop {
+        let pair = if index < written.len() {
+            written[index].clone()
+        } else {
+            let real = real.get_or_insert_with(|| {
+                let resolve = |path: &Path| probe.real_path(path);
+                real_location_pairs(sources, home_dirs, system, &resolve, &written)
+            });
+            match real.get(index - written.len()) {
+                Some(pair) => pair.clone(),
+                None => break,
+            }
+        };
+        index += 1;
+        let (archive_root, folder) = pair;
         // A source that is itself a symbolic link is followed by the backup
         // client (its content is what gets archived), so the guard reads
         // through the link too; a folder *inside* a source that is a link is
@@ -2777,18 +2816,49 @@ interval_hours = 24
         // With both /home and /srv/homes as sources the written and the real
         // place are both looked at, each once.
         let both = vec![source("home", "/home"), source("homes", "/srv/homes")];
-        let pairs = protected_folders(&both, &homes, false, &|p| links.real_path(p));
-        let home_pairs: Vec<_> = pairs.iter().filter(|(_, f)| f.ends_with("alice")).collect();
+        let written = protected_folders(&both, &homes, false);
+        assert!(written.contains(&(PathBuf::from("/home"), PathBuf::from("/home/alice"))));
+        let real = real_location_pairs(&both, &homes, false, &|p| links.real_path(p), &written);
         assert_eq!(
-            home_pairs,
-            [
-                &(PathBuf::from("/home"), PathBuf::from("/home/alice")),
-                &(
-                    PathBuf::from("/srv/homes"),
-                    PathBuf::from("/srv/homes/alice")
-                ),
-            ]
+            real,
+            [(
+                PathBuf::from("/srv/homes"),
+                PathBuf::from("/srv/homes/alice")
+            )]
         );
+    }
+
+    #[test]
+    fn the_real_locations_are_only_asked_for_when_the_written_ones_do_not_refuse() {
+        // Each answer costs a child process, so a list that is refused by the
+        // written paths never gets there, and an accepted one asks once per
+        // home and source.
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        struct Counting(std::rc::Rc<std::cell::Cell<usize>>);
+        impl FolderProbe for Counting {
+            fn children(&self, _folder: &Path) -> Vec<(String, bool)> {
+                Vec::new()
+            }
+            fn real_path(&self, _path: &Path) -> Option<PathBuf> {
+                self.0.set(self.0.get() + 1);
+                None
+            }
+        }
+        let probe = Counting(asked.clone());
+        let sources = vec![source("home", "/home"), source("etc", "/etc")];
+        let homes = vec![PathBuf::from("/home/alice"), PathBuf::from("/home/bob")];
+        let refused =
+            excludes_reduce_protection(&[], &["/alice".into()], &sources, &homes, false, &probe);
+        assert!(refused.is_some());
+        assert_eq!(
+            asked.get(),
+            0,
+            "refused by the written paths: nothing resolved"
+        );
+        let accepted =
+            excludes_reduce_protection(&[], &["*.iso".into()], &sources, &homes, false, &probe);
+        assert!(accepted.is_none());
+        assert_eq!(asked.get(), 4, "two sources and two homes, each once");
     }
 
     #[test]
@@ -2805,32 +2875,59 @@ interval_hours = 24
     }
 
     #[test]
-    fn nothing_changes_where_no_path_is_a_link() {
-        // The real location equals the written one: the same pairs as before,
-        // none twice.
+    fn nothing_is_added_where_no_path_is_a_link() {
+        // The real location equals the written one: no further pairs, in
+        // normal and in system mode, whether the resolver answers or not.
         let sources = vec![source("home", "/home"), source("etc", "/etc")];
         let homes = vec![PathBuf::from("/home/alice"), PathBuf::from("/home/bob")];
         let same = |p: &Path| Some(p.to_path_buf());
         let none = |_: &Path| None;
-        let with = protected_folders(&sources, &homes, false, &same);
-        assert_eq!(with, protected_folders(&sources, &homes, false, &none));
-        let mut unique = with.clone();
-        unique.dedup();
-        assert_eq!(with.len(), unique.len());
+        for system in [false, true] {
+            let written = protected_folders(&sources, &homes, system);
+            let unique: std::collections::HashSet<_> = written.iter().collect();
+            assert_eq!(unique.len(), written.len(), "no pair twice: {written:?}");
+            assert!(real_location_pairs(&sources, &homes, system, &same, &written).is_empty());
+            assert!(real_location_pairs(&sources, &homes, system, &none, &written).is_empty());
+        }
         // No home directories (the exclude list did not change): nothing is
         // resolved at all.
         let panics = |_: &Path| -> Option<PathBuf> { panic!("resolved without need") };
-        let _ = protected_folders(&sources, &[], false, &panics);
+        assert!(real_location_pairs(&sources, &[], false, &panics, &[]).is_empty());
+    }
+
+    #[test]
+    fn two_homes_at_the_same_real_place_give_one_pair() {
+        let sources = vec![source("homes", "/srv/homes")];
+        let homes = vec![PathBuf::from("/home/alice"), PathBuf::from("/home/alias")];
+        let both = |_: &Path| Some(PathBuf::from("/srv/homes/alice"));
+        // (The source resolves to the same path here as well, which makes it
+        // contain nothing: use a resolver that leaves the source alone.)
+        let resolve = |p: &Path| {
+            if p.starts_with("/home") {
+                both(p)
+            } else {
+                None
+            }
+        };
+        let real = real_location_pairs(&sources, &homes, false, &resolve, &[]);
+        assert_eq!(
+            real,
+            [(
+                PathBuf::from("/srv/homes"),
+                PathBuf::from("/srv/homes/alice")
+            )]
+        );
     }
 
     #[test]
     fn in_system_mode_a_linked_home_is_protected_at_its_real_place_in_the_system_archive() {
         let homes = vec![PathBuf::from("/home/alice")];
         let links = Linked(vec![("/home/alice", "/srv/homes/alice")]);
-        let pairs = protected_folders(&[], &homes, true, &|p| links.real_path(p));
         let root = PathBuf::from("/");
-        assert!(pairs.contains(&(root.clone(), PathBuf::from("/home/alice"))));
-        assert!(pairs.contains(&(root, PathBuf::from("/srv/homes/alice"))));
+        let written = protected_folders(&[], &homes, true);
+        assert!(written.contains(&(root.clone(), PathBuf::from("/home/alice"))));
+        let real = real_location_pairs(&[], &homes, true, &|p| links.real_path(p), &written);
+        assert_eq!(real, [(root.clone(), PathBuf::from("/srv/homes/alice"))]);
         assert!(
             excludes_reduce_protection(
                 &[],
@@ -2841,6 +2938,16 @@ interval_hours = 24
                 &links
             )
             .is_some()
+        );
+        // A home that resolves to `/` itself is no folder in the archive: no
+        // pair, and nothing is refused because of it.
+        let to_root = Linked(vec![("/home/alice", "/")]);
+        assert!(
+            real_location_pairs(&[], &homes, true, &|p| to_root.real_path(p), &written).is_empty()
+        );
+        assert!(
+            excludes_reduce_protection(&[], &["*.iso".into()], &[], &homes, true, &to_root)
+                .is_none()
         );
     }
 
