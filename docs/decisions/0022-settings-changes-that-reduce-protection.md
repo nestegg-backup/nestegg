@@ -87,13 +87,17 @@ thus reported calmly (weekly), but from the start, not only after weeks.
 
   "Would empty the folder" means the list excludes the folder entry itself, or
   excludes every child. The children are the folder's **real top-level entry
-  names** (read as root, names only, at most 4096 of them, with a time limit of
-  two seconds so a dead network file system cannot hang the request): when
-  every one of them is left out, the folder is emptied. Only when the real
+  names** (read as root, names only, at most 4096 of them in the order the file
+  system lists them, with a time limit of two seconds so a dead network file
+  system cannot hang the request): when every one of them is left out, the
+  folder is emptied. For a folder with more entries the first 4096 decide, so
+  such a list can be refused although a later entry would stay; that errs on
+  the side of the guard. Only when the real
   names are not known (the folder is empty, cannot be read or does not answer
   in time) are made-up names used instead, one per kind of first character
   (digit, upper and lower case letter, underscore, dot, non-ASCII), and the
-  folder counts as emptied when the list leaves out all of them. A change is refused
+  folder counts as emptied when the list leaves out all of them. A change is
+  refused
   only when the **new** list would empty a folder that the **old** list did not,
   so a dangerous pattern root already put in the file is grandfathered and a
   plain reorder is refused only when it changes the outcome.
@@ -142,7 +146,9 @@ the value as root in `/etc/nestegg/config.toml`.
   most once every five minutes by later runs — later changes are combined and
   delivered by the next check after that time, and nothing is dropped. Nothing
   starts a check just for that moment: it is the next settings change or the
-  hourly check, so such a follow-up message can take up to about an hour. Within
+  hourly check, so such a follow-up message can take up to about an hour. The
+  same holds for a report that is completed in the instant after a running
+  check has looked at the inbox for the last time. Within
   one run the end-of-run drain may deliver again to a recipient it has just
   told (at most five more times). The record is combined per user
   rather than truncated when it would grow large, so one member's flood can
@@ -206,8 +212,9 @@ the value as root in `/etc/nestegg/config.toml`.
   `pathpatterns` 0.1.2; the backup client links 1.0.0 — the same code, an older
   release. The two behave the same on the cases that matter here (confirmed with
   `pxar create --exclude` in the e2e client image), but nestegg does not promise
-  byte-for-byte parity; it promises the same syntax. For the 36 malformed
-  patterns that were compared, both refuse the same ones.
+  byte-for-byte parity; it promises the same syntax. For the malformed
+  patterns compared by hand when this was written, both refused the same
+  ones (the comparison is not part of the test suite).
 - **root is unbounded in the file.** Every limit above binds only changes made
   through the API by a group member. root can set anything in
   `/etc/nestegg/config.toml`, which is the intended trust boundary.

@@ -139,18 +139,20 @@ pub fn reductions(
     // pure reorder of plain excludes changes nothing and is not reported.
     // Compared on the patterns both lists have, so that it is also seen when
     // something else was added or removed in the same request.
-    let kept_old: Vec<&String> = old
-        .backup
-        .excludes
-        .iter()
-        .filter(|p| new.backup.excludes.contains(p))
-        .collect();
-    let kept_new: Vec<&String> = new
-        .backup
-        .excludes
-        .iter()
-        .filter(|p| old.backup.excludes.contains(p))
-        .collect();
+    // Each pattern once (its last position counts, as for the client): a
+    // dropped duplicate is not a change of order.
+    let kept = |list: &[String], other: &[String]| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for p in list.iter().rev() {
+            if other.contains(p) && !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        out.reverse();
+        out
+    };
+    let kept_old = kept(&old.backup.excludes, &new.backup.excludes);
+    let kept_new = kept(&new.backup.excludes, &old.backup.excludes);
     if kept_old != kept_new && kept_new.iter().any(|p| p.starts_with('!')) {
         out.push(Reduction::ExcludesReordered);
     }
@@ -616,8 +618,8 @@ fn list_excludes_path(entries: &[MatchEntry], rel: &str, mode: u32) -> bool {
 /// Whether the exclude list leaves nothing of the folder at archive-relative
 /// path of `folder` inside `archive_root`: the folder entry itself is excluded,
 /// or every child is — tested against the folder's real top-level entries
-/// (`children`) and, in addition, two synthetic names that catch a pattern
-/// matching every possible child.
+/// (`children`); only when those are unknown, against made-up names that
+/// catch a pattern matching every possible child.
 fn list_empties_folder(
     entries: &[MatchEntry],
     archive_root: &Path,
@@ -729,11 +731,11 @@ fn protected_folders(
     out
 }
 
-/// Real top-level entry names (and whether each is a directory) of `folder`,
-/// bounded to [`MAX_PROBE_ENTRIES`]; only the names are read, never the
-/// contents. A folder with more entries, or one that cannot be read, yields an
-/// empty list, so the guard then relies on the two synthetic probes alone
-/// (decision 0022, item 5).
+/// Real top-level entry names (and whether each is a directory) of `folder`:
+/// at most [`MAX_PROBE_ENTRIES`], in the order the file system lists them, and
+/// only the names, never the contents. A folder that cannot be read, is empty
+/// or does not answer in time yields an empty list; the guard then falls back
+/// to the made-up names (decision 0022).
 fn real_children(folder: &Path) -> Vec<(String, bool)> {
     // In a helper thread with a time limit: a home directory on a network
     // file system that does not answer must not hang the request (which
@@ -1934,6 +1936,19 @@ interval_hours = 24
         // Without a re-include the order of plain excludes means nothing.
         let r = reductions(&cfg(&["a", "b", "c"]), &cfg(&["c", "a"]), true, true);
         assert!(!r.contains(&Reduction::ExcludesReordered), "{r:?}");
+        // A duplicate that is dropped is not a change of order.
+        let r = reductions(
+            &cfg(&["*.bak", "!k", "*.bak"]),
+            &cfg(&["!k", "*.bak"]),
+            true,
+            true,
+        );
+        assert!(!r.contains(&Reduction::ExcludesReordered), "{r:?}");
+        // The invisible characters refused in patterns (decision 0022).
+        for c in ['\u{180f}', '\u{13430}', '\u{202e}', '\u{200b}'] {
+            assert!(unprintable(c), "{c:?}");
+        }
+        assert!(!unprintable('ä') && !unprintable('-'));
     }
 
     #[test]

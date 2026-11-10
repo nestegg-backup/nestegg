@@ -244,13 +244,26 @@ impl SecretStore {
 
     fn encrypt(&self, name: &str, secret: &Secret, target: &Path, seal: SealWith) -> Result<()> {
         let tmp = target.with_extension("cred.tmp");
-        let mut child = Command::new(&self.creds_binary)
-            .args(encrypt_args(name, seal, &tmp))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("cannot run systemd-creds")?;
+        // "Text file busy" is a short-lived condition (the program file is
+        // still open for writing somewhere, e.g. during a package upgrade or
+        // in tests that have just written a stand-in): wait it out instead
+        // of treating it as "this way of sealing does not work".
+        let mut attempt = 0;
+        let mut child = loop {
+            let spawned = Command::new(&self.creds_binary)
+                .args(encrypt_args(name, seal, &tmp))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn();
+            match spawned {
+                Err(e) if e.raw_os_error() == Some(nix::libc::ETXTBSY) && attempt < 20 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                other => break other.context("cannot run systemd-creds")?,
+            }
+        };
         child
             .stdin
             .take()
