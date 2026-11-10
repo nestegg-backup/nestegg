@@ -705,6 +705,68 @@ impl<'a> Client<'a> {
         parse_snapshot_list(&String::from_utf8_lossy(&output.stdout))
     }
 
+    /// Like [`Client::list_snapshots`], but with a time limit. Used at the
+    /// end of a backup run (the server's verification state), where a server
+    /// that fell asleep must not keep the run and its lock hanging.
+    pub fn list_snapshots_bounded(
+        &self,
+        backup_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<SnapshotInfo>> {
+        let mut fds = FdPassing::new();
+        let mut cmd = self.command(&mut fds)?;
+        cmd.args([
+            "snapshot",
+            "list",
+            &format!("host/{backup_id}"),
+            "--output-format",
+            "json",
+        ]);
+        self.add_namespace(&mut cmd);
+        fds.apply(&mut cmd);
+        let cap = run_capturing(&mut cmd, Some(timeout))?;
+        match cap.stopped {
+            Stopped::TimedOut => bail!(
+                "listing the snapshots timed out after {}s",
+                timeout.as_secs()
+            ),
+            Stopped::Cancelled => bail!("listing the snapshots was cancelled"),
+            Stopped::No => {}
+        }
+        if !cap.status.success() {
+            bail!("{}", String::from_utf8_lossy(&cap.stderr).trim());
+        }
+        parse_snapshot_list(&String::from_utf8_lossy(&cap.stdout))
+    }
+
+    /// Like [`Client::set_notes`], but with a time limit (end of a backup
+    /// run, see [`Client::list_snapshots_bounded`]).
+    pub fn set_notes_bounded(
+        &self,
+        snapshot: &str,
+        notes: &str,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let mut fds = FdPassing::new();
+        let mut cmd = self.command(&mut fds)?;
+        cmd.args(["snapshot", "notes", "update", snapshot, notes]);
+        self.add_namespace(&mut cmd);
+        fds.apply(&mut cmd);
+        let cap = run_capturing(&mut cmd, Some(timeout))?;
+        match cap.stopped {
+            Stopped::TimedOut => bail!(
+                "writing the snapshot notes timed out after {}s",
+                timeout.as_secs()
+            ),
+            Stopped::Cancelled => bail!("writing the snapshot notes was cancelled"),
+            Stopped::No => {}
+        }
+        if !cap.status.success() {
+            bail!("{}", String::from_utf8_lossy(&cap.stderr).trim());
+        }
+        Ok(())
+    }
+
     pub fn set_notes(&self, snapshot: &str, notes: &str) -> Result<()> {
         let mut fds = FdPassing::new();
         let mut cmd = self.command(&mut fds)?;

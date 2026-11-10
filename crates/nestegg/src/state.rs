@@ -362,7 +362,8 @@ pub fn retry_not_before(
 }
 
 /// Fingerprint of the configuration file's content (SHA-256), `None` if it
-/// cannot be read. The file holds no secrets.
+/// cannot be read. Only this one-way digest is stored in the state: the
+/// file must not contain secrets, but a hook command in it might.
 pub fn config_stamp(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     Some(crate::secrets::digest(&crate::secrets::Secret::new(bytes)))

@@ -823,7 +823,9 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
     rep.phase(RunState::Finishing, "writing snapshot notes");
     let duration = (Utc::now() - rep.run.started_at).num_seconds();
     let notes = snapshot_notes(&rep.run, duration, &ctx);
-    if let Err(e) = client.set_notes(&snapshot, &notes) {
+    if let Err(e) =
+        client.set_notes_bounded(&snapshot, &notes, crate::client::readback_list_timeout())
+    {
         rep.warn(format!("could not write snapshot notes: {e:#}"));
     }
     rep.run.finish(RunState::Succeeded, Utc::now());
@@ -880,15 +882,16 @@ fn backup_metadata(
 /// Store the snapshots of this machine that the server's own verification
 /// marked as failed (`State::server_verify_failed`).
 fn record_server_verification(rep: &mut Reporter<'_>, client: &Client, backup_id: &str) {
-    let failed = match client.list_snapshots(backup_id) {
-        Ok(list) => crate::verify::failed_snapshots(&list),
-        Err(e) => {
-            rep.warn(format!(
-                "could not read the server's verification state: {e:#}"
-            ));
-            return;
-        }
-    };
+    let failed =
+        match client.list_snapshots_bounded(backup_id, crate::client::readback_list_timeout()) {
+            Ok(list) => crate::verify::failed_snapshots(&list),
+            Err(e) => {
+                rep.warn(format!(
+                    "could not read the server's verification state: {e:#}"
+                ));
+                return;
+            }
+        };
     if !failed.is_empty() {
         rep.line(&format!(
             "the server's verification marked {} snapshot(s) as failed: {}",
