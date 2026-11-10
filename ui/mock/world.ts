@@ -49,6 +49,8 @@ export const SCENARIOS = [
   "no_key",
   "no_timer",
   "cancelled",
+  "unknown_run",
+  "unknown_never",
   "daemon_down",
   "unauthorized",
 ] as const;
@@ -465,6 +467,27 @@ export class World {
           }),
         );
         break;
+      case "unknown_run": {
+        // Records written by a newer version: the newest run has a state this version does not know
+        // (the daemon reports health `failing` then), an older success has a trigger it does not know,
+        // and an older failure has an error kind it does not know.
+        this.history(now, 13, 1, { skip: [10, 5], pbsNight: 7 });
+        const done = this.runs.filter((r) => r.state === "succeeded");
+        if (done[1]) done[1].trigger = "unknown";
+        // The failure is on a day of its own (the unknown run is today), so both show on the strip.
+        const failedAt = localAt(now, 5, 1, 40);
+        const failed = makeRun(failedAt, "failed", {
+          error: { kind: "unknown", message: "quota exceeded on the server (error kind added in a later version)" },
+        });
+        this.runs.splice(this.runs.findIndex((r) => new Date(r.started_at).getTime() < failedAt), 0, failed);
+        this.runs.unshift(makeRun(now - 2 * HOUR, "unknown", { trigger: "unknown" }));
+        break;
+      }
+      case "unknown_never":
+        // No backup yet, and the one attempt that exists was written by a newer version.
+        this.runs.unshift(makeRun(now - 2 * HOUR, "unknown", { trigger: "unknown" }));
+        this.reachable = null;
+        break;
       case "key_not_exported":
         this.keyExported = false;
         this.runs.unshift(
@@ -625,7 +648,7 @@ export class World {
     if (!this.configured) health = "unconfigured";
     else if (this.active) health = "running";
     else if (!success) health = "never";
-    else if (last?.state === "failed") health = "failing";
+    else if (last?.state === "failed" || last?.state === "unknown") health = "failing";
     else if (now - new Date(success.finished_at ?? success.started_at).getTime() > overdueH * HOUR) health = "overdue";
     else if (success.incomplete?.length) health = "incomplete";
     else health = "ok";

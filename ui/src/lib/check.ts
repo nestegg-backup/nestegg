@@ -19,6 +19,35 @@ export interface CheckSummary {
   unreachable: boolean;
 }
 
+/** What is known about the backup server and since when. `reachable` null or absent: nothing known. */
+export interface Reach {
+  reachable?: boolean | null;
+  checked_at?: string | null;
+}
+
+/**
+ * What a connection check says about the server, or null when it has no such item (for example
+ * "no configuration"). A server that did not answer is "not reachable" whether the item failed or
+ * was only "not checked" (asleep, nobody asked to wake it): in both cases it did not answer.
+ */
+export function reachOfCheck(result: PbsCheckResult): Reach | null {
+  const item = result.checks.find((c) => c.name === REACHABLE_ITEM);
+  if (!item) return null;
+  return { reachable: itemStatus(item) === "passed", checked_at: result.checked_at };
+}
+
+/**
+ * The newest thing the page knows about the server. `status.pbs` holds what the last backup run
+ * found out; the daemon does not record the result of `POST /pbs/check` there. The page therefore
+ * keeps the result of its own check, and it wins until `/status` reports a later time.
+ */
+export function newestReach(pbs: Reach, check: Reach | null): Reach {
+  const fromStatus: Reach = { reachable: pbs.reachable ?? null, checked_at: pbs.checked_at ?? null };
+  if (!check || check.reachable == null || !check.checked_at) return fromStatus;
+  if (fromStatus.reachable == null || !fromStatus.checked_at) return check;
+  return Date.parse(check.checked_at) >= Date.parse(fromStatus.checked_at) ? check : fromStatus;
+}
+
 export function summarizeCheck(result: PbsCheckResult): CheckSummary {
   let failed = 0;
   let notChecked = 0;

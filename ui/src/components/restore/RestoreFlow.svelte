@@ -67,7 +67,8 @@
   .progress { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; max-width: 720px; }
   .progress li {
     border-top: 3px solid var(--rule); padding-top: 6px; font-size: var(--fs-s); color: var(--faint);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    /* Long titles wrap onto a second line (phone, German): they are never cut off. */
+    overflow-wrap: anywhere;
   }
   .progress li.done { border-color: var(--tick); color: var(--muted); }
   .progress li.now { border-color: var(--accent-text); color: var(--text); font-weight: 500; }

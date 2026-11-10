@@ -122,7 +122,27 @@ export function excludeProblem(pattern: string, limits: SettingsLimits = DEFAULT
   return null;
 }
 
-const isUint = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+const U32_MAX = 4_294_967_295;
+const isUint = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= U32_MAX;
+
+/** How serde (the daemon's JSON reader) names a value in "invalid type: <this>, expected ...". */
+function serdeUnexpected(v: unknown): string {
+  if (v === null) return "null";
+  if (typeof v === "boolean") return `boolean \`${v}\``;
+  if (typeof v === "number") return Number.isInteger(v) ? `integer \`${v}\`` : `floating point \`${v}\``;
+  if (typeof v === "string") return `string ${JSON.stringify(v)}`;
+  return Array.isArray(v) ? "sequence" : "map";
+}
+
+/**
+ * The daemon's answer to a body of the wrong type: `serde_json` rejects it while reading the
+ * request, so the text comes from serde and does not name the field (api: `invalid settings: …`).
+ * A number outside `u32` is a wrong "value", everything else a wrong "type".
+ */
+export function typeProblem(value: unknown, expected: "u32" | "a boolean" | "a sequence" | "a string"): string {
+  const kind = typeof value === "number" && Number.isInteger(value) && expected === "u32" ? "value" : "type";
+  return `invalid settings: invalid ${kind}: ${serdeUnexpected(value)}, expected ${expected}`;
+}
 
 /**
  * Check a `PATCH /config` body like the daemon does. Returns the error
@@ -148,11 +168,14 @@ export function settingsProblem(
   }
   const given = (k: SettingKey) => raw[k] !== undefined && raw[k] !== null;
   for (const k of ["interval_hours", "overdue_after_hours"] as const)
-    if (given(k) && !isUint(raw[k])) return `invalid settings: ${k} must be a non-negative integer`;
+    if (given(k) && !isUint(raw[k])) return typeProblem(raw[k], "u32");
   for (const k of ["wake_on_lan", "automatic_backups"] as const)
-    if (given(k) && typeof raw[k] !== "boolean") return `invalid settings: ${k} must be true or false`;
-  if (given("excludes") && !(Array.isArray(raw.excludes) && raw.excludes.every((p) => typeof p === "string")))
-    return "invalid settings: excludes must be a list of strings";
+    if (given(k) && typeof raw[k] !== "boolean") return typeProblem(raw[k], "a boolean");
+  if (given("excludes")) {
+    if (!Array.isArray(raw.excludes)) return typeProblem(raw.excludes, "a sequence");
+    const bad = raw.excludes.findIndex((p) => typeof p !== "string");
+    if (bad >= 0) return typeProblem(raw.excludes[bad], "a string");
+  }
   const change = raw as SettingsChange;
 
   const { interval_hours: iv, overdue_after_hours: od } = limits;

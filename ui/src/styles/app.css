@@ -151,6 +151,8 @@ code, .mono {
   .acts .btn { flex: 1 1 auto; padding: 10px 12px; }
   .selbar .btn { width: 100%; padding: 10px 12px; }
   .lead { font-size: 19px; }
+  /* A long label (German, or a narrow phone) wraps inside the button; it is never cut off or pushed out of the screen. */
+  .btn { white-space: normal; text-align: center; }
 }
 
 @media (prefers-reduced-motion: reduce) {

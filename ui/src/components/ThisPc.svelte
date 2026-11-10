@@ -67,6 +67,9 @@
       {:else}
         <h2 class="lead" tabindex="-1" class:bad={tone === "bad"}>{#if tone === "bad" || tone === "warn"}<Dot {tone} />{/if}{summary.lead}</h2>
         <p class="lead-text">{summary.text}</p>
+        {#if summary.autoOff}
+          <p class="hint"><a class="linkbtn" href={href({ view: "settings" })}>{t.self.toSettings}</a></p>
+        {/if}
         {#if offer === "empty" && status.last_success}
           <!-- The local history knows a backup, the server has none: say so instead of a dead end. -->
           <p class="hint">{t.restore.noSnapshots}</p>
@@ -190,6 +193,7 @@
             {t.self.nextBlocked[blocked]}
           {:else if !status.schedule.enabled}
             {t.self.nextOff}
+            <a class="linkbtn" href={href({ view: "settings" })}>{t.self.nextOffLink}</a>
           {:else if running}
             {t.self.runningLead}
           {:else if next}

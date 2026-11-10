@@ -52,11 +52,13 @@
     // Disk usage of the datastore, when the daemon can tell.
     untrack(() => void app.loadPbs());
   });
+  // The newest thing known: the last backup run or the check made on this page, whichever is later.
+  const reach = $derived(app.reach ?? p);
   const lead = $derived(
-    p.reachable === true ? t.server.reachableLead : p.reachable === false ? t.server.unreachableLead : t.server.unknownLead,
+    reach.reachable === true ? t.server.reachableLead : reach.reachable === false ? t.server.unreachableLead : t.server.unknownLead,
   );
   const text = $derived(
-    p.reachable == null || !p.checked_at ? t.server.unknownText : t.server.checked(f.moment(p.checked_at, app.now)),
+    reach.reachable == null || !reach.checked_at ? t.server.unknownText : t.server.checked(f.moment(reach.checked_at, app.now)),
   );
   // Finished runs and what they prove about the server (see serverContact).
   const contacts = $derived(
@@ -74,7 +76,7 @@
 
 <div class="head">
   <div class="status">
-    <h2 class="lead">{#if p.reachable === false}<Dot tone="pbs" />{/if}{lead}</h2>
+    <h2 class="lead">{#if reach.reachable === false}<Dot tone="pbs" />{/if}{lead}</h2>
     <p class="lead-text">{text}</p>
     <!-- The one live region of the check: it announces that the check runs, and the result when the
          focus is somewhere else. Otherwise the focus moves to the result and is read from there. -->

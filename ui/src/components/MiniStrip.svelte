@@ -22,4 +22,9 @@
     box-shadow: inset 0 0 0 1px var(--bad);
   }
   .k-run { background: var(--accent-text); }
+  /* Not understood: hollow with a dashed-looking grey base. */
+  .k-unknown {
+    background: linear-gradient(var(--muted), var(--muted)) bottom / 100% 5px no-repeat;
+    box-shadow: inset 0 0 0 1px var(--muted);
+  }
 </style>

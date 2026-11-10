@@ -29,7 +29,7 @@
   const others = $derived(
     app.machines && status ? sortMachines(app.machines.machines, status.machine.backup_id, app.now, overdueHours) : [],
   );
-  const server = $derived(status ? serverRow(status, t, f, app.now) : null);
+  const server = $derived(app.reach ? serverRow(app.reach, t, f, app.now) : null);
   // This PC: the same days as the boxes on its page, only once the history is loaded.
   const selfCells = $derived(
     status && status.health !== "unconfigured" && app.runs.state === "ok"

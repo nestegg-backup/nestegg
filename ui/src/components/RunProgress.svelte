@@ -1,6 +1,6 @@
 <script lang="ts">
   import { app } from "../lib/store.svelte";
-  import { runStep } from "../lib/derive";
+  import { runStep, runTrigger } from "../lib/derive";
   import { f, t } from "../lib/locale";
   import type { Run } from "../lib/types";
 
@@ -8,6 +8,11 @@
   let { run, wakeOnLan, stale = false }: { run: Run; wakeOnLan: boolean; stale?: boolean } = $props();
 
   const now = $derived(runStep(run.state));
+  /** A terminal start counts as "by hand". */
+  const how = $derived.by(() => {
+    const trigger = runTrigger(run);
+    return trigger === "timer" ? "timer" : trigger === "unknown" ? "unknown" : "manual";
+  });
   const elapsed = $derived(Math.max(0, (app.now.getTime() - new Date(run.started_at).getTime()) / 1000));
 
   // Archives finished so far against the size of the last backup: coarse (it moves after each archive), but honest.
@@ -62,7 +67,7 @@
     </li>
   {/each}
 </ol>
-<p class="hint">{stale ? t.conn.runUnknown : t.self.runningSince(f.duration(elapsed), run.trigger !== "timer")}</p>
+<p class="hint">{stale ? t.conn.runUnknown : t.self.runningSince(f.duration(elapsed), how)}</p>
 
 <style>
   .pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--accent-text); flex: none; transform: translateY(-2px); animation: pulse 1.6s ease-in-out infinite; }

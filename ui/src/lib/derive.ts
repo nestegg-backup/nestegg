@@ -2,12 +2,55 @@
 // No strings here except stable ids; texts live in ../i18n.
 
 import { daysBetween, shiftDayKey, type Formatter } from "./format";
-import type { ConfigView, Machine, Run, RunErrorKind, Status } from "./types";
+import type { ConfigView, Machine, Run, RunErrorKind, RunState, RunTrigger, Status } from "./types";
 
 export const ACTIVE_STATES = ["starting", "waking_pbs", "inventory", "uploading", "finishing"] as const;
 
 export function isActive(run: Pick<Run, "state"> | null | undefined): boolean {
   return !!run && (ACTIVE_STATES as readonly string[]).includes(run.state);
+}
+
+// ---------------------------------------------------------------- values of a newer version
+
+// The API sends `unknown` for a value written by a newer version of nestegg (api/openapi.yaml). A
+// daemon that is older than this page, or a future one, can also send a word this page has never
+// seen. Such a word is the same thing as `unknown`: it must never fall into a branch that was meant
+// for a known value (cancelled, succeeded, internal error, ...). Every lookup over a state, trigger
+// or error kind goes through these three functions.
+
+const RUN_STATES: readonly string[] = [...ACTIVE_STATES, "succeeded", "failed", "pbs_unreachable", "cancelled"];
+const RUN_TRIGGERS: readonly string[] = ["timer", "manual", "cli"];
+const ERROR_KINDS: readonly string[] = [
+  "pbs_unreachable",
+  "authentication",
+  "source_missing",
+  "client_missing",
+  "client_failed",
+  "already_running",
+  "config",
+  "credentials_unreadable",
+  "verification_failed",
+  "cancelled",
+  "internal",
+];
+
+/** The state of a run; a state this page does not know counts as `unknown`. */
+export function runState(run: Pick<Run, "state">): RunState {
+  return RUN_STATES.includes(run.state) ? run.state : "unknown";
+}
+
+/** The run's state is one this version does not understand: it must be shown as exactly that. */
+export function isUnknownRun(run: Pick<Run, "state"> | null | undefined): boolean {
+  return !!run && runState(run) === "unknown";
+}
+
+export function runTrigger(run: Pick<Run, "trigger">): RunTrigger {
+  return RUN_TRIGGERS.includes(run.trigger) ? run.trigger : "unknown";
+}
+
+/** An error kind as one this page has a text for; anything else is `unknown`. */
+export function knownErrorKind(kind: string | null | undefined): RunErrorKind {
+  return kind && ERROR_KINDS.includes(kind) ? (kind as RunErrorKind) : "unknown";
 }
 
 /** What the detail page of this PC is about, in priority order. */
@@ -17,6 +60,9 @@ export function selfKind(s: Status): SelfKind {
   if (s.health === "unconfigured") return "unconfigured";
   if (s.health === "running" || isActive(s.current_run)) return "running";
   if (s.encryption.enabled && s.encryption.key_exported === false) return "key_missing";
+  // The daemon reports `failing` when the last run's state is unknown. An older daemon says `ok`
+  // then: the page does not repeat "Everything is fine" above an entry it cannot read.
+  if (isUnknownRun(s.last_run) && (s.health === "ok" || s.health === "incomplete" || s.health === "overdue")) return "failing";
   switch (s.health) {
     case "failing":
       return "failing";
@@ -65,7 +111,7 @@ export function ageOf(iso: string, now: Date): { hours: number; days: number } {
 
 // ---------------------------------------------------------------- 14-day strip
 
-export type DayKind = "ok" | "incomplete" | "damaged" | "fail" | "pbs" | "none" | "run";
+export type DayKind = "ok" | "incomplete" | "damaged" | "fail" | "pbs" | "unknown" | "none" | "run";
 
 export interface DayCell {
   key: string; // YYYY-MM-DD, local calendar day; format it with f.keyShort/keyLong/keyNumber
@@ -89,7 +135,8 @@ export function dayStrip(
   }
   // A complete backup beats an incomplete one of the same day; a day whose
   // only snapshot is damaged is not a backed-up day.
-  const rank: DayKind[] = ["ok", "incomplete", "damaged", "run", "fail", "pbs"];
+  // A run this version cannot read is the weakest evidence: any known result of the day beats it.
+  const rank: DayKind[] = ["ok", "incomplete", "damaged", "run", "fail", "pbs", "unknown"];
   const cells: DayCell[] = [];
   for (let i = count - 1; i >= 0; i--) {
     const key = shiftDayKey(todayKey, -i);
@@ -108,12 +155,26 @@ export function runEvents(
 ): { at: string; kind: Exclude<DayKind, "none"> }[] {
   const out: { at: string; kind: Exclude<DayKind, "none"> }[] = [];
   for (const r of runs) {
-    if (r.state === "succeeded") {
-      const k = succeededKind(r, damaged);
-      out.push({ at: r.started_at, kind: k === "warnings" ? "ok" : k });
+    const state = runState(r);
+    switch (state) {
+      case "succeeded": {
+        const k = succeededKind(r, damaged);
+        out.push({ at: r.started_at, kind: k === "warnings" ? "ok" : k });
+        break;
+      }
+      case "failed":
+        out.push({ at: r.started_at, kind: "fail" });
+        break;
+      case "pbs_unreachable":
+        out.push({ at: r.started_at, kind: "pbs" });
+        break;
+      case "unknown":
+        out.push({ at: r.started_at, kind: "unknown" });
+        break;
+      default:
+        // cancelled: no mark (as before); a running state is drawn from `current` below
+        break;
     }
-    else if (r.state === "failed") out.push({ at: r.started_at, kind: "fail" });
-    else if (r.state === "pbs_unreachable") out.push({ at: r.started_at, kind: "pbs" });
   }
   if (current && isActive(current)) out.push({ at: current.started_at, kind: "run" });
   return out;
@@ -238,22 +299,51 @@ export function historyRows(runs: Run[], f: Formatter): RunRow[] {
       continue;
     }
     const expandable =
-      run.state === "failed" || run.state === "pbs_unreachable" || (run.warnings?.length ?? 0) > 0 || isIncomplete(run);
+      run.state === "failed" ||
+      run.state === "pbs_unreachable" ||
+      isUnknownRun(run) ||
+      (run.warnings?.length ?? 0) > 0 ||
+      isIncomplete(run);
     rows.push({ run, count: 1, expandable });
   }
   return rows;
 }
 
+/** Colour of the dot in a history row. A run this version cannot read is amber: neither a success nor a failure. */
+export function runTone(run: Run, damaged: ReadonlySet<string> = new Set()): Tone {
+  switch (runState(run)) {
+    case "failed":
+      return "bad";
+    case "pbs_unreachable":
+      return "pbs";
+    case "succeeded": {
+      const k = succeededKind(run, damaged);
+      return k === "damaged" ? "bad" : k === "incomplete" || k === "warnings" ? "warn" : "neutral";
+    }
+    case "unknown":
+      return "warn";
+    default:
+      return "neutral";
+  }
+}
+
 export function errorKind(run: Run): RunErrorKind | null {
-  if (run.error?.kind) return run.error.kind;
-  if (run.state === "pbs_unreachable") return "pbs_unreachable";
-  if (run.state === "failed") return "internal";
-  return null;
+  if (run.error?.kind) return knownErrorKind(run.error.kind);
+  switch (runState(run)) {
+    case "pbs_unreachable":
+      return "pbs_unreachable";
+    case "failed":
+      return "internal";
+    case "unknown":
+      return "unknown";
+    default:
+      return null;
+  }
 }
 
 /** Progress steps for a running backup: index of the current step (0-3). */
 export function runStep(state: Run["state"]): number {
-  switch (state) {
+  switch (runState({ state })) {
     case "starting":
     case "waking_pbs":
       return 0;
@@ -281,10 +371,11 @@ export function runStep(state: Run["state"]): number {
  * happen anywhere.
  */
 export function serverContact(run: Run): "reached" | "not_reached" | "unknown" {
-  if (run.state === "succeeded") return "reached";
-  if (run.state === "pbs_unreachable") return "not_reached";
-  if (run.state === "failed") {
-    const k = run.error?.kind;
+  const state = runState(run);
+  if (state === "succeeded") return "reached";
+  if (state === "pbs_unreachable") return "not_reached";
+  if (state === "failed") {
+    const k = errorKind(run);
     if (k === "authentication" || k === "client_missing" || k === "client_failed") return "reached";
     if (k === "pbs_unreachable") return "not_reached";
   }
@@ -343,7 +434,8 @@ export function machineEvents(m: Machine): { at: string; kind: Exclude<DayKind, 
   if (m.last_snapshot && !(m.recent_snapshots ?? []).includes(m.last_snapshot)) out.push({ at: m.last_snapshot, kind: "ok" });
   const r = m.report;
   if (r && r.result !== "succeeded") {
-    out.push({ at: r.run_started_at ?? r.reported_at, kind: r.result === "failed" ? "fail" : "pbs" });
+    const kind = r.result === "failed" ? "fail" : r.result === "pbs_unreachable" ? "pbs" : "unknown";
+    out.push({ at: r.run_started_at ?? r.reported_at, kind });
   }
   return out;
 }

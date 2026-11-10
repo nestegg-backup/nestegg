@@ -92,6 +92,24 @@ is needed.
   and so is everything that needs the server. The UI therefore checks
   without `wake` first and offers "wake the server and check again". Items
   without `status` (older daemons) are read by `ok`.
+- **The result of `POST /pbs/check` is not recorded in `/status` (open):**
+  `status.pbs.reachable` and `checked_at` are written only by a backup run
+  (`run.rs`); `pbs_check` in the daemon answers and forgets. After a check in
+  which the server did not answer, `/status` therefore still says "reachable"
+  with the time of the last backup. The UI keeps the result of its own check
+  (reachable = the item "PBS reachable" passed; failed and not checked both
+  count as "did not answer") and shows it in the server view, the sidebar and
+  the status bar until `/status` reports a later `checked_at`. That only holds
+  for this page session: another tab, or a reload, shows the run's value
+  again. If the daemon wrote the check's result into the state, as
+  `reachable`/`checked_at` of the status, every client would agree. Optional.
+- **`unknown` run values (settled):** the contract has `unknown` for a run
+  `state`, `trigger` and `error.kind` written by a newer version. The UI
+  treats any word it does not know like `unknown` and says so ("not
+  understood by this version of nestegg, update nestegg") in the history, the
+  14-day strip and the headline. The daemon reports `health = failing` when
+  the last run's state is unknown; a daemon that still says `ok` gets the same
+  headline from the UI. `MachineReport.result` (other PCs) is read the same way.
 - **Who may cancel:** `POST /runs/{id}/cancel` does not mention permissions.
   The UI offers the button to every user of the page and shows the daemon's
   message for any other error.

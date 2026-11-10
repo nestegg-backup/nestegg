@@ -2,6 +2,7 @@
 
 import { api, ApiFailure, optional } from "./api";
 import { initBrowserSession } from "./session";
+import { newestReach, reachOfCheck, type Reach } from "./check";
 import { isActive } from "./derive";
 import type {
   ConfigView,
@@ -60,6 +61,8 @@ class AppState {
     | { state: "done"; result: PbsCheckResult; wake: boolean }
     | { state: "error"; message: string }
   >({ state: "idle" });
+  /** What the newest connection check of this page session found out about the server; kept across new checks. */
+  checkReach = $state<Reach | null>(null);
   /** The cancel action of the running backup. */
   cancel = $state<
     | { state: "idle" }
@@ -77,6 +80,11 @@ class AppState {
 
   get running(): boolean {
     return isActive(this.status?.current_run);
+  }
+
+  /** The newest thing known about the server: the last backup run (`/status`) or this page's own check. */
+  get reach(): Reach | null {
+    return this.status ? newestReach(this.status.pbs, this.checkReach) : null;
   }
 
   /** Cached data is shown, but the daemon does not answer right now. */
@@ -259,7 +267,9 @@ class AppState {
     this.pbsCheck = { state: "running", wake };
     try {
       // An unreachable server is a normal answer (200 with a failed "PBS reachable" item), not an error.
-      this.pbsCheck = { state: "done", result: await api.checkPbs(wake), wake };
+      const result = await api.checkPbs(wake);
+      this.pbsCheck = { state: "done", result, wake };
+      this.checkReach = reachOfCheck(result) ?? this.checkReach;
     } catch (e) {
       this.pbsCheck = { state: "error", message: asFailure(e).message };
     }

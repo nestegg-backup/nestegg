@@ -60,7 +60,10 @@ export function problemText(message: string, t: Messages): string | null {
     return p.overdueCapped(num(m[1]), num(m[2]), m[3] === undefined ? null : num(m[3]));
   if ((m = /^overdue_after_hours must be between (\d+) and (\d+)/.exec(message))) return p.overdueRange(num(m[1]), num(m[2]));
   if ((m = /must be greater than interval_hours \((\d+)\)/.exec(message))) return p.overdueNotGreater(num(m[1]));
-  if (/must be a non-negative integer/.test(message)) return p.wholeNumber;
+  // A wrong type or an out-of-range number: serde's own text, without the name of the field, for
+  // example "invalid settings: invalid value: integer `-1`, expected u32" or "... invalid type:
+  // floating point `1.5`, expected u32". Only the two hour fields are numbers.
+  if (/^invalid settings: invalid (?:type|value): .*, expected u32$/s.test(message)) return p.wholeNumber;
   if (/^exclude patterns must not be empty/.test(message)) return p.excludeEmpty;
   if ((m = /^exclude patterns may have at most (\d+) (?:bytes|characters)/.exec(message))) return p.excludeTooLong(num(m[1]));
   if (/contains a control character/.test(message)) return p.excludeControl;

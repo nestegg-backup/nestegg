@@ -116,11 +116,15 @@ const de = {
           : `${dayMonth} ${m.time} gesichert, unvollständig`,
     failing: (day: string) => `Fehlgeschlagen am ${day}`,
     failingUndated: "Letzte Sicherung fehlgeschlagen",
+    unknownRun: "Letzter Eintrag nicht verstanden",
     overdue: (day: string) => `Überfällig, zuletzt ${day}`,
     never: "Noch nie gesichert",
     neverServer: "Frühere Stände auf dem Server",
     overdueUndated: "Überfällig",
     okUndated: "Gesichert",
+    okOffUndated: "Gesichert, automatische Sicherung aus",
+    okOff: (m: Moment, dayMonth: string) =>
+      `${m.rel === "today" ? `Heute ${m.time} gesichert` : m.rel === "yesterday" ? `Gestern ${m.time} gesichert` : `${dayMonth} ${m.time} gesichert`}, automatische Sicherung aus`,
     ok: (m: Moment, dayMonth: string) =>
       m.rel === "today" ? `Heute ${m.time} gesichert` : m.rel === "yesterday" ? `Gestern ${m.time} gesichert` : `${dayMonth} ${m.time} gesichert`,
     serverReachable: (time: string) => `Erreichbar, geprüft um ${time}`,
@@ -151,11 +155,18 @@ const de = {
       `Die nächste Sicherung ist ${at(m)} fällig. Ist der PC dann aus, wird sie beim nächsten Einschalten nachgeholt.`,
     nextRunDue: "Die nächste Sicherung ist fällig und startet in Kürze.",
     scheduleOff:
-      "Die automatische Sicherung ist ausgeschaltet. Gesichert wird nur, wenn du sie startest.",
+      "Die automatische Sicherung ist ausgeschaltet. Gesichert wird nur, wenn du sie startest. In den Einstellungen kannst du sie einschalten.",
+    okOffLead: "Die automatische Sicherung ist aus.",
+    okOffText: "Gesichert wird nur, wenn du die Sicherung startest. Einschalten kannst du sie in den Einstellungen.",
+    okOffDamaged: "Der Server hat aber beschädigte Sicherungen gemeldet, siehe unten.",
+    toSettings: "Zu den Einstellungen",
     lastAttemptPbs: (m: Moment) => `Der letzte Versuch ${at(m)} hat den Backup-Server nicht erreicht.`,
     autoRetry: "nestegg versucht es stündlich von selbst wieder.",
     failingLead: (m: Moment) => `Die Sicherung ${at(m)} ist fehlgeschlagen.`,
     failingLeadUndated: "Die letzte Sicherung ist fehlgeschlagen.",
+    unknownLead: (m: Moment) => `Der letzte Eintrag im Verlauf, ${at(m)}, wird von dieser Version von nestegg nicht verstanden.`,
+    unknownText:
+      "Er stammt vermutlich von einer neueren Version von nestegg. Ob diese Sicherung geklappt hat, ist deshalb unklar. Aktualisiere nestegg.",
     overdueLead: (days: number, hours: number) =>
       days >= 2 ? `Seit ${days} Tagen nicht gesichert.` : `Seit ${hours} Stunden nicht gesichert.`,
     overduePbs:
@@ -168,10 +179,12 @@ const de = {
     neverNext: (m: Moment) => `Die erste Sicherung ist ${at(m)} fällig. Du kannst sie auch jetzt starten.`,
     neverNow: "Du kannst die erste Sicherung jetzt starten.",
     neverAttempt: (m: Moment) => `Der letzte Versuch ${at(m)} hat nicht geklappt.`,
+    neverUnknown: (m: Moment) =>
+      `Der letzte Versuch ${at(m)} wird von dieser Version von nestegg nicht verstanden. Aktualisiere nestegg.`,
     runningLead: "Sicherung läuft.",
     runningText: "Du kannst diese Seite schließen, die Sicherung läuft im Hintergrund weiter.",
-    runningSince: (dur: string, manual: boolean) =>
-      `${manual ? "Von Hand gestartet" : "Vom Zeitplan gestartet"}, läuft seit ${dur}`,
+    runningSince: (dur: string, how: "timer" | "manual" | "unknown") =>
+      `${how === "manual" ? "Von Hand gestartet" : how === "timer" ? "Vom Zeitplan gestartet" : "Auf unbekannte Weise gestartet"}, läuft seit ${dur}`,
     stepWake: "Server wecken",
     stepReach: "Server erreichen",
     stepWakeNow: "Server wird geweckt. Warte auf Antwort.",
@@ -201,7 +214,8 @@ const de = {
       key_confirm: "Noch keine, die Schlüsselkopie ist nicht bestätigt",
       credentials_unreadable: "Noch keine, die gespeicherten Zugangsdaten sind nicht lesbar",
     },
-    nextOff: "Keine, automatisch sichern ist aus",
+    nextOff: "Keine, automatisch sichern ist aus.",
+    nextOffLink: "In den Einstellungen einschalten",
     onServer: (size: string, count: number) =>
       `${size} im letzten Stand, ${count} ${plural(count, "Stand", "Stände")} insgesamt`,
     onServerCount: (count: number) => `${count} ${plural(count, "Stand", "Stände")}`,
@@ -262,7 +276,7 @@ const de = {
     setupIntro:
       "nestegg braucht drei Angaben vom Backup-Server: seine Adresse, den Datastore (der Speicherplatz dort) und ein API-Token, also einen Zugangsschlüssel nur für diesen PC. Ein Token besteht aus einer ID und einem Secret (so nennt es auch die Weboberfläche des Servers). Die ID trägst du unten ein, das Secret tippst du nie hier auf der Seite ein, sondern nur im Terminal beim nächsten Schritt.",
     setupClient:
-      "Außerdem muss das Programm proxmox-backup-client installiert sein. Wie das geht, steht in der Dokumentation (docs/configuration.md, Abschnitt „Installing the backup client“).",
+      "Außerdem muss das Programm proxmox-backup-client installiert sein. Wie das geht, steht in der Dokumentation, die mit nestegg installiert wird: in der Datei /usr/share/doc/nestegg/configuration.md, im Abschnitt mit dem (englischen) Titel „Installing the backup client“.",
     server: "Adresse des Backup-Servers",
     serverPlaceholder: "pbs.example.com:8007",
     datastore: "Datastore",
@@ -345,6 +359,7 @@ const de = {
     run: "Läuft gerade",
     incomplete: "Unvollständig gesichert",
     damaged: "Beschädigt auf dem Server",
+    unknown: "Eintrag nicht verstanden",
   },
   runs: {
     succeeded: "Gesichert",
@@ -354,6 +369,8 @@ const de = {
     pbs: "Server nicht erreichbar",
     pbsTimes: (n: number) => `Server nicht erreichbar, ${n} Versuche`,
     cancelled: "Abgebrochen",
+    unknown: "Nicht verstanden, bitte nestegg aktualisieren",
+    succeededOtherStart: "Gesichert, auf unbekannte Weise gestartet",
     succeededIncomplete: "Gesichert, aber unvollständig",
     damaged: "Gesichert, aber auf dem Server beschädigt",
     incompleteReasons: "Was fehlt",
@@ -386,6 +403,7 @@ const de = {
     verification_failed: "Kontrolle nach dem Hochladen fehlgeschlagen",
     cancelled: "abgebrochen",
     internal: "interner Fehler",
+    unknown: "unbekannter Fehler",
   } satisfies Record<RunErrorKind, string>,
   explain: {
     pbs_unreachable:
@@ -407,6 +425,8 @@ const de = {
       "Die Sicherung wurde hochgeladen, aber beim anschließenden Gegenlesen vom Server kam etwas anderes zurück als abgeschickt wurde oder gar nichts. Deshalb gilt sie nicht als gelungen. Starte die Sicherung noch einmal. Wiederholt sich der Fehler, prüfe den Backup-Server: freier Platz, Platten, Netzwerk.",
     cancelled: "Die Sicherung wurde abgebrochen. Schon hochgeladene Daten gehen nicht verloren.",
     internal: "In nestegg selbst ist ein Fehler aufgetreten. Was genau passiert ist, steht im Protokoll.",
+    unknown:
+      "Diese Version von nestegg versteht diesen Eintrag nicht. Er stammt vermutlich von einer neueren Version. Aktualisiere nestegg.",
   } satisfies Record<RunErrorKind, string>,
   other: {
     failingLead: (m: Moment) => `Die Sicherung ${at(m)} ist fehlgeschlagen.`,

@@ -76,7 +76,13 @@ describe("status sentence of this PC", () => {
 
   it("mentions a switched-off schedule", () => {
     const s = selfSummary(status({ schedule: { enabled: false } }), de, fde, now);
-    expect(s.text).toContain("Die automatische Sicherung ist ausgeschaltet.");
+    // Not "Alles in Ordnung": the lead says what is off, the text when the last backup was.
+    expect(s.lead).toBe("Die automatische Sicherung ist aus.");
+    expect(s.text).toContain("Zuletzt gesichert heute um 01:42.");
+    expect(s.text).toContain("Gesichert wird nur, wenn du die Sicherung startest.");
+    // Other states keep the plain sentence.
+    const overdue = selfSummary(status({ schedule: { enabled: false }, health: "overdue" }), de, fde, now);
+    expect(overdue.text).toContain("Die automatische Sicherung ist ausgeschaltet.");
   });
 });
 
@@ -136,14 +142,14 @@ describe("other PCs and server", () => {
 
   it("server line in the list states the last check, with time", () => {
     const st = status({});
-    expect(serverRow({ ...st, pbs: { ...st.pbs, reachable: true, checked_at: "2026-11-08T00:42:00Z" } }, de, fde, now).text).toBe("Erreichbar, geprüft um 01:42");
+    expect(serverRow({ ...st.pbs, reachable: true, checked_at: "2026-11-08T00:42:00Z" }, de, fde, now).text).toBe("Erreichbar, geprüft um 01:42");
     // Wake-on-LAN does not turn "not reachable" into "asleep".
-    expect(serverRow({ ...st, pbs: { ...st.pbs, reachable: false, checked_at: "2026-11-08T13:30:00Z", wake_on_lan: true } }, de, fde, now)).toEqual({
+    expect(serverRow({ ...st.pbs, reachable: false, checked_at: "2026-11-08T13:30:00Z" }, de, fde, now)).toEqual({
       tone: "pbs",
       text: "Nicht erreichbar, geprüft um 14:30",
     });
-    expect(serverRow({ ...st, pbs: { ...st.pbs, reachable: false, checked_at: "2026-11-05T13:30:00Z" } }, en, fen, now).text).toBe("Not reachable, checked on 5 Nov");
-    expect(serverRow({ ...st, pbs: { ...st.pbs, reachable: null } }, de, fde, now).text).toBe("Noch nicht geprüft");
+    expect(serverRow({ ...st.pbs, reachable: false, checked_at: "2026-11-05T13:30:00Z" }, en, fen, now).text).toBe("Not reachable, checked on 5 Nov");
+    expect(serverRow({ ...st.pbs, reachable: null }, de, fde, now).text).toBe("Noch nicht geprüft");
   });
 });
 
@@ -193,7 +199,7 @@ describe("contract-valid minimal status objects", () => {
         expect(s.lead.length).toBeGreaterThan(0);
         expect(s.lead + s.text).not.toMatch(/undefined|null|NaN|Invalid/);
         expect(selfRowText(st, msgs, fmt, now)).not.toMatch(/undefined|null|NaN|Invalid/);
-        expect(serverRow(st, msgs, fmt, now).text.length).toBeGreaterThan(0);
+        expect(serverRow(st.pbs, msgs, fmt, now).text.length).toBeGreaterThan(0);
       }
     }
   });

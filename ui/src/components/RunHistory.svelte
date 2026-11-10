@@ -8,9 +8,9 @@
 <script lang="ts">
   import Dot from "./Dot.svelte";
   import { api } from "../lib/api";
-  import { errorKind, isIncomplete, otherWarnings, succeededKind, type RunRow } from "../lib/derive";
+  import { errorKind, isIncomplete, otherWarnings, runTone, type RunRow } from "../lib/derive";
+  import { runResultText } from "../lib/text";
   import { f, t } from "../lib/locale";
-  import type { Run } from "../lib/types";
 
   /**
    * `remote`: rows of another PC, built from what the PBS reports; there is no
@@ -36,38 +36,6 @@
   function isOpen(row: RunRow, i: number): boolean {
     if (!row.expandable) return false;
     return toggled[row.run.id] ?? (i === 0 && row.run.state === "failed");
-  }
-
-  function what(row: RunRow): string {
-    const r = row.run;
-    switch (r.state) {
-      case "succeeded":
-        switch (succeededKind(r, damaged)) {
-          case "damaged":
-            return t.runs.damaged;
-          case "incomplete":
-            return t.runs.succeededIncomplete;
-          case "warnings":
-            return t.runs.succeededWarnings(otherWarnings(r).length);
-        }
-        return r.trigger === "timer" ? t.runs.succeeded : t.runs.succeededManual;
-      case "failed":
-        return t.runs.failed(t.reason[errorKind(r) ?? "internal"]);
-      case "pbs_unreachable":
-        return row.count > 1 ? t.runs.pbsTimes(row.count) : t.runs.pbs;
-      default:
-        return t.runs.cancelled;
-    }
-  }
-
-  function tone(r: Run) {
-    if (r.state === "failed") return "bad";
-    if (r.state === "pbs_unreachable") return "pbs";
-    if (r.state === "succeeded") {
-      const k = succeededKind(r, damaged);
-      return k === "damaged" ? "bad" : k === "incomplete" || k === "warnings" ? "warn" : "neutral";
-    }
-    return "neutral";
   }
 
   const slug = (id: string) => `log-${id.replace(/[^A-Za-z0-9_-]/g, "_")}`;
@@ -120,7 +88,7 @@
         <tr class="run" class:bad={r.state === "failed"}>
           <td class="m">{f.dayShort(r.started_at)}</td>
           <td class="start">{f.time(r.started_at)}</td>
-          <td class="c-res"><span class="res"><Dot tone={tone(r)} /><span class:muted={r.state === "cancelled"}>{what(row)}</span></span></td>
+          <td class="c-res"><span class="res"><Dot tone={runTone(r, damaged)} /><span class:muted={r.state === "cancelled"}>{runResultText(r, row.count, damaged, t)}</span></span></td>
           {#if !remote}<td class="m c-dur">{r.duration_seconds != null ? f.duration(r.duration_seconds) : ""}</td>{/if}
           <td class="r c-end" class:c-empty={!row.expandable && (remote || r.uploaded_bytes == null || r.state !== "succeeded")}>
             {#if row.expandable}

@@ -114,11 +114,15 @@ const en = {
           : `Backed up ${dayMonth} ${m.time}, incomplete`,
     failing: (day: string) => `Failed on ${day}`,
     failingUndated: "Last backup failed",
+    unknownRun: "Last entry not understood",
     overdue: (day: string) => `Overdue, last ${day}`,
     never: "Never backed up",
     neverServer: "Earlier backups on the server",
     overdueUndated: "Overdue",
     okUndated: "Backed up",
+    okOffUndated: "Backed up, automatic backups off",
+    okOff: (m: Moment, dayMonth: string) =>
+      `${m.rel === "today" ? `Backed up today ${m.time}` : m.rel === "yesterday" ? `Backed up yesterday ${m.time}` : `Backed up ${dayMonth} ${m.time}`}, automatic backups off`,
     ok: (m: Moment, dayMonth: string) =>
       m.rel === "today"
         ? `Backed up today ${m.time}`
@@ -152,11 +156,19 @@ const en = {
     nextRun: (m: Moment) =>
       `The next backup is due ${at(m)}. If the computer is off then, it catches up the next time it is switched on.`,
     nextRunDue: "The next backup is due and starts shortly.",
-    scheduleOff: "Automatic backups are switched off. Backups only happen when you start them.",
+    scheduleOff:
+      "Automatic backups are switched off. Backups only happen when you start them. You can switch them on in the settings.",
+    okOffLead: "Automatic backups are off.",
+    okOffText: "Backups only happen when you start them. You can switch automatic backups on in the settings.",
+    okOffDamaged: "The server did report damaged backups though, see below.",
+    toSettings: "Go to the settings",
     lastAttemptPbs: (m: Moment) => `The last attempt ${at(m)} could not reach the backup server.`,
     autoRetry: "nestegg tries again every hour by itself.",
     failingLead: (m: Moment) => `The backup ${at(m)} failed.`,
     failingLeadUndated: "The last backup failed.",
+    unknownLead: (m: Moment) => `The last entry in the history, ${at(m)}, is not understood by this version of nestegg.`,
+    unknownText:
+      "It was probably written by a newer version of nestegg, so it is unclear whether that backup worked. Update nestegg.",
     overdueLead: (days: number, hours: number) =>
       days >= 2 ? `Not backed up for ${days} days.` : `Not backed up for ${hours} hours.`,
     overduePbs: "The backup server was not reachable during the last attempts. This computer did nothing wrong.",
@@ -168,9 +180,12 @@ const en = {
     neverNext: (m: Moment) => `The first backup is due ${at(m)}. You can also start it now.`,
     neverNow: "You can start the first backup now.",
     neverAttempt: (m: Moment) => `The last attempt ${at(m)} did not work.`,
+    neverUnknown: (m: Moment) =>
+      `The last attempt ${at(m)} is not understood by this version of nestegg. Update nestegg.`,
     runningLead: "Backup in progress.",
     runningText: "You can close this page; the backup keeps running in the background.",
-    runningSince: (dur: string, manual: boolean) => `${manual ? "Started by hand" : "Started by the schedule"}, running for ${dur}`,
+    runningSince: (dur: string, how: "timer" | "manual" | "unknown") =>
+      `${how === "manual" ? "Started by hand" : how === "timer" ? "Started by the schedule" : "Started in an unknown way"}, running for ${dur}`,
     stepWake: "Wake the server",
     stepReach: "Reach the server",
     stepWakeNow: "Waking the server. Waiting for an answer.",
@@ -200,7 +215,8 @@ const en = {
       key_confirm: "None yet, the key copy is not confirmed",
       credentials_unreadable: "None yet, the stored secrets cannot be read",
     },
-    nextOff: "None, automatic backups are off",
+    nextOff: "None, automatic backups are off.",
+    nextOffLink: "Switch on in the settings",
     onServer: (size: string, count: number) =>
       `${size} in the latest backup, ${count} ${plural(count, "backup", "backups")} in total`,
     onServerCount: (count: number) => `${count} ${plural(count, "backup", "backups")}`,
@@ -261,7 +277,7 @@ const en = {
     setupIntro:
       "nestegg needs three things from the backup server: its address, the datastore (the storage space there) and an API token, an access key for this computer only. A token consists of an ID and a secret (the web interface of the server calls it “Secret”). You enter the ID below; you never type the secret on this page, only in the terminal in the next step.",
     setupClient:
-      "The program proxmox-backup-client must be installed as well. How to do that is described in the documentation (docs/configuration.md, section “Installing the backup client”).",
+      "The program proxmox-backup-client must be installed as well. How to do that is described in the documentation that is installed with nestegg: in the file /usr/share/doc/nestegg/configuration.md, in the section titled “Installing the backup client” (the documentation is in English).",
     server: "Address of the backup server",
     serverPlaceholder: "pbs.example.com:8007",
     datastore: "Datastore",
@@ -344,6 +360,7 @@ const en = {
     run: "Running now",
     incomplete: "Backed up incompletely",
     damaged: "Damaged on the server",
+    unknown: "Entry not understood",
   },
   runs: {
     succeeded: "Backed up",
@@ -353,6 +370,8 @@ const en = {
     pbs: "Server not reachable",
     pbsTimes: (n: number) => `Server not reachable, ${n} attempts`,
     cancelled: "Cancelled",
+    unknown: "Not understood, please update nestegg",
+    succeededOtherStart: "Backed up, started in an unknown way",
     succeededIncomplete: "Backed up, but incomplete",
     damaged: "Backed up, but damaged on the server",
     incompleteReasons: "What is missing",
@@ -385,6 +404,7 @@ const en = {
     verification_failed: "check after the upload failed",
     cancelled: "cancelled",
     internal: "internal error",
+    unknown: "unknown error",
   },
   explain: {
     pbs_unreachable:
@@ -403,6 +423,8 @@ const en = {
       "The backup was uploaded, but reading it back from the server returned something different from what was sent, or nothing at all. That is why it does not count as successful. Start the backup again. If the error repeats, check the backup server: free space, disks, network.",
     cancelled: "The backup was cancelled. Data that was already uploaded is not lost.",
     internal: "An error happened inside nestegg itself. The log shows what exactly happened.",
+    unknown:
+      "This version of nestegg does not understand this entry. It was probably written by a newer version. Update nestegg.",
   },
   other: {
     failingLead: (m: Moment) => `The backup ${at(m)} failed.`,

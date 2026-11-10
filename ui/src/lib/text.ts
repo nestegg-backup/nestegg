@@ -2,7 +2,8 @@
 // can be tested with both languages.
 
 import type { Messages } from "../i18n";
-import { ageOf, errorKind, machineKind, runEnd, selfKind, setupGuide, type MachineKind, type SelfKind, type ServerBackups } from "./derive";
+import { ageOf, errorKind, isUnknownRun, knownErrorKind, machineKind, otherWarnings, runEnd, runState, runTrigger, selfKind, setupGuide, succeededKind, type MachineKind, type SelfKind, type ServerBackups } from "./derive";
+import type { Reach } from "./check";
 import type { Formatter } from "./format";
 import type { Machine, Run, Status } from "./types";
 
@@ -15,6 +16,8 @@ export interface Summary {
   kind: SelfKind;
   lead: string;
   text: string;
+  /** Automatic backups are switched off although nothing else is wrong: the page offers the way to the settings. */
+  autoOff?: boolean;
 }
 
 /**
@@ -47,6 +50,10 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       if (setupGuide(s)?.current === "key_create") return { kind, lead: t.self.keyCreateLead, text: t.self.keyCreateText };
       return { kind, lead: t.self.keyLead, text: successAt ? `${t.self.keyText} ${lastSuccessText}` : t.self.keyText };
     case "failing": {
+      // The last entry was written by a newer version: say that, not "failed" and not "cancelled".
+      if (last && isUnknownRun(last)) {
+        return { kind, lead: t.self.unknownLead(m(last.started_at)), text: `${t.self.unknownText} ${lastSuccessText}` };
+      }
       // The contract allows health=failing without run details; then the text stays undated.
       const failed = last && last.state === "failed" ? last : null;
       const ek = failed ? errorKind(failed) : null;
@@ -89,6 +96,8 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       if (earlier) parts.push(t.self.neverServer(earlier.count, m(earlier.latest!)));
       if (last && last.state === "cancelled") {
         parts.push(t.self.neverCancelled(m(last.started_at)));
+      } else if (last && isUnknownRun(last)) {
+        parts.push(t.self.neverUnknown(m(last.started_at)));
       } else if (last && last.state !== "succeeded") {
         parts.push(t.self.neverAttempt(m(last.started_at)));
         const ek = errorKind(last);
@@ -102,6 +111,19 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
     default: {
       // The lead must not say "everything is fine" above a notice about damaged backups.
       const damaged = (s.server_verify_failed?.length ?? 0) > 0 || (server?.damaged ?? 0) > 0;
+      // Switched off: "Everything is fine" would hide that nothing happens by itself any more. Say it
+      // first, with the time of the last backup and the way to the settings.
+      if (!s.schedule.enabled) {
+        const off: string[] = [];
+        if (successAt) off.push(lastSuccessText);
+        const pbsLate = !!last && last.state === "pbs_unreachable" && (!success || last.started_at > success.started_at);
+        if (pbsLate) off.push(t.self.lastAttemptPbs(m(last.started_at)));
+        const wasCancelled = cancelledAfter(last, success);
+        if (wasCancelled) off.push(t.self.lastCancelled(m(wasCancelled.started_at)));
+        if (damaged) off.push(t.self.okOffDamaged);
+        off.push(t.self.okOffText);
+        return { kind, lead: t.self.okOffLead, text: off.join(" "), autoOff: true };
+      }
       const parts = [damaged ? t.self.okTextDamaged : t.self.okText];
       const pbsAfterSuccess =
         !!last && last.state === "pbs_unreachable" && (!success || last.started_at > success.started_at);
@@ -123,6 +145,47 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
   }
 }
 
+/**
+ * The "Result" cell of a history row. A state or trigger this version does not know has its own
+ * text (`runState`/`runTrigger` turn any unrecognised word into "unknown"): it can never end up as
+ * "cancelled" or "backed up". `count`: attempts folded into the row (server not reachable).
+ */
+export function runResultText(r: Run, count: number, damaged: ReadonlySet<string>, t: Messages): string {
+  switch (runState(r)) {
+    case "succeeded":
+      switch (succeededKind(r, damaged)) {
+        case "damaged":
+          return t.runs.damaged;
+        case "incomplete":
+          return t.runs.succeededIncomplete;
+        case "warnings":
+          return t.runs.succeededWarnings(otherWarnings(r).length);
+        case "ok":
+          switch (runTrigger(r)) {
+            case "timer":
+              return t.runs.succeeded;
+            case "manual":
+            case "cli":
+              return t.runs.succeededManual;
+            case "unknown":
+              return t.runs.succeededOtherStart;
+          }
+      }
+      return t.runs.succeeded;
+    case "failed":
+      return t.runs.failed(t.reason[errorKind(r) ?? "internal"]);
+    case "pbs_unreachable":
+      return count > 1 ? t.runs.pbsTimes(count) : t.runs.pbs;
+    case "cancelled":
+      return t.runs.cancelled;
+    case "unknown":
+      return t.runs.unknown;
+    default:
+      // A run that is still going is not part of the history; if one shows up, it has no result yet.
+      return t.runs.unknown;
+  }
+}
+
 /** One short line for the list pane. `server` as in selfSummary. */
 export function selfRowText(s: Status, t: Messages, f: Formatter, now: Date, server: ServerBackups | null = null): string {
   const kind = selfKind(s);
@@ -138,6 +201,7 @@ export function selfRowText(s: Status, t: Messages, f: Formatter, now: Date, ser
     case "incomplete":
       return successAt ? t.row.incomplete(f.moment(successAt, now), f.dayMonth(successAt)) : t.row.incompleteUndated;
     case "failing": {
+      if (isUnknownRun(s.last_run)) return t.row.unknownRun;
       const failed = s.last_run && s.last_run.state === "failed" ? s.last_run : null;
       return failed ? t.row.failing(f.dayMonth(failed.started_at)) : t.row.failingUndated;
     }
@@ -146,6 +210,7 @@ export function selfRowText(s: Status, t: Messages, f: Formatter, now: Date, ser
     case "never":
       return server && server.count > 0 ? t.row.neverServer : t.row.never;
     default:
+      if (!s.schedule.enabled) return successAt ? t.row.okOff(f.moment(successAt, now), f.dayMonth(successAt)) : t.row.okOffUndated;
       return successAt ? t.row.ok(f.moment(successAt, now), f.dayMonth(successAt)) : t.row.okUndated;
   }
 }
@@ -166,7 +231,7 @@ export function machineSummary(mc: Machine, t: Messages, f: Formatter, now: Date
   switch (kind) {
     case "failing": {
       const at = report!.run_started_at ?? report!.reported_at;
-      const ek = report!.error?.kind ?? "internal";
+      const ek = knownErrorKind(report!.error?.kind ?? "internal");
       const tail = last ? t.other.lastSuccess(m(last)) : t.self.noSuccessYet;
       return { kind, lead: t.other.failingLead(m(at)), text: `${t.explain[ek]} ${tail}` };
     }
@@ -203,9 +268,8 @@ export function machineRowText(mc: Machine, t: Messages, f: Formatter, now: Date
   }
 }
 
-/** Server line in the list pane: the result of the last check, nothing more. */
-export function serverRow(s: Status, t: Messages, f: Formatter, now: Date): { tone: "neutral" | "pbs"; text: string } {
-  const p = s.pbs;
+/** Server line in the list pane: the newest known result of a check (see `newestReach`), nothing more. */
+export function serverRow(p: Reach, t: Messages, f: Formatter, now: Date): { tone: "neutral" | "pbs"; text: string } {
   if (p.reachable == null || !p.checked_at) return { tone: "neutral", text: t.row.serverUnknown };
   const mo = f.moment(p.checked_at, now);
   const today = mo.rel === "today";

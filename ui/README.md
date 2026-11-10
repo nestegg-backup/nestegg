@@ -152,6 +152,8 @@ and resets it:
 | `no_key` | set up, but `nestegg key create` has not run yet (guide step 3) |
 | `no_timer` | everything ready, but the timer is off and there is no backup yet (guide step 5) |
 | `cancelled` | the last run was cancelled by the user |
+| `unknown_run` | the newest run has a state this version does not know (health `failing`, as the daemon reports it), an older success has an unknown trigger, an older failure an unknown error kind |
+| `unknown_never` | no backup yet; the one attempt has an unknown state |
 | `daemon_down` | every call answers 502, like `nestegg ui` without the daemon |
 | `unauthorized` | every call answers 401 |
 
@@ -203,7 +205,10 @@ mock) answers `409 target_exists`. A restore takes about 4 s and reports
 `PATCH /config` changes the settings of the current scenario like the daemon
 (same validation and the same refusal texts, `src/lib/settings.ts`); later
 `/config` and `/status` calls show the new values. Reloading with `?scenario=`
-resets them. Decision 0022:
+resets them. A value of the wrong type is refused with serde's own text, which
+names no field (`invalid settings: invalid type: floating point `1.5`, expected
+u32`; `invalid value: integer `-1`, expected u32`); `problemText` turns the
+`expected u32` ones into "whole number of hours". Decision 0022:
 
 - "Overdue after" is capped at 168 hours or the rhythm plus 72 hours, whichever
   is larger, for the rhythm that is in effect after the same request (the

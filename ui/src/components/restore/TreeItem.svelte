@@ -70,7 +70,8 @@
   .twist[aria-expanded="true"] svg { transform: rotate(90deg); }
   input { margin: 0; width: 17px; height: 17px; accent-color: var(--accent); }
   input:disabled + label { color: var(--muted); }
-  label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  /* Names wrap (a long file name or the translated "list of programs ..." label is never cut off). */
+  label { min-width: 0; overflow-wrap: anywhere; cursor: pointer; }
   .dir label { font-weight: 500; }
   .size { font-size: var(--fs-s); color: var(--faint); }
   .state { font-size: var(--fs-s); color: var(--muted); padding: 4px 0; }

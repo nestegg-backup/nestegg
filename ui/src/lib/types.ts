@@ -12,7 +12,12 @@ export type RunState =
   | "succeeded"
   | "failed"
   | "pbs_unreachable"
-  | "cancelled";
+  | "cancelled"
+  /** Written by a newer version of nestegg that this one does not understand (forward compatibility). */
+  | "unknown";
+
+/** `timer`, `manual`, `cli`; `unknown` is a value written by a newer version. */
+export type RunTrigger = "timer" | "manual" | "cli" | "unknown";
 
 export type RunErrorKind =
   | "pbs_unreachable"
@@ -25,7 +30,9 @@ export type RunErrorKind =
   | "credentials_unreadable"
   | "verification_failed"
   | "cancelled"
-  | "internal";
+  | "internal"
+  /** Written by a newer version of nestegg that this one does not understand (forward compatibility). */
+  | "unknown";
 
 export interface RunError {
   kind: RunErrorKind;
@@ -40,7 +47,7 @@ export interface Archive {
 
 export interface Run {
   id: string;
-  trigger: "timer" | "manual" | "cli";
+  trigger: RunTrigger;
   state: RunState;
   started_at: string;
   finished_at?: string | null;

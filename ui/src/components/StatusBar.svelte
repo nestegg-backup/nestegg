@@ -7,7 +7,7 @@
   // The quiet default line: what the last check of the backup server said.
   const line = $derived.by((): { text: string; tone: "neutral" | "pbs" | "warn" } | null => {
     if (app.fatal) return { text: app.fatal.kind === "unauthorized" ? t.sbar.sessionEnded : t.sbar.offline, tone: "warn" };
-    const p = app.status?.pbs;
+    const p = app.reach;
     if (!p) return null;
     if (p.reachable == null || !p.checked_at) return { text: t.sbar.serverUnknown, tone: "neutral" };
     const m = f.moment(p.checked_at, app.now);

@@ -5,7 +5,7 @@
   let { cells }: { cells: DayCell[] } = $props();
 
   const label = (k: DayKind) => t.strip[k];
-  const order: DayKind[] = ["ok", "incomplete", "none", "run", "pbs", "fail", "damaged"];
+  const order: DayKind[] = ["ok", "incomplete", "none", "run", "pbs", "fail", "damaged", "unknown"];
   const used = $derived(order.filter((k) => cells.some((c) => c.kind === k)));
 </script>
 
@@ -42,8 +42,10 @@
   /* Damaged: dashed red ring. Running: solid blue ring. They must not differ by colour alone. */
   .cells .k-damaged { background: none; border: 2px dashed var(--bad); color: var(--text); }
   .cells .k-run { background: none; box-shadow: inset 0 0 0 2px var(--accent-text); color: var(--text); }
+  /* Not understood: dashed neutral ring (neither a success nor a failure), apart from the red one by colour and by the hint in the legend. */
+  .cells .k-unknown { background: none; border: 2px dashed var(--muted); color: var(--text); }
   /* The dashed ring is a border: keep the weekday where it is on the other days. */
-  .cells .k-damaged .w { top: -20px; }
+  .cells .k-damaged .w, .cells .k-unknown .w { top: -20px; }
   .cells li.today { outline: 2px solid var(--text); outline-offset: 2px; }
   .cells li.today .w { color: var(--text); }
 
@@ -56,6 +58,7 @@
   .legend .k-incomplete { background: var(--warn); }
   .legend .k-damaged { background: none; border: 2px dashed var(--bad); }
   .legend .k-run { background: none; box-shadow: inset 0 0 0 2px var(--accent-text); }
+  .legend .k-unknown { background: none; border: 2px dashed var(--muted); }
 
   @media (max-width: 760px) {
     .cells { gap: 3px; }

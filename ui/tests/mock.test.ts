@@ -30,6 +30,8 @@ describe("mock API", () => {
       no_key: "never",
       no_timer: "never",
       cancelled: "ok",
+      unknown_run: "failing",
+      unknown_never: "never",
     };
     expect(s.health).toBe(expected[sc]);
     expect(s.encryption.key_exported).toBe(!["key_not_exported", "unconfigured", "no_credentials", "no_key"].includes(sc));
