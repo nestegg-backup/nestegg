@@ -1850,8 +1850,10 @@ mod tests {
             .uri(format!("/api/v1/runs/{id}/cancel"))
             .body(Body::empty())
             .unwrap();
-        req.extensions_mut()
-            .insert(ConnectInfo(Peer { uid: Some(0) }));
+        req.extensions_mut().insert(ConnectInfo(Peer {
+            uid: Some(0),
+            gid: Some(0),
+        }));
         let resp = router(p).oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert_eq!(json(resp).await["code"], "cannot_cancel");

@@ -323,7 +323,7 @@ describe("the daemon's literal settings messages", () => {
     "exclude pattern `[abc` is not a valid pattern (unclosed character class); the backup client would reject it",
     "exclude pattern `foo\\` is malformed (an unclosed `[`…`]` character class or a dangling `\\`, for example) and would break every backup run",
     "this exclude list would leave out the whole folder /home/alice from the backup; an administrator can still set it as root in /etc/nestegg/config.toml.",
-    "Wake-on-LAN is not set up: the configuration has no [wake] section with the MAC address of the backup server. Add it in the terminal (see docs/configuration.md), then switch it on here.",
+    "Wake-on-LAN is not set up: the configuration has no [wake] section with the MAC address of the backup server. Add it in the terminal (see /usr/share/doc/nestegg/configuration.md), then switch it on here.",
     '"datastore" cannot be changed here; as root, edit /etc/nestegg/config.toml or use the nestegg commands in the terminal',
     // wrong types and numbers out of range (interval_hours / overdue_after_hours)
     "invalid settings: invalid value: integer `-1`, expected u32",

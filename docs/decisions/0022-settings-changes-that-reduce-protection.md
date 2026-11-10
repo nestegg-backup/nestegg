@@ -178,6 +178,22 @@ the value as root in `/etc/nestegg/config.toml`.
   rather than truncated when it would grow large, so one member's flood can
   never push another member's unreported change out.
 
+- **Nothing leaves the record undelivered.** An announcement is removed only
+  after it has reached every channel that is switched on (the command, if one
+  is configured, succeeded; the desktop message reached at least one user),
+  never by time alone: a long weekend without a login or a command that keeps
+  failing does not lose it. After that it is kept for the keep window (three
+  days) so that a user who logs in later still gets it, counted from the
+  newest change in a combined entry. A command that keeps failing is retried
+  without end, with a pause that doubles from five minutes up to six hours
+  instead of at every check (decision 0017 has the details).
+
+- **A wrong clock cannot suppress or stall it.** Stored times that lie in the
+  future (the clock was ahead and was corrected) are pulled back to now when
+  the record and the inbox are read; the rate limit ignores such a stamp, and
+  the quiet period is additionally bounded by elapsed time (two minutes), well
+  below the unit's start time limit.
+
 - **Delivery is independent of the problem conditions**, so a `settings` change
   is announced even while a backup is in progress. The record is saved after
   each delivery, so a check killed halfway does not resend what it already sent;
@@ -196,6 +212,19 @@ the value as root in `/etc/nestegg/config.toml`.
   `/proc/locks` rather than the lock file. The daemon's wait for the inbox lock
   in the request path is time-bounded, so a stuck lock cannot tie up a worker
   thread forever.
+- **Lock files of an older version.** Earlier versions created these files
+  `0644`, and a group member who opened one before the upgrade keeps a
+  descriptor that tightening the mode does not take away. A root process (and
+  `postinst`, for all four files) therefore replaces a lock file with a too
+  open mode by a fresh `0600` one, unless a root-owned process holds a lock on
+  it according to `/proc/locks`: a backup still running from before the
+  upgrade keeps its lock, and the file is replaced the next time. Every lock
+  is taken through one helper that, after it got the lock, checks that the
+  file at the path is still the one it locked and starts over otherwise, so
+  two processes can never both hold "the" lock across a replacement; and
+  every wait for one of these locks has a time limit (the run lock half a
+  second, `current.json` 30 seconds, the notification check 90 seconds, the
+  inbox 5 seconds).
 - `postinst` only **tightens** a `config.toml` that is too open (readable,
   writable or executable by others, or writable by the group) or wrongly owned;
   it sets the owner to root, and the mode only after the owner change worked. A
@@ -282,7 +311,10 @@ the value as root in `/etc/nestegg/config.toml`.
   files are `0600`; `postinst` also tightens a group-writable or wrongly owned
   file and falls back to `0600` without the group; and `nestegg init` writes the
   file atomically with its final mode and refuses a symlink.
-- **Third review (2026-11-10).** The folder guard no longer reads entry names as
+- **Third review (2026-11-10).** The reviewers proposed to replace the
+  content-dependent folder guard by a purely computed one. The maintainer
+  decided to keep reading folder contents and to close the leak instead. The
+  folder guard no longer reads entry names as
   root: it reads them with the requester's own identity (uid and primary gid of
   the socket, no supplementary groups) in a child process with a time limit and
   a bound on how many such reads run at once, so its answer can no longer reveal
@@ -295,4 +327,7 @@ the value as root in `/etc/nestegg/config.toml`.
   as emptying it (a parent such as `/var/home` above `/var/home/alice`), which
   the earlier version missed. The old in-thread read with a timeout, which left
   a thread hanging on a dead file system and added one per further request, is
-  replaced by the bounded child-process reader.
+  replaced by the bounded child-process reader. In the same round:
+  announcements are no longer dropped by time alone and a clock that was ahead
+  can neither suppress nor stall them (section 4); old `0644` lock files are
+  replaced and every lock wait is bounded (section 5).

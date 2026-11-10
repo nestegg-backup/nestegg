@@ -391,7 +391,7 @@ fn validate_with_reader(
         return Err(invalid(
             "Wake-on-LAN is not set up: the configuration has no [wake] section with the \
              MAC address of the backup server. Add it in the terminal (see \
-             docs/configuration.md), then switch it on here.",
+             /usr/share/doc/nestegg/configuration.md), then switch it on here.",
         ));
     }
     // The folder guard is the LAST validation step: it is the only check whose
