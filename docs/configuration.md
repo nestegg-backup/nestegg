@@ -510,8 +510,10 @@ Two ways to keep a copy; use at least one, better both:
   The command takes the run lock only for the moment it changes the state:
   while a backup is running it stops with "try again" before anything is
   written. Into a pipe, the paper key is recorded as exported only after all of
-  it was written without an error (a printer or `head` that closes the pipe
-  early is an error: nothing is recorded, exit code 1). The lock is not held
+  it was written without an error (a reader that is already gone is an error:
+  nothing is recorded, exit code 1; whether a reader that took the data also
+  printed all of it, nestegg cannot know, which is why backups still wait for
+  the confirmation with the check code from the paper). The lock is not held
   while the output goes into the pipe; it is taken again for the short update
   (waiting up to 30 seconds). If a backup holds it longer, or the key changed
   meanwhile, the paper key is out but not recorded: the command says so and how

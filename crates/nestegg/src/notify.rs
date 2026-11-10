@@ -77,10 +77,9 @@ const SETTINGS_RATE_LIMIT: Duration = Duration::minutes(5);
 /// still retried for ever — nothing is dropped — but at most a few times an
 /// hour, not on every check and not several times within one run.
 const SETTINGS_COMMAND_MAX_BACKOFF: Duration = Duration::hours(6);
-/// A success stamp up to this far ahead of the clock is just clock noise and
-/// counts as "now"; a further one says nothing about the age of the last
-/// backup (the clock of this computer was wrong when it was written).
-const FUTURE_TOLERANCE: Duration = Duration::minutes(5);
+/// Start of the log line of a check that did not try the failing settings
+/// command because of the pause between attempts.
+const STILL_FAILS_PREFIX: &str = "settings: the command still fails";
 /// An announcement that no member of group `nestegg` ever received (nobody who
 /// gets the full text logged in) stops being held for one after this long, so
 /// the record stays bounded even on a computer where no member logs in. The
@@ -251,7 +250,7 @@ pub fn evaluate(
     // run finished and was corrected later) says nothing about the age of the
     // last backup. Decided here from the stamp itself, so it is right whether
     // or not `status.health` already reports it.
-    let clock_wrong = last_success_at.is_some_and(|t| t - now > FUTURE_TOLERANCE);
+    let clock_wrong = last_success_at.is_some_and(|t| t - now > crate::state::future_tolerance());
     let age_hours = last_success_at
         .filter(|_| !clock_wrong)
         .map(|t| (now - t).num_hours().max(0));
@@ -1569,8 +1568,16 @@ pub fn deliver_settings(
     let desktop_on = channels.desktop_enabled();
     let command = channels.command_enabled();
     for session in &sessions {
+        // A recipient of the full text is also owed an announcement they have
+        // only seen in the general wording (they joined group `nestegg` after
+        // it went out, or entries were combined) as long as nobody has had the
+        // full text yet: otherwise it would wait for a member who is already
+        // here and end up dropped unread.
         let pending: Vec<usize> = (0..state.settings.len())
-            .filter(|&i| !state.settings[i].users_done.contains(&session.uid))
+            .filter(|&i| {
+                let a = &state.settings[i];
+                !a.users_done.contains(&session.uid) || (session.privileged && !a.full_done)
+            })
             .collect();
         if pending.is_empty() {
             continue;
@@ -1650,7 +1657,7 @@ pub fn deliver_settings(
                 // so the unit does not flip between failed and fine.
                 hook_failed = true;
                 log.push(format!(
-                    "settings: the command still fails ({} failures in a row), the \
+                    "{STILL_FAILS_PREFIX} ({} failures in a row), the \
                      announcement is kept and tried again after the pause",
                     state.settings_command_failures
                 ));
@@ -2172,7 +2179,7 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
             .map(|run| run.finished_at.unwrap_or(run.started_at))
             // A stamp from a clock that was ahead says nothing; the hook gets
             // an empty value then, as if there were none.
-            .filter(|t| *t - now <= FUTURE_TOLERANCE),
+            .filter(|t| *t - now <= crate::state::future_tolerance()),
     };
     let channels = SystemChannels {
         config: &notify_config,
@@ -2299,7 +2306,15 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
                     &mut delivered_users,
                     &mut delivered_cmd,
                 );
-                out.log.extend(a.log);
+                // One line per check about a command that fails: the try of
+                // this check has said it, the pass after it need not add
+                // "still fails".
+                let said = out.hook_failed;
+                out.log.extend(
+                    a.log
+                        .into_iter()
+                        .filter(|l| !(said && l.starts_with(STILL_FAILS_PREFIX))),
+                );
                 out.hook_failed |= a.hook_failed;
             }
         }
@@ -4952,6 +4967,32 @@ mod tests {
             state.settings.is_empty(),
             "delivered to a member and past the keep window"
         );
+    }
+
+    #[test]
+    fn a_user_who_joins_the_group_after_the_general_text_gets_the_full_text() {
+        use crate::settings::Reduction;
+        // bob got the general text while he was not in the group. Then he is
+        // added to group nestegg: he is the member the announcement waits
+        // for, so he gets the full text once, and that releases it.
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], hours(0)));
+        let mut ch = Fake::new(&[], false);
+        ch.login_plain(2000, "bob");
+        deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        assert!(!state.settings[0].full_done);
+        let mut ch = Fake::new(&[], false);
+        ch.login(2000, "bob");
+        deliver(&mut state, hours(2), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(ch.desktop, [(2000, Event::Settings)]);
+        assert!(ch.bodies[0].contains("alice"), "{}", ch.bodies[0]);
+        assert!(state.settings[0].full_done);
+        // Not again at the next check.
+        ch.clear();
+        deliver(&mut state, hours(3), Lang::En, &mut ch, &mut |_| {});
+        assert!(ch.desktop.is_empty());
     }
 
     #[test]

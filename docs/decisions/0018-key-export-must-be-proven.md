@@ -316,7 +316,11 @@ first.
   the whole output went out without an error the lock is taken again (waiting at
   most 30 seconds), the state is read again, the stored key must still have the
   digest that was printed, and then `key_last_exported_digest` is set. A closed
-  pipe (`EPIPE`) is an error: nothing recorded, exit code 1. If the state cannot
+  pipe (`EPIPE`) is an error: nothing recorded, exit code 1. That catches a
+  reader that is already gone, not one that takes the data and then fails: a
+  pipe accepts the whole paper key into its buffer, so "written without an
+  error" is not "arrived on paper". The proof remains the confirmation with
+  the check code read from the paper. If the state cannot
   be updated after all (a backup holds the lock longer than the wait, the key
   changed, the state cannot be saved), the command says that the paper key is out
   but not recorded, why, and how to record it (`nestegg key confirm-exported
