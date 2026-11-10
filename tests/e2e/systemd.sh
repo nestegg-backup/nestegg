@@ -378,7 +378,9 @@ echo "-- a home directory that is a link into another source is protected there"
 # out, which the written paths alone do not show. The daemon finds the real
 # place with the requester's identity (alice may follow the link, she need not
 # be able to enter the home), so the change is refused.
-on_client bash -c 'mkdir -p /srv/homes/carol-data && useradd -M -d /home/carol carol && ln -s /srv/homes/carol-data /home/carol && echo x > /srv/homes/carol-data/file && chown -R carol: /srv/homes/carol-data && chmod 700 /srv/homes/carol-data'
+# (A second folder in the source, so that the exclude does not also empty the
+# source as a whole: the refusal must come from the home directory.)
+on_client bash -c 'mkdir -p /srv/homes/carol-data /srv/homes/shared && useradd -M -d /home/carol carol && ln -s /srv/homes/carol-data /home/carol && echo x > /srv/homes/carol-data/file && chown -R carol: /srv/homes/carol-data && chmod 700 /srv/homes/carol-data'
 on_client bash -c "printf '\n[[backup.sources]]\narchive = \"e2e-homes\"\npath = \"/srv/homes\"\n' >> $cfg"
 linked="$(patch_config as_alice '{"excludes":["/carol-data"]}')"
 check "excluding the real place of a linked home is refused" test "$(tail -1 <<<"$linked")" = 400
