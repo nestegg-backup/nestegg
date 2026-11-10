@@ -624,12 +624,10 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
     let store = Store::new(paths);
     let secrets_store = SecretStore::new(&paths.credentials_dir);
     // Key changes and backup runs exclude each other (same lock), so a run
-    // never sees a half-replaced key or overwrites the key state.
+    // never sees a half-replaced key or overwrites the key state. (`key
+    // paperkey` takes the lock itself, only around what changes the state.)
     let _lock = match &cmd {
-        KeyCmd::Create { .. }
-        | KeyCmd::Import { .. }
-        | KeyCmd::Export { .. }
-        | KeyCmd::Paperkey { .. } => Some(
+        KeyCmd::Create { .. } | KeyCmd::Import { .. } | KeyCmd::Export { .. } => Some(
             nestegg::run::RunLock::try_acquire(paths)?
                 .context("a backup is running; try again when it has finished")?,
         ),
@@ -776,6 +774,32 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                      (or pipe it to a printer: nestegg key paperkey | lpr)"
                 );
             }
+            // Where the paper key goes is found out before anything is
+            // written. The path of a file is remembered in the state (text):
+            // a name that cannot be stored is refused now, because the shell
+            // has already created a file that is redirected to.
+            use nestegg::keyproof::StdoutTarget;
+            let redirected = match &output {
+                Some(file) => {
+                    if absolute_user_path(file)?.to_str().is_none() {
+                        bail!(
+                            "the name of the output file contains characters that are not valid \
+                             UTF-8; choose another name"
+                        );
+                    }
+                    StdoutTarget::Other
+                }
+                None => match nestegg::keyproof::stdout_target() {
+                    StdoutTarget::Unstorable(why) => bail!(
+                        "the paper key goes to a file, but {why}. Nothing was written (the \
+                         empty file your shell created can be deleted). Redirect to a file \
+                         with a plain name, or use --output <file>."
+                    ),
+                    other => other,
+                },
+            };
+            // The part that takes time (the client renders the paper key)
+            // runs without the run lock.
             let cfg = Config::load(&paths.config_file)?;
             let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;
             let material = nestegg::keyproof::KeyMaterial::from_key_json(&String::from_utf8_lossy(
@@ -802,23 +826,41 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                 PaperFormat::Text => nestegg::keyproof::compose_text(&header, &raw),
                 PaperFormat::Html => nestegg::keyproof::compose_html(&header, &raw)?,
             };
-            match output {
-                Some(file) => {
-                    // The path is remembered in the state (text): refuse a
-                    // name that cannot be stored before anything is written.
-                    if absolute_user_path(&file)?.to_str().is_none() {
-                        bail!(
-                            "the name of the output file contains characters that are not valid \
-                             UTF-8; choose another name"
-                        );
-                    }
+            // The state is changed under the run lock, like the other key
+            // commands do, so that a backup run cannot overwrite it at the
+            // same moment. The lock is taken before anything is written
+            // (a running backup: nothing happened, try again), and it is
+            // not held while the output goes into a pipe (a printer queue
+            // can take its time).
+            let lock = nestegg::run::RunLock::try_acquire(paths)?.context(
+                "a backup is running; try again when it has finished. Nothing was written",
+            )?;
+            let digest = secrets::digest(&key);
+            if secrets::digest(&secrets_store.load(secrets::ENCRYPTION_KEY)?) != digest {
+                bail!("the stored key changed while the paper key was made; nothing was written");
+            }
+            let to_file = output.is_some() || matches!(redirected, StdoutTarget::File(_));
+            let mut state = store.load_state()?;
+            if to_file {
+                // Never forget a file that still exists: only entries whose
+                // file is gone make room; otherwise refuse another one.
+                state.prune_paperkey_files(&digest, nestegg::state::paperkey_file_exists);
+                if state.paperkey_files_full() {
+                    bail!(
+                        "{}",
+                        nestegg::keyproof::paperkey_limit_message(&state.paperkey_files)
+                    );
+                }
+            }
+            match (output, redirected) {
+                (Some(file), _) => {
                     write_user_file(&file, &data)?;
                     // Remember where it is: confirming with the check code is
                     // refused while this file lies on this computer's disk.
                     let written = absolute_user_path(&file)?;
                     let written = std::fs::canonicalize(&written).unwrap_or(written);
-                    let mut state = store.load_state()?;
-                    state.remember_paperkey_file(written, &secrets::digest(&key));
+                    state.remember_paperkey_file(written, &digest);
+                    state.key_last_exported_digest = Some(digest);
                     store.save_state(&state)?;
                     // The check code stays on the paper: it is not shown here.
                     println!(
@@ -832,25 +874,33 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                         file.display()
                     );
                 }
-                None => {
-                    std::io::stdout().write_all(&data)?;
+                (None, StdoutTarget::File(written)) => {
                     // `nestegg key paperkey > file` writes a file just like
                     // --output does: remember it the same way.
-                    if let Some(written) = stdout_regular_file() {
-                        let mut state = store.load_state()?;
-                        state.remember_paperkey_file(written.clone(), &secrets::digest(&key));
-                        store.save_state(&state)?;
-                        eprintln!(
-                            "Paper key written to {}.\n\
-                             Print it, then delete the file (or move it to a USB stick). \
-                             Confirming with the check code is refused while the file lies on \
-                             this computer.",
-                            written.display()
-                        );
-                    }
+                    std::io::stdout().write_all(&data)?;
+                    std::io::stdout().flush()?;
+                    state.remember_paperkey_file(written.clone(), &digest);
+                    state.key_last_exported_digest = Some(digest);
+                    store.save_state(&state)?;
+                    eprintln!(
+                        "Paper key written to {}.\n\
+                         Print it, then delete the file (or move it to a USB stick). \
+                         Confirming with the check code is refused while the file lies on \
+                         this computer.",
+                        written.display()
+                    );
+                }
+                (None, _) => {
+                    // A pipe (a printer), /dev/null, ...: nothing stays on
+                    // this computer that could be remembered. Note the
+                    // export, then let go of the lock before the output
+                    // goes out.
+                    state.key_last_exported_digest = Some(digest);
+                    store.save_state(&state)?;
+                    drop(lock);
+                    std::io::stdout().write_all(&data)?;
                 }
             }
-            record_export(&store, &key)?;
         }
         KeyCmd::Export { file } => {
             let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;
@@ -999,28 +1049,22 @@ fn backup_scope(paths: &Paths) -> nestegg::keyproof::BackupScope {
             } else {
                 None
             };
-            BackupScope::for_config(&cfg, layout.as_ref())
+            let scope = BackupScope::for_config(&cfg, layout.as_ref());
+            // The mount table tells which file systems below a source are
+            // not part of the backup (the client does not cross mount
+            // points). Unreadable: everything below a source counts.
+            match nestegg::mounts::load() {
+                Ok((mounts, _)) => {
+                    scope.with_mount_points(mounts.into_iter().map(|m| m.point).collect())
+                }
+                Err(_) => scope,
+            }
         }
         Err(e) => BackupScope {
             unknown: Some(format!("the configuration cannot be read: {e:#}")),
             ..BackupScope::default()
         },
     }
-}
-
-/// The file standard output is redirected to (`nestegg ... > file`), if it is
-/// a regular file whose path can be told.
-fn stdout_regular_file() -> Option<PathBuf> {
-    use std::os::unix::fs::FileTypeExt;
-    let meta = std::fs::metadata("/proc/self/fd/1").ok()?;
-    let kind = meta.file_type();
-    if !meta.is_file() || kind.is_fifo() || kind.is_char_device() {
-        return None;
-    }
-    let path = std::fs::read_link("/proc/self/fd/1").ok()?;
-    // A deleted file shows as "... (deleted)"; a path that is not UTF-8
-    // cannot be kept in the state.
-    (path.is_absolute() && path.exists() && path.to_str().is_some()).then_some(path)
 }
 
 /// `nestegg key confirm-exported`: record that the key is safe outside this
@@ -1128,21 +1172,12 @@ fn confirm_exported(
         let existing = keyproof::existing_paperkey_files(
             &remembered,
             &digest,
-            |p| p.symlink_metadata().is_ok(),
+            nestegg::state::paperkey_file_exists,
             |p| keyproof::locate_in(p, &backup_scope(paths)),
         );
         let in_the_way = keyproof::paperkey_files_in_the_way(&existing);
-        if let Some(first) = in_the_way.first() {
-            bail!(
-                "the paper key file {}{} still exists on this computer, so the check code could \
-                 have been read from the screen. Print it, then delete the file or move it to a \
-                 USB stick, and run this again. Nothing was recorded.",
-                first.display(),
-                match in_the_way.len() {
-                    1 => String::new(),
-                    n => format!(" (and {} more)", n - 1),
-                }
-            );
+        if !in_the_way.is_empty() {
+            bail!("{}", keyproof::paperkey_in_the_way_message(&in_the_way));
         }
         on_removable = !existing.is_empty();
         // ... and then the user has to say that the sheet exists.

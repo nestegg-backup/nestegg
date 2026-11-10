@@ -248,3 +248,52 @@ new one for the paper code).
   prompt waits is seen.
 - `--printed` cannot be combined with `--file`, nor `--accept-local-copy`
   with `--paper-code`.
+
+## Amendment 2026-11-10 (second round): small points around the key commands
+
+Found in a further review of the code; each was checked against the code
+first.
+
+- **A paper key file that cannot be deleted.** A remembered file on a
+  read-only mount, or one the user may not delete, would block `--paper-code`
+  for good. The refusal now names the way out: the file is a copy of the key,
+  so `confirm-exported --file <that file> --accept-local-copy` accepts it with
+  the same statement that another copy exists outside this computer. No new
+  command removes the entry: that path already exists, needs no root-only
+  state editing, and the statement is the same one the paper code needs.
+- **The list of remembered files is never trimmed while the files exist.** It
+  used to push out the oldest entry at 50, so a 51st file made the check
+  "no paper key file left on this computer" miss a file that still lay there.
+  Now `key paperkey` first drops entries whose file is gone (only a clear "no
+  such file" counts; any other error counts as present), and if 50 existing
+  files remain it refuses to write another one and lists them. The same test
+  for existence is used by `confirm-exported`.
+- **Standard output is examined before the key is written.** For `key
+  paperkey > file` the shell has already created the file. nestegg now reads
+  where descriptor 1 points before it renders anything: a regular file with a
+  path that cannot be stored (not UTF-8) is refused with the key unwritten
+  (the empty file the shell made is harmless). A terminal check, `/dev/null`,
+  a pipe, a socket or a deleted file leave nothing to remember; the key is
+  written as before.
+- **Run lock.** The lock was already taken for the whole `key paperkey`
+  command, which held it while the client rendered the paper key and while the
+  output went into a pipe (a printer queue can take its time). It is now
+  taken after the paper key is rendered and before anything is written, and
+  released before a pipe gets the output. A running backup gives "a backup is
+  running; try again when it has finished. Nothing was written." The stored
+  key is read again under the lock; if it changed meanwhile, nothing is
+  written.
+- **A stick mounted below a source is not inside the backup.** Checked with
+  the real tools: `pxar create` (the archiver `proxmox-backup-client backup`
+  uses) prints "skipping mount point" for a file system mounted below the
+  source and leaves its content out unless `--all-file-systems` is given,
+  which for the client means `--include-dev`. nestegg's `mounts.rs` already
+  relies on that. The rule for the configured sources is therefore the one the
+  system mode already used: a path is inside the backup if it lies under a
+  source (or `include_dev` path) with no other mount point between them. A
+  stick mounted below `/home` is outside, as is a data disk that is not
+  listed; a file system that is itself a source or `include_dev` entry is a
+  root of its own. If the mount table cannot be read, everything below a
+  source counts as inside (the previous behaviour).
+- **Rescue console.** `show_network()` passes the output of `ip` through the
+  same `printable` filter as the rest of the console.

@@ -388,9 +388,34 @@ pub struct BackupScope {
     /// no disk layout in system mode): a copy on removable media can then
     /// not be told apart from one inside the backup.
     pub unknown: Option<String>,
+    /// Every mount point of the running system (the mount table). The backup
+    /// client does not cross mount points: a file system mounted below a
+    /// source is not part of the backup unless it is a source or listed in
+    /// `include_dev` itself. `None` when the table could not be read; every
+    /// path below a source then counts as inside (the safe side).
+    pub mount_points: Option<Vec<PathBuf>>,
 }
 
 impl BackupScope {
+    /// The same scope, knowing the mount points of the running system.
+    pub fn with_mount_points(mut self, points: Vec<PathBuf>) -> BackupScope {
+        self.mount_points = Some(points);
+        self
+    }
+
+    /// Whether a file system is mounted between `root` (a source or an
+    /// `include_dev` path) and `path`: then `path` is on another file system
+    /// than `root`, which the backup client skips. A mount point that is
+    /// `root` itself is the file system of `root`; a path that is itself a
+    /// source or `include_dev` entry is a root of its own.
+    fn crosses_mount(&self, root: &Path, path: &Path) -> bool {
+        self.mount_points.as_ref().is_some_and(|points| {
+            points
+                .iter()
+                .any(|m| m != root && m.starts_with(root) && path.starts_with(m))
+        })
+    }
+
     /// The scope of a configuration, with the paths resolved on this system.
     /// `layout` is the disk layout and is only needed in system mode.
     pub fn for_config(config: &crate::config::Config, layout: Option<&Layout>) -> BackupScope {
@@ -417,7 +442,11 @@ impl BackupScope {
 
     /// Why `path` (canonical) lies inside the backup, if it does.
     pub fn contains(&self, path: &Path) -> Option<String> {
-        if let Some(root) = self.roots.iter().find(|r| path.starts_with(r)) {
+        if let Some(root) = self
+            .roots
+            .iter()
+            .find(|r| path.starts_with(r) && !self.crosses_mount(r, path))
+        {
             return Some(format!(
                 "inside {}, which is part of the backup, so the copy exists only together \
                  with the data it protects",
@@ -625,6 +654,112 @@ pub fn paperkey_files_in_the_way(existing: &[(PathBuf, Location)]) -> Vec<&Path>
         .filter(|(_, location)| location.needs_statement())
         .map(|(path, _)| path.as_path())
         .collect()
+}
+
+/// Quote a path for the shell if it needs it (for a command shown to the
+/// user).
+fn shell_quote(path: &Path) -> String {
+    let text = path.display().to_string();
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%".contains(c));
+    if plain {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// The refusal of `confirm-exported --paper-code` while remembered paper key
+/// files lie on this computer (`in_the_way` is not empty). Names the way out
+/// for a file that cannot be deleted: it is a copy of the key, so `--file`
+/// with the statement accepts it.
+pub fn paperkey_in_the_way_message(in_the_way: &[&Path]) -> String {
+    let first = in_the_way.first().copied().unwrap_or(Path::new(""));
+    let more = match in_the_way.len() {
+        0 | 1 => String::new(),
+        n => format!(" (and {} more)", n - 1),
+    };
+    format!(
+        "the paper key file {}{more} still exists on this computer, so the check code could \
+         have been read from the screen. Print it, then delete the file or move it to a USB \
+         stick, and run this again. If it cannot be deleted (read-only file system, no \
+         permission), it is a copy of the key: confirm with `sudo nestegg key confirm-exported \
+         --file {} --accept-local-copy` instead (you then state that another copy exists \
+         outside this computer). Nothing was recorded.",
+        first.display(),
+        shell_quote(first)
+    )
+}
+
+/// The refusal of `key paperkey` when as many paper key files as can be
+/// remembered still exist. Forgetting one that exists would let
+/// `confirm-exported --paper-code` miss it, so none is forgotten.
+pub fn paperkey_limit_message(files: &[PaperKeyFile]) -> String {
+    let mut text = format!(
+        "{} paper key files written earlier still exist, and nestegg cannot keep track of more \
+         than {}. Print the one you need, delete the others (or move them to a USB stick), \
+         then run this again. Nothing was written. The files:",
+        files.len(),
+        crate::state::MAX_PAPERKEY_FILES
+    );
+    for f in files {
+        text.push_str("\n  ");
+        text.push_str(&f.path.display().to_string());
+    }
+    text
+}
+
+/// Where standard output of `key paperkey` goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdoutTarget {
+    /// A terminal, a pipe, a socket, a device such as `/dev/null`, or
+    /// something not known: nothing stays on the disk that could be
+    /// remembered.
+    Other,
+    /// A regular file (`nestegg key paperkey > key.txt`) with this path.
+    File(PathBuf),
+    /// A regular file whose path cannot be kept in the state (not UTF-8, or
+    /// not known). The shell has already created it, so this has to be found
+    /// out before the key is written. The text says why.
+    Unstorable(String),
+}
+
+/// The target of standard output of this process.
+pub fn stdout_target() -> StdoutTarget {
+    stdout_target_at(Path::new("/proc/self/fd/1"))
+}
+
+/// [`stdout_target`] for the file descriptor link `fd` (`/proc/self/fd/1`).
+pub fn stdout_target_at(fd: &Path) -> StdoutTarget {
+    // `metadata` follows the link to the open file itself: a regular file
+    // is the only kind that leaves something on the disk.
+    match std::fs::metadata(fd) {
+        Ok(meta) if meta.is_file() => {}
+        _ => return StdoutTarget::Other,
+    }
+    let path = match std::fs::read_link(fd) {
+        Ok(path) => path,
+        Err(e) => {
+            return StdoutTarget::Unstorable(format!(
+                "the name of the file it is redirected to cannot be found out ({e})"
+            ));
+        }
+    };
+    // A deleted file shows as "... (deleted)" and has no path any more:
+    // nothing stays on the disk.
+    if !path.is_absolute() || !path.exists() {
+        return StdoutTarget::Other;
+    }
+    if path.to_str().is_none() {
+        return StdoutTarget::Unstorable(
+            "the name of the file it is redirected to contains characters that are not valid \
+             UTF-8, so it could not be remembered"
+                .into(),
+        );
+    }
+    StdoutTarget::File(path)
 }
 
 #[cfg(test)]
@@ -1019,15 +1154,11 @@ mod tests {
         // A new key forgets the files of the old one.
         state.remember_paperkey_file(PathBuf::from("/b/key.html"), "d2");
         assert_eq!(state.paperkey_files, vec![remembered("/b/key.html", "d2")]);
-        // The list stays bounded.
+        // No entry for the current key is ever dropped to make room ...
         for i in 0..80 {
             state.remember_paperkey_file(PathBuf::from(format!("/c/{i}.html")), "d2");
         }
-        assert_eq!(state.paperkey_files.len(), 50);
-        assert_eq!(
-            state.paperkey_files.last().unwrap().path,
-            Path::new("/c/79.html")
-        );
+        assert_eq!(state.paperkey_files.len(), 81);
         // It survives a round trip through the state file.
         let json = serde_json::to_string(&state).unwrap();
         let back: crate::state::State = serde_json::from_str(&json).unwrap();
@@ -1037,12 +1168,200 @@ mod tests {
         assert!(old.paperkey_files.is_empty());
     }
 
+    #[test]
+    fn a_full_list_forgets_only_what_is_gone_and_then_refuses() {
+        use crate::state::MAX_PAPERKEY_FILES;
+        let mut state = crate::state::State::default();
+        for i in 0..MAX_PAPERKEY_FILES {
+            state.remember_paperkey_file(PathBuf::from(format!("/c/{i}.html")), "d1");
+        }
+        // Everything still exists: no room (the oldest is not pushed out).
+        state.prune_paperkey_files("d1", |_| true);
+        assert!(state.paperkey_files_full());
+        assert_eq!(state.paperkey_files.len(), MAX_PAPERKEY_FILES);
+        assert_eq!(state.paperkey_files[0].path, Path::new("/c/0.html"));
+        let message = paperkey_limit_message(&state.paperkey_files);
+        assert!(message.contains("delete the others"), "{message}");
+        assert!(message.contains("Nothing was written"), "{message}");
+        assert!(message.contains("/c/0.html") && message.contains("/c/49.html"));
+        // Files that are gone, or made from another key, make room.
+        state.prune_paperkey_files("d1", |p| p != Path::new("/c/7.html"));
+        assert!(!state.paperkey_files_full());
+        assert_eq!(state.paperkey_files.len(), MAX_PAPERKEY_FILES - 1);
+        state.prune_paperkey_files("d2", |_| true);
+        assert!(state.paperkey_files.is_empty());
+    }
+
+    #[test]
+    fn only_a_clear_not_there_means_a_remembered_file_is_gone() {
+        use crate::state::paperkey_file_exists;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("key.html");
+        assert!(!paperkey_file_exists(&file));
+        std::fs::write(&file, "x").unwrap();
+        assert!(paperkey_file_exists(&file));
+        // A dangling link is still an entry on the disk.
+        let link = dir.path().join("link.html");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
+        assert!(paperkey_file_exists(&link));
+        // The parent became a file: the path is gone.
+        assert!(!paperkey_file_exists(&file.join("below")));
+    }
+
+    #[test]
+    fn the_refusal_names_the_way_out_for_a_file_that_cannot_be_deleted() {
+        let message = paperkey_in_the_way_message(&[Path::new("/home/alice/key.html")]);
+        assert!(
+            message.contains("/home/alice/key.html still exists"),
+            "{message}"
+        );
+        assert!(message.contains("delete the file or move it to a USB stick"));
+        assert!(message.contains("cannot be deleted"), "{message}");
+        assert!(
+            message.contains("confirm-exported --file /home/alice/key.html --accept-local-copy"),
+            "{message}"
+        );
+        assert!(message.contains("Nothing was recorded"), "{message}");
+        // Several files: the first is named, the others counted; a path with
+        // a space is quoted so the command can be pasted.
+        let message = paperkey_in_the_way_message(&[
+            Path::new("/home/alice/My Keys/key.html"),
+            Path::new("/b"),
+        ]);
+        assert!(message.contains("(and 1 more)"), "{message}");
+        assert!(
+            message.contains("--file '/home/alice/My Keys/key.html' --accept-local-copy"),
+            "{message}"
+        );
+        assert_eq!(shell_quote(Path::new("/a/it's")), "'/a/it'\\''s'");
+    }
+
+    #[test]
+    fn stdout_that_is_a_regular_file_is_found_out_and_nothing_else_is() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let fd_path = |f: &dyn AsRawFd| PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd()));
+        // A file: its path.
+        let path = dir.path().join("redirected.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        assert_eq!(
+            stdout_target_at(&fd_path(&file)),
+            StdoutTarget::File(std::fs::canonicalize(&path).unwrap())
+        );
+        // /dev/null and a pipe leave nothing to remember: the key is written.
+        let null = std::fs::File::create("/dev/null").unwrap();
+        assert_eq!(stdout_target_at(&fd_path(&null)), StdoutTarget::Other);
+        let (read, write) = nix::unistd::pipe().unwrap();
+        assert_eq!(stdout_target_at(&fd_path(&read)), StdoutTarget::Other);
+        assert_eq!(stdout_target_at(&fd_path(&write)), StdoutTarget::Other);
+        // A directory, a closed descriptor and a path that is not there.
+        let dir_fd = std::fs::File::open(dir.path()).unwrap();
+        assert_eq!(stdout_target_at(&fd_path(&dir_fd)), StdoutTarget::Other);
+        assert_eq!(
+            stdout_target_at(Path::new("/proc/self/fd/9999")),
+            StdoutTarget::Other
+        );
+        // A deleted file has no path any more.
+        let gone = dir.path().join("gone.txt");
+        let file = std::fs::File::create(&gone).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        assert_eq!(stdout_target_at(&fd_path(&file)), StdoutTarget::Other);
+        // A name that is not UTF-8 cannot be remembered: refused up front.
+        use std::os::unix::ffi::OsStrExt;
+        let odd = dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"paper-\xff-key.txt"));
+        let file = std::fs::File::create(&odd).unwrap();
+        match stdout_target_at(&fd_path(&file)) {
+            StdoutTarget::Unstorable(why) => assert!(why.contains("UTF-8"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     fn scope_with(roots: &[&str], system: Option<SystemMounts>) -> BackupScope {
         BackupScope {
             roots: roots.iter().map(PathBuf::from).collect(),
             system,
             unknown: None,
+            mount_points: None,
         }
+    }
+
+    fn mounted(points: &[&str]) -> Vec<PathBuf> {
+        points.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_stick_mounted_below_a_source_is_outside_the_backup() {
+        // The client does not cross mount points: /home/alice/STICK is a
+        // file system of its own and is not backed up with /home.
+        let scope = scope_with(&["/home"], None).with_mount_points(mounted(&[
+            "/",
+            "/home/alice/STICK",
+            "/boot/efi",
+        ]));
+        let key = Path::new("/home/alice/STICK/key.json");
+        assert_eq!(scope.contains(key), None);
+        assert_eq!(
+            apply_scope(Location::Removable, key, &scope),
+            Location::Removable
+        );
+        // The rest of /home is inside, also next to the mount point.
+        assert!(scope.contains(Path::new("/home/alice/key.json")).is_some());
+        assert!(scope.contains(Path::new("/home/alice/STICK2/k")).is_some());
+        // A mount point above the source does not matter: same file system.
+        let above = scope_with(&["/home/alice"], None).with_mount_points(mounted(&["/", "/home"]));
+        assert!(above.contains(Path::new("/home/alice/k")).is_some());
+        // Neither does a mount point that is the source itself.
+        let itself =
+            scope_with(&["/mnt/data"], None).with_mount_points(mounted(&["/", "/mnt/data"]));
+        assert!(itself.contains(Path::new("/mnt/data/k")).is_some());
+        // A stick below the source that is not removable still needs the
+        // statement, as any disk of this computer.
+        assert!(apply_scope(Location::Internal, key, &scope).needs_statement());
+    }
+
+    #[test]
+    fn a_file_system_below_a_source_is_inside_when_it_is_a_source_or_in_include_dev() {
+        // /mnt/data is a source of its own, /srv/disk is in include_dev
+        // (both are roots); /home is another source with a mount below it.
+        let scope =
+            scope_with(&["/home", "/home/alice/data", "/srv/disk"], None).with_mount_points(
+                mounted(&["/", "/home/alice/data", "/home/alice/STICK", "/srv/disk"]),
+            );
+        for inside in [
+            "/home/alice/data/k",
+            "/home/alice/data/deep/k",
+            "/srv/disk/k",
+        ] {
+            assert!(scope.contains(Path::new(inside)).is_some(), "{inside}");
+        }
+        assert!(scope.contains(Path::new("/home/alice/STICK/k")).is_none());
+        // A mount below the data disk is again its own file system.
+        let nested = scope_with(&["/home/alice/data"], None)
+            .with_mount_points(mounted(&["/home/alice/data", "/home/alice/data/usb"]));
+        assert!(
+            nested
+                .contains(Path::new("/home/alice/data/usb/k"))
+                .is_none()
+        );
+        assert!(nested.contains(Path::new("/home/alice/data/k")).is_some());
+        // Component-wise, not by prefix.
+        let by_name = scope_with(&["/home"], None).with_mount_points(mounted(&["/home/alice/US"]));
+        assert!(by_name.contains(Path::new("/home/alice/USB/k")).is_some());
+    }
+
+    #[test]
+    fn without_a_readable_mount_table_everything_below_a_source_counts_as_inside() {
+        let scope = scope_with(&["/home"], None);
+        assert!(scope.mount_points.is_none());
+        assert!(scope.contains(Path::new("/home/alice/STICK/k")).is_some());
+        // The system backup still follows its own rule (the layout).
+        let layout = crate::layout::tests::btrfs_layout();
+        let system = scope_with(&[], Some(SystemMounts::from_layout(&layout)))
+            .with_mount_points(mounted(&["/", "/home"]));
+        assert!(system.contains(Path::new("/home/alice/k")).is_some());
+        assert!(system.contains(Path::new("/media/alice/USB/k")).is_none());
     }
 
     #[test]

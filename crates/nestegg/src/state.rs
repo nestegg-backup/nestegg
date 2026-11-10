@@ -275,16 +275,48 @@ pub struct PaperKeyFile {
     pub key_digest: String,
 }
 
-/// At most this many paper key files are remembered for the current key.
-const MAX_PAPERKEY_FILES: usize = 50;
+/// At most this many paper key files are remembered for the current key. A
+/// file that still exists is never forgotten to make room: past this number
+/// `key paperkey` refuses to write another one (see
+/// [`State::paperkey_files_full`]).
+pub const MAX_PAPERKEY_FILES: usize = 50;
+
+/// Whether a remembered paper key file may still exist. Only a clear "not
+/// there" counts as gone: a file in a directory that cannot be searched is
+/// still a file on this computer.
+pub fn paperkey_file_exists(path: &Path) -> bool {
+    match path.symlink_metadata() {
+        Ok(_) => true,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
+}
 
 impl State {
     pub fn key_exported(&self) -> bool {
         self.key_digest.is_some() && self.key_digest == self.key_exported_digest
     }
 
+    /// Drop the entries that are of no interest any more: files made from
+    /// another key, and files that are gone (`exists` says which still are).
+    pub fn prune_paperkey_files(&mut self, key_digest: &str, exists: impl Fn(&Path) -> bool) {
+        self.paperkey_files
+            .retain(|f| f.key_digest == key_digest && exists(&f.path));
+    }
+
+    /// No room for another paper key file: the bound is reached and every
+    /// entry is a file that exists (call [`State::prune_paperkey_files`]
+    /// first). The caller refuses to write one more, because forgetting a
+    /// file that still exists would let `--paper-code` miss it.
+    pub fn paperkey_files_full(&self) -> bool {
+        self.paperkey_files.len() >= MAX_PAPERKEY_FILES
+    }
+
     /// Remember a paper key file written for the key with `key_digest`.
-    /// Entries for other keys are dropped.
+    /// Entries for other keys are dropped; no entry for this key is ever
+    /// dropped here.
     pub fn remember_paperkey_file(&mut self, path: PathBuf, key_digest: &str) {
         self.paperkey_files.retain(|f| f.key_digest == key_digest);
         if !self.paperkey_files.iter().any(|f| f.path == path) {
@@ -293,8 +325,6 @@ impl State {
                 key_digest: key_digest.to_string(),
             });
         }
-        let excess = self.paperkey_files.len().saturating_sub(MAX_PAPERKEY_FILES);
-        self.paperkey_files.drain(..excess);
     }
 }
 

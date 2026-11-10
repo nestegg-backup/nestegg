@@ -1550,6 +1550,275 @@ fn a_paper_key_redirected_into_a_file_is_remembered_like_an_output_file() {
     assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+impl Env {
+    /// Paths remembered as paper key files in the state.
+    fn remembered_paper_keys(&self) -> Vec<String> {
+        self.state()["paperkey_files"]
+            .as_array()
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|f| f["path"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `key paperkey` with standard output redirected to `stdout`.
+    fn paperkey_to(&self, stdout: Stdio) -> Output {
+        self.command(&["key", "paperkey"])
+            .env("NESTEGG_ALLOW_NON_ROOT", "1")
+            .env_remove("SUDO_UID")
+            .stdout(stdout)
+            .output()
+            .unwrap()
+    }
+
+    /// Remember `paths` as paper key files for the stored key.
+    fn remember_paper_keys(&self, paths: &[PathBuf]) {
+        let digest = nestegg::secrets::digest(&nestegg::secrets::Secret::new(
+            fs::read(self.root().join("cred/encryption-key")).unwrap(),
+        ));
+        self.set_state(
+            "paperkey_files",
+            serde_json::Value::Array(
+                paths
+                    .iter()
+                    .map(|p| serde_json::json!({"path": p, "key_digest": digest}))
+                    .collect(),
+            ),
+        );
+    }
+}
+
+#[test]
+fn a_paper_key_to_dev_null_or_a_pipe_is_written_and_nothing_is_remembered() {
+    let env = Env::new();
+    env.set_key_exported(false);
+    let out = env.paperkey_to(Stdio::null());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(env.remembered_paper_keys().is_empty());
+    // A pipe: the key is on standard output, nothing to remember.
+    let out = env.paperkey_to(Stdio::piped());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("BEGIN PROXMOX BACKUP KEY"),
+        "the key is written to the pipe"
+    );
+    assert!(env.remembered_paper_keys().is_empty());
+}
+
+#[test]
+fn a_paper_key_redirected_to_a_file_with_a_name_that_cannot_be_stored_is_not_written() {
+    use std::os::unix::ffi::OsStrExt;
+    let env = Env::new();
+    env.set_key_exported(false);
+    let odd = env
+        .root()
+        .join(std::ffi::OsStr::from_bytes(b"paper-\xff-key.txt"));
+    let out = env.paperkey_to(Stdio::from(fs::File::create(&odd).unwrap()));
+    assert_eq!(code(&out), 1);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("not valid UTF-8"), "{err}");
+    assert!(err.contains("Nothing was written"), "{err}");
+    // The shell's empty file is all there is: the key was not written.
+    assert_eq!(fs::metadata(&odd).unwrap().len(), 0);
+    assert!(env.remembered_paper_keys().is_empty());
+    // With a plain name it works.
+    let plain = env.root().join("plain.txt");
+    let out = env.paperkey_to(Stdio::from(fs::File::create(&plain).unwrap()));
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        fs::read_to_string(&plain)
+            .unwrap()
+            .contains("BEGIN PROXMOX")
+    );
+}
+
+#[test]
+fn a_remembered_paper_key_file_that_exists_is_never_forgotten() {
+    let env = Env::new();
+    env.set_key_exported(false);
+    let files: Vec<PathBuf> = (0..50)
+        .map(|i| env.write_user_file(&format!("old-{i}.html"), "x").into())
+        .collect();
+    env.remember_paper_keys(&files);
+    // The 51st would push out the oldest, which still exists: refused, with
+    // a message that says to delete old ones; nothing is written.
+    let new = env.root().join("new.html");
+    let args = ["key", "paperkey", "--output", new.to_str().unwrap()];
+    let out = env.root_cmd(&args);
+    assert_eq!(code(&out), 1);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("delete the others"), "{err}");
+    assert!(
+        err.contains("old-0.html") && err.contains("old-49.html"),
+        "{err}"
+    );
+    assert!(!new.exists());
+    assert_eq!(env.remembered_paper_keys().len(), 50);
+    // The same for a redirect: the shell's empty file stays empty.
+    let redirected = env.root().join("redirected.txt");
+    let out = env.paperkey_to(Stdio::from(fs::File::create(&redirected).unwrap()));
+    assert_eq!(code(&out), 1);
+    assert_eq!(fs::metadata(&redirected).unwrap().len(), 0);
+    // A pipe leaves no file and is not affected.
+    assert_eq!(code(&env.paperkey_to(Stdio::piped())), 0);
+    // Three files deleted: entries whose file is gone make room, the others
+    // stay, the new one is added.
+    for f in &files[..3] {
+        fs::remove_file(f).unwrap();
+    }
+    let out = env.root_cmd(&args);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let remembered = env.remembered_paper_keys();
+    assert_eq!(remembered.len(), 48);
+    assert!(remembered.contains(&canonical_name(&new)));
+    assert!(remembered.contains(&files[3].to_str().unwrap().to_string()));
+    assert!(!remembered.contains(&files[0].to_str().unwrap().to_string()));
+}
+
+#[test]
+fn the_refusal_for_a_paper_key_file_that_stays_names_the_way_out() {
+    let env = Env::new();
+    env.set_key_exported(false);
+    let file = env.root().join("key.html");
+    let out = env.root_cmd(&[
+        "key",
+        "paperkey",
+        "--format",
+        "html",
+        "--output",
+        file.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let check_code = nestegg::keyproof::KeyMaterial::from_key_json(KEY_JSON)
+        .unwrap()
+        .check_code();
+    let out = env.root_cmd(&[
+        "key",
+        "confirm-exported",
+        "--paper-code",
+        &check_code,
+        "--printed",
+    ]);
+    assert_eq!(code(&out), 1);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    // The file cannot be deleted (say): the message names the other way,
+    // with this very file.
+    let named = canonical_name(&file);
+    assert!(err.contains("cannot be deleted"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "confirm-exported --file {named} --accept-local-copy"
+        )),
+        "{err}"
+    );
+    assert!(env.state()["key_exported_digest"].is_null());
+    // And that way works: the file is a copy of the key, with the statement.
+    let out = env.root_cmd(&[
+        "key",
+        "confirm-exported",
+        "--file",
+        &named,
+        "--accept-local-copy",
+    ]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!env.state()["key_exported_digest"].is_null());
+    assert_eq!(code(&env.run(&["run"])), 0);
+}
+
+#[test]
+fn key_paperkey_takes_the_run_lock_and_says_to_try_again_while_a_backup_runs() {
+    let env = Env::new();
+    env.set_key_exported(false);
+    let file = env.root().join("key.txt");
+    let redirected = env.root().join("redirected.txt");
+    {
+        let lock_file = fs::File::create(env.root().join("run/run.lock")).unwrap();
+        let _held =
+            nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive).unwrap();
+        let out = env.root_cmd(&["key", "paperkey", "--output", file.to_str().unwrap()]);
+        assert_eq!(code(&out), 1);
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(err.contains("a backup is running; try again"), "{err}");
+        assert!(err.contains("Nothing was written"), "{err}");
+        assert!(!file.exists());
+        // Redirected into a file, and into a pipe: the same, nothing out.
+        let out = env.paperkey_to(Stdio::from(fs::File::create(&redirected).unwrap()));
+        assert_eq!(code(&out), 1);
+        assert_eq!(fs::metadata(&redirected).unwrap().len(), 0);
+        let out = env.paperkey_to(Stdio::piped());
+        assert_eq!(code(&out), 1);
+        assert!(out.stdout.is_empty());
+    }
+    // Backup over: it works, and the lock is not kept by the command.
+    let out = env.root_cmd(&["key", "paperkey", "--output", file.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let lock_file = fs::File::open(env.root().join("run/run.lock")).unwrap();
+    assert!(
+        nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock).is_ok(),
+        "the lock is free again"
+    );
+}
+
+#[test]
+fn a_stick_mounted_below_a_source_is_not_inside_the_backup() {
+    // The client does not cross mount points. With a file system mounted
+    // below the source, a copy there is not "part of the backup" (the
+    // device then decides, here a disk of this computer or unknown); a copy
+    // elsewhere in the source still is.
+    let env = Env::new();
+    env.set_key_exported(false);
+    let stick = env.root().join("src/home/alice/STICK");
+    fs::create_dir_all(&stick).unwrap();
+    let on_stick = stick.join("key.json");
+    let in_home = env.root().join("src/home/alice/key.json");
+    let stderr = |out: &Output| String::from_utf8_lossy(&out.stderr).into_owned();
+    for file in [&on_stick, &in_home] {
+        let out = env.root_cmd(&["key", "export", file.to_str().unwrap()]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+    }
+    let mountinfo = env.root().join("mountinfo");
+    fs::write(
+        &mountinfo,
+        format!(
+            "22 1 259:2 / / rw - ext4 /dev/sda1 rw\n40 22 8:17 / {} rw - vfat /dev/sdb1 rw\n",
+            canonical_name(&stick)
+        ),
+    )
+    .unwrap();
+    let confirm = |file: &Path, mounts: bool| {
+        let mut cmd = env.command(&["key", "confirm-exported", "--file", file.to_str().unwrap()]);
+        cmd.env("NESTEGG_ALLOW_NON_ROOT", "1")
+            .env_remove("SUDO_UID");
+        if mounts {
+            cmd.env("NESTEGG_MOUNTINFO", &mountinfo);
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(code(&out), 1, "no statement: refused");
+        stderr(&out)
+    };
+    // With the mount table: the stick is outside, the rest of the source in.
+    let msg = confirm(&on_stick, true);
+    assert!(!msg.contains("lies inside"), "{msg}");
+    assert!(confirm(&in_home, true).contains("lies inside"));
+    // Without a mount there (the table as it is): everything below the
+    // source is inside.
+    let plain = env.root().join("mountinfo-plain");
+    fs::write(&plain, "22 1 259:2 / / rw - ext4 /dev/sda1 rw\n").unwrap();
+    let mut cmd = env.command(&[
+        "key",
+        "confirm-exported",
+        "--file",
+        on_stick.to_str().unwrap(),
+    ]);
+    cmd.env("NESTEGG_ALLOW_NON_ROOT", "1")
+        .env_remove("SUDO_UID")
+        .env("NESTEGG_MOUNTINFO", &plain);
+    assert!(stderr(&cmd.output().unwrap()).contains("lies inside"));
+}
+
 #[test]
 fn repeated_failures_pause_the_timer_but_not_manual_runs() {
     let env = Env::new();

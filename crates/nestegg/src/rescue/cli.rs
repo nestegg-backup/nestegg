@@ -576,11 +576,19 @@ fn show_network() {
     let text = out
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    if text.trim().is_empty() {
-        eprintln!("No network connection yet. Plug in a cable, or run `nmtui` for Wi-Fi.");
-    } else {
-        eprintln!("Network:\n{}", text.trim_end());
+    match network_report(&text) {
+        Some(report) => eprintln!("{report}"),
+        None => eprintln!("No network connection yet. Plug in a cable, or run `nmtui` for Wi-Fi."),
     }
+}
+
+/// What `show_network` prints for the output of `ip`: interface names and
+/// addresses come from the system (a USB network adapter or a router can
+/// name them), so control characters become `?` like everywhere else on the
+/// console. `None` if there is no address.
+fn network_report(ip_output: &str) -> Option<String> {
+    let text = printable_block(ip_output.trim_end());
+    (!text.trim().is_empty()).then(|| format!("Network:\n{text}"))
 }
 
 fn wizard() -> Result<u8> {
@@ -1113,6 +1121,21 @@ fn type_key() -> Result<Option<Secret>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_network_overview_is_printable_and_empty_means_no_connection() {
+        let report = network_report(
+            "eth0             UP             192.0.2.10/24 \n\
+             \x1b[2J\x1b]0;evil\x07usb0  UP  198.51.100.7/24\r\n",
+        )
+        .unwrap();
+        assert!(report.starts_with("Network:\neth0"), "{report}");
+        assert!(!report.contains('\x1b') && !report.contains('\x07') && !report.contains('\r'));
+        assert!(report.contains("?[2J?]0;evil?usb0"), "{report}");
+        assert_eq!(report.lines().count(), 3, "line breaks stay: {report}");
+        assert_eq!(network_report(""), None);
+        assert_eq!(network_report("  \n"), None);
+    }
 
     fn saved<'a>(fingerprint: &'a str) -> Option<SavedFingerprint<'a>> {
         Some(SavedFingerprint {

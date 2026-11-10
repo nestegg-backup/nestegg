@@ -482,6 +482,14 @@ Two ways to keep a copy; use at least one, better both:
   refuses to write into a terminal; piping to a printer
   (`nestegg key paperkey | lpr`) works. The check code appears in the paper
   key output only; no other command, log or page shows it.
+  `nestegg key paperkey > key.txt` writes a file as well and is remembered
+  like `--output`. nestegg finds out where the output goes before it writes
+  anything: a file whose name is not valid UTF-8 (it could not be remembered)
+  is refused, and so is a further file once 50 earlier paper key files still
+  exist. Delete or move old ones first; nestegg never forgets a file that
+  still exists. The command takes the run lock only for the moment it changes
+  the state: while a backup is running it stops with "try again" before
+  anything is written.
 - **Key file:** `sudo nestegg key export /media/usb/nestegg-key.json`. The
   file is read back and compared with the key. If it lies on a disk of this
   computer you get a warning: that copy is lost together with the disk and
@@ -510,6 +518,10 @@ statement nothing is recorded. In addition, the command is refused while a
 file written by `key paperkey --output` still exists on a disk of this
 computer; the message names the file. Delete it after printing, or move it to
 a USB stick. A file that is gone or lies on removable media does not block.
+If the file cannot be deleted (read-only file system, no permission), it is a
+copy of the key: the message then names the other way,
+`sudo nestegg key confirm-exported --file <that file> --accept-local-copy`,
+which needs the same statement that another copy exists outside this computer.
 A paper key piped to a printer leaves no file; the statement covers that
 case. (A copy of the file made by hand elsewhere cannot be found; the
 statement is where you promise there is none.)
@@ -524,7 +536,12 @@ rules). Not if it is part of the backup: a path inside a configured source
 the device is, because the copy then exists only together with the data it
 protects, and inside the backup it is encrypted with the key it contains. In
 system mode this includes everything on the file systems that go into
-`system.pxar`. `key export` warns about such a place; `key import` and
+`system.pxar`. The backup does not cross mount points, so a USB stick mounted
+*below* a source (for example under `/home/alice` when `/home` is a source) is
+not part of the backup and counts as removable: only paths on the file system
+of the source itself, or on one that is a source or listed in `include_dev`,
+are inside. nestegg reads the mount table for this; if it cannot, everything
+below a source counts as inside. `key export` warns about such a place; `key import` and
 `confirm-exported` treat it like a disk of this computer. If the
 configuration cannot be read, a removable copy cannot be told apart from one
 inside the backup and is treated the same way.

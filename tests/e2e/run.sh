@@ -117,6 +117,17 @@ check "shortcut: the code read from the file on this computer is refused" \
   fails_with 1 'paper key file /root/paper\.' on_client nestegg key confirm-exported --paper-code "$paper_code" --printed
 check "shortcut: the message says what to do" \
   fails_with 1 'delete the file or move it to a USB stick' on_client nestegg key confirm-exported --paper-code "$paper_code" --printed
+check "shortcut: the message names the way out for a file that cannot be deleted" \
+  fails_with 1 'confirm-exported --file /root/paper\.(txt|html) --accept-local-copy' \
+  on_client nestegg key confirm-exported --paper-code "$paper_code" --printed
+# Where standard output goes is found out before the key is written.
+check "paper key to /dev/null is written and nothing is remembered" \
+  on_client bash -c 'nestegg key paperkey >/dev/null'
+check "paper key redirected to a file with a name that is not UTF-8 is refused" \
+  fails_with 1 'not valid UTF-8' on_client bash -c 'nestegg key paperkey > "$(printf "/root/odd-\377.txt")"'
+check "... and the key was not written into that file" \
+  on_client bash -c 'test -f "$(printf "/root/odd-\377.txt")" && ! test -s "$(printf "/root/odd-\377.txt")"'
+on_client bash -c 'rm -f "$(printf "/root/odd-\377.txt")"'
 # After printing, the files are deleted or moved away.
 on_client bash -c 'mkdir -p /root/printed && mv /root/paper.txt /root/paper.html /root/printed/'
 check "without the statement the right code is not enough" \
