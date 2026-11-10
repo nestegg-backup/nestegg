@@ -1009,6 +1009,15 @@ pub struct Active {
     /// Announcement each user (by uid) has received.
     #[serde(default)]
     pub users: BTreeMap<u32, u64>,
+    /// Users who were told about this problem in an earlier wording (the
+    /// error text changed and the condition was announced anew). They do not
+    /// count for the announcement of the current wording, but they are owed
+    /// the "works again" message like everybody in `users`.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub told_users: BTreeSet<u32>,
+    /// The same for the command: it received an earlier wording.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub told_command: bool,
 }
 
 /// A "works again" message that still has to reach some of its audience.
@@ -1265,7 +1274,8 @@ pub fn apply(
         if let Some(entry) = state.active.remove(&kind) {
             log.push(format!("{}: no longer the case", kind.as_str()));
             told_users.extend(entry.users.keys().copied());
-            told_command |= entry.command_seq > 0;
+            told_users.extend(entry.told_users);
+            told_command |= entry.command_seq > 0 || entry.told_command;
         }
     }
 
@@ -1290,16 +1300,29 @@ pub fn apply(
             None => true,
         };
         if announce {
-            let replaced = state.active.contains_key(&c.kind);
+            // The wording changed: everybody is told again, so the counters
+            // that steer the announcement start over. Who was told before is
+            // kept apart from them: those users (and the command) are owed
+            // the "works again" message even if they never see the new
+            // wording, for example because they logged out in between.
+            let replaced = state.active.remove(&c.kind);
             log.push(format!(
                 "{}: {}",
                 c.kind.as_str(),
-                if replaced {
+                if replaced.is_some() {
                     "changed, announcing again"
                 } else {
                     "new, announcing"
                 }
             ));
+            let (told_users, told_command) = match replaced {
+                Some(old) => {
+                    let mut users = old.told_users;
+                    users.extend(old.users.keys().copied());
+                    (users, old.told_command || old.command_seq > 0)
+                }
+                None => (BTreeSet::new(), false),
+            };
             state.active.insert(
                 c.kind,
                 Active {
@@ -1309,6 +1332,8 @@ pub fn apply(
                     seq: 1,
                     command_seq: 0,
                     users: BTreeMap::new(),
+                    told_users,
+                    told_command,
                 },
             );
         }
@@ -3042,6 +3067,57 @@ mod tests {
         step(&mut state, &[], hours(11), &mut ch);
         assert_eq!(ch.desktop, [(1000, Event::Recovered)]);
         assert!(state.recovery.is_none());
+    }
+
+    #[test]
+    fn who_was_told_an_earlier_wording_still_hears_that_it_works_again() {
+        // Alice gets the first failure message and logs out. The error text
+        // changes (announced anew, nobody is there to get it), then a backup
+        // succeeds. Alice was told there was a problem: she is owed the end
+        // of it when she comes back, and so is the command, whose second
+        // call failed.
+        let mut state = NotifyState::default();
+        let mut ch = Fake::new(&[(1000, "alice")], true);
+        step(&mut state, &[failing("disk full")], hours(0), &mut ch);
+        assert_eq!(ch.desktop, [(1000, Event::Failing)]);
+        assert_eq!(ch.hook, [Event::Failing]);
+        ch.sessions.clear();
+        ch.command_fails = true;
+        step(&mut state, &[failing("wrong password")], hours(2), &mut ch);
+        assert!(ch.desktop.is_empty());
+        let entry = &state.active[&Event::Failing];
+        assert!(entry.users.is_empty(), "nobody has the new wording");
+        assert!(entry.told_users.contains(&1000) && entry.told_command);
+        // A third wording keeps them too.
+        step(&mut state, &[failing("no space left")], hours(3), &mut ch);
+        assert!(state.active[&Event::Failing].told_users.contains(&1000));
+        // The backup works again while alice is away: the message waits.
+        ch.command_fails = false;
+        step(&mut state, &[], hours(5), &mut ch);
+        assert_eq!(ch.hook, [Event::Recovered], "the command hears the end");
+        assert!(ch.desktop.is_empty());
+        assert!(state.recovery.is_some(), "kept for alice");
+        ch.login(1000, "alice");
+        step(&mut state, &[], hours(6), &mut ch);
+        assert_eq!(ch.desktop, [(1000, Event::Recovered)]);
+        assert!(state.recovery.is_none());
+    }
+
+    #[test]
+    fn a_record_without_the_earlier_recipients_is_still_read() {
+        let old = serde_json::json!({
+            "condition": serde_json::to_value(failing("x")).unwrap(),
+            "since": "2026-01-05T08:00:00Z",
+            "announced_at": "2026-01-05T08:00:00Z",
+            "seq": 1,
+            "command_seq": 1,
+            "users": {"1000": 1}
+        });
+        let entry: Active = serde_json::from_value(old).unwrap();
+        assert!(entry.told_users.is_empty() && !entry.told_command);
+        // And nothing new is written for a problem with one wording.
+        let text = serde_json::to_string(&entry).unwrap();
+        assert!(!text.contains("told_"), "{text}");
     }
 
     #[test]
@@ -4779,6 +4855,8 @@ mod tests {
                 seq: 1,
                 command_seq: 0,
                 users: BTreeMap::new(),
+                told_users: BTreeSet::new(),
+                told_command: false,
             },
         );
         assert!(state.clamp_future_times(now));
