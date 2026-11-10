@@ -242,7 +242,8 @@ export interface Machine {
 
 export interface MachineReport {
   reported_at: string;
-  result: "succeeded" | "failed" | "pbs_unreachable";
+  /** Written by the other PC's nestegg, possibly a newer version: any other word counts as "unknown". */
+  result: "succeeded" | "failed" | "pbs_unreachable" | "unknown";
   run_started_at?: string | null;
   error?: RunError | null;
   key_exported?: boolean | null;

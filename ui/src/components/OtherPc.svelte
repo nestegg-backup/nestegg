@@ -31,7 +31,8 @@
       list.push({
         id: `report-${r.reported_at}`,
         trigger: "timer",
-        state: r.result === "failed" ? "failed" : "pbs_unreachable",
+        // Any result this version does not know is shown as "not understood", never as a known one.
+        state: r.result === "failed" ? "failed" : r.result === "pbs_unreachable" ? "pbs_unreachable" : "unknown",
         started_at: r.run_started_at ?? r.reported_at,
         error: r.error ?? null,
       });

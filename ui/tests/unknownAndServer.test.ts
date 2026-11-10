@@ -262,6 +262,27 @@ describe("automatic backups switched off", () => {
     expect(selfSummary(off({ last_run: pbs }), en, fen, now).text).toContain("could not reach the backup server");
   });
 
+  it("says so above a failed, an unknown and a missing first backup too", () => {
+    const failed = run("2026-11-08T10:30:00Z", "failed", { error: { kind: "client_failed", message: "x" } });
+    const unknown = run("2026-11-08T10:30:00Z", "paused_by_future");
+    const cases: [string, Partial<Status>][] = [
+      ["failed", { health: "failing", last_run: failed }],
+      ["unknown", { health: "failing", last_run: unknown }],
+      ["never", { health: "never", last_run: null, last_success: null }],
+    ];
+    for (const [name, over] of cases) {
+      for (const [, t, f] of both) {
+        const s = selfSummary(off(over), t, f, now);
+        expect(s.autoOff, name).toBe(true);
+        expect(s.text, name).toContain(t.self.scheduleOff);
+        // Switched on: no such sentence and no link.
+        const on = selfSummary(status(over), t, f, now);
+        expect(on.autoOff, name).toBeUndefined();
+        expect(on.text, name).not.toContain(t.self.scheduleOff);
+      }
+    }
+  });
+
   it("the list row says it too; switched on, nothing changes", () => {
     expect(selfRowText(off(), en, fen, now)).toBe("Backed up today 01:42, automatic backups off");
     expect(selfRowText(off(), de, fde, now)).toBe("Heute 01:42 gesichert, automatische Sicherung aus");

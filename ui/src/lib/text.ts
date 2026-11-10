@@ -51,8 +51,16 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       return { kind, lead: t.self.keyLead, text: successAt ? `${t.self.keyText} ${lastSuccessText}` : t.self.keyText };
     case "failing": {
       // The last entry was written by a newer version: say that, not "failed" and not "cancelled".
+      // Switched off: nothing is retried by itself, so the text says that too and links to the settings.
+      const off = s.schedule.enabled ? {} : { autoOff: true };
+      const tail = s.schedule.enabled ? "" : ` ${t.self.scheduleOff}`;
       if (last && isUnknownRun(last)) {
-        return { kind, lead: t.self.unknownLead(m(last.started_at)), text: `${t.self.unknownText} ${lastSuccessText}` };
+        return {
+          kind,
+          lead: t.self.unknownLead(m(last.started_at)),
+          text: `${t.self.unknownText} ${lastSuccessText}${tail}`,
+          ...off,
+        };
       }
       // The contract allows health=failing without run details; then the text stays undated.
       const failed = last && last.state === "failed" ? last : null;
@@ -60,7 +68,8 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       return {
         kind,
         lead: failed ? t.self.failingLead(m(failed.started_at)) : t.self.failingLeadUndated,
-        text: ek ? `${t.explain[ek]} ${lastSuccessText}` : lastSuccessText,
+        text: (ek ? `${t.explain[ek]} ${lastSuccessText}` : lastSuccessText) + tail,
+        ...off,
       };
     }
     case "overdue": {
@@ -106,7 +115,14 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       if (s.schedule.enabled && s.schedule.next_run && new Date(s.schedule.next_run) > now)
         parts.push(t.self.neverNext(m(s.schedule.next_run)));
       else parts.push(t.self.neverNow);
-      return { kind, lead: earlier ? t.self.neverLeadServer : t.self.neverLead, text: parts.join(" ") };
+      // Switched off: without this the page would let the reader wait for a first backup that never starts.
+      if (!s.schedule.enabled) parts.push(t.self.scheduleOff);
+      return {
+        kind,
+        lead: earlier ? t.self.neverLeadServer : t.self.neverLead,
+        text: parts.join(" "),
+        ...(s.schedule.enabled ? {} : { autoOff: true }),
+      };
     }
     default: {
       // The lead must not say "everything is fine" above a notice about damaged backups.
@@ -130,8 +146,7 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       if (pbsAfterSuccess) parts.push(t.self.lastAttemptPbs(m(last.started_at)));
       const cancelled = cancelledAfter(last, success);
       if (cancelled) parts.push(t.self.lastCancelled(m(cancelled.started_at)));
-      if (!s.schedule.enabled) parts.push(t.self.scheduleOff);
-      else if (pbsAfterSuccess) parts.push(t.self.autoRetry);
+      if (pbsAfterSuccess) parts.push(t.self.autoRetry);
       else if (s.schedule.next_run) {
         parts.push(new Date(s.schedule.next_run) <= now ? t.self.nextRunDue : t.self.nextRun(m(s.schedule.next_run)));
       }
