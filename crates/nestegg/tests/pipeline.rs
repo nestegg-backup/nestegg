@@ -1626,6 +1626,118 @@ fn a_paper_key_to_dev_null_or_a_pipe_is_written_and_nothing_is_remembered() {
     assert!(env.remembered_paper_keys().is_empty());
 }
 
+impl Env {
+    /// The digest of the key that `key paperkey` last wrote out, as recorded.
+    fn last_exported_digest(&self) -> Option<String> {
+        self.state()["key_last_exported_digest"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn stored_key_digest(&self) -> String {
+        nestegg::secrets::digest(&nestegg::secrets::Secret::new(
+            fs::read(self.root().join("cred/encryption-key")).unwrap(),
+        ))
+    }
+}
+
+#[test]
+fn a_paper_key_into_a_pipe_is_recorded_only_after_it_was_written_completely() {
+    let env = Env::new();
+    env.set_key_exported(false);
+    assert_eq!(env.last_exported_digest(), None);
+    // A reader that closes at once (`| head -1` closing early, a printer that
+    // died): the write fails, so nothing is recorded and the exit code says so.
+    let mut child = env
+        .command(&["key", "paperkey"])
+        .env("NESTEGG_ALLOW_NON_ROOT", "1")
+        .env_remove("SUDO_UID")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert_ne!(code(&out), 0);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("could not be written completely"), "{err}");
+    assert!(err.contains("nothing was recorded"), "{err}");
+    assert_eq!(env.last_exported_digest(), None, "state unchanged");
+    // A reader that reads everything: recorded, and the lock is free again.
+    let out = env.paperkey_to(Stdio::piped());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("BEGIN PROXMOX BACKUP KEY"));
+    assert_eq!(env.last_exported_digest(), Some(env.stored_key_digest()));
+    let lock_file = fs::File::open(env.root().join("run/run.lock")).unwrap();
+    assert!(
+        nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock).is_ok()
+    );
+}
+
+#[test]
+fn a_paper_key_redirected_into_an_already_remembered_file_is_allowed_with_50_files() {
+    let env = Env::new();
+    env.set_key_exported(false);
+    let files: Vec<PathBuf> = (0..50)
+        .map(|i| env.write_user_file(&format!("old-{i}.txt"), "x").into())
+        .collect();
+    env.remember_paper_keys(&files);
+    // The shell empties the file (the redirect), the target is in the list: it
+    // is no new entry, so the key is written.
+    let target = &files[7];
+    let out = env.paperkey_to(Stdio::from(fs::File::create(target).unwrap()));
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        fs::read_to_string(target)
+            .unwrap()
+            .contains("BEGIN PROXMOX BACKUP KEY")
+    );
+    let remembered = env.remembered_paper_keys();
+    assert_eq!(remembered.len(), 50);
+    assert_eq!(
+        remembered
+            .iter()
+            .filter(|p| p.as_str() == target.to_str().unwrap())
+            .count(),
+        1,
+        "no duplicate"
+    );
+    assert_eq!(env.last_exported_digest(), Some(env.stored_key_digest()));
+    // Another file is still refused while all 50 exist, and stays empty.
+    let other = env.root().join("other.txt");
+    let out = env.paperkey_to(Stdio::from(fs::File::create(&other).unwrap()));
+    assert_eq!(code(&out), 1);
+    assert_eq!(fs::metadata(&other).unwrap().len(), 0);
+    assert_eq!(env.remembered_paper_keys().len(), 50);
+}
+
+#[test]
+fn a_paper_key_file_name_that_is_not_there_yet_is_remembered_in_its_canonical_form() {
+    // `--output` names a file that does not exist yet; before and after writing
+    // it is the same entry (here through a link to the directory).
+    let env = Env::new();
+    env.set_key_exported(false);
+    let real = env.root().join("real-dir");
+    fs::create_dir(&real).unwrap();
+    let link = env.root().join("link-dir");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let args = |f: &Path| {
+        vec![
+            "key".to_string(),
+            "paperkey".to_string(),
+            "--output".to_string(),
+            f.to_str().unwrap().to_string(),
+        ]
+    };
+    let a = args(&link.join("one.txt"));
+    let out = env.root_cmd(&a.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        env.remembered_paper_keys(),
+        vec![canonical_name(&real.join("one.txt"))]
+    );
+}
+
 #[test]
 fn a_paper_key_redirected_to_a_file_with_a_name_that_cannot_be_stored_is_not_written() {
     use std::os::unix::ffi::OsStrExt;
@@ -2026,6 +2138,128 @@ fn restore_target_with_dotdot_is_rejected() {
         .unwrap();
     assert_eq!(code(&out), 1);
     assert!(String::from_utf8_lossy(&out.stderr).contains("'..'"));
+}
+
+// ---------------------------------------------------------------- notify
+
+impl Env {
+    /// A configuration with a notification hook that appends
+    /// `event|message` lines to `hook.log` (the desktop channel is off), and
+    /// the backup timer switched on.
+    fn with_notify_hook(&self) {
+        let hook = self.root().join("hook.sh");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$NESTEGG_EVENT\" \"$NESTEGG_MESSAGE\" >> \"$(dirname \"$0\")/hook.log\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        self.write_config(&format!(
+            "\n[notify]\ncommand = [\"{}\"]\ndesktop = false\n",
+            hook.display()
+        ));
+        fs::write(self.root().join("timer-state"), "enabled\n").unwrap();
+        // A clean situation but for what the test sets up: the optional source
+        // exists (the backup is complete) and the server found nothing damaged.
+        fs::create_dir_all(self.root().join("does-not-exist")).unwrap();
+        let mut state = self.state();
+        state["server_verify_failed"] = serde_json::json!([]);
+        state["last_success"]["incomplete"] = serde_json::json!([]);
+        fs::write(self.root().join("state/state.json"), state.to_string()).unwrap();
+    }
+
+    fn hook_lines(&self) -> Vec<String> {
+        fs::read_to_string(self.root().join("hook.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Stamp the last success (and the last run) at `at`.
+    fn stamp_success(&self, at: &str) {
+        let mut state = self.state();
+        for run in ["last_run", "last_success"] {
+            state[run]["started_at"] = serde_json::json!(at);
+            state[run]["finished_at"] = serde_json::json!(at);
+        }
+        fs::write(self.root().join("state/state.json"), state.to_string()).unwrap();
+    }
+
+    fn notify(&self) -> Output {
+        self.root_cmd(&["notify"])
+    }
+}
+
+#[test]
+fn a_success_stamp_in_the_future_is_reported_as_overdue_not_as_fresh_or_recovered() {
+    let env = Env::new();
+    assert_eq!(code(&env.run(&["run"])), 0);
+    env.with_notify_hook();
+    let real = env.state()["last_success"]["finished_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A fresh backup: nothing to report.
+    let out = env.notify();
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("everything is fine"));
+    assert!(env.hook_lines().is_empty());
+
+    // An old one is overdue ...
+    env.stamp_success(&(chrono::Utc::now() - chrono::Duration::hours(50)).to_rfc3339());
+    assert_eq!(code(&env.notify()), 0);
+    let lines = env.hook_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("overdue|"), "{lines:?}");
+    assert!(lines[0].contains("ago"), "{lines:?}");
+
+    // ... and when the stamp then lies in the future (the clock was ahead) the
+    // check does not conclude "fresh backup" and does not announce a recovery:
+    // it says the time lies in the future and the clock was wrong.
+    env.stamp_success("2099-01-01T00:00:00Z");
+    let out = env.notify();
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!stdout.contains("everything is fine"), "{stdout}");
+    let lines = env.hook_lines();
+    assert!(
+        lines.iter().all(|l| !l.starts_with("recovered|")),
+        "{lines:?}"
+    );
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[1].starts_with("overdue|"), "{lines:?}");
+    assert!(lines[1].contains("lies in the future"), "{lines:?}");
+    assert!(
+        lines[1].contains("clock of this computer was wrong"),
+        "{lines:?}"
+    );
+    // Not repeated at the next check.
+    assert_eq!(code(&env.notify()), 0);
+    assert_eq!(env.hook_lines().len(), 2);
+
+    // The next backup puts a real stamp there: now it is a recovery.
+    env.stamp_success(&real);
+    assert_eq!(code(&env.notify()), 0);
+    let lines = env.hook_lines();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines[2].starts_with("recovered|"), "{lines:?}");
+}
+
+#[test]
+fn a_success_stamp_in_the_future_with_the_timer_off_is_reported_without_a_wrong_age() {
+    let env = Env::new();
+    assert_eq!(code(&env.run(&["run"])), 0);
+    env.with_notify_hook();
+    fs::write(env.root().join("timer-state"), "disabled\n").unwrap();
+    env.stamp_success("2099-01-01T00:00:00Z");
+    assert_eq!(code(&env.notify()), 0);
+    let lines = env.hook_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("automatic_off|"), "{lines:?}");
+    assert!(lines[0].contains("lies in the future"), "{lines:?}");
+    assert!(!lines[0].contains("not been backed up"), "{lines:?}");
 }
 
 // ---------------------------------------------------------------- daemon

@@ -123,6 +123,13 @@ check "shortcut: the message names the way out for a file that cannot be deleted
 # Where standard output goes is found out before the key is written.
 check "paper key to /dev/null is written and nothing is remembered" \
   on_client bash -c 'nestegg key paperkey >/dev/null'
+# Recorded as exported only after the whole output was written: a reader that
+# is gone (a printer that died, `| true`) is an error, a reader that takes it
+# all is not.
+check "paper key into a pipe whose reader is gone fails and records nothing" \
+  fails_with 1 'nothing was recorded' on_client bash -c 'set -o pipefail; nestegg key paperkey | true'
+check "paper key into a pipe that is read completely works" \
+  on_client bash -c 'set -o pipefail; nestegg key paperkey | cat >/dev/null'
 check "paper key redirected to a file with a name that is not UTF-8 is refused" \
   fails_with 1 'not valid UTF-8' on_client bash -c 'nestegg key paperkey > "$(printf "/root/odd-\377.txt")"'
 check "... and the key was not written into that file" \

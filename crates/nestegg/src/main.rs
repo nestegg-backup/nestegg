@@ -845,7 +845,14 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                 // Never forget a file that still exists: only entries whose
                 // file is gone make room; otherwise refuse another one.
                 state.prune_paperkey_files(&digest, nestegg::state::paperkey_file_exists);
-                if state.paperkey_files_full() {
+                // A file that is already remembered is no new entry: the limit
+                // refuses only another file, never one it already keeps track of.
+                let target = match (&output, &redirected) {
+                    (Some(file), _) => paperkey_target(file),
+                    (None, StdoutTarget::File(written)) => written.clone(),
+                    _ => PathBuf::new(),
+                };
+                if nestegg::keyproof::paperkey_files_full_for(&state.paperkey_files, &target) {
                     bail!(
                         "{}",
                         nestegg::keyproof::paperkey_limit_message(&state.paperkey_files)
@@ -857,8 +864,7 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                     write_user_file(&file, &data)?;
                     // Remember where it is: confirming with the check code is
                     // refused while this file lies on this computer's disk.
-                    let written = absolute_user_path(&file)?;
-                    let written = std::fs::canonicalize(&written).unwrap_or(written);
+                    let written = paperkey_target(&file);
                     state.remember_paperkey_file(written, &digest);
                     state.key_last_exported_digest = Some(digest);
                     store.save_state(&state)?;
@@ -892,13 +898,37 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                 }
                 (None, _) => {
                     // A pipe (a printer), /dev/null, ...: nothing stays on
-                    // this computer that could be remembered. Note the
-                    // export, then let go of the lock before the output
-                    // goes out.
-                    state.key_last_exported_digest = Some(digest);
-                    store.save_state(&state)?;
+                    // this computer that could be remembered. The run lock
+                    // is let go before the output goes out (a printer queue
+                    // can take its time), and the export is recorded only
+                    // after all of it was written and flushed without an
+                    // error (a closed pipe is one): otherwise the state would
+                    // say "exported" for a paper key that never arrived.
                     drop(lock);
-                    std::io::stdout().write_all(&data)?;
+                    let sent = {
+                        let mut out = std::io::stdout().lock();
+                        out.write_all(&data).and_then(|()| out.flush())
+                    };
+                    if let Err(e) = sent {
+                        bail!(
+                            "the paper key could not be written completely to standard output \
+                             ({e}); nothing was recorded as exported. Run the command again"
+                        );
+                    }
+                    if let Err(why) = nestegg::keyproof::record_piped_paperkey(
+                        paths,
+                        nestegg::keyproof::PAPERKEY_RECORD_WAIT,
+                        &digest,
+                    ) {
+                        bail!(
+                            "the paper key was written to standard output, but it was NOT \
+                             recorded as exported: {why}. Once the paper key is printed and \
+                             stored away from this computer, record it with: sudo nestegg key \
+                             confirm-exported --paper-code <check code at the top of the paper> \
+                             (with your statement that the sheet is printed and stored away; \
+                             without a terminal add --printed)"
+                        );
+                    }
                 }
             }
         }
@@ -1328,6 +1358,22 @@ fn write_user_file(path: &Path, data: &[u8]) -> Result<()> {
     match nestegg::identity::UserIdentity::from_sudo()? {
         Some(user) if is_root() => nestegg::identity::write_new_file_as(&user, path, data),
         _ => secrets::create_new_private_file(path, data),
+    }
+}
+
+/// The path under which `key paperkey --output <file>` remembers its file: the
+/// canonical absolute path. The file may not exist yet, then its directory is
+/// made canonical, so the name is the same before and after writing.
+fn paperkey_target(file: &Path) -> PathBuf {
+    let Ok(abs) = absolute_user_path(file) else {
+        return file.to_path_buf();
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&abs) {
+        return canonical;
+    }
+    match (abs.parent().map(std::fs::canonicalize), abs.file_name()) {
+        (Some(Ok(parent)), Some(name)) => parent.join(name),
+        _ => abs,
     }
 }
 

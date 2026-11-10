@@ -321,7 +321,7 @@ Switch it off with `sudo systemctl disable --now nestegg-notify.timer`.
 | Message | When | Repeated |
 |---|---|---|
 | `failing` – "Backup failed" | The last backup failed. The message names the reason. | every 24 h |
-| `overdue` – "Backups are overdue" | No successful backup within `overdue_after_hours` (this includes a server that stays unreachable, and a setup that never succeeded). | every 24 h |
+| `overdue` – "Backups are overdue" | No successful backup within `overdue_after_hours` (this includes a server that stays unreachable, and a setup that never succeeded). Also when the time of the last successful backup lies in the future (the clock of this computer was wrong): then its age is unknown, the text says so, and nestegg backs up again at the next check. | every 24 h |
 | `automatic_off` – "Automatic backups are off" | The backup timer is switched off while nestegg is set up. Reported at once, independent of the overdue threshold. The text says how old the last backup is. | every 7 days |
 | `incomplete` – "Backup is incomplete" | The last backup worked but left something out (for example the full system backup was skipped). | every 7 days |
 | `damaged` – "Damaged backups on the server" | The server's own verification reports damaged snapshots of this computer. | every 24 h |
@@ -330,7 +330,12 @@ Switch it off with `sudo systemctl disable --now nestegg-notify.timer`.
 
 A different problem (another error, another kind) is reported at once. Each
 message goes to every logged-in user and, if configured, to your command;
-someone who logs in later still gets it once. Problem messages (`failing`,
+someone who logs in later still gets it once. A `settings` message is kept
+until a member of group `nestegg` has received it (the full text): users
+outside the group get the general text once each, but that does not close it,
+so a member who logs in after a few days still sees who changed what. If no
+member logs in for 30 days, it is dropped (one line in the journal) so the
+record stays small. Problem messages (`failing`,
 `overdue`, ...) are not judged while a backup is running, but a `settings`
 change is still delivered then, so lowering the protection during a backup is
 reported without waiting. A flurry of settings changes does not flood anyone:
@@ -377,11 +382,16 @@ this, to keep its dependencies small (decision 0017).
 | `NESTEGG_EVENT` | `failing`, `overdue`, `automatic_off`, `incomplete`, `damaged`, `settings`, `outdated`, `recovered` or `test` |
 | `NESTEGG_TITLE`, `NESTEGG_MESSAGE` | The short title and the text (also on stdin) |
 | `NESTEGG_HOSTNAME` | Host name of this computer |
-| `NESTEGG_LAST_SUCCESS` | Time of the last successful backup (RFC 3339), or empty |
+| `NESTEGG_LAST_SUCCESS` | Time of the last successful backup (RFC 3339), or empty (also when that time lies in the future) |
 
 If the command fails or does not finish, the check logs it, `nestegg notify`
 ends with a non-zero exit code so `systemctl --failed` shows it, and the
-delivery is tried again an hour later; the desktop message is not held back.
+delivery is tried again at the next check; the desktop message is not held
+back. A `settings` message that the command could not take is retried with a
+growing pause (5 minutes, doubling, at most 6 hours). While that failure is
+pending, every check ends with the same non-zero exit code and one line in the
+journal, also the ones that wait out the pause, so the unit stays failed until
+the command works or is switched off.
 
 **The message contains text people typed.** `NESTEGG_TITLE` and
 `NESTEGG_MESSAGE` can contain an exclude pattern, a file name or a user name a
@@ -495,9 +505,18 @@ Two ways to keep a copy; use at least one, better both:
   anything: a file whose name is not valid UTF-8 (it could not be remembered)
   is refused, and so is a further file once 50 earlier paper key files still
   exist. Delete or move old ones first; nestegg never forgets a file that
-  still exists. The command takes the run lock only for the moment it changes
-  the state: while a backup is running it stops with "try again" before
-  anything is written.
+  still exists. A file that is already remembered is not a new one: writing
+  into it again (`> key.txt` on the same file) is allowed, also at 50 files.
+  The command takes the run lock only for the moment it changes the state:
+  while a backup is running it stops with "try again" before anything is
+  written. Into a pipe, the paper key is recorded as exported only after all of
+  it was written without an error (a printer or `head` that closes the pipe
+  early is an error: nothing is recorded, exit code 1). The lock is not held
+  while the output goes into the pipe; it is taken again for the short update
+  (waiting up to 30 seconds). If a backup holds it longer, or the key changed
+  meanwhile, the paper key is out but not recorded: the command says so and how
+  to record it (`nestegg key confirm-exported --paper-code ...`), and exits
+  with a non-zero code.
 - **Key file:** `sudo nestegg key export /media/usb/nestegg-key.json`. The
   file is read back and compared with the key. If it lies on a disk of this
   computer you get a warning: that copy is lost together with the disk and

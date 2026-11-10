@@ -77,6 +77,15 @@ const SETTINGS_RATE_LIMIT: Duration = Duration::minutes(5);
 /// still retried for ever — nothing is dropped — but at most a few times an
 /// hour, not on every check and not several times within one run.
 const SETTINGS_COMMAND_MAX_BACKOFF: Duration = Duration::hours(6);
+/// A success stamp up to this far ahead of the clock is just clock noise and
+/// counts as "now"; a further one says nothing about the age of the last
+/// backup (the clock of this computer was wrong when it was written).
+const FUTURE_TOLERANCE: Duration = Duration::minutes(5);
+/// An announcement that no member of group `nestegg` ever received (nobody who
+/// gets the full text logged in) stops being held for one after this long, so
+/// the record stays bounded even on a computer where no member logs in. The
+/// users who only get the general text have had their message by then.
+const SETTINGS_FULL_MAX_WAIT: Duration = Duration::days(30);
 /// Regular (non-system) accounts: from `UID_MIN` of `/etc/login.defs`
 /// (default 1000) up to the end of the systemd-homed range. Above that come
 /// container, dynamic-service and `nobody` ids.
@@ -171,6 +180,11 @@ pub struct Condition {
     pub age_hours: Option<i64>,
     /// `overdue`: the backup timer is switched off.
     pub timer_off: bool,
+    /// `overdue` / `automatic_off`: the time of the last successful backup lies
+    /// in the future (the clock of this computer was wrong), so it says nothing
+    /// about how old that backup is; `age_hours` is `None` then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clock_wrong: bool,
 }
 
 impl Condition {
@@ -183,6 +197,7 @@ impl Condition {
             damaged: 0,
             age_hours: None,
             timer_off: false,
+            clock_wrong: false,
         }
     }
 
@@ -232,7 +247,14 @@ pub fn evaluate(
         .last_success
         .as_ref()
         .map(|run| run.finished_at.unwrap_or(run.started_at));
-    let age_hours = last_success_at.map(|t| (now - t).num_hours().max(0));
+    // A success stamp clearly ahead of the clock (the clock was ahead when the
+    // run finished and was corrected later) says nothing about the age of the
+    // last backup. Decided here from the stamp itself, so it is right whether
+    // or not `status.health` already reports it.
+    let clock_wrong = last_success_at.is_some_and(|t| t - now > FUTURE_TOLERANCE);
+    let age_hours = last_success_at
+        .filter(|_| !clock_wrong)
+        .map(|t| (now - t).num_hours().max(0));
     let failed = status
         .last_run
         .as_ref()
@@ -287,6 +309,7 @@ pub fn evaluate(
         let mut c = Condition::new(Event::AutomaticOff, "off".to_string());
         c.age_hours = age_hours;
         c.timer_off = true;
+        c.clock_wrong = clock_wrong;
         conditions.push(c);
     }
     // Overdue and incomplete are only judged when the last run did not fail and
@@ -297,9 +320,14 @@ pub fn evaluate(
         let overdue_limit = Duration::hours(i64::from(status.overdue_after_hours));
         let never_and_old = status.health == Health::Never
             && unbacked_since.is_some_and(|since| now - since > overdue_limit);
-        if timer_enabled && (status.health == Health::Overdue || never_and_old) {
-            let mut c = Condition::new(Event::Overdue, "timer on".to_string());
+        // With a success stamp in the future the backup counts as overdue
+        // whatever `health` says: nothing proves a recent backup, and the next
+        // check backs up again.
+        if timer_enabled && (status.health == Health::Overdue || never_and_old || clock_wrong) {
+            let key = if clock_wrong { "clock" } else { "timer on" };
+            let mut c = Condition::new(Event::Overdue, key.to_string());
             c.age_hours = age_hours;
+            c.clock_wrong = clock_wrong;
             conditions.push(c);
         } else if status.health == Health::Incomplete {
             let reasons = status
@@ -583,6 +611,25 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>, detail: 
         Event::Overdue => {
             let age = c.age_hours.map(|h| span(lang, h));
             let (title, first, last) = match &age {
+                // The stamp of the last backup lies in the future: its age is
+                // unknown, not "never".
+                None if c.clock_wrong => (
+                    tr(lang, "Backups are overdue", "Datensicherung überfällig"),
+                    tr(
+                        lang,
+                        "The time of the last backup of this computer lies in the future: the \
+                         clock of this computer was wrong. nestegg backs up again at the next \
+                         check.",
+                        "Die Zeit der letzten Sicherung dieses Computers liegt in der Zukunft: \
+                         Die Uhr dieses Computers ging falsch. nestegg sichert beim nächsten \
+                         Prüflauf erneut.",
+                    ),
+                    tr(
+                        lang,
+                        "Details: \"nestegg ui\".",
+                        "Mehr dazu: \"nestegg ui\".",
+                    ),
+                ),
                 Some(age) => (
                     tr(lang, "Backups are overdue", "Datensicherung überfällig"),
                     match lang {
@@ -631,6 +678,15 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>, detail: 
                 "Wieder einschalten: \"nestegg ui\".",
             );
             let first = match c.age_hours.map(|h| span(lang, h)) {
+                None if c.clock_wrong => match lang {
+                    Lang::En => "Automatic backups are switched off, and the time of the last \
+                                 backup lies in the future (the clock of this computer was wrong)."
+                        .to_string(),
+                    Lang::De => "Automatische Sicherungen sind ausgeschaltet, und die Zeit der \
+                                 letzten Sicherung liegt in der Zukunft (die Uhr dieses Computers \
+                                 ging falsch)."
+                        .to_string(),
+                },
                 Some(age) => match lang {
                     Lang::En => format!(
                         "Automatic backups are switched off, and the last successful \
@@ -988,6 +1044,12 @@ pub struct SettingsAnnouncement {
     /// The hook already received it.
     #[serde(default)]
     pub command_done: bool,
+    /// The desktop message with the full text (who, what) has reached at least
+    /// one member of group `nestegg`. Users outside the group only get the
+    /// general text; they are in `users_done` after they got it, but they do not
+    /// release the announcement: a member who logs in later must still see it.
+    #[serde(default)]
+    pub full_done: bool,
     /// Non-zero while this is a write-ahead *intent*: the daemon recorded it
     /// before changing the configuration and has not yet filled in the real
     /// reductions. The id lets the daemon find and complete (or cancel) it
@@ -1003,14 +1065,24 @@ pub struct SettingsAnnouncement {
 impl SettingsAnnouncement {
     /// Whether this announcement has reached every channel that is switched on
     /// (R3 item 1): the hook, if one is configured, has run; the desktop
-    /// message, if the desktop channel is on, has reached at least one user. A
-    /// switched-off channel holds nothing back. Only once this is true may the
-    /// keep window (counted from `at`, the newest change in a merged entry)
-    /// remove it; before that, time alone never drops it.
-    fn delivered(&self, desktop_on: bool, command_on: bool) -> bool {
-        let desktop_ok = !desktop_on || !self.users_done.is_empty();
+    /// message, if the desktop channel is on, has reached at least one
+    /// recipient who gets the full text (a member of group `nestegg`; users who
+    /// only get the general text do not count). A switched-off channel holds
+    /// nothing back. Only once this is true may the keep window (counted from
+    /// `at`, the newest change in a merged entry) remove it; before that, time
+    /// alone never drops it — with one bound: when no member has logged in for
+    /// [`SETTINGS_FULL_MAX_WAIT`], the desktop part counts as done, so the
+    /// record stays bounded on a computer where nobody of the group ever logs in.
+    fn delivered(&self, desktop_on: bool, command_on: bool, now: DateTime<Utc>) -> bool {
+        let desktop_ok = !desktop_on || self.full_done || self.full_wait_over(now);
         let command_ok = !command_on || self.command_done;
         desktop_ok && command_ok
+    }
+
+    /// The announcement has waited for a member longer than
+    /// [`SETTINGS_FULL_MAX_WAIT`] (counted from its newest change).
+    fn full_wait_over(&self, now: DateTime<Utc>) -> bool {
+        now - self.at > SETTINGS_FULL_MAX_WAIT
     }
 }
 
@@ -1456,6 +1528,7 @@ fn cap_settings(settings: &mut Vec<SettingsAnnouncement>) {
             m.at = m.at.max(a.at);
             m.users_done = m.users_done.intersection(&a.users_done).copied().collect();
             m.command_done &= a.command_done;
+            m.full_done &= a.full_done;
         } else {
             merged.push(a);
         }
@@ -1523,6 +1596,10 @@ pub fn deliver_settings(
             Ok(Delivery::Sent) => {
                 for &i in &pending {
                     state.settings[i].users_done.insert(session.uid);
+                    // Only the full text releases the announcement.
+                    if session.privileged {
+                        state.settings[i].full_done = true;
+                    }
                 }
                 state.settings_sent_users.insert(session.uid, now);
                 delivered_users.insert(session.uid);
@@ -1542,6 +1619,14 @@ pub fn deliver_settings(
             )),
         }
     }
+    if !command
+        && (state.settings_command_failures > 0 || state.settings_command_retry_after.is_some())
+    {
+        // The hook was switched off: its failure is no longer pending.
+        state.settings_command_failures = 0;
+        state.settings_command_retry_after = None;
+        save(state);
+    }
     if command {
         let pending: Vec<usize> = (0..state.settings.len())
             .filter(|&i| !state.settings[i].command_done)
@@ -1559,7 +1644,19 @@ pub fn deliver_settings(
             .settings_command_retry_after
             .is_some_and(|t| now < t && t - now <= SETTINGS_COMMAND_MAX_BACKOFF);
         if !pending.is_empty() && !*delivered_cmd && (rate_hold || backoff_hold) {
-            log.push("settings: holding back the hook (one call per few minutes)".to_string());
+            if state.settings_command_failures > 0 {
+                // The failure is still pending, only the next try waits for the
+                // pause: the check ends as non-zero as the one that really tried,
+                // so the unit does not flip between failed and fine.
+                hook_failed = true;
+                log.push(format!(
+                    "settings: the command still fails ({} failures in a row), the \
+                     announcement is kept and tried again after the pause",
+                    state.settings_command_failures
+                ));
+            } else {
+                log.push("settings: holding back the hook (one call per few minutes)".to_string());
+            }
         } else if !pending.is_empty() {
             let groups = combine_reductions(&state.settings, &pending);
             let message = compose_settings_many(lang, &groups, Detail::Full);
@@ -1597,9 +1694,29 @@ pub fn deliver_settings(
     // announcement that has not yet been delivered on an enabled channel (R3
     // item 1). A future `at` was clamped to now on read, so the window is honest.
     let before = state.settings.len();
+    // One line for an announcement that gives up waiting for a member of the
+    // group (it is dropped below), so this does not repeat at every check.
+    for a in &state.settings {
+        if desktop_on
+            && !a.full_done
+            && a.full_wait_over(now)
+            && a.delivered(desktop_on, command, now)
+            && now - a.at > RECOVERY_KEEP
+        {
+            log.push(format!(
+                "settings: dropping the change by {}: no member of group nestegg logged in for {} days",
+                if a.user.is_empty() {
+                    "?".to_string()
+                } else {
+                    visible(&a.user)
+                },
+                SETTINGS_FULL_MAX_WAIT.num_days()
+            ));
+        }
+    }
     state
         .settings
-        .retain(|a| !a.delivered(desktop_on, command) || now - a.at <= RECOVERY_KEEP);
+        .retain(|a| !a.delivered(desktop_on, command, now) || now - a.at <= RECOVERY_KEEP);
     if state.settings.len() != before {
         save(state);
     }
@@ -2052,7 +2169,10 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
         last_success: status
             .as_ref()
             .and_then(|s| s.last_success.as_ref())
-            .map(|run| run.finished_at.unwrap_or(run.started_at)),
+            .map(|run| run.finished_at.unwrap_or(run.started_at))
+            // A stamp from a clock that was ahead says nothing; the hook gets
+            // an empty value then, as if there were none.
+            .filter(|t| *t - now <= FUTURE_TOLERANCE),
     };
     let channels = SystemChannels {
         config: &notify_config,
@@ -2377,6 +2497,7 @@ fn load_inbox_noting_damage(paths: &Paths) -> Vec<SettingsAnnouncement> {
             at: Utc::now(),
             users_done: BTreeSet::new(),
             command_done: false,
+            full_done: false,
             id: 0,
             provisional: true,
         });
@@ -2421,6 +2542,7 @@ pub fn record_settings_change(
         at: Utc::now(),
         users_done: BTreeSet::new(),
         command_done: false,
+        full_done: false,
         id: 0,
         provisional: false,
     });
@@ -2446,6 +2568,7 @@ pub fn record_settings_intent(paths: &Paths, user: &str) -> Result<u64> {
         at: Utc::now(),
         users_done: BTreeSet::new(),
         command_done: false,
+        full_done: false,
         id,
         provisional: true,
     });
@@ -2484,6 +2607,7 @@ pub fn finalize_settings_change(
             at: Utc::now(),
             users_done: BTreeSet::new(),
             command_done: false,
+            full_done: false,
             id: 0,
             provisional: false,
         });
@@ -2643,6 +2767,7 @@ mod tests {
             at,
             users_done: BTreeSet::new(),
             command_done: false,
+            full_done: false,
             id: 0,
             provisional: false,
         }
@@ -4590,7 +4715,12 @@ mod tests {
             &mut ch,
             &mut |_| {},
         );
-        assert!(!out.hook_failed, "held back within the backoff");
+        // The failure is still pending, so the check ends as failed too (R4
+        // item 3), but the hook is not tried again.
+        assert!(
+            out.hook_failed,
+            "held back within the backoff, still failing"
+        );
         assert!(ch.hook.is_empty());
         assert_eq!(
             state.settings_command_failures, 1,
@@ -4682,6 +4812,7 @@ mod tests {
             at: Utc::now() + Duration::days(365),
             users_done: BTreeSet::new(),
             command_done: false,
+            full_done: false,
             id: 42,
             provisional: true,
         }];
@@ -4778,5 +4909,428 @@ mod tests {
         drop(held);
         // With the lock free again it succeeds.
         assert!(lock_with_timeout(&paths, StdDuration::from_millis(200)).is_ok());
+    }
+
+    // --- R4 item 1: who counts as "delivered" -------------------------------
+
+    #[test]
+    fn users_without_details_do_not_release_a_settings_announcement() {
+        use crate::settings::Reduction;
+        // Only a user outside the group is logged in: they get the general
+        // text once, but the announcement stays for a member who logs in later,
+        // also past the keep window.
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], hours(0)));
+        let mut ch = Fake::new(&[], false);
+        ch.login_plain(2000, "bob");
+        let out = deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(ch.desktop, [(2000, Event::Settings)]);
+        assert!(!ch.bodies[0].contains("alice"), "only the general text");
+        assert!(out.log.iter().all(|l| !l.contains("dropping")));
+        assert!(state.settings[0].users_done.contains(&2000));
+        assert!(!state.settings[0].full_done);
+        // Days later (past the keep window): kept, and bob is not told again.
+        ch.clear();
+        let out = deliver(&mut state, hours(24 * 10), Lang::En, &mut ch, &mut |_| {});
+        assert!(ch.desktop.is_empty(), "bob has had his message");
+        assert!(out.log.is_empty(), "no noise: {:?}", out.log);
+        assert_eq!(state.settings.len(), 1, "still waiting for a member");
+        // A member logs in and gets the full text; now it is delivered.
+        ch.login(1000, "carol");
+        deliver(
+            &mut state,
+            hours(24 * 10 + 1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert_eq!(ch.desktop, [(1000, Event::Settings)]);
+        assert!(ch.bodies[0].contains("alice"), "{}", ch.bodies[0]);
+        assert!(
+            state.settings.is_empty(),
+            "delivered to a member and past the keep window"
+        );
+    }
+
+    #[test]
+    fn a_member_logging_in_inside_the_keep_window_gets_it_and_it_is_then_kept() {
+        use crate::settings::Reduction;
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], hours(0)));
+        let mut ch = Fake::new(&[], false);
+        ch.login_plain(2000, "bob");
+        deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        ch.clear();
+        ch.login(1000, "carol");
+        deliver(&mut state, hours(1), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(ch.desktop, [(1000, Event::Settings)]);
+        assert!(state.settings[0].full_done);
+        // Delivered: only the keep window is left, the same as before.
+        assert_eq!(state.settings.len(), 1);
+        deliver(
+            &mut state,
+            hours(0) + RECOVERY_KEEP + Duration::seconds(1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(state.settings.is_empty());
+    }
+
+    #[test]
+    fn the_only_member_who_made_the_change_releases_it_when_she_gets_it() {
+        use crate::settings::Reduction;
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], hours(0)));
+        // alice is the only member and is not logged in: it waits ...
+        let mut ch = Fake::new(&[], false);
+        deliver(&mut state, hours(1), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(state.settings.len(), 1);
+        // ... and counts as delivered once she gets it.
+        ch.login(1000, "alice");
+        deliver(&mut state, hours(2), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(ch.desktop, [(1000, Event::Settings)]);
+        assert!(state.settings[0].full_done);
+    }
+
+    #[test]
+    fn without_any_member_the_record_stays_bounded_and_quiet() {
+        use crate::settings::Reduction;
+        // Nobody of the group ever logs in; one user outside it does. Hourly
+        // checks for a month: one message to that user, no log line, one
+        // entry, and then it is dropped with a single line.
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], hours(0)));
+        let mut ch = Fake::new(&[], false);
+        ch.login_plain(2000, "bob");
+        let mut sent = 0;
+        let mut lines = 0;
+        for h in 0..(24 * 30) {
+            ch.clear();
+            let out = deliver(&mut state, hours(h), Lang::En, &mut ch, &mut |_| {});
+            sent += ch.desktop.len();
+            lines += out
+                .log
+                .iter()
+                .filter(|l| !l.contains("desktop notification"))
+                .count();
+            assert_eq!(state.settings.len(), 1, "hour {h}");
+        }
+        assert_eq!(sent, 1, "bob gets it once");
+        assert_eq!(lines, 0, "quiet while it waits");
+        // Past the bound: dropped, with exactly one line, once.
+        let out = deliver(
+            &mut state,
+            hours(0) + SETTINGS_FULL_MAX_WAIT + Duration::seconds(1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(state.settings.is_empty());
+        let dropped: Vec<_> = out.log.iter().filter(|l| l.contains("dropping")).collect();
+        assert_eq!(dropped.len(), 1, "{:?}", out.log);
+        assert!(dropped[0].contains("alice"));
+    }
+
+    #[test]
+    fn a_hook_that_has_not_run_still_holds_an_announcement_past_the_member_bound() {
+        use crate::settings::Reduction;
+        // The bound only ends the wait for a member; a hook message that was
+        // never delivered is still kept (R3 item 1).
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], hours(0)));
+        let mut ch = Fake::new(&[], true);
+        ch.command_fails = true;
+        deliver(
+            &mut state,
+            hours(0) + SETTINGS_FULL_MAX_WAIT + Duration::days(1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert_eq!(state.settings.len(), 1);
+    }
+
+    #[test]
+    fn merged_entries_count_as_reached_by_a_member_only_if_all_were() {
+        use crate::settings::Reduction;
+        let mut a = announce("alice", vec![Reduction::WakeOnLanOff], hours(0));
+        a.users_done = [1000, 2000].into();
+        a.full_done = true;
+        let mut b = announce("alice", vec![Reduction::AutomaticBackupsOff], hours(1));
+        b.users_done = [2000].into();
+        let mut v: Vec<SettingsAnnouncement> = Vec::new();
+        for _ in 0..MAX_SETTINGS {
+            v.push(a.clone());
+        }
+        v.push(b);
+        cap_settings(&mut v);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].users_done, [2000].into(), "intersection");
+        assert!(!v[0].full_done, "the member has not seen the newer change");
+        // All reached by a member: stays reached.
+        let mut v: Vec<SettingsAnnouncement> = (0..=MAX_SETTINGS).map(|_| a.clone()).collect();
+        cap_settings(&mut v);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].full_done);
+    }
+
+    #[test]
+    fn with_the_desktop_off_only_the_hook_holds_an_announcement() {
+        use crate::settings::Reduction;
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], hours(0)));
+        let mut ch = Fake::new(&[], true);
+        ch.desktop_on = false;
+        deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(ch.hook, [Event::Settings]);
+        assert!(!state.settings[0].full_done, "no desktop message was sent");
+        // Delivered on the one channel that is on; the keep window then ends it.
+        deliver(
+            &mut state,
+            hours(0) + RECOVERY_KEEP + Duration::seconds(1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(state.settings.is_empty());
+    }
+
+    #[test]
+    fn a_record_written_before_full_done_existed_is_still_read() {
+        let text =
+            r#"{"user":"alice","reductions":[],"at":"2026-11-09T08:00:00Z","users_done":[1000]}"#;
+        let a: SettingsAnnouncement = serde_json::from_str(text).unwrap();
+        assert!(!a.full_done);
+        assert_eq!(a.users_done, [1000].into());
+    }
+
+    // --- R4 item 2: a success stamp in the future -------------------------------
+
+    fn future_overdue_list(timer: bool, health: Health, ahead: Duration) -> Vec<Condition> {
+        let future = run_with(RunState::Succeeded, t0() + ahead);
+        let s = status(health, Some(future.clone()), Some(future), &[]);
+        checked(evaluate(&s, timer, None, t0())).0
+    }
+
+    #[test]
+    fn a_success_stamp_in_the_future_is_not_a_fresh_backup() {
+        // Whatever `health` says: the stamp itself decides.
+        for health in [Health::Ok, Health::Overdue, Health::Incomplete] {
+            let list = future_overdue_list(true, health, Duration::days(10));
+            assert_eq!(list.len(), 1, "{health:?}: {list:?}");
+            assert_eq!(list[0].kind, Event::Overdue);
+            assert!(list[0].clock_wrong);
+            assert_eq!(list[0].age_hours, None, "the age is unknown, not 0");
+            assert_eq!(list[0].key, "clock");
+        }
+        // A few minutes ahead is clock noise, not a problem.
+        assert!(future_overdue_list(true, Health::Ok, Duration::minutes(3)).is_empty());
+        // Just past the tolerance it counts.
+        assert_eq!(
+            future_overdue_list(true, Health::Ok, Duration::minutes(6)).len(),
+            1
+        );
+        // With the timer off the separate condition says it, not "never".
+        let list = future_overdue_list(false, Health::Ok, Duration::days(10));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].kind, Event::AutomaticOff);
+        assert!(list[0].clock_wrong && list[0].age_hours.is_none());
+        // A failed last run stays the louder message.
+        let future = run_with(RunState::Succeeded, t0() + Duration::days(10));
+        let bad = run_with(RunState::Failed, hours(-1));
+        let s = status(Health::Failing, Some(bad), Some(future), &[]);
+        let kinds: Vec<Event> = checked(evaluate(&s, true, None, t0()))
+            .0
+            .iter()
+            .map(|c| c.kind)
+            .collect();
+        assert_eq!(kinds, [Event::Failing]);
+    }
+
+    #[test]
+    fn the_text_for_a_future_stamp_says_what_happened() {
+        let overdue = &future_overdue_list(true, Health::Ok, Duration::days(10))[0];
+        let off = &future_overdue_list(false, Health::Ok, Duration::days(10))[0];
+        for (c, kind) in [(overdue, Event::Overdue), (off, Event::AutomaticOff)] {
+            let en = compose(Lang::En, kind, Some(c), Detail::Full).body;
+            assert!(en.contains("lies in the future"), "{en}");
+            assert!(en.contains("clock"), "{en}");
+            assert!(!en.contains("not been backed up"), "{en}");
+            let de = compose(Lang::De, kind, Some(c), Detail::Full).body;
+            assert!(de.contains("in der Zukunft"), "{de}");
+            assert!(de.contains("Uhr"), "{de}");
+        }
+        let en = compose(Lang::En, Event::Overdue, Some(overdue), Detail::Full).body;
+        assert!(en.contains("next check"), "{en}");
+    }
+
+    #[test]
+    fn a_success_stamp_in_the_future_announces_no_recovery() {
+        // Overdue was announced; then the clock jumps ahead and the last success
+        // gets a future stamp. That is no "works again".
+        let mut state = NotifyState::default();
+        let mut ch = Fake::new(&[(1000, "alice")], true);
+        step(&mut state, &[overdue(false, Some(50))], hours(0), &mut ch);
+        assert_eq!(ch.hook, [Event::Overdue]);
+        let list = future_overdue_list(true, Health::Ok, Duration::days(10));
+        step(&mut state, &list, hours(1), &mut ch);
+        assert!(!ch.hook.contains(&Event::Recovered), "{:?}", ch.hook);
+        assert_eq!(
+            ch.hook,
+            [Event::Overdue],
+            "announced again with the new text"
+        );
+        assert!(ch.hook_bodies[0].contains("lies in the future"));
+        step(&mut state, &list, hours(2), &mut ch);
+        assert!(ch.hook.is_empty() && ch.desktop.is_empty(), "then quiet");
+        // The next backup (a fresh stamp) ends it with the recovery.
+        step(&mut state, &[], hours(3), &mut ch);
+        assert_eq!(ch.hook, [Event::Recovered]);
+    }
+
+    #[test]
+    fn a_condition_stored_before_clock_wrong_existed_is_still_read() {
+        let c = overdue(false, Some(5));
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(!text.contains("clock_wrong"), "{text}");
+        let back: Condition = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, c);
+    }
+
+    // --- R4 item 3: the exit code while the settings hook fails -----------------
+
+    #[test]
+    fn every_check_fails_while_the_settings_hook_failure_is_pending() {
+        use crate::settings::Reduction;
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], t0()));
+        let mut ch = Fake::new(&[], true);
+        ch.desktop_on = false;
+        ch.command_fails = true;
+        // The check that really tries the hook.
+        let out = deliver(&mut state, t0(), Lang::En, &mut ch, &mut |_| {});
+        assert!(out.hook_failed);
+        // Checks held back by the pause end the same way, with one line.
+        for secs in [30, 60, 120] {
+            let out = deliver(
+                &mut state,
+                t0() + Duration::seconds(secs),
+                Lang::En,
+                &mut ch,
+                &mut |_| {},
+            );
+            assert!(out.hook_failed, "{secs} s: held back, but still failing");
+            assert_eq!(out.log.len(), 1, "{:?}", out.log);
+            assert!(out.log[0].contains("still fails"), "{:?}", out.log);
+            assert_eq!(
+                state.settings_command_failures, 1,
+                "no new try, no new count"
+            );
+        }
+        assert!(ch.hook.is_empty());
+        // Past the pause it tries again and fails again.
+        let out = deliver(
+            &mut state,
+            t0() + SETTINGS_RATE_LIMIT + Duration::seconds(1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(out.hook_failed);
+        assert_eq!(state.settings_command_failures, 2);
+        // The hook works again: the next try that happens succeeds and ends it.
+        ch.command_fails = false;
+        let later = t0() + SETTINGS_COMMAND_MAX_BACKOFF + Duration::minutes(1);
+        let out = deliver(&mut state, later, Lang::En, &mut ch, &mut |_| {});
+        assert!(!out.hook_failed);
+        assert_eq!(ch.hook, [Event::Settings]);
+        assert_eq!(state.settings_command_failures, 0);
+        let out = deliver(
+            &mut state,
+            later + Duration::minutes(1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(!out.hook_failed, "nothing pending any more");
+    }
+
+    #[test]
+    fn a_pause_after_a_success_is_not_a_failure() {
+        use crate::settings::Reduction;
+        // The rate limit after a delivered message holds a second one back, but
+        // no failure is pending, so the check ends fine.
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], t0()));
+        let mut ch = Fake::new(&[], true);
+        ch.desktop_on = false;
+        assert!(!deliver(&mut state, t0(), Lang::En, &mut ch, &mut |_| {}).hook_failed);
+        state.settings.push(announce(
+            "alice",
+            vec![Reduction::AutomaticBackupsOff],
+            t0(),
+        ));
+        let out = deliver(
+            &mut state,
+            t0() + Duration::seconds(30),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(!out.hook_failed);
+        assert!(out.log.iter().any(|l| l.contains("holding back the hook")));
+    }
+
+    #[test]
+    fn switching_the_hook_off_ends_the_pending_failure() {
+        use crate::settings::Reduction;
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], t0()));
+        let mut ch = Fake::new(&[], true);
+        ch.desktop_on = false;
+        ch.command_fails = true;
+        assert!(deliver(&mut state, t0(), Lang::En, &mut ch, &mut |_| {}).hook_failed);
+        ch.command = false;
+        let out = deliver(
+            &mut state,
+            t0() + Duration::seconds(30),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(!out.hook_failed);
+        assert_eq!(state.settings_command_failures, 0);
+        assert!(state.settings_command_retry_after.is_none());
+        // Switched on again later: a fresh start, not held by the old pause.
+        ch.command = true;
+        ch.command_fails = false;
+        let out = deliver(
+            &mut state,
+            t0() + Duration::seconds(60),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(!out.hook_failed);
+        assert_eq!(ch.hook, [Event::Settings]);
     }
 }

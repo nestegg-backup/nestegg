@@ -415,6 +415,43 @@ on_client systemctl reset-failed nestegg-notify.service >/dev/null 2>&1 || true
 # Restore a good configuration for the rest of the run.
 on_client bash -c "cat /root/config.good > $cfg"
 
+echo "-- a pending settings-hook failure fails every check, also the ones inside the pause (decision 0017)"
+# Start healthy: good configuration, a fresh successful backup, nothing recorded.
+check "the backup works again for the pause test" on_client systemctl start nestegg-backup.service
+for _ in $(seq 1 60); do
+  [[ "$(on_client systemctl is-active nestegg-notify.service 2>/dev/null || true)" == inactive ]] && break
+  sleep 1
+done
+on_client rm -f /var/lib/nestegg/notify.json /var/lib/nestegg/notify-settings.json
+on_client systemctl reset-failed nestegg-notify.service >/dev/null 2>&1 || true
+on_client sed -i 's#^command = .*#command = ["/usr/local/bin/nestegg-failing-hook"]#' "$cfg"
+# alice raises "overdue after": a reported reduction. The daemon starts a check,
+# which waits out the quiet period and then runs the hook, which fails.
+out="$(patch_config as_alice '{"overdue_after_hours":60}')"
+check "group member raises the overdue threshold" test "$(tail -1 <<<"$out")" = 200
+failed_by_check() {
+  for _ in $(seq 1 90); do
+    on_client systemctl is-failed --quiet nestegg-notify.service && return 0
+    sleep 1
+  done
+  return 1
+}
+check "the check that tries the hook leaves the unit failed" failed_by_check
+# The hook is now held back by the pause (5 minutes), but the failure is still
+# pending: every further check ends the same way, and the unit stays failed.
+for n in 1 2; do
+  check "check $n inside the pause fails again" exits_with 1 on_client systemctl start nestegg-notify.service
+  check "unit is failed after check $n inside the pause" on_client systemctl is-failed --quiet nestegg-notify.service
+done
+check "the check says why it fails" fails_with 1 'the command still fails' on_client nestegg notify
+check "the journal has that line" bash -c "docker exec $client journalctl -u nestegg-notify.service --no-pager | grep -q 'the command still fails'"
+# Switching the hook off ends it: the check is fine and the unit is not failed.
+on_client sed -i '/^command = /d' "$cfg"
+check "with the hook switched off the check ends fine" on_client nestegg notify
+check "the unit starts fine again" on_client systemctl start nestegg-notify.service
+check "the unit is no longer failed" bash -c "! docker exec $client systemctl is-failed --quiet nestegg-notify.service"
+on_client bash -c "cat /root/config.good > $cfg"
+
 echo "== removal keeps credentials"
 check "package removes cleanly" on_client bash -c 'DEBIAN_FRONTEND=noninteractive apt-get remove -y -q nestegg >/tmp/apt-rm.log 2>&1'
 check "health check timer stopped by the removal" bash -c "! docker exec $client systemctl is-active --quiet nestegg-notify.timer"

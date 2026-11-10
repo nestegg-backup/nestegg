@@ -735,6 +735,67 @@ pub fn paperkey_limit_message(files: &[PaperKeyFile]) -> String {
     text
 }
 
+/// Whether `key paperkey` has to refuse a paper key file at `target`: as many
+/// files as can be remembered still exist, and `target` is not one of them. A
+/// target that is already in the list is not a new entry (the shell may have
+/// emptied it by a redirect, so refusing then would only lose the file), so it
+/// is allowed and its entry stays.
+pub fn paperkey_files_full_for(files: &[PaperKeyFile], target: &Path) -> bool {
+    files.len() >= crate::state::MAX_PAPERKEY_FILES && !files.iter().any(|f| f.path == target)
+}
+
+/// How long `key paperkey` waits for the run lock to record a paper key that
+/// went into a pipe. A backup can hold it for hours, so the wait is short.
+pub const PAPERKEY_RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Record that the paper key for the key with `digest` went out through
+/// standard output (a pipe): `key_last_exported_digest` is set. Called only
+/// after the whole output was written and flushed without error. The run lock
+/// is taken only now and only for this short update (waiting at most `wait`),
+/// the state is read again and the stored key must still be the one that was
+/// printed. `Err` says in words why nothing was recorded.
+pub fn record_piped_paperkey(
+    paths: &crate::config::Paths,
+    wait: std::time::Duration,
+    digest: &str,
+) -> std::result::Result<(), String> {
+    let deadline = std::time::Instant::now() + wait;
+    let _lock = loop {
+        match crate::run::RunLock::try_acquire(paths) {
+            Ok(Some(lock)) => break lock,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "a backup was running for more than {} seconds",
+                    wait.as_secs()
+                ));
+            }
+            Err(e) => return Err(format!("the run lock cannot be taken: {e:#}")),
+        }
+    };
+    let secrets_store = crate::secrets::SecretStore::new(&paths.credentials_dir);
+    let current = secrets_store
+        .load(crate::secrets::ENCRYPTION_KEY)
+        .map_err(|e| format!("the stored key cannot be read again: {e:#}"))?;
+    if crate::secrets::digest(&current) != digest {
+        return Err(
+            "the stored key changed after the paper key was made, so this paper \
+                    key is for a key that is not used any more"
+                .to_string(),
+        );
+    }
+    let store = crate::state::Store::new(paths);
+    let mut state = store
+        .load_state()
+        .map_err(|e| format!("the state cannot be read: {e:#}"))?;
+    state.key_last_exported_digest = Some(digest.to_string());
+    store
+        .save_state(&state)
+        .map_err(|e| format!("the state cannot be saved: {e:#}"))
+}
+
 /// Where standard output of `key paperkey` goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StdoutTarget {
@@ -1589,5 +1650,93 @@ mod tests {
         let layout = crate::layout::tests::btrfs_layout();
         let with_layout = BackupScope::for_config(&system, Some(&layout));
         assert!(with_layout.system.is_some() && with_layout.unknown.is_none());
+    }
+
+    // --- recording a paper key that went into a pipe ----------------------
+
+    fn paperkey_paths(dir: &tempfile::TempDir) -> crate::config::Paths {
+        use std::os::unix::fs::PermissionsExt;
+        let root = dir.path();
+        for d in ["cred", "state", "run"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::set_permissions(root.join("cred"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let key = root.join("cred/encryption-key");
+        std::fs::write(&key, KEY).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        crate::config::Paths {
+            config_file: root.join("config.toml"),
+            credentials_dir: root.join("cred"),
+            state_dir: root.join("state"),
+            runtime_dir: root.join("run"),
+            systemctl: PathBuf::from("systemctl"),
+        }
+    }
+
+    fn key_digest() -> String {
+        crate::secrets::digest(&crate::secrets::Secret::new(KEY.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn a_piped_paper_key_is_recorded_under_the_lock_for_the_key_that_was_printed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paperkey_paths(&dir);
+        let wait = std::time::Duration::from_millis(300);
+        record_piped_paperkey(&paths, wait, &key_digest()).unwrap();
+        let state = crate::state::Store::new(&paths).load_state().unwrap();
+        assert_eq!(state.key_last_exported_digest, Some(key_digest()));
+        // The lock is let go again.
+        assert!(crate::run::RunLock::try_acquire(&paths).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_piped_paper_key_is_not_recorded_while_a_backup_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paperkey_paths(&dir);
+        let held = crate::run::RunLock::try_acquire(&paths).unwrap().unwrap();
+        let start = std::time::Instant::now();
+        let err =
+            record_piped_paperkey(&paths, std::time::Duration::from_millis(400), &key_digest())
+                .unwrap_err();
+        assert!(err.contains("backup was running"), "{err}");
+        assert!(start.elapsed() >= std::time::Duration::from_millis(400));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "bounded"
+        );
+        let state = crate::state::Store::new(&paths).load_state().unwrap();
+        assert_eq!(state.key_last_exported_digest, None);
+        drop(held);
+    }
+
+    #[test]
+    fn a_piped_paper_key_of_a_replaced_key_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paperkey_paths(&dir);
+        let err = record_piped_paperkey(
+            &paths,
+            std::time::Duration::from_millis(300),
+            "digest-of-the-old-key",
+        )
+        .unwrap_err();
+        assert!(err.contains("key changed"), "{err}");
+        let state = crate::state::Store::new(&paths).load_state().unwrap();
+        assert_eq!(state.key_last_exported_digest, None);
+    }
+
+    #[test]
+    fn a_file_that_is_already_remembered_is_no_new_entry_for_the_limit() {
+        let files: Vec<PaperKeyFile> = (0..crate::state::MAX_PAPERKEY_FILES)
+            .map(|i| remembered(&format!("/c/{i}.html"), "d1"))
+            .collect();
+        // Full: another file is refused, one that is in the list is not.
+        assert!(paperkey_files_full_for(&files, Path::new("/c/new.html")));
+        assert!(!paperkey_files_full_for(&files, Path::new("/c/7.html")));
+        // Not full: nothing is refused.
+        assert!(!paperkey_files_full_for(
+            &files[1..],
+            Path::new("/c/new.html")
+        ));
     }
 }

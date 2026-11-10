@@ -301,3 +301,46 @@ record from a newer version, a stuck lock, and a many-user desktop.
   the dependency tree and the decision above keeps `notify-send` rather than add
   one. The limit is documented in `docs/configuration.md` and accepted; it is not
   changed here.
+
+## Update 2026-11-10 (fourth round): who releases a settings message, future success stamps, the unit state
+
+- **A settings message is delivered when a member has it, not when anyone has
+  it.** The desktop part of "delivered" counted as soon as any logged-in user
+  had received the announcement, also a user outside group `nestegg`, who only
+  gets the general text. After the keep window a member who logged in later
+  never saw it. An announcement now carries `full_done`: set when the message
+  with the full text reached at least one member (or root). Users without the
+  detail still get the general text once each (`users_done`), but they do not
+  release it. When entries are merged above the bound, `full_done` is the
+  intersection like `users_done` (a member who saw only the older change has
+  not seen the combined one). With the desktop channel off nothing is held for
+  it. So that the record stays bounded on a computer where no member ever logs
+  in, the wait for a member ends after 30 days (counted from the newest change):
+  the desktop part then counts as done, the announcement is dropped by the
+  normal keep window, with one journal line. A hook message that was never
+  delivered is still never dropped by time. Records written before the field
+  existed read as "not yet seen by a member"; they wait at most the 30 days.
+- **A success stamp in the future is not a fresh backup.** `evaluate` computed
+  the age with `.max(0)`, so with a last success stamped in the future (the
+  clock was ahead, then corrected) a check concluded "fresh backup, nothing to
+  report" and, after an earlier overdue message, announced "works again". A
+  stamp more than 5 minutes ahead of the clock now says nothing about the age
+  (`age_hours` is empty): while the timer is on, the backup counts as overdue
+  (event `overdue`, key `clock`, text: the time of the last backup lies in the
+  future, the clock of this computer was wrong, nestegg backs up again at the
+  next check); with the timer off the `automatic_off` text says the same
+  instead of "not backed up yet". It is decided from the stamp itself, so it is
+  right whether or not `status.health` already reports it, and it hides the
+  quieter `incomplete`; a failed last run stays the louder message. The hook's
+  `NESTEGG_LAST_SUCCESS` is empty then. Up to 5 minutes ahead is clock noise
+  and counts as now.
+- **The unit's failed state no longer flips.** A settings message the hook could
+  not take is retried with a growing pause. Only the check that really tried
+  the hook ended non-zero; a check held back by the pause ended 0 and cleared
+  the failed state of `nestegg-notify.service`, so `systemctl --failed`
+  alternated. While the failure is pending (`settings_command_failures` > 0 and
+  the hook still switched on) every check ends non-zero with one line
+  ("the command still fails ..."), also the ones inside the pause. The other
+  hook paths (problem and recovery messages) try at every check and already
+  ended non-zero each time, so they agree. Switching the hook off ends the
+  pending failure (counter and pause are reset); a later switch-on starts fresh.

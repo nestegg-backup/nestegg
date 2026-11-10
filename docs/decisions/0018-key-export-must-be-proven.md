@@ -305,3 +305,30 @@ first.
   everything below it counts as inside.
 - **Rescue console.** `show_network()` passes the output of `ip` through the
   same `printable` filter as the rest of the console.
+
+## Amendment 2026-11-10 (fourth round): the paper key into a pipe, and a file that is already remembered
+
+- **"Exported" is recorded after the paper key was written.** For a pipe, the
+  last round recorded `key_last_exported_digest` and released the lock before the
+  output went out, so a printer or `| head -1` that failed left a state that said
+  "exported" for a paper key that never arrived. Now the output is written and
+  flushed first, without the run lock (a printer queue can be slow); only after
+  the whole output went out without an error the lock is taken again (waiting at
+  most 30 seconds), the state is read again, the stored key must still have the
+  digest that was printed, and then `key_last_exported_digest` is set. A closed
+  pipe (`EPIPE`) is an error: nothing recorded, exit code 1. If the state cannot
+  be updated after all (a backup holds the lock longer than the wait, the key
+  changed, the state cannot be saved), the command says that the paper key is out
+  but not recorded, why, and how to record it (`nestegg key confirm-exported
+  --paper-code <check code at the top of the paper>`, with the statement), and
+  exits non-zero. The check before anything is written stays: a running backup
+  ends the command with "try again ... Nothing was written" before the key goes
+  out. Files (`--output`, `> file`) are unchanged: the lock is held while the file
+  is written and the entry is recorded.
+- **A file that is already remembered is no new entry.** With 50 remembered files
+  `key paperkey > file` into one of them was refused as "another file", although
+  it adds no entry, and the shell had already emptied it. The limit now refuses
+  only a target that is not in the list; for a listed one the entry is kept (one
+  entry, no duplicate). `--output` names a file that does not exist yet: its name
+  is made canonical through its directory before and after writing, so it is the
+  same entry both times.
