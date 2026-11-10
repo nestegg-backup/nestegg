@@ -45,7 +45,7 @@ struct App {
 }
 
 /// Key for the metadata cache. The blob a snapshot has, and whether it may
-/// be trusted, depends not only on the snapshot path but on the datastore
+/// be trusted, depends not only on the snapshot path but on the server
 /// (address and port), datastore and namespace it is read from and on whether
 /// encryption is configured.
 /// All of these can change in the configuration file while the daemon runs,
