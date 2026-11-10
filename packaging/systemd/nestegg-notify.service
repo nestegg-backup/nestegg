@@ -8,9 +8,13 @@ After=network-online.target
 # normal, not a crash loop, so the default start rate limit must not trip.
 # The unit has no OnFailure= of its own, so it cannot loop. A flood of settings
 # changes cannot turn into a flood of expensive runs either: the daemon writes
-# each change to a small inbox and systemd coalesces repeated `start --no-block`
-# jobs, and one run then combines all pending changes into a single message
-# (decision 0022), so keeping the rate limit off is safe.
+# each change to a small inbox, and a run that was started for a settings change
+# sleeps out a short quiet period before it takes the work lock, so systemd
+# coalesces the repeated `start --no-block` jobs into that one activating
+# instance (decision 0022, item 3) and one run then combines all pending
+# changes into a single message. So keeping the rate limit off is correct:
+# without it a burst of changes could trip the default 5-starts-in-10-s limit
+# and systemd would refuse to run the check, dropping the reports.
 StartLimitIntervalSec=0
 
 [Service]

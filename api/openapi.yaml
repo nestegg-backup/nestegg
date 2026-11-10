@@ -709,16 +709,18 @@ components:
             list with items added or removed). `proxmox-backup-client
             --exclude` syntax. At most 200 patterns, each 1-256 bytes, no
             control characters or invisible Unicode format characters, no
-            leading or trailing spaces, no duplicates, no leading `-`, and no
-            pattern that matches everything (`*`, `**`, `/`, `/*`, `**/*`,
-            ...). A newly added pattern is refused when it would leave out a
-            whole configured source, a whole home directory of a regular
-            user inside a source, or (full system backup) a whole top-level
-            system directory. This is evaluated with the backup client's own
-            matcher against the accounts of this computer, whatever the
-            spelling (`/alice`, `alice`, `**/alice`, `/[a-z]*`, ...); the
-            message names the folder. Such a pattern already in the file is
-            kept (decision 0022).
+            leading or trailing spaces, no duplicates, no leading `-`, no
+            pattern the backup client cannot parse (an unclosed `[`…`]` class, a
+            trailing `\`, `[a-]`), and no pattern that matches everything (`*`,
+            `**`, `/`, `/*`, `**/*`, ...). A change is refused when its whole new
+            list, evaluated with the backup client's own matcher inside each
+            archive it really produces (later patterns win), would leave out a
+            whole configured source, a whole home directory of a regular user
+            inside a source, or (full system backup) a whole top-level system
+            directory that the old list did not — whatever the spelling
+            (`/alice`, `alice`, `**/alice`, `/[a-z]*`, `/alice/[.a-zA-Z]*`, …);
+            the message names the folder. A folder the old list already left out
+            is kept (decision 0022).
           maxItems: 200
           items: { type: string, minLength: 1, maxLength: 256 }
         wake_on_lan:

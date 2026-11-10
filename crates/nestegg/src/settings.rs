@@ -359,22 +359,22 @@ pub fn validate(
     }
     if let Some(list) = &patch.excludes {
         validate_excludes(list).map_err(invalid)?;
-        // A pattern that would leave out a whole configured source, a whole
-        // home directory of a regular user, or (in system mode) a whole
-        // top-level system directory is refused when it is newly added; one
-        // that root already put in the file is kept (decision 0022).
-        for pattern in list {
-            if current.backup.excludes.contains(pattern) {
-                continue;
-            }
-            if let Some(why) = removes_whole_folder(
-                pattern,
-                &current.backup.sources,
-                home_dirs,
-                current.backup.system,
-            ) {
-                return Err(invalid(why));
-            }
+        // The whole new list is judged as the client applies it: a change that
+        // would leave out a whole configured source, a whole home directory of
+        // a regular user, or (in system mode) a whole top-level system
+        // directory is refused, unless the old list already left it out (root
+        // may have put the pattern there). Judging the list as a whole catches
+        // character-class and several-patterns bypasses and reordering too
+        // (decision 0022, items 5, 9).
+        if let Some(why) = excludes_reduce_protection(
+            &current.backup.excludes,
+            list,
+            &current.backup.sources,
+            home_dirs,
+            current.backup.system,
+            &real_children,
+        ) {
+            return Err(invalid(why));
         }
     }
     if patch.wake_on_lan == Some(true) && current.wake.is_none() {
@@ -435,7 +435,69 @@ pub fn validate_exclude(pattern: &str) -> Result<(), String> {
             "exclude pattern `{pattern}` would exclude everything; the backups would be empty"
         ));
     }
+    // The real backup client parses every `--exclude` with the `pathpatterns`
+    // crate; nestegg links an older release (0.1.2) of the client's own version
+    // (1.0.0). A pattern neither can parse — an unclosed character class
+    // (`[abc`), a trailing backslash (`foo\`), a malformed range (`[a-]`) —
+    // makes every backup fail until root repairs the file; some even panic the
+    // parser (the same off-by-one bug in both releases), which would otherwise
+    // reach the user as an HTTP 500. Refuse such a pattern here, catching any
+    // panic so none escapes into the request (decision 0022, item 4).
+    match parse_pattern_result(pattern) {
+        ParseOutcome::Ok => {}
+        ParseOutcome::Error(why) => {
+            return Err(format!(
+                "exclude pattern `{pattern}` is not a valid pattern ({why}); \
+                 the backup client would reject it"
+            ));
+        }
+        ParseOutcome::Panic => {
+            return Err(format!(
+                "exclude pattern `{pattern}` is malformed (an unclosed `[`…`]` character \
+                 class or a dangling `\\`, for example) and would break every backup run"
+            ));
+        }
+    }
     Ok(())
+}
+
+/// What happened when the pattern matcher parsed a pattern.
+enum ParseOutcome {
+    Ok,
+    Error(String),
+    Panic,
+}
+
+/// Parse a pattern the way `proxmox-backup-client` does, catching both a clean
+/// parse error and a panic (the `pathpatterns` releases panic on some malformed
+/// character classes). The panic hook is silenced for the duration so a refused
+/// pattern does not spill a backtrace into the daemon journal (decision 0022).
+fn parse_pattern_result(pattern: &str) -> ParseOutcome {
+    let owned = pattern.to_string();
+    let parsed = with_silent_panics(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            MatchEntry::parse_pattern(&owned, PatternFlag::PATH_NAME, MatchType::Exclude)
+        }))
+    });
+    match parsed {
+        Ok(Ok(_)) => ParseOutcome::Ok,
+        Ok(Err(e)) => ParseOutcome::Error(e.to_string()),
+        Err(_) => ParseOutcome::Panic,
+    }
+}
+
+/// Run `f` with the panic hook replaced by a silent one, so an expected,
+/// caught panic (a malformed pattern) does not print a message and backtrace.
+/// Serialised, because the panic hook is process-global.
+fn with_silent_panics<T>(f: impl FnOnce() -> T) -> T {
+    use std::sync::Mutex;
+    static HOOK_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = f();
+    std::panic::set_hook(previous);
+    result
 }
 
 /// Patterns that match every entry of an archive: only slashes, or every
@@ -453,45 +515,127 @@ fn excludes_everything(pattern: &str) -> bool {
         .all(|part| part.contains('*') && part.chars().all(|c| matches!(c, '*' | '?')))
 }
 
-/// Control characters, and the invisible Unicode format characters that
-/// reorder or hide text in a terminal or a notification (bidirectional
-/// overrides, zero-width characters). Kept in step with the same filter in
-/// `crate::rescue` (decision 0022); duplicated on purpose so the settings path
-/// does not depend on the rescue module.
+/// Control characters, and the invisible Unicode format and default-ignorable
+/// characters that reorder or hide text in a terminal or a notification
+/// (bidirectional overrides, zero-width joiners, tag characters, variation
+/// selectors, line/paragraph separators, Hangul fillers, ...). This is the one
+/// shared list used for both rejecting such a character in an exclude pattern
+/// and replacing it in a notification (`crate::notify::visible`), so the two
+/// never drift apart (decision 0022, item 11). `crate::rescue` keeps its own,
+/// narrower copy on purpose, so the settings path does not depend on it.
 pub fn unprintable(c: char) -> bool {
     c.is_control()
         || matches!(c,
-            '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2069}' | '\u{feff}')
+            '\u{00ad}'                      // soft hyphen
+            | '\u{034f}'                    // combining grapheme joiner
+            | '\u{061c}'                    // arabic letter mark
+            | '\u{115f}' | '\u{1160}'       // Hangul choseong/jungseong fillers
+            | '\u{17b4}' | '\u{17b5}'       // Khmer inherent vowels
+            | '\u{180b}'..='\u{180e}'       // Mongolian variation selectors + MVS
+            | '\u{200b}'..='\u{200f}'       // zero-width space/joiners, LRM/RLM
+            | '\u{2028}' | '\u{2029}'       // line / paragraph separators
+            | '\u{202a}'..='\u{202e}'       // bidi embeddings / overrides
+            | '\u{2060}'..='\u{206f}'       // word joiner, bidi isolates, deprecated
+            | '\u{3164}'                    // Hangul filler
+            | '\u{fe00}'..='\u{fe0f}'       // variation selectors
+            | '\u{feff}'                    // zero-width no-break space / BOM
+            | '\u{ffa0}'                    // halfwidth Hangul filler
+            | '\u{fff9}'..='\u{fffb}'       // interlinear annotation anchors
+            | '\u{1bca0}'..='\u{1bca3}'     // shorthand format controls
+            | '\u{1d173}'..='\u{1d17a}'     // musical beam/slur/phrase controls
+            | '\u{e0000}'..='\u{e007f}'     // tag characters
+            | '\u{e0100}'..='\u{e01ef}') // variation selectors supplement
 }
 
-/// Build the exclude [`MatchEntry`] exactly as `proxmox-backup-client` does for
-/// one `--exclude <pattern>` (gitignore-style, `PatternFlag::PATH_NAME`). A `!`
-/// re-include widens the backup and never removes anything, so it yields
-/// `None`; a pattern that cannot be parsed is treated as harmless here (it is
-/// not our job to reject it, the client will).
-fn exclude_entry(pattern: &str) -> Option<MatchEntry> {
-    if pattern.starts_with('!') {
-        return None;
-    }
-    MatchEntry::parse_pattern(pattern, PatternFlag::PATH_NAME, MatchType::Exclude).ok()
+/// Build the exclude list as `proxmox-backup-client` sees it: one `MatchEntry`
+/// per pattern, in order (a `!` pattern becomes a re-include; later entries
+/// win). A pattern the matcher cannot parse, or that makes it panic, is left
+/// out of the list — the real client would fail on it, and for a *new* list
+/// `validate_exclude` has already refused it; a dangerous pattern root put in
+/// the file by hand is simply not analysed, which only means the guard does not
+/// count it (decision 0022, item 4/5).
+fn match_entries(list: &[String]) -> Vec<MatchEntry> {
+    list.iter().filter_map(|p| parse_entry(p)).collect()
 }
 
-/// Two arbitrary, structurally different child names. A pattern that excludes
-/// both of them excludes *every* child, so the folder would be emptied even if
-/// the folder entry itself stays (`alice/**`, `alice/*`). They are chosen so
-/// that an ordinary narrow pattern (`alice/Downloads`, `**/.cache`) matches
-/// neither.
+/// Parse one pattern into a [`MatchEntry`], catching a parse error and a panic
+/// (the `pathpatterns` releases panic on some malformed classes).
+fn parse_entry(pattern: &str) -> Option<MatchEntry> {
+    let owned = pattern.to_string();
+    with_silent_panics(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            MatchEntry::parse_pattern(&owned, PatternFlag::PATH_NAME, MatchType::Exclude).ok()
+        }))
+        .ok()
+        .flatten()
+    })
+}
+
+/// Two arbitrary, structurally different child names. A list that excludes both
+/// of them excludes *every* possible child, so the folder would be emptied even
+/// if the folder entry itself stays (`alice/**`, `/alice/[a-zA-Z0-9]*`). They
+/// are chosen so that an ordinary narrow pattern (`alice/Downloads`,
+/// `**/.cache`) matches neither; one starts with a digit, the other with an
+/// uppercase letter and contains a dot.
 const PROBE_A: &str = "0_nestegg_probe_one";
 const PROBE_B: &str = "Zq.keep-me_two";
 
-/// Whether this single exclude pattern, applied in one archive, would leave
-/// nothing of the folder at archive-relative path `rel` (like `/alice`): the
-/// folder itself is excluded, or every one of its children is.
-fn removes_folder(entry: &MatchEntry, rel: &str) -> bool {
-    let dir = Some(nix::libc::S_IFDIR);
-    let hits = |p: &str| entry.matches(p.as_bytes(), dir);
-    hits(rel) || (hits(&format!("{rel}/{PROBE_A}")) && hits(&format!("{rel}/{PROBE_B}")))
+/// At most this many real top-level entries of a protected folder are read to
+/// judge whether the new list empties it (only the names, never the contents;
+/// the daemon is root). A folder with more entries falls back to the two
+/// synthetic probes alone (decision 0022, item 5).
+const MAX_PROBE_ENTRIES: usize = 64;
+
+/// The final match decision of the whole exclude list for one archive-relative
+/// path, exactly as the client applies it: the *last* entry whose pattern
+/// matches decides, a `!` re-include can bring the path back, and no match
+/// keeps it (so the default is "included").
+fn list_excludes_path(entries: &[MatchEntry], rel: &str, mode: u32) -> bool {
+    let mut excluded = false;
+    for e in entries {
+        if e.matches(rel.as_bytes(), Some(mode)) {
+            excluded = e.match_type() == MatchType::Exclude;
+        }
+    }
+    excluded
+}
+
+/// Whether the exclude list leaves nothing of the folder at archive-relative
+/// path of `folder` inside `archive_root`: the folder entry itself is excluded,
+/// or every child is — tested against the folder's real top-level entries
+/// (`children`) and, in addition, two synthetic names that catch a pattern
+/// matching every possible child.
+fn list_empties_folder(
+    entries: &[MatchEntry],
+    archive_root: &Path,
+    folder: &Path,
+    children: &[(String, bool)],
+) -> bool {
+    let Some(rel) = archive_rel(archive_root, folder) else {
+        return false;
+    };
+    let dir = nix::libc::S_IFDIR;
+    // The folder entry itself (not meaningful for the archive root "/").
+    if rel != "/" && list_excludes_path(entries, &rel, dir) {
+        return true;
+    }
+    let base = if rel == "/" { "" } else { rel.as_str() };
+    let probe = |name: &str| list_excludes_path(entries, &format!("{base}/{name}"), dir);
+    // A pattern that matches every possible name empties the folder.
+    if probe(PROBE_A) && probe(PROBE_B) {
+        return true;
+    }
+    // Or every real top-level entry is excluded (each with its real file type,
+    // so a directory-only pattern does not wrongly count a file as removed).
+    !children.is_empty()
+        && children.iter().all(|(name, is_dir)| {
+            let mode = if *is_dir {
+                nix::libc::S_IFDIR
+            } else {
+                nix::libc::S_IFREG
+            };
+            list_excludes_path(entries, &format!("{base}/{name}"), mode)
+        })
 }
 
 /// The path of `folder` inside an archive rooted at `root`, with a leading
@@ -519,61 +663,140 @@ fn deepest_source<'a>(
         .max_by_key(|s| s.path.as_os_str().len())
 }
 
-/// Reject an exclude that would, as `proxmox-backup-client` applies it to each
-/// archive, leave out a whole configured source, a whole home directory of a
-/// regular user inside a source, or (in system mode) a whole top-level system
-/// directory (decision 0022). Returns the plain-words reason, or `None` when
-/// the pattern is fine. Ordinary patterns (`**/.cache`, `**/node_modules`,
-/// `/alice/Downloads`, `/home/*/Videos`) pass. This is a guard against
-/// accidents, not a security boundary: a group member can still exclude a
-/// user's folders one by one, which is reported.
-fn removes_whole_folder(
-    pattern: &str,
+/// The (archive root, protected folder) pairs for the archives the
+/// configuration really produces (decision 0022, item 14). In normal mode each
+/// configured source is its own archive (`home.pxar` from `/home`), so a home
+/// directory inside it is tested there (`/alice` in `home.pxar`) and the source
+/// as a whole by emptying its top-level entries. In system mode the operating
+/// system is a single `system.pxar` rooted at `/`: the top-level system
+/// directories and the home directories are tested there by their full path
+/// (`/home` and `/home/alice` in `system.pxar`), and a source that keeps its
+/// own archive (a data disk that must be its own mount) is tested separately.
+fn protected_folders(
     sources: &[crate::config::Source],
     home_dirs: &[PathBuf],
     system: bool,
-) -> Option<String> {
-    let entry = exclude_entry(pattern)?;
+) -> Vec<(PathBuf, PathBuf)> {
     let root = PathBuf::from("/");
-    // (archive root, protected folder) pairs to test. A source is tested as a
-    // top-level entry ("/home" in a parent archive); a home directory in the
-    // archive of the source that holds it ("/alice" in home.pxar), and in
-    // system mode also in system.pxar ("/home/alice" at "/").
-    let mut checks: Vec<(&Path, &Path)> = Vec::new();
-    for s in sources {
-        checks.push((&root, s.path.as_path()));
-    }
-    for h in home_dirs {
-        if let Some(src) = deepest_source(h, sources) {
-            checks.push((src.path.as_path(), h.as_path()));
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if system {
+        for d in SYSTEM_DIRS {
+            out.push((root.clone(), PathBuf::from(d)));
         }
-        if system {
-            checks.push((&root, h.as_path()));
+        for h in home_dirs {
+            out.push((root.clone(), h.clone()));
         }
-    }
-    let system_dirs: Vec<PathBuf> = if system {
-        SYSTEM_DIRS.iter().map(PathBuf::from).collect()
+        let own: Vec<crate::config::Source> = sources
+            .iter()
+            .filter(|s| s.require_mount)
+            .cloned()
+            .collect();
+        for s in &own {
+            out.push((s.path.clone(), s.path.clone()));
+        }
+        for h in home_dirs {
+            if let Some(src) = deepest_source(h, &own) {
+                out.push((src.path.clone(), h.clone()));
+            }
+        }
     } else {
-        Vec::new()
-    };
-    for d in &system_dirs {
-        checks.push((&root, d.as_path()));
+        for s in sources {
+            out.push((s.path.clone(), s.path.clone()));
+        }
+        for h in home_dirs {
+            if let Some(src) = deepest_source(h, sources) {
+                out.push((src.path.clone(), h.clone()));
+            }
+        }
     }
-    for (archive_root, folder) in checks {
-        let Some(rel) = archive_rel(archive_root, folder) else {
+    out
+}
+
+/// Real top-level entry names (and whether each is a directory) of `folder`,
+/// bounded to [`MAX_PROBE_ENTRIES`]; only the names are read, never the
+/// contents. A folder with more entries, or one that cannot be read, yields an
+/// empty list, so the guard then relies on the two synthetic probes alone
+/// (decision 0022, item 5).
+fn real_children(folder: &Path) -> Vec<(String, bool)> {
+    let Ok(rd) = fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for entry in rd.flatten() {
+        if out.len() >= MAX_PROBE_ENTRIES {
+            // More entries than we read: we cannot prove the list empties the
+            // folder, so give up the real-entry test for it.
+            return Vec::new();
+        }
+        let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        // The whole-archive case (`rel == "/"`) is an empty backup, caught by
-        // `excludes_everything` in `validate_exclude`.
-        if rel != "/" && removes_folder(&entry, &rel) {
-            return Some(format!(
-                "exclude pattern `{pattern}` would leave out the whole folder {} from the backup; \
-                 an administrator can still set it as root in /etc/nestegg/config.toml.",
-                folder.display()
-            ));
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        out.push((name, is_dir));
+    }
+    out
+}
+
+/// Reject a new exclude list that would, as the client applies it, leave out a
+/// whole configured source, a whole home directory of a regular user, or (in
+/// system mode) a whole top-level system directory — but only when the *old*
+/// list did not already leave it out, so a dangerous pattern root put in the
+/// file by hand is grandfathered and a plain reorder is caught only when it
+/// changes the outcome (decision 0022, items 5, 9). `read_children` reads a
+/// folder's real top-level entry names (injected for tests). Returns the
+/// plain-words reason, or `None` when the change is fine. This is a guard
+/// against accidents, not a security boundary: a group member can still exclude
+/// folders one by one, which is reported.
+fn excludes_reduce_protection(
+    old_list: &[String],
+    new_list: &[String],
+    sources: &[crate::config::Source],
+    home_dirs: &[PathBuf],
+    system: bool,
+    read_children: &dyn Fn(&Path) -> Vec<(String, bool)>,
+) -> Option<String> {
+    let old = match_entries(old_list);
+    let new = match_entries(new_list);
+    for (archive_root, folder) in protected_folders(sources, home_dirs, system) {
+        let children = read_children(&folder);
+        if !list_empties_folder(&new, &archive_root, &folder, &children) {
+            continue;
         }
+        if list_empties_folder(&old, &archive_root, &folder, &children) {
+            // Already left out before this change: keep it (root may have put
+            // it there), so the rest of the list can still be edited.
+            continue;
+        }
+        return Some(format!(
+            "this exclude list would leave out the whole folder {} from the backup; \
+             an administrator can still set it as root in /etc/nestegg/config.toml.",
+            folder.display()
+        ));
     }
     None
+}
+
+/// The home directories the exclude guard needs — read from the account
+/// database only when the exclude list actually changes, so an ordinary
+/// interval or timer change does not walk NSS on every request (decision 0022,
+/// item 6). When no regular user account is found at all, the home-directory
+/// part of the guard is off, which is logged so it is not a silent gap.
+fn excludes_guard_home_dirs(patch: &SettingsPatch, current: &Config) -> Vec<PathBuf> {
+    let changed = patch
+        .excludes
+        .as_ref()
+        .is_some_and(|new| new != &current.backup.excludes);
+    if !changed {
+        return Vec::new();
+    }
+    let homes = regular_home_dirs();
+    if homes.is_empty() {
+        eprintln!(
+            "warning: no regular user account found; the exclude guard for home \
+             directories is off for this settings change"
+        );
+    }
+    homes
 }
 
 /// The home directories of regular users, from the account database (NSS, not
@@ -834,7 +1057,7 @@ pub fn update(
             config_file.display()
         )
     })?;
-    validate(patch, &current, &regular_home_dirs())?;
+    validate(patch, &current, &excludes_guard_home_dirs(patch, &current))?;
     let new_text = rewrite(&old_text, patch)?;
     let new = Config::parse(&new_text).map_err(|e| {
         invalid(format!(
@@ -972,6 +1195,54 @@ fn describe(old: &Config, new: &Config) -> Vec<String> {
         ));
     }
     changes
+}
+
+/// Write `text` to `path` atomically with a fixed `mode`: a new temporary file
+/// (exclusive, no symlinks) is created with the final mode from the start,
+/// written, synced and renamed over any old file, and the directory is synced.
+/// A symlink at `path` is refused rather than followed and truncated. Unlike
+/// [`write_atomically`] the file need not already exist, so `nestegg init` can
+/// create the configuration this way with no window at a looser mode and no
+/// symlink following (decision 0022, item 14).
+pub fn write_file_atomic(path: &Path, text: &str, mode: u32) -> Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        bail!(
+            "{} is a symbolic link; refusing to overwrite it (remove it first)",
+            path.display()
+        );
+    }
+    let dir = path.parent().context("path without parent")?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("path without file name")?;
+    let tmp = dir.join(format!(".{name}.{:016x}.tmp", rand::random::<u64>()));
+    let write = || -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&tmp)
+            .with_context(|| format!("cannot create {}", tmp.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    };
+    let result = write().and_then(|()| {
+        fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))
+    });
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 /// Replace `path` atomically with `text`: a new file in the same directory
@@ -1327,6 +1598,10 @@ interval_hours = 24
         for bad in [
             "", "!", "*", "**", "/", "//", "/*", "/**", "**/*", "*/*", "**/", "?*", " x", "x ",
             "a\nb", "a\0b", "a\tb",
+            // Patterns the backup client cannot parse: an unclosed character
+            // class (panics the parser), a dangling range, a trailing backslash
+            // (decision 0022, item 4). None may escape as a panic.
+            "[abc", "a[b", "foo[bar", "[a-]", "[a-", "foo\\", "x[^",
         ] {
             assert!(validate_exclude(bad).is_err(), "{bad:?}");
         }
@@ -1348,31 +1623,61 @@ interval_hours = 24
         assert!(validate_excludes(&[]).is_ok());
     }
 
+    /// Test harness for the whole-list guard: add `new` as the only exclude
+    /// list (old list empty) and report whether it is refused, with the given
+    /// real top-level entries per folder (default: none, so only the probes and
+    /// the folder entry decide). The expected outcomes were confirmed with the
+    /// real tool (`pxar create --exclude`) in the e2e client image.
+    fn guard(new: &[&str], system: bool) -> Option<String> {
+        guard_with(&[], new, system, &[])
+    }
+
+    fn guard_with(
+        old: &[&str],
+        new: &[&str],
+        system: bool,
+        children: &[(&str, &[(&str, bool)])],
+    ) -> Option<String> {
+        let sources = current().backup.sources;
+        let homes = [PathBuf::from("/home/alice"), PathBuf::from("/home/bob")];
+        let owned: Vec<(PathBuf, Vec<(String, bool)>)> = children
+            .iter()
+            .map(|(folder, entries)| {
+                (
+                    PathBuf::from(folder),
+                    entries
+                        .iter()
+                        .map(|(n, d)| (n.to_string(), *d))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let read = move |folder: &Path| -> Vec<(String, bool)> {
+            owned
+                .iter()
+                .find(|(f, _)| f == folder)
+                .map(|(_, e)| e.clone())
+                .unwrap_or_default()
+        };
+        excludes_reduce_protection(
+            &strings(old),
+            &strings(new),
+            &sources,
+            &homes,
+            system,
+            &read,
+        )
+    }
+
     #[test]
     fn whole_folder_excludes_are_refused_but_ordinary_ones_pass() {
         // current() has the default sources: /home, /etc, /root, /usr/local.
         // alice and bob are regular users with homes inside the /home source.
-        // The expected outcomes below were confirmed with the real tool
-        // (`pxar create --exclude`) in the e2e client image (decision 0022).
-        let sources = current().backup.sources;
-        let homes = [PathBuf::from("/home/alice"), PathBuf::from("/home/bob")];
-        let refused = |p: &str, system: bool| removes_whole_folder(p, &sources, &homes, system);
-
-        // Refused in every mode: a whole source, or a whole home directory
-        // inside the /home source.
+        // Excludes are matched archive-relative, so in the default (non-system)
+        // configuration each source is its own archive (home.pxar from /home,
+        // with entries /alice, /bob): a pattern that empties a home directory is
+        // refused (decision 0022, item 5).
         for bad in [
-            "/home",
-            "/home/",
-            "/home/*",
-            "/home/**", // the whole /home source
-            "/etc",
-            "/root",
-            "/usr/local",
-            "/usr/local/*",
-            "/usr/local/**", // other sources
-            "home",
-            "etc",
-            "local", // a bare name = a source's last component
             "/alice",
             "alice",
             "alice/",
@@ -1382,37 +1687,54 @@ interval_hours = 24
             "/a*",
             "/*[a-z0-9]", // match alice (and more) in home.pxar
         ] {
-            assert!(refused(bad, false).is_some(), "{bad} should be refused");
+            assert!(guard(&[bad], false).is_some(), "{bad} should be refused");
         }
 
-        // Harmless in the default configuration: ordinary subfolder patterns,
-        // and anchored single-component names that are not a home directory or
-        // a source (they used to be refused with a misleading message).
+        // Harmless in the default configuration. The source paths and their
+        // bare names (`/home`, `/etc`, `home`, `local`, `/usr/local/*`) match
+        // nothing inside their own archive, so excluding them loses nothing
+        // there (confirmed with the real tool); they used to be refused with a
+        // misleading message (decision 0022, item 14).
         for ok in [
+            "/home",
+            "/home/",
+            "/home/*",
+            "/home/**",
+            "/etc",
+            "/root",
+            "/usr/local",
+            "/usr/local/*",
+            "/usr/local/**",
+            "home",
+            "etc",
+            "local",
             "**/.cache",
             "**/node_modules",
             "**/lost+found",
             "/alice/Downloads", // a subfolder of a home, not the whole home
             "/home/*/Videos",   // a subfolder, not the whole source
             "*.iso",
-            "node_modules", // not a source's last component
-            "/usr/lib",     // not a source nor its parent
+            "node_modules",
+            "/usr/lib",
             "!/home",       // a re-include widens the backup
-            "/.cache",      // anchored one component, but not a home or source
+            "/.cache",      // anchored one component, but not a home
             "/Downloads",   // likewise
             "Downloads",    // a subfolder name, not a home
-            "/usr",         // not a source; only a system directory in system mode
+            "/usr",         // only a system directory in system mode
             "/var",         // likewise
             "/home/[a-z]*", // no-op in home.pxar (entries are /alice, not /home/alice)
-            "/home/[!.]*",  // matches only dot-names, confirmed with the real tool
+            "/home/[!.]*",  // `[!.]` is a class of `!` and `.`, so dot-names only
         ] {
-            assert!(refused(ok, false).is_none(), "{ok} should pass");
+            assert!(guard(&[ok], false).is_none(), "{ok} should pass");
         }
 
-        // System mode adds system.pxar rooted at "/": a pattern that names a
-        // whole top-level system directory, or a home directory by its full
-        // path, is refused there.
+        // System mode backs the operating system up as a single system.pxar
+        // rooted at "/": a pattern that names a whole top-level system
+        // directory, or a home directory by its full path, is refused there.
         for bad in [
+            "/etc",
+            "/home",
+            "/root",
             "/usr",
             "/var",
             "/opt",
@@ -1422,7 +1744,7 @@ interval_hours = 24
             "/home/alice",  // a home by its full path
         ] {
             assert!(
-                refused(bad, true).is_some(),
+                guard(&[bad], true).is_some(),
                 "{bad} should be refused in system mode"
             );
         }
@@ -1432,51 +1754,119 @@ interval_hours = 24
             "/home/*/Videos",
             "/alice/Downloads",
             "/home/[!.]*",
+            "/usr/local", // a subfolder of /usr in system.pxar, not a whole dir
         ] {
             assert!(
-                refused(ok, true).is_none(),
+                guard(&[ok], true).is_none(),
                 "{ok} should pass in system mode"
             );
         }
     }
 
     #[test]
-    fn an_added_whole_folder_exclude_is_refused_but_an_existing_one_is_kept() {
-        let c = current();
-        let e = validate(
-            &SettingsPatch {
-                excludes: Some(strings(&["/home"])),
-                ..patch()
-            },
-            &c,
-            &[],
-        )
-        .unwrap_err();
-        assert!(e.to_string().contains("whole folder"), "{e}");
-        assert!(e.to_string().contains("/etc/nestegg/config.toml"), "{e}");
-        // Root already put /home in the file: a change that keeps it passes
-        // and may add ordinary patterns.
-        let mut with = c.clone();
-        with.backup.excludes = strings(&["/home"]);
+    fn the_whole_list_is_judged_together() {
+        // A character class that skips the two synthetic probes still empties a
+        // home directory once its real entries are read (decision 0022, item 5).
+        let alice_entries: &[(&str, bool)] =
+            &[("Documents", true), ("photos", true), ("notes.txt", false)];
         assert!(
-            validate(
-                &SettingsPatch {
-                    excludes: Some(strings(&["/home", "*.iso"])),
-                    ..patch()
-                },
-                &with,
+            guard_with(
                 &[],
+                &["/alice/[.a-zA-Z]*"],
+                false,
+                &[("/home/alice", alice_entries)],
             )
-            .is_ok()
+            .is_some(),
+            "a class that covers every real entry empties the home"
         );
-        // A home directory from the account database is refused by its path.
+        // Several patterns that are each harmless but together leave nothing.
+        assert!(
+            guard_with(
+                &[],
+                &[
+                    "/alice/[a-m]*",
+                    "/alice/[n-z]*",
+                    "/alice/[A-Z]*",
+                    "/alice/.*"
+                ],
+                false,
+                &[("/home/alice", alice_entries)],
+            )
+            .is_some(),
+            "several patterns together empty the home"
+        );
+        // One of the real entries survives, so the home is not emptied.
+        assert!(
+            guard_with(
+                &[],
+                &["/alice/[a-m]*"],
+                false,
+                &[("/home/alice", alice_entries)],
+            )
+            .is_none(),
+            "photos and notes.txt survive"
+        );
+    }
+
+    #[test]
+    fn reordering_that_changes_the_outcome_is_refused() {
+        // The old list keeps alice via a re-include after a broad exclude; the
+        // new list reorders them so the exclude wins and alice is emptied. The
+        // whole-list comparison catches it (decision 0022, item 9).
+        let old = ["/alice/**", "!/alice/**"];
+        let new = ["!/alice/**", "/alice/**"];
+        assert!(guard(&old, false).is_none(), "old list keeps alice");
+        assert!(
+            guard_with(&old, &new, false, &[]).is_some(),
+            "the reorder empties alice and is refused"
+        );
+        // A plain reorder that changes no outcome is not refused.
+        assert!(guard_with(&["a", "b"], &["b", "a"], false, &[]).is_none());
+    }
+
+    #[test]
+    fn an_added_whole_folder_exclude_is_refused_but_an_existing_one_is_kept() {
+        let c = current(); // non-system mode; home.pxar from /home
+        let homes = [PathBuf::from("/home/alice")];
+        // A newly added exclude of a whole home directory is refused.
         let e = validate(
             &SettingsPatch {
                 excludes: Some(strings(&["/alice"])),
                 ..patch()
             },
             &c,
-            &[PathBuf::from("/home/alice")],
+            &homes,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("whole folder"), "{e}");
+        assert!(e.to_string().contains("/etc/nestegg/config.toml"), "{e}");
+        assert!(e.to_string().contains("/home/alice"), "{e}");
+        // Root already put /alice in the file: a change that keeps it passes
+        // and may add ordinary patterns.
+        let mut with = c.clone();
+        with.backup.excludes = strings(&["/alice"]);
+        assert!(
+            validate(
+                &SettingsPatch {
+                    excludes: Some(strings(&["/alice", "*.iso"])),
+                    ..patch()
+                },
+                &with,
+                &homes,
+            )
+            .is_ok()
+        );
+        // In system mode the same list is refused by the full path in
+        // system.pxar.
+        let mut sys = c.clone();
+        sys.backup.system = true;
+        let e = validate(
+            &SettingsPatch {
+                excludes: Some(strings(&["/home/alice"])),
+                ..patch()
+            },
+            &sys,
+            &homes,
         )
         .unwrap_err();
         assert!(e.to_string().contains("/home/alice"), "{e}");
@@ -2144,6 +2534,35 @@ interval_hours = 24
         }
         assert!(validate_exclude("**/-cache").is_ok());
         assert!(validate_exclude("\u{feff}foo").is_err());
+    }
+
+    #[test]
+    fn write_file_atomic_sets_the_final_mode_and_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // A fresh file gets mode 0640 from the start.
+        write_file_atomic(&path, "a = 1\n", 0o640).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+        // Overwriting an existing file (as `init --force` does) keeps 0640 even
+        // if the old one was looser, with no window at the looser mode.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        write_file_atomic(&path, "a = 2\n", 0o640).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a = 2\n");
+        // No temporary files are left behind.
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["config.toml"]);
+        // A symlink at the path is refused rather than followed.
+        let target = dir.path().join("real.toml");
+        fs::write(&target, "keep\n").unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let e = write_file_atomic(&link, "x", 0o640).unwrap_err();
+        assert!(e.to_string().contains("symbolic link"), "{e}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep\n");
     }
 
     #[test]

@@ -213,3 +213,28 @@ as above.
   mode, and the package's `postinst` corrects an existing 0644 file on upgrade.
   A secret a hook needs belongs in a root-only file that the command reads; the
   ntfy example in `docs/configuration.md` shows this.
+
+## Update 2026-11-10 (decision 0022, second review): settings pacing and locks
+
+A second review of the settings-change reporting refined how the notification
+machinery delivers and protects itself (full detail in
+[decision 0022](0022-settings-changes-that-reduce-protection.md)):
+
+- **The `settings` event is paced.** A check started for a settings change
+  waits out a short quiet period before taking the notification lock (so a burst
+  coalesces into one run), re-drains the inbox once more before releasing the
+  lock (so a change recorded during a slow hook is delivered by the same run,
+  not the next hourly timer), and after the first message holds a recipient to
+  at most one settings message every few minutes (later ones combined, nothing
+  dropped). `nestegg-notify.service` keeps `StartLimitIntervalSec=0` so a burst
+  cannot trip the default start-rate limit and drop reports.
+
+- **The report is durable.** The change is recorded as a write-ahead intent
+  before the configuration is changed and completed afterwards, so a crash in
+  between still yields a (generic) message; a damaged inbox is set aside and
+  reported, not silently discarded.
+
+- **The notification lock files are root-only.** `.notify.lock` and
+  `.notify-settings.lock` (like `.current.lock` and the run lock) are now `0600`
+  and tightened on open, so a group member cannot hold a shared `flock` that
+  would block the daemon. The daemon's wait for the inbox lock is time-bounded.

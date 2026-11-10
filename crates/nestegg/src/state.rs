@@ -444,11 +444,9 @@ impl Store {
     /// remove" cannot interleave with another process replacing the file.
     fn with_current_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         fs::create_dir_all(&self.paths.state_dir)?;
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.paths.state_dir.join(".current.lock"))?;
+        // 0600 so a group member cannot hold a shared lock on it and block the
+        // daemon (decision 0022, item 2).
+        let file = open_private_lock(&self.paths.state_dir.join(".current.lock"))?;
         let _guard = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
             .map_err(|(_, e)| e)
             .context("cannot lock current run file")?;
@@ -613,6 +611,28 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Open (creating if needed) a lock file that only root processes need, with
+/// mode 0600 and no symlink following, and tighten an existing file to 0600
+/// when it is opened. A lock file left 0644 by an older version lets a group
+/// member open it read-only and hold a shared `flock`, which would block the
+/// root process that wants the exclusive lock; 0600 closes that (decision 0022,
+/// item 2). The caller takes the `flock` on the returned file.
+pub fn open_private_lock(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("cannot open lock file {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot set mode of {}", path.display()))?;
+    Ok(file)
 }
 
 pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {

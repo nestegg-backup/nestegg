@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration as StdDuration, Instant};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -53,9 +53,24 @@ const MAX_BODY_BYTES: usize = 4096;
 const MAX_LISTED_PATTERNS: usize = 5;
 /// Each named pattern in a message is shortened to this many bytes.
 const MAX_PATTERN_BYTES: usize = 80;
-/// Most settings announcements kept at once (across the inbox and the record),
-/// a brake on a flood from switching a setting back and forth (decision 0022).
+/// Beyond this many pending settings announcements they are combined per user
+/// instead of growing without bound, a brake on a flood from switching a
+/// setting back and forth. Nothing unreported is dropped (decision 0022,
+/// item 7).
 const MAX_SETTINGS: usize = 50;
+/// Quiet period before a recorded settings change is delivered: the check waits
+/// until the newest pending change is this old, so a burst of changes made in
+/// quick succession becomes a single run and a single message (decision 0022,
+/// item 3).
+const SETTINGS_QUIET: Duration = Duration::seconds(20);
+/// Upper bound on that wait, measured from the oldest pending change, so a
+/// continuous stream of changes cannot postpone delivery forever.
+const SETTINGS_MAX_WAIT: Duration = Duration::seconds(120);
+/// After a recipient has been sent a settings message, further settings
+/// messages to them are combined and held for this long, so a stream of changes
+/// cannot notify anyone more than once every few minutes (decision 0022,
+/// item 3). The first message after a quiet spell is sent at once.
+const SETTINGS_RATE_LIMIT: Duration = Duration::minutes(5);
 /// Regular (non-system) accounts: from `UID_MIN` of `/etc/login.defs`
 /// (default 1000) up to the end of the systemd-homed range. Above that come
 /// container, dynamic-service and `nobody` ids.
@@ -421,13 +436,12 @@ fn truncate_bytes(text: &str, max: usize) -> String {
 /// step with the same filter in `crate::rescue`; duplicated so this module does
 /// not depend on it.
 fn visible(text: &str) -> String {
+    // The one shared list of control and invisible format characters lives in
+    // `crate::settings` (decision 0022, item 11), so validation and the message
+    // text never disagree on what counts as invisible.
     text.chars()
         .map(|c| {
-            if c.is_control()
-                || matches!(c,
-                    '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
-                    | '\u{2060}'..='\u{2069}' | '\u{feff}')
-            {
+            if crate::settings::unprintable(c) {
                 '?'
             } else {
                 c
@@ -733,6 +747,27 @@ pub fn compose_settings_many(
         .iter()
         .map(|(user, reductions)| {
             let user = visible(user);
+            if reductions.is_empty() {
+                // A write-ahead intent whose details a crash lost, or a record
+                // that was damaged and set aside: name the user if known and
+                // point to the journal (decision 0022, item 8).
+                return match (lang, user.is_empty()) {
+                    (Lang::En, false) => format!(
+                        "{user} changed the backup settings of this computer; the details are \
+                         in the system log"
+                    ),
+                    (Lang::En, true) => "the backup settings of this computer were changed; the \
+                         details are in the system log"
+                        .to_string(),
+                    (Lang::De, false) => format!(
+                        "{user} hat die Sicherungseinstellungen dieses Computers geändert; die \
+                         Einzelheiten stehen im Systemprotokoll"
+                    ),
+                    (Lang::De, true) => "die Sicherungseinstellungen dieses Computers wurden \
+                         geändert; die Einzelheiten stehen im Systemprotokoll"
+                        .to_string(),
+                };
+            }
             let list = reductions
                 .iter()
                 .map(|r| reduction_phrase(lang, r))
@@ -899,6 +934,16 @@ pub struct SettingsAnnouncement {
     /// The hook already received it.
     #[serde(default)]
     pub command_done: bool,
+    /// Non-zero while this is a write-ahead *intent*: the daemon recorded it
+    /// before changing the configuration and has not yet filled in the real
+    /// reductions. The id lets the daemon find and complete (or cancel) it
+    /// after the change. A crash in between leaves the provisional entry, which
+    /// is delivered as a generic "settings were changed" message (item 8).
+    #[serde(default)]
+    pub id: u64,
+    /// This is still a write-ahead intent (details not yet known).
+    #[serde(default)]
+    pub provisional: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -913,6 +958,13 @@ pub struct NotifyState {
     /// Protection-reducing settings changes still to be delivered (0022).
     #[serde(default)]
     pub settings: Vec<SettingsAnnouncement>,
+    /// When each user (by uid) last received a settings message, for the
+    /// per-recipient rate limit (decision 0022, item 3).
+    #[serde(default)]
+    pub settings_sent_users: BTreeMap<u32, DateTime<Utc>>,
+    /// When the hook last received a settings message.
+    #[serde(default, with = "crate::state::rfc3339_opt")]
+    pub settings_sent_command: Option<DateTime<Utc>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,13 +1282,42 @@ fn combine_reductions(
     groups
 }
 
-/// Keep at most the newest [`MAX_SETTINGS`] announcements, so endless
-/// back-and-forth cannot grow the record without bound (decision 0022).
+/// Keep endless back-and-forth from growing the record without bound, but never
+/// drop a reduction that has not been reported yet (decision 0022, item 7).
+/// Once there are more than [`MAX_SETTINGS`] announcements, they are combined
+/// per user into one each — the union of their reductions — which bounds the
+/// count by the number of distinct users. An announcement counts as delivered
+/// to a recipient only if every announcement merged into it was (the
+/// intersection), so nothing unreported is lost; at worst a recipient sees one
+/// combined message again. A write-ahead intent is left untouched so its id
+/// still finds it.
 fn cap_settings(settings: &mut Vec<SettingsAnnouncement>) {
-    if settings.len() > MAX_SETTINGS {
-        let drop = settings.len() - MAX_SETTINGS;
-        settings.drain(0..drop);
+    if settings.len() <= MAX_SETTINGS {
+        return;
     }
+    let mut merged: Vec<SettingsAnnouncement> = Vec::new();
+    for a in settings.drain(..) {
+        if a.provisional {
+            merged.push(a);
+            continue;
+        }
+        if let Some(m) = merged
+            .iter_mut()
+            .find(|m| !m.provisional && m.user == a.user)
+        {
+            for r in a.reductions {
+                if !m.reductions.contains(&r) {
+                    m.reductions.push(r);
+                }
+            }
+            m.at = m.at.min(a.at);
+            m.users_done = m.users_done.intersection(&a.users_done).copied().collect();
+            m.command_done &= a.command_done;
+        } else {
+            merged.push(a);
+        }
+    }
+    *settings = merged;
 }
 
 /// Deliver the recorded protection-reducing settings changes (decision 0022):
@@ -1245,12 +1326,23 @@ fn cap_settings(settings: &mut Vec<SettingsAnnouncement>) {
 /// one recipient are combined into a single message, so a flurry of changes
 /// does not flood anyone. Independent of the problem conditions, so it runs
 /// even while a backup is in progress. The record is saved after each delivery.
+///
+/// A recipient who was sent a settings message within [`SETTINGS_RATE_LIMIT`]
+/// is skipped (their pending changes stay and are combined into the next
+/// message), so a continuous stream cannot notify anyone more than once every
+/// few minutes — unless they are already in `delivered_users` / `*delivered_cmd`
+/// because this same run delivered to them, in which case a change that arrived
+/// mid-run is still delivered now (decision 0022, items 1, 3). Those sets grow
+/// as deliveries happen so the caller can call again (the end-of-run re-drain).
+#[allow(clippy::too_many_arguments)]
 pub fn deliver_settings(
     state: &mut NotifyState,
     now: DateTime<Utc>,
     lang: Lang,
     channels: &mut dyn Channels,
     save: &mut dyn FnMut(&NotifyState),
+    delivered_users: &mut BTreeSet<u32>,
+    delivered_cmd: &mut bool,
 ) -> ApplyOutcome {
     let mut log = Vec::new();
     let mut hook_failed = false;
@@ -1266,6 +1358,20 @@ pub fn deliver_settings(
         if pending.is_empty() {
             continue;
         }
+        // Rate limit across runs, bypassed for a recipient this run already
+        // notified (so a mid-run arrival still goes out).
+        if !delivered_users.contains(&session.uid)
+            && state
+                .settings_sent_users
+                .get(&session.uid)
+                .is_some_and(|t| now - *t < SETTINGS_RATE_LIMIT)
+        {
+            log.push(format!(
+                "settings: holding back {} (one message per few minutes)",
+                session.name
+            ));
+            continue;
+        }
         let groups = combine_reductions(&state.settings, &pending);
         let message = compose_settings_many(lang, &groups, session.detail());
         match channels.send_desktop(session, &message) {
@@ -1273,6 +1379,8 @@ pub fn deliver_settings(
                 for &i in &pending {
                     state.settings[i].users_done.insert(session.uid);
                 }
+                state.settings_sent_users.insert(session.uid, now);
+                delivered_users.insert(session.uid);
                 save(state);
                 log.push(format!(
                     "settings: desktop notification to {}",
@@ -1293,7 +1401,13 @@ pub fn deliver_settings(
         let pending: Vec<usize> = (0..state.settings.len())
             .filter(|&i| !state.settings[i].command_done)
             .collect();
-        if !pending.is_empty() {
+        let throttled = !*delivered_cmd
+            && state
+                .settings_sent_command
+                .is_some_and(|t| now - t < SETTINGS_RATE_LIMIT);
+        if !pending.is_empty() && throttled {
+            log.push("settings: holding back the hook (one call per few minutes)".to_string());
+        } else if !pending.is_empty() {
             let groups = combine_reductions(&state.settings, &pending);
             let message = compose_settings_many(lang, &groups, Detail::Full);
             match channels.send_command(&message) {
@@ -1301,6 +1415,8 @@ pub fn deliver_settings(
                     for &i in &pending {
                         state.settings[i].command_done = true;
                     }
+                    state.settings_sent_command = Some(now);
+                    *delivered_cmd = true;
                     save(state);
                     log.push("settings: command ran".to_string());
                 }
@@ -1665,14 +1781,11 @@ pub struct Options {
     pub dry_run: bool,
 }
 
-/// Serialises concurrent checks (timer, `OnSuccess=`, by hand).
+/// Serialises concurrent checks (timer, `OnSuccess=`, by hand). 0600 so a group
+/// member cannot hold a shared lock on it (decision 0022, item 2).
 fn lock(paths: &Paths) -> Result<nix::fcntl::Flock<fs::File>> {
     fs::create_dir_all(&paths.state_dir)?;
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(paths.state_dir.join(".notify.lock"))?;
+    let file = crate::state::open_private_lock(&paths.state_dir.join(".notify.lock"))?;
     nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
         .map_err(|(_, e)| e)
         .context("cannot lock the notification state")
@@ -1711,6 +1824,15 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
             .and_then(|text| lenient_notify_config(&text))
             .unwrap_or_default(),
     };
+    // Debounce before taking the lock: when a settings change was just
+    // recorded, wait out a short quiet period so a burst of changes coalesces
+    // into one run and one message. Sleeping here, before the lock, means it
+    // never blocks the hourly check or the post-backup report; concurrent
+    // `systemctl start --no-block` triggers are collapsed by systemd while this
+    // one sleeps (decision 0022, item 3).
+    if !options.dry_run && !options.test {
+        settings_debounce(paths, Utc::now, std::thread::sleep);
+    }
     // The lock comes first: a check that waits for another one (a slow hook)
     // must judge the situation as it is when its turn comes.
     let _lock = if options.dry_run || options.test {
@@ -1804,21 +1926,57 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
     // Deliver the settings changes first, then judge the problems; `apply` is
     // skipped when there is nothing to judge or when the last run gave no
     // result (an announced failure then stays open, nothing new to say).
+    // Finally, before the lock is released, the inbox is drained again so a
+    // change recorded while this check ran (its hook can be slow) is delivered
+    // now instead of waiting for the next hourly timer (decision 0022, item 1).
+    #[allow(clippy::too_many_arguments)]
     fn drive(
+        paths: &Paths,
         state: &mut NotifyState,
         problem: &Option<(Vec<Condition>, bool)>,
         now: DateTime<Utc>,
         lang: Lang,
         channels: &mut dyn Channels,
         save: &mut dyn FnMut(&NotifyState),
+        redrain: bool,
     ) -> ApplyOutcome {
-        let mut out = deliver_settings(state, now, lang, channels, save);
+        let mut delivered_users = BTreeSet::new();
+        let mut delivered_cmd = false;
+        let mut out = deliver_settings(
+            state,
+            now,
+            lang,
+            channels,
+            save,
+            &mut delivered_users,
+            &mut delivered_cmd,
+        );
         if let Some((conditions, settled)) = problem
             && !(conditions.is_empty() && !settled)
         {
             let a = apply(state, conditions, !settled, now, lang, channels, save);
             out.log.extend(a.log);
             out.hook_failed |= a.hook_failed;
+        }
+        if redrain {
+            for _ in 0..MAX_REDRAIN {
+                let before = state.settings.len();
+                drain_settings_inbox(paths, state);
+                if state.settings.len() == before {
+                    break;
+                }
+                let a = deliver_settings(
+                    state,
+                    now,
+                    lang,
+                    channels,
+                    save,
+                    &mut delivered_users,
+                    &mut delivered_cmd,
+                );
+                out.log.extend(a.log);
+                out.hook_failed |= a.hook_failed;
+            }
         }
         out
     }
@@ -1828,18 +1986,29 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
             inner: channels,
             log: Vec::new(),
         };
-        let mut out = drive(&mut state, &problem, now, context.lang, &mut dry, &mut save);
+        let mut out = drive(
+            paths,
+            &mut state,
+            &problem,
+            now,
+            context.lang,
+            &mut dry,
+            &mut save,
+            false,
+        );
         out.log.extend(dry.log);
         out
     } else {
         let mut channels = channels;
         let out = drive(
+            paths,
             &mut state,
             &problem,
             now,
             context.lang,
             &mut channels,
             &mut save,
+            true,
         );
         save(&state);
         out
@@ -1873,28 +2042,134 @@ fn settings_inbox_file(paths: &Paths) -> PathBuf {
     paths.state_dir.join("notify-settings.json")
 }
 
-/// Short lock for the settings inbox, separate from the main notification lock,
-/// so a running check (which holds the main lock for the length of a slow hook)
-/// never blocks the daemon from recording a change.
-fn settings_inbox_lock(paths: &Paths) -> Result<nix::fcntl::Flock<fs::File>> {
-    fs::create_dir_all(&paths.state_dir)?;
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(paths.state_dir.join(".notify-settings.lock"))?;
-    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
-        .map_err(|(_, e)| e)
-        .context("cannot lock the settings inbox")
+/// How many times the end-of-run re-drain repeats, a bound so it cannot loop
+/// forever against a daemon that keeps recording changes (decision 0022,
+/// item 1).
+const MAX_REDRAIN: usize = 5;
+
+/// The timestamps of the changes currently in the inbox (read under its own
+/// short lock). Empty on any error.
+fn inbox_entry_times(paths: &Paths) -> Vec<DateTime<Utc>> {
+    if !settings_inbox_file(paths).exists() {
+        return Vec::new();
+    }
+    let Ok(_lock) = settings_inbox_lock(paths) else {
+        return Vec::new();
+    };
+    read_json::<Vec<SettingsAnnouncement>>(&settings_inbox_file(paths))
+        .map(|inbox| inbox.iter().map(|a| a.at).collect())
+        .unwrap_or_default()
 }
 
-/// Record a protection-reducing settings change for `nestegg notify` to
-/// deliver (decision 0022). The daemon calls this synchronously, before it
-/// answers the HTTP request, so a daemon restart (a package upgrade) in the
-/// minutes a slow check may hold the main lock cannot lose it. It writes to a
-/// small inbox under a short lock of its own and never waits for a running
-/// check; the next check drains the inbox and announces it. Root's own changes
-/// are not recorded by the caller (root is trusted).
+/// How long to wait before delivering, given the inbox entry times: until the
+/// newest is [`SETTINGS_QUIET`] old, but never past [`SETTINGS_MAX_WAIT`] after
+/// the oldest, and zero when the inbox is empty or already quiet (decision
+/// 0022, item 3). Pure, so the pacing is tested without sleeping.
+fn settings_debounce_wait(times: &[DateTime<Utc>], now: DateTime<Utc>) -> Duration {
+    let (Some(newest), Some(oldest)) = (times.iter().max(), times.iter().min()) else {
+        return Duration::zero();
+    };
+    let deadline = (*newest + SETTINGS_QUIET).min(*oldest + SETTINGS_MAX_WAIT);
+    (deadline - now).max(Duration::zero())
+}
+
+/// Wait out the quiet period before the main lock is taken, re-reading the
+/// inbox so a new arrival extends the wait up to the bound (decision 0022,
+/// item 3). `now_fn`/`sleep_fn` are injected so the loop is driven by a test
+/// clock without really sleeping.
+fn settings_debounce(
+    paths: &Paths,
+    now_fn: impl Fn() -> DateTime<Utc>,
+    sleep_fn: impl Fn(StdDuration),
+) {
+    // Bounded: the deadline never exceeds oldest + SETTINGS_MAX_WAIT, and each
+    // step is at most two seconds, so this cannot spin.
+    for _ in 0..200 {
+        let wait = settings_debounce_wait(&inbox_entry_times(paths), now_fn());
+        if wait <= Duration::zero() {
+            return;
+        }
+        let step = wait.min(Duration::seconds(2));
+        sleep_fn(StdDuration::from_millis(
+            step.num_milliseconds().max(1) as u64
+        ));
+    }
+}
+
+/// Longest the daemon waits for the settings-inbox lock in the request path
+/// before giving up, so a stuck lock cannot tie up the HTTP worker thread
+/// forever (decision 0022, item 2). The lock is held only for the moment a
+/// change is read and written, and it is 0600 so only root processes can take
+/// it, so this bound is reached only if something is badly wrong.
+const INBOX_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+/// Short lock for the settings inbox, separate from the main notification lock,
+/// so a running check (which holds the main lock for the length of a slow hook)
+/// never blocks the daemon from recording a change. 0600 so a group member
+/// cannot hold a shared lock on it; the wait is bounded (decision 0022, item 2).
+fn settings_inbox_lock(paths: &Paths) -> Result<nix::fcntl::Flock<fs::File>> {
+    fs::create_dir_all(&paths.state_dir)?;
+    let mut file = crate::state::open_private_lock(&paths.state_dir.join(".notify-settings.lock"))?;
+    let deadline = std::time::Instant::now() + INBOX_LOCK_TIMEOUT;
+    loop {
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(lock),
+            Err((f, nix::errno::Errno::EWOULDBLOCK)) => {
+                if std::time::Instant::now() >= deadline {
+                    bail!("the settings inbox is locked by another process; try again");
+                }
+                file = f;
+                std::thread::sleep(StdDuration::from_millis(50));
+            }
+            Err((_, e)) => return Err(e).context("cannot lock the settings inbox"),
+        }
+    }
+}
+
+/// Read the inbox, setting a damaged file aside under a `.corrupt-<time>` name
+/// (and logging it) instead of deleting it silently, so a report is never lost
+/// without a trace. Returns the entries and, when the file was damaged, a note
+/// for the record so the owner is told (decision 0022, item 8).
+fn load_inbox(paths: &Paths) -> (Vec<SettingsAnnouncement>, Option<String>) {
+    let file = settings_inbox_file(paths);
+    if !file.exists() {
+        return (Vec::new(), None);
+    }
+    match read_json::<Vec<SettingsAnnouncement>>(&file) {
+        Ok(inbox) => (inbox, None),
+        Err(e) => {
+            let aside = file.with_extension(format!("corrupt-{}", Utc::now().timestamp()));
+            let note = match fs::rename(&file, &aside) {
+                Ok(()) => format!(
+                    "the record of settings changes was damaged and set aside as {}",
+                    aside.display()
+                ),
+                Err(re) => {
+                    let _ = fs::remove_file(&file);
+                    format!("the record of settings changes was damaged and discarded ({re:#})")
+                }
+            };
+            eprintln!("warning: {note}: {e:#}");
+            (Vec::new(), Some(note))
+        }
+    }
+}
+
+/// A unique, non-zero id for a write-ahead intent. The requests that could
+/// overlap are serialised by the daemon's settings lock, so the nanosecond
+/// clock is unique enough.
+fn new_intent_id() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        | 1
+}
+
+/// Record a finished protection-reducing settings change for `nestegg notify`
+/// to deliver (decision 0022). Writes to a small inbox under a short lock of its
+/// own and never waits for a running check; the next check drains it. Root's own
+/// changes are not recorded by the caller (root is trusted).
 pub fn record_settings_change(
     paths: &Paths,
     user: &str,
@@ -1904,29 +2179,107 @@ pub fn record_settings_change(
         return Ok(());
     }
     let _lock = settings_inbox_lock(paths)?;
-    let file = settings_inbox_file(paths);
-    let mut inbox: Vec<SettingsAnnouncement> = if file.exists() {
-        read_json(&file).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let (mut inbox, _) = load_inbox(paths);
     inbox.push(SettingsAnnouncement {
         user: user.to_string(),
         reductions,
         at: Utc::now(),
         users_done: BTreeSet::new(),
         command_done: false,
+        id: 0,
+        provisional: false,
     });
     cap_settings(&mut inbox);
-    write_json_atomic(&file, &inbox)
+    write_json_atomic(&settings_inbox_file(paths), &inbox)
         .context("cannot record the settings change for the health check")
+}
+
+/// Write-ahead *intent*: record that `user` is about to change the settings,
+/// **before** the configuration file is changed, and return its id. If this
+/// fails the caller must refuse the change (the report could not be recorded),
+/// so a change is never applied without a durable report of it (decision 0022,
+/// item 8). A crash between here and [`finalize_settings_change`] leaves the
+/// provisional entry, which the next check delivers as a generic "the settings
+/// were changed by …; details are in the journal" message.
+pub fn record_settings_intent(paths: &Paths, user: &str) -> Result<u64> {
+    let _lock = settings_inbox_lock(paths)?;
+    let (mut inbox, _) = load_inbox(paths);
+    let id = new_intent_id();
+    inbox.push(SettingsAnnouncement {
+        user: user.to_string(),
+        reductions: Vec::new(),
+        at: Utc::now(),
+        users_done: BTreeSet::new(),
+        command_done: false,
+        id,
+        provisional: true,
+    });
+    cap_settings(&mut inbox);
+    write_json_atomic(&settings_inbox_file(paths), &inbox)
+        .context("cannot record the settings change for the health check")?;
+    Ok(id)
+}
+
+/// Complete the intent `id` with the real reductions once the change has taken
+/// effect, or drop it when the change lowered nothing (decision 0022, item 8).
+/// Best effort: the change already happened, but the intent guarantees a report
+/// even if this write fails.
+pub fn finalize_settings_change(
+    paths: &Paths,
+    id: u64,
+    reductions: Vec<crate::settings::Reduction>,
+) -> Result<()> {
+    let _lock = settings_inbox_lock(paths)?;
+    let (mut inbox, _) = load_inbox(paths);
+    if reductions.is_empty() {
+        // The change raised the protection (or left it unchanged): no report.
+        inbox.retain(|a| a.id != id);
+    } else if let Some(a) = inbox.iter_mut().find(|a| a.id == id) {
+        a.reductions = reductions;
+        a.provisional = false;
+        a.at = Utc::now();
+    } else {
+        // The intent is gone (a check drained it, or it was coalesced): record
+        // the reductions afresh so the report is not lost.
+        inbox.push(SettingsAnnouncement {
+            user: String::new(),
+            reductions,
+            at: Utc::now(),
+            users_done: BTreeSet::new(),
+            command_done: false,
+            id: 0,
+            provisional: false,
+        });
+    }
+    cap_settings(&mut inbox);
+    let file = settings_inbox_file(paths);
+    if inbox.is_empty() {
+        let _ = fs::remove_file(&file);
+        return Ok(());
+    }
+    write_json_atomic(&file, &inbox).context("cannot record the settings change")
+}
+
+/// Drop the intent `id`: the change was refused, so nothing took effect and
+/// there is nothing to report (decision 0022, item 8).
+pub fn cancel_settings_intent(paths: &Paths, id: u64) -> Result<()> {
+    let _lock = settings_inbox_lock(paths)?;
+    let (mut inbox, _) = load_inbox(paths);
+    inbox.retain(|a| a.id != id);
+    let file = settings_inbox_file(paths);
+    if inbox.is_empty() {
+        let _ = fs::remove_file(&file);
+        return Ok(());
+    }
+    write_json_atomic(&file, &inbox).context("cannot update the settings inbox")
 }
 
 /// Move everything the daemon left in the inbox into the check's record and
 /// clear the inbox. Called under the main notification lock; takes the inbox's
 /// own short lock only for the moment it reads and clears the file. The record
 /// is persisted before the inbox is cleared, so a crash in between re-delivers
-/// at worst, never drops a change (decision 0022).
+/// at worst, never drops a change. A damaged inbox is set aside and reported
+/// (decision 0022, items 4, 8).
 fn drain_settings_inbox(paths: &Paths, state: &mut NotifyState) {
     let file = settings_inbox_file(paths);
     if !file.exists() {
@@ -1939,15 +2292,22 @@ fn drain_settings_inbox(paths: &Paths, state: &mut NotifyState) {
             return;
         }
     };
-    let inbox: Vec<SettingsAnnouncement> = match read_json(&file) {
-        Ok(inbox) => inbox,
-        Err(e) => {
-            eprintln!("warning: cannot read the settings inbox: {e:#}");
-            let _ = fs::remove_file(&file);
-            return;
-        }
-    };
-    if inbox.is_empty() {
+    let (inbox, damaged) = load_inbox(paths);
+    let was_damaged = damaged.is_some();
+    if was_damaged {
+        // Tell the owner the record was damaged (a generic settings message
+        // with no user); the detail is in the journal.
+        state.settings.push(SettingsAnnouncement {
+            user: String::new(),
+            reductions: Vec::new(),
+            at: Utc::now(),
+            users_done: BTreeSet::new(),
+            command_done: false,
+            id: 0,
+            provisional: true,
+        });
+    }
+    if inbox.is_empty() && !was_damaged {
         let _ = fs::remove_file(&file);
         return;
     }
@@ -2009,6 +2369,43 @@ mod tests {
 
     fn hours(h: i64) -> DateTime<Utc> {
         t0() + Duration::hours(h)
+    }
+
+    /// A finished settings announcement (not an intent) for the tests.
+    fn announce(
+        user: &str,
+        reductions: Vec<crate::settings::Reduction>,
+        at: DateTime<Utc>,
+    ) -> SettingsAnnouncement {
+        SettingsAnnouncement {
+            user: user.to_string(),
+            reductions,
+            at,
+            users_done: BTreeSet::new(),
+            command_done: false,
+            id: 0,
+            provisional: false,
+        }
+    }
+
+    /// Deliver settings with fresh per-run delivered sets (no rate-limit
+    /// bypass), the common case in the tests.
+    fn deliver(
+        state: &mut NotifyState,
+        now: DateTime<Utc>,
+        lang: Lang,
+        channels: &mut dyn Channels,
+        save: &mut dyn FnMut(&NotifyState),
+    ) -> ApplyOutcome {
+        deliver_settings(
+            state,
+            now,
+            lang,
+            channels,
+            save,
+            &mut BTreeSet::new(),
+            &mut false,
+        )
     }
 
     // --- policy -----------------------------------------------------------
@@ -2436,6 +2833,13 @@ mod tests {
             let a = &s.active[&Event::Failing];
             (a.users.len(), a.command_seq)
         };
+        // The very first snapshot already reflects exactly one delivery, not
+        // zero and not both (decision 0022, item 13).
+        assert_eq!(
+            done(&snaps[0]).0,
+            1,
+            "the first snapshot records exactly one recipient"
+        );
         let mut users_seen = 0;
         for s in &snaps {
             let (users, _cmd) = done(s);
@@ -2556,21 +2960,19 @@ mod tests {
     fn settings_changes_are_announced_to_users_and_the_hook() {
         use crate::settings::Reduction;
         let mut state = NotifyState::default();
-        state.settings.push(SettingsAnnouncement {
-            user: "alice".into(),
-            reductions: vec![
+        state.settings.push(announce(
+            "alice",
+            vec![
                 Reduction::AutomaticBackupsOff,
                 Reduction::ExcludesAdded {
                     patterns: vec!["/home/alice/secret".into()],
                 },
             ],
-            at: hours(0),
-            users_done: BTreeSet::new(),
-            command_done: false,
-        });
+            hours(0),
+        ));
         let mut ch = Fake::new(&[(1000, "carol")], true); // carol: group member
         ch.login_plain(1001, "guest");
-        let out = deliver_settings(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        let out = deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
         assert!(!out.hook_failed);
         assert_eq!(
             ch.desktop,
@@ -2585,16 +2987,16 @@ mod tests {
 
         // Delivered once: a later check sends nothing again.
         ch.clear();
-        deliver_settings(&mut state, hours(1), Lang::En, &mut ch, &mut |_| {});
+        deliver(&mut state, hours(1), Lang::En, &mut ch, &mut |_| {});
         assert!(ch.desktop.is_empty() && ch.hook.is_empty());
         // A user who logs in later still gets it, within the keep window.
         ch.clear();
         ch.login(1002, "dave");
-        deliver_settings(&mut state, hours(2), Lang::En, &mut ch, &mut |_| {});
+        deliver(&mut state, hours(2), Lang::En, &mut ch, &mut |_| {});
         assert_eq!(ch.desktop, [(1002, Event::Settings)]);
         // After a few days the announcement is dropped.
         ch.clear();
-        deliver_settings(
+        deliver(
             &mut state,
             hours(24 * 3 + 1),
             Lang::En,
@@ -2608,22 +3010,18 @@ mod tests {
     fn a_failing_hook_keeps_a_settings_announcement_for_retry() {
         use crate::settings::Reduction;
         let mut state = NotifyState::default();
-        state.settings.push(SettingsAnnouncement {
-            user: "alice".into(),
-            reductions: vec![Reduction::WakeOnLanOff],
-            at: hours(0),
-            users_done: BTreeSet::new(),
-            command_done: false,
-        });
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], hours(0)));
         let mut ch = Fake::new(&[], true);
         ch.command_fails = true;
-        let out = deliver_settings(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        let out = deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
         assert!(out.hook_failed);
         assert!(!state.settings[0].command_done);
         // Retried at the next check.
         ch.command_fails = false;
         ch.clear();
-        let out = deliver_settings(&mut state, hours(1), Lang::En, &mut ch, &mut |_| {});
+        let out = deliver(&mut state, hours(1), Lang::En, &mut ch, &mut |_| {});
         assert!(!out.hook_failed);
         assert_eq!(ch.hook, [Event::Settings]);
     }
@@ -2635,23 +3033,17 @@ mod tests {
         // forth) become a single message per recipient (decision 0022, item 8).
         let mut state = NotifyState::default();
         for _ in 0..3 {
-            state.settings.push(SettingsAnnouncement {
-                user: "alice".into(),
-                reductions: vec![Reduction::AutomaticBackupsOff],
-                at: hours(0),
-                users_done: BTreeSet::new(),
-                command_done: false,
-            });
+            state.settings.push(announce(
+                "alice",
+                vec![Reduction::AutomaticBackupsOff],
+                hours(0),
+            ));
         }
-        state.settings.push(SettingsAnnouncement {
-            user: "bob".into(),
-            reductions: vec![Reduction::WakeOnLanOff],
-            at: hours(0),
-            users_done: BTreeSet::new(),
-            command_done: false,
-        });
+        state
+            .settings
+            .push(announce("bob", vec![Reduction::WakeOnLanOff], hours(0)));
         let mut ch = Fake::new(&[(1000, "carol")], true);
-        deliver_settings(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
         // One desktop message and one hook call, not four each.
         assert_eq!(ch.desktop, [(1000, Event::Settings)]);
         assert_eq!(ch.hook, [Event::Settings]);
@@ -2700,6 +3092,259 @@ mod tests {
         // A second drain with an empty inbox changes nothing.
         drain_settings_inbox(&paths, &mut state);
         assert_eq!(state.settings.len(), 2);
+    }
+
+    fn test_paths(dir: &tempfile::TempDir) -> Paths {
+        Paths {
+            config_file: dir.path().join("config.toml"),
+            credentials_dir: dir.path().join("cred"),
+            state_dir: dir.path().to_path_buf(),
+            runtime_dir: dir.path().join("run"),
+            systemctl: PathBuf::from("systemctl"),
+        }
+    }
+
+    #[test]
+    fn a_change_recorded_during_a_check_is_delivered_by_the_same_run() {
+        use crate::settings::Reduction;
+        // A report that lands in the inbox while a check is running is delivered
+        // by that same run's re-drain, not left for the hourly timer — even to a
+        // recipient the run already notified (decision 0022, items 1, 3).
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        record_settings_change(&paths, "alice", vec![Reduction::AutomaticBackupsOff]).unwrap();
+        let mut state = NotifyState::default();
+        drain_settings_inbox(&paths, &mut state);
+        let mut ch = Fake::new(&[(1000, "carol")], true);
+        let mut du = BTreeSet::new();
+        let mut dc = false;
+        deliver_settings(
+            &mut state,
+            t0(),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+            &mut du,
+            &mut dc,
+        );
+        assert_eq!(ch.desktop.len(), 1);
+        // A new change lands during the check.
+        record_settings_change(&paths, "bob", vec![Reduction::WakeOnLanOff]).unwrap();
+        ch.clear();
+        // The re-drain delivers it now, carrying the run's delivered sets so the
+        // rate limit does not hold carol back within the same run.
+        drain_settings_inbox(&paths, &mut state);
+        deliver_settings(
+            &mut state,
+            t0(),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+            &mut du,
+            &mut dc,
+        );
+        assert_eq!(ch.desktop, [(1000, Event::Settings)]);
+        assert!(ch.bodies[0].contains("bob"), "{}", ch.bodies[0]);
+        // A fresh run at the same instant (new delivered sets) would hold carol
+        // back instead.
+        record_settings_change(&paths, "carol", vec![Reduction::WakeOnLanOff]).unwrap();
+        ch.clear();
+        drain_settings_inbox(&paths, &mut state);
+        deliver(&mut state, t0(), Lang::En, &mut ch, &mut |_| {});
+        assert!(
+            ch.desktop.is_empty(),
+            "the rate limit holds a fresh run back"
+        );
+    }
+
+    #[test]
+    fn the_debounce_waits_for_quiet_but_not_forever() {
+        let now = t0();
+        assert_eq!(settings_debounce_wait(&[], now), Duration::zero());
+        // One recent change: wait until it is SETTINGS_QUIET (20 s) old.
+        assert_eq!(
+            settings_debounce_wait(&[now - Duration::seconds(5)], now),
+            Duration::seconds(15)
+        );
+        // Already quiet.
+        assert_eq!(
+            settings_debounce_wait(&[now - Duration::seconds(25)], now),
+            Duration::zero()
+        );
+        // A fresh change keeps extending the wait, but never past the oldest
+        // plus SETTINGS_MAX_WAIT (120 s).
+        assert_eq!(
+            settings_debounce_wait(
+                &[now - Duration::seconds(118), now - Duration::seconds(1)],
+                now
+            ),
+            Duration::seconds(2)
+        );
+        // Past the bound: deliver now.
+        assert_eq!(
+            settings_debounce_wait(&[now - Duration::seconds(121), now], now),
+            Duration::zero()
+        );
+    }
+
+    #[test]
+    fn a_recipient_is_not_notified_more_than_once_in_a_few_minutes() {
+        use crate::settings::Reduction;
+        let mut state = NotifyState::default();
+        state
+            .settings
+            .push(announce("alice", vec![Reduction::WakeOnLanOff], t0()));
+        let mut ch = Fake::new(&[(1000, "carol")], true);
+        deliver(&mut state, t0(), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(ch.desktop.len(), 1);
+        // A new change one minute later: carol is within the window, so held back.
+        state.settings.push(announce(
+            "bob",
+            vec![Reduction::AutomaticBackupsOff],
+            t0() + Duration::minutes(1),
+        ));
+        ch.clear();
+        deliver(
+            &mut state,
+            t0() + Duration::minutes(1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(ch.desktop.is_empty(), "held back within the window");
+        assert!(
+            !state.settings[1].users_done.contains(&1000),
+            "nothing is dropped; the change stays pending"
+        );
+        // After the window the held-back change is delivered, combined.
+        ch.clear();
+        deliver(
+            &mut state,
+            t0() + Duration::minutes(6),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert_eq!(ch.desktop, [(1000, Event::Settings)]);
+        assert!(ch.bodies[0].contains("bob"), "{}", ch.bodies[0]);
+    }
+
+    #[test]
+    fn the_cap_combines_per_user_without_dropping_unreported_changes() {
+        use crate::settings::Reduction;
+        // More pending announcements than the cap: they are combined per user,
+        // and the one change from alice is never dropped to make room for bob's
+        // flood (decision 0022, item 7).
+        let mut v: Vec<SettingsAnnouncement> = vec![announce(
+            "alice",
+            vec![Reduction::AutomaticBackupsOff],
+            hours(0),
+        )];
+        for _ in 0..=MAX_SETTINGS {
+            v.push(announce("bob", vec![Reduction::WakeOnLanOff], hours(0)));
+        }
+        assert!(v.len() > MAX_SETTINGS);
+        cap_settings(&mut v);
+        assert_eq!(v.len(), 2, "one combined entry per user");
+        assert!(
+            v.iter().any(
+                |a| a.user == "alice" && a.reductions.contains(&Reduction::AutomaticBackupsOff)
+            ),
+            "alice's change survives"
+        );
+    }
+
+    #[test]
+    fn a_write_ahead_intent_is_delivered_generically_after_a_crash() {
+        use crate::settings::Reduction;
+        // The intent is recorded before the change; a crash before it is
+        // completed still leads to a generic message naming the user (item 8).
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let id = record_settings_intent(&paths, "alice").unwrap();
+        assert_ne!(id, 0);
+        let mut state = NotifyState::default();
+        drain_settings_inbox(&paths, &mut state);
+        assert_eq!(state.settings.len(), 1);
+        assert!(state.settings[0].provisional);
+        let mut ch = Fake::new(&[(1000, "carol")], true);
+        deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(ch.hook, [Event::Settings]);
+        assert!(
+            ch.hook_bodies[0].contains("alice") && ch.hook_bodies[0].contains("system log"),
+            "{}",
+            ch.hook_bodies[0]
+        );
+        // Completing the intent later yields the full detail instead.
+        let dir2 = tempfile::tempdir().unwrap();
+        let paths2 = test_paths(&dir2);
+        let id2 = record_settings_intent(&paths2, "alice").unwrap();
+        finalize_settings_change(&paths2, id2, vec![Reduction::WakeOnLanOff]).unwrap();
+        let mut state2 = NotifyState::default();
+        drain_settings_inbox(&paths2, &mut state2);
+        assert_eq!(state2.settings.len(), 1);
+        assert!(!state2.settings[0].provisional);
+        assert_eq!(state2.settings[0].reductions, vec![Reduction::WakeOnLanOff]);
+    }
+
+    #[test]
+    fn a_cancelled_or_empty_intent_leaves_nothing_to_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        // A refused change cancels its intent.
+        let id = record_settings_intent(&paths, "alice").unwrap();
+        cancel_settings_intent(&paths, id).unwrap();
+        // A protection-raising change completes with no reductions: nothing left.
+        let id2 = record_settings_intent(&paths, "bob").unwrap();
+        finalize_settings_change(&paths, id2, Vec::new()).unwrap();
+        let mut state = NotifyState::default();
+        drain_settings_inbox(&paths, &mut state);
+        assert!(state.settings.is_empty(), "no leftover intents");
+    }
+
+    #[test]
+    fn a_damaged_inbox_is_set_aside_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(settings_inbox_file(&paths), b"{ this is not json").unwrap();
+        let mut state = NotifyState::default();
+        drain_settings_inbox(&paths, &mut state);
+        // The damaged file is moved aside, not left in place or silently deleted.
+        assert!(!settings_inbox_file(&paths).exists());
+        let aside = std::fs::read_dir(&paths.state_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt"))
+            .count();
+        assert_eq!(aside, 1, "the damaged inbox was set aside once");
+        // A generic 'settings were changed' message is recorded and delivered.
+        assert_eq!(state.settings.len(), 1);
+        assert!(state.settings[0].provisional);
+        let mut ch = Fake::new(&[(1000, "carol")], true);
+        deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        assert!(
+            ch.hook_bodies[0].contains("system log"),
+            "{}",
+            ch.hook_bodies[0]
+        );
+    }
+
+    #[test]
+    fn a_hook_that_never_reads_stdin_does_not_hang_the_check() {
+        // The stdin write is non-blocking, so even an input larger than the pipe
+        // buffer cannot hang the check when the hook ignores its stdin (item 13).
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 0"]);
+        let huge = vec![b'x'; 256 * 1024];
+        let start = Instant::now();
+        let out = run_with_timeout(cmd, &huge, StdDuration::from_secs(10)).unwrap();
+        assert!(out.status.is_some_and(|s| s.success()));
+        assert!(
+            start.elapsed() < StdDuration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

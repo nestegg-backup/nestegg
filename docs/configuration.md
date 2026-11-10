@@ -253,7 +253,7 @@ The daemon identifies the caller by the socket credentials:
   |---|---|---|
   | Backup rhythm | `schedule.interval_hours` | 1 to 168 hours |
   | "Overdue" after | `overdue_after_hours` | 2 hours up to `max(168, interval + 72)` hours, and more than the rhythm (so a weekly rhythm can be overdue after up to 10 days) |
-  | Excludes | `backup.excludes` | up to 200 patterns of at most 256 bytes each, none that excludes everything (`*`, `**`, `/`, ...) or that would leave out a whole source, a whole user home directory, or (in system mode) a whole top-level system directory |
+  | Excludes | `backup.excludes` | up to 200 patterns of at most 256 bytes each, each one the backup client can parse; none that excludes everything (`*`, `**`, `/`, ...) and no change whose list, as the client applies it (matched inside each archive, later patterns win), would leave out a whole source, a whole user home directory, or (in system mode) a whole top-level system directory |
   | Wake-on-LAN on/off | `wake.enabled` | only with a `[wake]` section; switching off keeps the MAC |
   | Automatic backups on/off | `nestegg-backup.timer` | `systemctl enable/disable --now` |
 
@@ -267,6 +267,13 @@ The daemon identifies the caller by the socket credentials:
   `/etc/nestegg/config.toml` is kept, and can then only be lowered or
   narrowed through the web interface, never widened past it
   ([decision 0022](decisions/0022-settings-changes-that-reduce-protection.md)).
+  The exclude guard is a guard against accidents and casual misuse, not a
+  security boundary: a group member can still narrow the backup folder by
+  folder, which is reported, named, to the owner. nestegg matches patterns with
+  the same `pathpatterns` library the backup client uses (an older release of
+  the same code), so a pattern that the client cannot parse — an unclosed
+  `[`…`]` class, a trailing `\` — is refused here with a plain message instead
+  of breaking every backup later.
   A change by a group member that lowers the protection (automatic backups
   off, an exclude added, a `!` re-include removed, the exclude list reordered,
   "overdue after" or the interval raised, Wake-on-LAN off) is reported to the
@@ -318,9 +325,13 @@ message goes to every logged-in user and, if configured, to your command;
 someone who logs in later still gets it once. Problem messages (`failing`,
 `overdue`, ...) are not judged while a backup is running, but a `settings`
 change is still delivered then, so lowering the protection during a backup is
-reported without waiting. A flurry of settings changes is combined into one
-message per recipient. An unreachable server alone is not reported on every
-attempt, only when it becomes `overdue`.
+reported without waiting. A flurry of settings changes does not flood anyone:
+the report waits out a short quiet period (about 20 seconds, at most two
+minutes) so a burst becomes one run, everything pending is combined into one
+message per recipient, and after the first message a recipient is told at most
+once every few minutes — nothing is dropped, later changes are combined and
+delivered once that time is over. An unreachable server alone is not reported
+on every attempt, only when it becomes `overdue`.
 A configuration file that cannot be read (a typo, an unknown key) is reported
 as `failing` with the parser's message; the `[notify]` section is still
 honoured in that case, if it is valid.

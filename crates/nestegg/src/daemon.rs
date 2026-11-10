@@ -469,12 +469,54 @@ async fn update_config(
     let patch =
         crate::settings::SettingsPatch::from_json(body).map_err(|e| refuse(e.to_string()))?;
     let paths = app.paths.clone();
+    let record_user = user_name.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _one_change_at_a_time = app.settings.lock().unwrap_or_else(|e| e.into_inner());
+        // A group member's change is reported to the users and the hook; root
+        // is trusted and not reported (decision 0022). The report is written
+        // ahead as an *intent*, before the configuration is changed, so a crash
+        // in between still leads to a message; if even the intent cannot be
+        // recorded the change is not applied (item 8).
+        let intent = if uid != 0 {
+            match crate::notify::record_settings_intent(&app.paths, &record_user) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    return Err(crate::settings::SettingsError::Failed(e.context(
+                        "the settings change was not applied because its report could not be \
+                         recorded; try again",
+                    )));
+                }
+            }
+        } else {
+            None
+        };
         let timer = crate::settings::SystemdTimer {
             systemctl: &app.paths.systemctl,
         };
-        crate::settings::update(&app.paths.config_file, &patch, &timer)
+        match crate::settings::update(&app.paths.config_file, &patch, &timer) {
+            Ok(outcome) => {
+                // The change took effect: complete the intent with the real
+                // reductions (or drop it when nothing was lowered). Best effort
+                // — the intent already guarantees a message if this fails.
+                if let Some(id) = intent {
+                    if let Err(e) = crate::notify::finalize_settings_change(
+                        &app.paths,
+                        id,
+                        outcome.reductions.clone(),
+                    ) {
+                        eprintln!("warning: could not complete the settings report: {e:#}");
+                    }
+                }
+                Ok(outcome)
+            }
+            Err(e) => {
+                // Nothing took effect: drop the intent so no message is sent.
+                if let Some(id) = intent {
+                    let _ = crate::notify::cancel_settings_intent(&app.paths, id);
+                }
+                Err(e)
+            }
+        }
     })
     .await
     .map_err(ApiError::internal)?;
@@ -488,31 +530,14 @@ async fn update_config(
                     outcome.changes.join("; ")
                 );
             }
-            // A group member who lowered the protection is reported to the
-            // users and the hook; root is trusted and not reported (decision
-            // 0022). Recorded synchronously, before the HTTP answer, into a
-            // small inbox with its own short lock (never waits for a running
-            // check), so a daemon restart cannot lose it; then the check is
-            // triggered. A change that took effect but ended in an error
-            // (`outcome.error`) is reported too.
+            // When the change lowered the protection, trigger the check so the
+            // recorded report is delivered within seconds (a change that took
+            // effect but ended in an error, `outcome.error`, is reported too).
             if uid != 0 && !outcome.reductions.is_empty() {
-                let reductions = outcome.reductions.clone();
-                let record_paths = paths.clone();
-                let record_user = user_name.clone();
-                let recorded = tokio::task::spawn_blocking(move || {
-                    crate::notify::record_settings_change(&record_paths, &record_user, reductions)
-                })
-                .await;
-                match recorded {
-                    Ok(Ok(())) => {
-                        // Triggering the check runs `systemctl start`; keep it
-                        // off the async reactor.
-                        let notify_paths = paths.clone();
-                        tokio::task::spawn_blocking(move || spawn_notify(&notify_paths));
-                    }
-                    Ok(Err(e)) => eprintln!("warning: {e:#}"),
-                    Err(e) => eprintln!("warning: cannot record the settings change: {e}"),
-                }
+                // Triggering the check runs `systemctl start`; keep it off the
+                // async reactor.
+                let notify_paths = paths.clone();
+                tokio::task::spawn_blocking(move || spawn_notify(&notify_paths));
             }
             if let Some(err) = outcome.error {
                 eprintln!("settings change by {caller} partly failed: {err:#}");

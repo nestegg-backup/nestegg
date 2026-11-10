@@ -447,24 +447,17 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
         std::fs::create_dir_all(dir)?;
     }
     let group = ensure_group();
-    // 0640 root:nestegg from the start (no window at the umask default): group
-    // members read it (for `nestegg status`), but a user outside the group
-    // cannot, because `[notify] command` may carry a token (decision 0022). The
-    // settings writer creates its temporary file the same way.
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o640)
-            .open(&paths.config_file)?;
-        file.write_all((config_header() + &cfg.to_toml()?).as_bytes())?;
-    }
-    // On `--force` the file already existed, so its mode was kept above; set it
-    // again to be sure it is not looser than 0640.
-    std::fs::set_permissions(&paths.config_file, std::fs::Permissions::from_mode(0o640))?;
+    // 0640 root:nestegg from the start (no window at the umask default, and no
+    // window at a looser mode on `--force`): group members read it (for
+    // `nestegg status`), but a user outside the group cannot, because
+    // `[notify] command` may carry a token. Written like the settings writer —
+    // a new file with the final mode, then rename — so a symlink at the path is
+    // refused rather than followed and truncated (decision 0022, item 14).
+    nestegg::settings::write_file_atomic(
+        &paths.config_file,
+        &(config_header() + &cfg.to_toml()?),
+        0o640,
+    )?;
     if let Some(gid) = group {
         let _ = nix::unistd::chown(
             &paths.config_file,

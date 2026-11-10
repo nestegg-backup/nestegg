@@ -56,18 +56,12 @@ impl RunLock {
     pub fn try_acquire(paths: &Paths) -> Result<Option<RunLock>> {
         fs::create_dir_all(&paths.runtime_dir)
             .with_context(|| format!("cannot create {}", paths.runtime_dir.display()))?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(paths.lock_file())
-            .with_context(|| format!("cannot open {}", paths.lock_file().display()))?;
-        // Group members probe the lock read-only; do not depend on the umask.
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o644))
-                .with_context(|| format!("cannot set mode of {}", paths.lock_file().display()))?;
-        }
+        // 0600, not 0644: a group member must not be able to open the lock
+        // read-only and hold a shared `flock` on it, which would make the
+        // exclusive lock below block and so keep backups from starting. Status
+        // queries no longer need to open it — they read `/proc/locks` instead
+        // (decision 0022, item 2).
+        let file = crate::state::open_private_lock(&paths.lock_file())?;
         // A short retry: a reader that briefly holds a shared lock (older
         // versions, fallback probe) must not make a start fail.
         let mut file = file;
@@ -108,11 +102,12 @@ pub fn active_run(paths: &Paths) -> Result<Option<Run>> {
     }
 }
 
-/// Probe the run lock without write access, so group members can call it.
-/// `None` if the lock file cannot be opened.
-/// Primary method: look the lock up in `/proc/locks` (no lock is taken, so
-/// a status query can never disturb a starting run). Fallback: a shared
-/// non-blocking probe.
+/// Probe the run lock. Primary method: look the lock up in `/proc/locks` (no
+/// lock is taken, so a status query can never disturb a starting run, and a
+/// group member needs no access to the 0600 lock file itself — only to stat it
+/// through the state directory, decision 0022, item 2). Fallback (only if
+/// `/proc/locks` is unreadable): a shared non-blocking probe, which needs to
+/// open the file and so works only for root. `None` if neither method applies.
 fn lock_is_held(paths: &Paths) -> Option<bool> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(paths.lock_file()).ok()?;

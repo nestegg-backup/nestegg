@@ -321,14 +321,32 @@ check "group member switches automatic backups off" test "$(tail -1 <<<"$out")" 
 check "the change reaches the hook as a settings event" wait_for_event settings 1
 check "the settings event names the user who made it" bash -c "docker exec $client grep -Eq '^settings[|][^|]*[|][^|]*[|].*alice' /root/hook-events"
 check "the switched-off timer is reported as its own condition" wait_for_event automatic_off 1
-# An exclude that drops a whole source is refused with a plain message.
-out="$(patch_config as_alice '{"excludes":["/home"]}')"
-check "an exclude of a whole source is refused" test "$(tail -1 <<<"$out")" = 400
+# An exclude that empties a whole home directory is refused with a plain
+# message. Excludes are matched archive-relative, so in this non-system setup
+# (home.pxar from /home, entries /alice, ...) the pattern that drops alice's
+# home is "/alice", not "/home" (which matches nothing inside home.pxar).
+out="$(patch_config as_alice '{"excludes":["/alice"]}')"
+check "an exclude of a whole home directory is refused" test "$(tail -1 <<<"$out")" = 400
+check "the refusal names the folder" contains "$out" 'whole folder'
 check "the refusal points to the file for an administrator" contains "$out" '/etc/nestegg/config.toml'
 check "config.toml still 0640 root:nestegg after the change" bash -c "[[ \$(docker exec $client stat -c '%a %U:%G' $cfg) == '640 root:nestegg' ]]"
 # Put automatic backups back (an increase in protection, not reported).
 patch_config as_alice '{"automatic_backups":true}' >/dev/null
 check "automatic backups on again" on_client systemctl is-enabled --quiet nestegg-backup.timer
+
+echo "-- a group member cannot take the daemon's lock files (decision 0022, item 2)"
+# The lock files only root processes need are 0600 root, so a group member
+# cannot open them (and so cannot hold a shared flock that would block the
+# daemon or keep backups from starting). By now all four exist: backups have run
+# (run.lock, .current.lock), the health check has run (.notify.lock) and a
+# settings change was recorded (.notify-settings.lock).
+for lk in /var/lib/nestegg/.notify.lock /var/lib/nestegg/.notify-settings.lock \
+          /var/lib/nestegg/.current.lock /run/nestegg/run.lock; do
+  check "lock $lk is 0600 root" bash -c "[[ \$(docker exec $client stat -c '%a %U' $lk) == '600 root' ]]"
+  check "group member cannot open lock $lk" bash -c "! docker exec -u alice $client sh -c 'exec 9<$lk' 2>/dev/null"
+done
+# A group member can still read the status while a backup runs (the status path
+# uses /proc/locks, not the lock file): covered by the pipeline test.
 
 echo "-- a failing hook makes 'nestegg notify' exit non-zero and the unit fail (decision 0022)"
 # Point the hook at a script that always fails, and create a failing backup.
