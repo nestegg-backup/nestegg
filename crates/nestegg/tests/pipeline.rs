@@ -2670,6 +2670,7 @@ fn a_run_lock_blocked_without_a_run_is_an_error_and_recorded() {
     assert_eq!(env.fake_log().matches("ARGS backup").count(), 1);
     let state = env.state();
     assert_eq!(state["last_run"]["state"], "failed", "{state}");
+
     assert!(
         state["last_run"]["error"]["message"]
             .as_str()
@@ -2706,6 +2707,19 @@ fn a_run_lock_blocked_without_a_run_is_an_error_and_recorded() {
     let exclusive = nix::fcntl::Flock::lock(holder, nix::fcntl::FlockArg::LockExclusive).unwrap();
     let before = env.state()["last_run"]["id"].clone();
     let out = env.run(&["run", "--trigger", "timer"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("in progress"));
+    assert_eq!(env.state()["last_run"]["id"], before);
+    // The same through the whole command when the kernel's list of locks does
+    // not show the lock file (as on btrfs, where it is listed under another
+    // device number): the run is found by asking the kernel directly.
+    let empty = env.root().join("proc-locks-empty");
+    fs::write(&empty, "").unwrap();
+    let out = env
+        .command(&["run", "--trigger", "timer"])
+        .env("NESTEGG_PROC_LOCKS", &empty)
+        .output()
+        .unwrap();
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).contains("in progress"));
     assert_eq!(env.state()["last_run"]["id"], before);

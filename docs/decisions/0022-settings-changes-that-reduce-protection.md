@@ -258,7 +258,7 @@ the value as root in `/etc/nestegg/config.toml`.
   file can leave two processes each holding a lock on a different inode of "the"
   lock. A descriptor a group member opened before the upgrade keeps working
   until that process ends; on a development machine that is accepted. Every
-  wait for one of these locks has a time limit (the run lock half a second,
+  wait for one of these locks has a time limit (the run lock two seconds,
   `current.json` 30 seconds, the notification check 90 seconds, the inbox
   5 seconds).
 - **A run lock that cannot be taken although no backup runs is an error.** A
@@ -275,7 +275,13 @@ the value as root in `/etc/nestegg/config.toml`.
   processes `/proc/locks` lists as holders (where it shows them), and it is
   recorded as a failed run
   like a missing key, so the health becomes `failing` and the notification
-  check reports it (and the growing pause of decision 0021 applies). A timer
+  check reports it (and the growing pause of decision 0021 applies). A start
+  keeps trying for those two seconds rather than a fixed number of times,
+  because every probe of the lock (a status query, another start) holds a
+  shared lock for an instant and makes an attempt at that instant fail; only
+  a lock that stays blocked for the whole time is an error. Starts that find
+  it blocked at the same moment record their failure one after the other, so
+  no count is lost. A timer
   run that is not due stays quiet as before. The key commands that take the
   run lock give the same message instead of "a backup is running".
 - `postinst` only **tightens** a `config.toml` that is too open (readable,

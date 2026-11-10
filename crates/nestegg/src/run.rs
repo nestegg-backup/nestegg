@@ -52,9 +52,10 @@ pub struct RunLock {
     _lock: Flock<File>,
 }
 
-/// The run lock could not be taken, but nothing recognisable holds it: no
-/// exclusive lock on the file according to `/proc/locks` and no fresh record of
-/// a running backup. Something else (a stray shared lock, for example) keeps
+/// The run lock could not be taken, but nothing recognisable holds it: nobody
+/// holds the file exclusively (asked of the kernel with a shared probe, see
+/// [`lock_is_held`]) and there is no fresh record of a running backup, for
+/// the whole of [`ACQUIRE_WINDOW`]. Something else (a stray shared lock, for example) keeps
 /// backups from starting. This is an error, not "already running": reported
 /// with exit code 1 and recorded as a failed run, so it does not go unnoticed.
 #[derive(Debug)]
@@ -90,21 +91,36 @@ impl RunLock {
         // exclusive lock below block and so keep backups from starting. Status
         // queries do not need to open it — they read `/proc/locks` instead
         // (decision 0022, item 2).
-        // A short retry: a reader that briefly holds a shared lock (fallback
-        // probe) must not make a start fail.
-        for attempt in 0..10 {
+        Self::try_acquire_with(paths, own_run_id, &proc_locks)
+    }
+
+    /// [`RunLock::try_acquire_for`] with the reader of `/proc/locks` passed
+    /// in, so tests can show a list that does not contain the lock file.
+    fn try_acquire_with(
+        paths: &Paths,
+        own_run_id: Option<&str>,
+        read_locks: &dyn Fn() -> Option<String>,
+    ) -> Result<Option<RunLock>> {
+        // Probes of the lock (status queries of the daemon, another start)
+        // hold a shared lock for an instant, and each one makes an exclusive
+        // attempt at that instant fail. So the start keeps trying for a fixed
+        // time, not a fixed number of times: only a lock that stays blocked
+        // for all of it, with nobody holding it exclusively, is an error.
+        let deadline = std::time::Instant::now() + ACQUIRE_WINDOW;
+        loop {
             let one_try = std::time::Duration::ZERO;
             if let Some(lock) = crate::state::lock_private(&paths.lock_file(), one_try)
                 .context("cannot lock run file")?
             {
                 return Ok(Some(RunLock { _lock: lock }));
             }
-            if lock_is_held(paths) == Some(true) {
+            if lock_is_held_with(paths, read_locks().as_deref()) == Some(true) {
                 return Ok(None);
             }
-            if attempt < 9 {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+            if std::time::Instant::now() >= deadline {
+                break;
             }
+            std::thread::sleep(ACQUIRE_STEP);
         }
         if run_in_progress(paths, own_run_id) {
             return Ok(None);
@@ -114,6 +130,21 @@ impl RunLock {
         }
         .into())
     }
+}
+
+/// How long a start keeps trying to take the run lock while nobody holds it
+/// exclusively. Long enough that momentary probes cannot use it up by chance
+/// (about eighty attempts), short enough for a command at the terminal.
+const ACQUIRE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+const ACQUIRE_STEP: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The kernel's list of file locks. `NESTEGG_PROC_LOCKS` names another file
+/// for tests (as `NESTEGG_MOUNTINFO` does for the mount table).
+fn proc_locks() -> Option<String> {
+    let path = std::env::var_os("NESTEGG_PROC_LOCKS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/proc/locks"));
+    fs::read_to_string(path).ok()
 }
 
 /// Whether a backup run is recognisable: an exclusive lock on the run lock
@@ -130,7 +161,7 @@ fn run_in_progress(paths: &Paths, own_run_id: Option<&str>) -> bool {
 fn blocked_message(paths: &Paths) -> String {
     use std::os::unix::fs::MetadataExt;
     let path = paths.lock_file();
-    let locks = fs::read_to_string("/proc/locks").ok();
+    let locks = proc_locks();
     let holders = fs::metadata(&path)
         .ok()
         .zip(locks.as_deref())
@@ -242,11 +273,15 @@ pub fn active_run(paths: &Paths) -> Result<Option<Run>> {
 /// read, a shared non-blocking probe decides for those who may open the file
 /// (root). `None` if neither method applies.
 fn lock_is_held(paths: &Paths) -> Option<bool> {
+    lock_is_held_with(paths, proc_locks().as_deref())
+}
+
+/// [`lock_is_held`] for a given content of `/proc/locks` (`None`: it cannot
+/// be read).
+fn lock_is_held_with(paths: &Paths, locks: Option<&str>) -> Option<bool> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(paths.lock_file()).ok()?;
-    let listed = fs::read_to_string("/proc/locks")
-        .ok()
-        .map(|locks| proc_locks_has_write_flock(&locks, meta.dev(), meta.ino()));
+    let listed = locks.map(|locks| proc_locks_has_write_flock(locks, meta.dev(), meta.ino()));
     if listed == Some(true) {
         return Some(true);
     }
@@ -263,7 +298,13 @@ fn lock_is_held(paths: &Paths) -> Option<bool> {
 /// [`RunLock::try_acquire_for`]). `None` when the file cannot be opened (not
 /// root) or the probe fails for another reason.
 fn exclusive_holder_probe(paths: &Paths) -> Option<bool> {
-    let file = File::open(paths.lock_file()).ok()?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Never through a symbolic link, as everywhere the lock file is opened.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(paths.lock_file())
+        .ok()?;
     match Flock::lock(file, FlockArg::LockSharedNonblock) {
         Ok(_shared) => Some(false),
         Err((_, nix::errno::Errno::EWOULDBLOCK)) => Some(true),
@@ -503,7 +544,13 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     let final_state = rep.run.state;
     rep.line(&format!("run finished: {:?}", final_state));
     store.record_finished_with_config(&rep.run, keep, config_stamp)?;
-    store.clear_current_if(&rep.run.id)?;
+    // The run is finished and recorded. Tidying up must not turn its result
+    // into an error: if `current.json` cannot be removed now (its lock is
+    // held past the time limit), it is left behind, counts as stale after a
+    // minute and is replaced by the next run.
+    if let Err(e) = store.clear_current_if(&rep.run.id) {
+        eprintln!("warning: could not remove the record of the running backup: {e:#}");
+    }
     let _ = fs::remove_file(&pid_file);
     let _ = fs::remove_file(&cancel_note);
     Ok(match final_state {
@@ -553,7 +600,10 @@ fn timer_skip(
 /// run that would not have started anyway stays quiet; otherwise the attempt is
 /// recorded as a failed run (like a missing key), so the health becomes
 /// `failing` and the notification check reports it, and the exit code is 1.
-/// No run holds the lock, so updating `state.json` here races with nobody.
+/// No run holds the run lock here, but a second blocked start may be at the
+/// same point: the update of `state.json` is serialised among them
+/// ([`Store::record_finished_serialised`]), so the count of failures in a
+/// row is not lost.
 fn record_blocked(paths: &Paths, options: &RunOptions, message: &str) -> Result<RunExit> {
     let store = Store::new(paths);
     let config_stamp = crate::state::config_stamp(&paths.config_file);
@@ -588,8 +638,10 @@ fn record_blocked(paths: &Paths, options: &RunOptions, message: &str) -> Result<
     });
     run.finish(RunState::Failed, Utc::now());
     let keep = config.as_ref().map(|c| c.backup.keep_runs).unwrap_or(200);
-    store.record_finished_with_config(&run, keep, config_stamp)?;
-    store.clear_current_if(&run.id)?;
+    store.record_finished_serialised(&run, keep, config_stamp)?;
+    if let Err(e) = store.clear_current_if(&run.id) {
+        eprintln!("warning: could not remove the record of the running backup: {e:#}");
+    }
     Ok(RunExit::Failed)
 }
 
@@ -1435,7 +1487,7 @@ mod tests {
             "{}",
             blocked.message
         );
-        if fs::read_to_string("/proc/locks").is_ok() {
+        if proc_locks().is_some() {
             assert!(
                 blocked
                     .message
@@ -1475,6 +1527,137 @@ mod tests {
         assert_eq!(lock_is_held(&paths), Some(true));
         drop(lock);
         assert_eq!(lock_is_held(&paths), Some(false));
+    }
+
+    fn lock_test_paths(dir: &std::path::Path) -> Paths {
+        Paths {
+            config_file: dir.join("c.toml"),
+            credentials_dir: dir.join("cred"),
+            state_dir: dir.join("state"),
+            runtime_dir: dir.join("run"),
+            systemctl: PathBuf::from("systemctl"),
+        }
+    }
+
+    #[test]
+    fn of_two_starts_at_the_same_moment_one_runs_and_the_other_sees_it_running() {
+        // Neither may come out as "blocked": each probes while the other
+        // tries, and whoever loses must find the winner holding the lock.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = lock_test_paths(dir.path());
+        for round in 0..40 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let starters: Vec<_> = (0..2)
+                .map(|_| {
+                    let (paths, barrier) = (paths.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        RunLock::try_acquire(&paths)
+                    })
+                })
+                .collect();
+            // Both results are kept until both starts are over, so the loser
+            // cannot get the lock after the winner let go.
+            let results: Vec<_> = starters.into_iter().map(|t| t.join().unwrap()).collect();
+            let got = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+            let running = results.iter().filter(|r| matches!(r, Ok(None))).count();
+            assert_eq!(
+                (got, running),
+                (1, 1),
+                "round {round}: {:?}",
+                results
+                    .iter()
+                    .map(|r| r.as_ref().map(|l| l.is_some()).map_err(|e| e.to_string()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn probes_of_the_lock_do_not_make_a_start_fail() {
+        // Status queries probe the lock with a momentary shared lock. Four
+        // threads doing nothing else must not make a single start come out
+        // as "blocked" (with a fixed number of attempts one in a few hundred
+        // did).
+        let dir = tempfile::tempdir().unwrap();
+        let paths = lock_test_paths(dir.path());
+        drop(RunLock::try_acquire(&paths).unwrap().unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probers: Vec<_> = (0..4)
+            .map(|_| {
+                let (paths, stop) = (paths.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = exclusive_holder_probe(&paths);
+                    }
+                })
+            })
+            .collect();
+        let mut problems = Vec::new();
+        for round in 0..300 {
+            match RunLock::try_acquire(&paths) {
+                Ok(Some(lock)) => drop(lock),
+                Ok(None) => problems.push(format!("round {round}: taken for running")),
+                Err(e) => problems.push(format!("round {round}: {e:#}")),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for p in probers {
+            p.join().unwrap();
+        }
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_lock_list_that_does_not_show_the_file_still_gives_the_right_answer() {
+        // On btrfs `/proc/locks` lists the lock under another device number,
+        // so the list never shows the lock file; the same when it cannot be
+        // read. A run that holds the lock must still be "already running",
+        // and a mere shared holder must still be "blocked".
+        let dir = tempfile::tempdir().unwrap();
+        let paths = lock_test_paths(dir.path());
+        let not_listed: [&dyn Fn() -> Option<String>; 2] = [&|| Some(String::new()), &|| None];
+        for read_locks in not_listed {
+            let run = RunLock::try_acquire(&paths).unwrap().unwrap();
+            let started = std::time::Instant::now();
+            let second = RunLock::try_acquire_with(&paths, None, read_locks).unwrap();
+            assert!(second.is_none(), "a run holds the lock");
+            assert!(
+                started.elapsed() < ACQUIRE_WINDOW,
+                "seen at once, not after the whole window"
+            );
+            drop(run);
+
+            let shared = Flock::lock(
+                File::open(paths.lock_file()).unwrap(),
+                FlockArg::LockSharedNonblock,
+            )
+            .map_err(|(_, e)| e)
+            .unwrap();
+            let started = std::time::Instant::now();
+            let err = match RunLock::try_acquire_with(&paths, None, read_locks) {
+                Err(e) => e,
+                Ok(_) => panic!("a shared holder blocks the lock without being a run"),
+            };
+            assert!(err.downcast_ref::<LockBlocked>().is_some(), "{err:#}");
+            assert!(
+                started.elapsed() >= ACQUIRE_WINDOW,
+                "only after the whole window"
+            );
+            drop(shared);
+            assert!(RunLock::try_acquire(&paths).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn the_probe_does_not_follow_a_symbolic_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = lock_test_paths(dir.path());
+        fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::write(&elsewhere, "").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, paths.lock_file()).unwrap();
+        assert_eq!(exclusive_holder_probe(&paths), None);
     }
 
     #[test]

@@ -642,6 +642,19 @@ impl Store {
         Ok(())
     }
 
+    /// [`Store::record_finished_with_config`] for a caller that does not hold
+    /// the run lock (a start that found the lock blocked): several of them
+    /// can be here at once, so the read-modify-write of `state.json` happens
+    /// under the short lock that also guards `current.json`.
+    pub fn record_finished_serialised(
+        &self,
+        run: &Run,
+        keep: usize,
+        config_stamp: Option<String>,
+    ) -> Result<()> {
+        self.with_current_lock(|| self.record_finished_with_config(run, keep, config_stamp))
+    }
+
     /// Persist a finished run, update `state.json` and prune old records.
     pub fn record_finished(&self, run: &Run, keep: usize) -> Result<()> {
         let dir = self.paths.runs_dir();
@@ -1166,6 +1179,42 @@ mod tests {
         state.last_run = Some(finished(RunState::Failed, t(1)));
         let not_before = retry_not_before(&state, 3, same, now).unwrap();
         assert!(not_before <= now + Duration::hours(3));
+    }
+
+    #[test]
+    fn starts_that_found_the_lock_blocked_at_the_same_time_all_count() {
+        // Several starts can find the run lock blocked at the same moment and
+        // record their failure without holding it. None of the counts may be
+        // lost to another one's read-modify-write of state.json.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: dir.path().join("c.toml"),
+            credentials_dir: dir.path().join("cred"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+            systemctl: std::path::PathBuf::from("systemctl"),
+        };
+        let starts = 12;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(starts));
+        let threads: Vec<_> = (0..starts)
+            .map(|i| {
+                let (paths, barrier) = (paths.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let mut run = finished(RunState::Failed, t(10));
+                    run.id = format!("20261108T100000Z-timer-{i:04}");
+                    barrier.wait();
+                    Store::new(&paths)
+                        .record_finished_serialised(&run, 50, Some("stamp".into()))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let state = Store::new(&paths).load_state().unwrap();
+        assert_eq!(state.consecutive_failures, starts as u32);
+        assert_eq!(state.failed_config.as_deref(), Some("stamp"));
     }
 
     #[test]
