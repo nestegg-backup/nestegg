@@ -365,41 +365,87 @@ describe("GET /machines while the backup server does not answer", () => {
 
 describe("PATCH /config limits (decision 0022)", () => {
   const patch = (w: World, body: unknown) => w.handle("PATCH", "/config", params, body);
-  const limits = (w: World) => (w.handle("GET", "/config", params, null).body as { limits: { overdue_after_hours: { max: number } } }).limits;
+  type Limits = { overdue_after_hours: { max: number; base: number; per_interval_extra: number; file_minimum: number } };
+  const limits = (w: World) => (w.handle("GET", "/config", params, null).body as { limits: Limits }).limits;
+  const message = (r: { body: unknown }) => (r.body as { message: string }).message;
 
-  it("refuses 'overdue after' above 168 hours and says an administrator can set it in the file", () => {
+  it("reports the numbers the page needs to compute the cap", () => {
     const w = new World("ok", "full");
-    expect(limits(w).overdue_after_hours.max).toBe(168);
+    expect(limits(w).overdue_after_hours).toMatchObject({ min: 2, max: 168, base: 168, per_interval_extra: 72, file_minimum: 36 });
+    expect(patch(w, { interval_hours: 168, overdue_after_hours: 240 }).status).toBe(200);
+    expect(limits(w).overdue_after_hours).toMatchObject({ max: 240, base: 168, per_interval_extra: 72, file_minimum: 240 });
+  });
+
+  it("refuses 'overdue after' above the cap of the rhythm in the same request", () => {
+    const w = new World("ok", "full");
     expect(patch(w, { overdue_after_hours: 168 }).status).toBe(200);
     const r = patch(w, { overdue_after_hours: 169 });
     expect(r.status).toBe(400);
-    expect((r.body as { message: string }).message).toContain("(7 days) through the web interface");
-    expect((r.body as { message: string }).message).toContain("/etc/nestegg/config.toml");
+    expect(message(r)).toBe(
+      "overdue_after_hours must be between 2 and 168 hours through the web interface. A longer time can only be set as root in /etc/nestegg/config.toml.",
+    );
+    // The weekly rhythm works: 168 hours is the rhythm, 240 the cap.
+    expect(patch(w, { interval_hours: 168, overdue_after_hours: 241 }).status).toBe(400);
+    // A weekly rhythm alone does not fit the current 168 hours (it must stay longer than the rhythm).
+    expect(message(patch(w, { interval_hours: 168 }))).toContain("must be greater than interval_hours (168)");
+    expect(patch(w, { interval_hours: 168, overdue_after_hours: 240 }).status).toBe(200);
+    // The 240 in the file stays the limit (it can only be lowered), also for a daily rhythm.
+    expect(patch(w, { interval_hours: 24, overdue_after_hours: 241 }).status).toBe(400);
+    // Lowered, the cap follows the rhythm of the same request again.
+    expect(patch(w, { interval_hours: 24, overdue_after_hours: 100 }).status).toBe(200);
+    expect(patch(w, { interval_hours: 24, overdue_after_hours: 200 }).status).toBe(400);
+    expect(patch(w, { interval_hours: 96, overdue_after_hours: 168 }).status).toBe(200);
+    expect(patch(w, { interval_hours: 120, overdue_after_hours: 192 }).status).toBe(200);
+    expect(patch(w, { interval_hours: 120, overdue_after_hours: 193 }).status).toBe(400);
   });
 
-  it("a value from the file above the limit is reported as the maximum and can only be lowered", () => {
+  it("a value from the file above the cap is reported as the maximum and can only be lowered", () => {
     const w = new World("ok", "full");
     w.faults.add("long_overdue");
     const cfg = w.handle("GET", "/config", params, null).body as { overdue_after_hours: number };
     expect(cfg.overdue_after_hours).toBe(744);
-    expect(limits(w).overdue_after_hours.max).toBe(744);
-    expect(patch(w, { overdue_after_hours: 745 }).status).toBe(400);
+    expect(limits(w).overdue_after_hours).toMatchObject({ max: 744, file_minimum: 744 });
+    const r = patch(w, { overdue_after_hours: 745 });
+    expect(r.status).toBe(400);
+    expect(message(r)).toContain("between 2 and 744 hours through the web interface; the current value of 744 can only be lowered here.");
     expect(patch(w, { interval_hours: 12 }).status).toBe(200);
     expect(patch(w, { overdue_after_hours: 100 }).status).toBe(200);
-    // Lowered once, the limit is the API's again.
+    // Lowered once, the cap is the API's again.
     expect(limits(w).overdue_after_hours.max).toBe(168);
     expect(patch(w, { overdue_after_hours: 200 }).status).toBe(400);
   });
 
-  it("refuses a new exclude that would drop a whole folder, but accepts ordinary ones", () => {
+  it("refuses the fixed set of patterns the daemon refuses on a default installation, with its message", () => {
     const w = new World("ok", "full");
-    for (const bad of ["/home", "/home/*", "/etc", "/var", "/alice", "/usr/local/**", "home"]) {
+    for (const [bad, folder] of [
+      ["/alice", "/home/alice"],
+      ["alice", "/home/alice"],
+      ["**/alice", "/home/alice"],
+      ["/[a-z]*", "/home/alice"],
+      ["/home", "/home"],
+      ["/etc/**", "/etc"],
+      ["/usr/local", "/usr/local"],
+    ] as const) {
       const r = patch(w, { excludes: [...(w.config()!.excludes ?? []), bad] });
       expect(r.status, bad).toBe(400);
-      expect((r.body as { message: string }).message).toContain("an administrator can still set it as root");
+      expect(message(r), bad).toBe(
+        `exclude pattern \`${bad}\` would leave out the whole folder ${folder} from the backup; an administrator can still set it as root in /etc/nestegg/config.toml.`,
+      );
     }
-    expect(patch(w, { excludes: ["**/.cache", "/home/*/Videos", "**/node_modules"] }).status).toBe(200);
-    expect(w.config()!.excludes).toEqual(["**/.cache", "/home/*/Videos", "**/node_modules"]);
+  });
+
+  it("accepts the rest, also what the old rule on spelling refused", () => {
+    const w = new World("ok", "full");
+    const ok = ["**/.cache", "/home/*/Videos", "**/node_modules", "/Downloads", "/var", "/alice/Downloads", "*.iso"];
+    expect(patch(w, { excludes: ok }).status).toBe(200);
+    expect(w.config()!.excludes).toEqual(ok);
+  });
+
+  it("does not judge a pattern again that is already in the list", () => {
+    const w = new World("ok", "full");
+    w.excludes = ["/alice", "**/.cache"];
+    expect(patch(w, { excludes: ["/alice", "**/.cache", "*.iso"] }).status).toBe(200);
+    expect(patch(w, { excludes: ["/alice", "**/.cache", "*.iso", "alice"] }).status).toBe(400);
   });
 });
 

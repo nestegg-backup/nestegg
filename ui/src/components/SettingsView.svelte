@@ -10,7 +10,7 @@
   import { ApiFailure } from "../lib/api";
   import { scheduleHours } from "../lib/derive";
   import { DEFAULT_LIMITS, settingsProblem } from "../lib/settings";
-  import { INTERVAL_CHOICES, intervalOptions, intervalReachable, overdueFor, parseHours, problemText, saveFailure } from "../lib/settingsForm";
+  import { intervalOptions, overdueFor, parseHours, problemText, saveFailure } from "../lib/settingsForm";
   import { f, t } from "../lib/locale";
   import type { SettingKey, SettingsChange, Status } from "../lib/types";
 
@@ -40,11 +40,8 @@
     interval_hours: interval ?? 24,
     overdue_after_hours: overdue ?? 36,
     wake_on_lan_configured: wolConfigured ?? false,
-    sources,
     excludes,
   });
-  // A longer rhythm needs a longer "overdue" time than the API allows: say why it is not offered.
-  const intervalCapped = $derived(INTERVAL_CHOICES.some((h) => h !== interval && !intervalReachable(h, limits)));
 
   // ---- per-row state: saving, just saved, not saved
   let pending = $state<Partial<Record<Row, boolean>>>({});
@@ -260,7 +257,7 @@
             {:else}
               <span class="l">{s.interval}</span>
             {/if}
-            <p class="h" id="h-interval">{s.intervalHint}{intervalCapped ? ` ${s.intervalLimit(limits.overdue_after_hours.max)}` : ""}</p>
+            <p class="h" id="h-interval">{s.intervalHint}</p>
           </div>
           <div class="c">
             {@render savedMark("interval")}

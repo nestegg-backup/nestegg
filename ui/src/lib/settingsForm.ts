@@ -1,21 +1,22 @@
 // Helpers of the settings page (decision 0013/0014): choices, number input,
 // and readable texts for the problems that settings.ts and the daemon report
-// (both in English, with the same wording).
+// (both in English, with the same wording as the daemon).
 
 import type { Messages } from "../i18n";
 import type { ApiFailure } from "./api";
-import { DEFAULT_LIMITS } from "./settings";
+import { DEFAULT_LIMITS, overdueCap } from "./settings";
 import type { SettingsLimits } from "./types";
 
 /** Rhythm choices of the select: 6 h, 12 h, daily, every 2 days, weekly. */
 export const INTERVAL_CHOICES: readonly number[] = [6, 12, 24, 48, 168];
 
 /**
- * Can this rhythm be chosen? "Overdue after" must stay above it, and the API caps that at its
- * `limits` maximum (decision 0022): a rhythm at or above the cap cannot be reached.
+ * Can this rhythm be chosen? "Overdue after" must stay above it, and the API caps that (decision
+ * 0022). The cap grows with the rhythm, so every rhythm is reachable for a daemon that sends
+ * `base` and `per_interval_extra`; for one that does not, the rhythm must stay below `max`.
  */
 export function intervalReachable(hours: number, limits: SettingsLimits = DEFAULT_LIMITS): boolean {
-  return limits.overdue_after_hours.greater_than_interval === false || hours < limits.overdue_after_hours.max;
+  return limits.overdue_after_hours.greater_than_interval === false || hours < overdueCap(hours, limits);
 }
 
 /**
@@ -42,7 +43,7 @@ export function parseHours(raw: string): number | null {
  */
 export function overdueFor(interval: number, overdue: number, limits: SettingsLimits = DEFAULT_LIMITS): number | null {
   if (limits.overdue_after_hours.greater_than_interval === false || overdue > interval) return null;
-  return Math.min(limits.overdue_after_hours.max, interval + Math.max(12, Math.ceil(interval / 2)));
+  return Math.min(overdueCap(interval, limits), interval + Math.max(12, Math.ceil(interval / 2)));
 }
 
 const num = (s: string | undefined) => (s === undefined ? NaN : Number(s));
@@ -55,20 +56,19 @@ export function problemText(message: string, t: Messages): string | null {
   const p = t.settings.problem;
   let m: RegExpExecArray | null;
   if ((m = /^interval_hours must be between (\d+) and (\d+)/.exec(message))) return p.intervalRange(num(m[1]), num(m[2]));
-  if ((m = /^overdue_after_hours must be between (\d+) and (\d+) hours \(7 days\) through the web interface(?:; the current value of (\d+) can only be lowered here)?/.exec(message)))
+  if ((m = /^overdue_after_hours must be between (\d+) and (\d+) hours through the web interface(?:; the current value of (\d+) can only be lowered here)?/.exec(message)))
     return p.overdueCapped(num(m[1]), num(m[2]), m[3] === undefined ? null : num(m[3]));
   if ((m = /^overdue_after_hours must be between (\d+) and (\d+)/.exec(message))) return p.overdueRange(num(m[1]), num(m[2]));
   if ((m = /must be greater than interval_hours \((\d+)\)/.exec(message))) return p.overdueNotGreater(num(m[1]));
   if (/must be a non-negative integer/.test(message)) return p.wholeNumber;
   if (/^exclude patterns must not be empty/.test(message)) return p.excludeEmpty;
-  if ((m = /^exclude patterns may have at most (\d+) characters/.exec(message))) return p.excludeTooLong(num(m[1]));
+  if ((m = /^exclude patterns may have at most (\d+) (?:bytes|characters)/.exec(message))) return p.excludeTooLong(num(m[1]));
   if (/contains a control character/.test(message)) return p.excludeControl;
   if (/must not start or end with spaces/.test(message)) return p.excludeSpaces;
   if (/must not start with `-`/.test(message)) return p.excludeDash;
   if (/would exclude everything/.test(message)) return p.excludeEverything;
-  if ((m = /matches the whole backup source `([^`]+)` in every archive/.exec(message))) return p.excludeSource(m[1]!);
-  if ((m = /would drop the whole top-level directory `([^`]+)`/.exec(message))) return p.excludeTopLevel(m[1]!);
-  if ((m = /would drop the whole backup source `([^`]+)`/.exec(message))) return p.excludeSource(m[1]!);
+  // The pattern can contain backticks itself: the folder is what stands between "folder" and "from the backup".
+  if ((m = /would leave out the whole folder (.+) from the backup; an administrator can still set it/s.exec(message))) return p.excludeFolder(m[1]!);
   if (/is listed twice/.test(message)) return p.excludeDuplicate;
   if ((m = /^at most (\d+) exclude patterns/.exec(message))) return p.excludeTooMany(num(m[1]));
   if (/^Wake-on-LAN is not set up/.test(message)) return p.wakeNotConfigured;

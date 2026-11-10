@@ -173,7 +173,17 @@ export interface SettingsChange {
 
 export interface SettingsLimits {
   interval_hours: { min: number; max: number };
-  overdue_after_hours: { min: number; max: number; greater_than_interval?: boolean };
+  overdue_after_hours: {
+    min: number;
+    /** The cap for the rhythm that is in the file now (or the larger value the file already has). */
+    max: number;
+    greater_than_interval?: boolean;
+    /** The cap is the larger of `base` and the rhythm plus `per_interval_extra` (decision 0022). */
+    base?: number;
+    per_interval_extra?: number;
+    /** The value in the file now: a value above the cap can only be lowered. */
+    file_minimum?: number;
+  };
   excludes: { max_items: number; max_length: number };
 }
 

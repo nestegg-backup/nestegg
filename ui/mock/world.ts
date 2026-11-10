@@ -18,10 +18,12 @@ import type {
   Run,
   RunDetail,
   SettingsChange,
+  SettingsLimits,
   Snapshot,
   Status,
 } from "../src/lib/types.ts";
-import { DEFAULT_LIMITS, SETTING_KEYS, settingsProblem } from "../src/lib/settings.ts";
+import { DEFAULT_LIMITS, OVERDUE_BASE_HOURS, OVERDUE_INTERVAL_EXTRA_HOURS, SETTING_KEYS, overdueCap, settingsProblem } from "../src/lib/settings.ts";
+import { wholeFolderProblem } from "./folderRule.ts";
 
 /** An item of the connection check, as `check::run` of the daemon builds it. */
 function item(name: string, status: CheckStatus, detail: string): PbsCheckItem {
@@ -718,9 +720,28 @@ export class World {
       wake_on_lan: this.wakeOn(),
       wake_on_lan_configured: this.wakeConfigured(),
       editable: SETTING_KEYS.filter((k) => k !== "wake_on_lan" || this.wakeConfigured()),
-      // Like the daemon: the API cap, or a larger value from the file (which can only be lowered).
-      limits: { ...DEFAULT_LIMITS, overdue_after_hours: { ...DEFAULT_LIMITS.overdue_after_hours, max: Math.max(DEFAULT_LIMITS.overdue_after_hours.max, this.overdue()) } },
+      limits: this.limits(),
     };
+  }
+
+  /**
+   * `limits` like the daemon: `max` is the cap for the rhythm in the file now (the larger of 168
+   * and the rhythm plus 72 hours, and never below a larger value in the file, which can then only
+   * be lowered); the page recomputes it from `base` and `per_interval_extra`.
+   */
+  private limits(): SettingsLimits {
+    const file = this.overdue();
+    const limits: SettingsLimits = {
+      ...DEFAULT_LIMITS,
+      overdue_after_hours: {
+        ...DEFAULT_LIMITS.overdue_after_hours,
+        base: OVERDUE_BASE_HOURS,
+        per_interval_extra: OVERDUE_INTERVAL_EXTRA_HOURS,
+        file_minimum: file,
+      },
+    };
+    limits.overdue_after_hours.max = overdueCap(this.intervalHours, limits);
+    return limits;
   }
 
   /** `PATCH /config` like the daemon: validate everything, then apply all or nothing. */
@@ -728,17 +749,17 @@ export class World {
     const err = (status: number, code: string, message: string): Reply => ({ status, body: { code, message } });
     if (!this.configured) return err(500, "internal", "cannot read configuration /etc/nestegg/config.toml: No such file or directory (os error 2)");
     const current = this.config()!;
-    const sources = current.sources ?? [];
+    const sources = (current.sources ?? []).filter((x) => x.archive !== "inventory.pxar").map((x) => x.path);
     const problem = settingsProblem(
       body,
       {
         interval_hours: this.intervalHours,
         overdue_after_hours: this.overdue(),
         wake_on_lan_configured: this.wakeConfigured(),
-        sources: sources.filter((x) => x.archive !== "inventory.pxar").map((x) => x.path),
         excludes: this.excludes,
       },
       current.limits,
+      (pattern) => wholeFolderProblem(pattern, sources),
     );
     if (problem) return err(400, "bad_request", problem);
     const change = body as SettingsChange;

@@ -174,7 +174,7 @@ Add faults to any scenario with `&fault=a,b`:
 | `no_encryption` | encryption is switched off (no key steps in the guide) |
 | `unknown_stored` | `credentials_stored` and `key_present` are `null` (the daemon cannot tell) |
 | `no_usage` | `GET /pbs` does not know the datastore usage |
-| `long_overdue` | "overdue after" is 744 hours in the file, above the API's limit of 168: `limits` reports 744 as the maximum and the settings page can only lower it |
+| `long_overdue` | "overdue after" is 744 hours in the file, above the API's cap: `limits` reports 744 as the maximum (and as `file_minimum`) and the settings page can only lower it |
 
 `down` can also be switched while the page is open:
 `curl -X POST 'http://127.0.0.1:5173/__mock/fault?down=1'` (and `down=0`); it
@@ -201,10 +201,27 @@ Restoring into `/home/alice/Dokumente` (or another existing folder of the
 mock) answers `409 target_exists`. A restore takes about 4 s and reports
 `restored_bytes` and `total_bytes` while it runs.
 `PATCH /config` changes the settings of the current scenario like the daemon
-(same validation, `src/lib/settings.ts`, including decision 0022: "overdue after"
-at most 168 hours, no new exclude that drops a whole backed-up folder or a whole
-top-level directory, both with the plain refusal text of the daemon); later `/config` and `/status` calls
-show the new values. Reloading with `?scenario=` resets them.
+(same validation and the same refusal texts, `src/lib/settings.ts`); later
+`/config` and `/status` calls show the new values. Reloading with `?scenario=`
+resets them. Decision 0022:
+
+- "Overdue after" is capped at 168 hours or the rhythm plus 72 hours, whichever
+  is larger, for the rhythm that is in effect after the same request (the
+  weekly rhythm allows up to 240 hours). A larger value in the file is kept and
+  can only be lowered. `limits.overdue_after_hours` has `min`, `max` (the cap
+  for the rhythm in the file now), `greater_than_interval`, `base` (168),
+  `per_interval_extra` (72) and `file_minimum` (the current value).
+- Whether a newly added exclude pattern would leave out a whole folder is
+  decided by the daemon alone, with the backup client's own matcher against the
+  real accounts. The mock cannot do that: `mock/folderRule.ts` is a **stand-in**
+  that refuses a small fixed set of patterns the daemon refuses on a default
+  installation, with the daemon's message, and accepts everything else. For the
+  home directory `alice` that is `/alice`, `alice`, `**/alice` and `/[a-z]*`;
+  for each backed-up folder it is the folder itself (`/home`, `/etc`, ...) and
+  the folder followed by `/`, `/*` or `/**`. A pattern already in the list is
+  not judged again. The page itself only checks what a browser can know (empty,
+  too long in bytes, control and invisible characters, spaces at the ends, a
+  leading `-`, a pattern that matches everything, duplicates).
 
 To use another port, set `NESTEGG_UI_PORT` (not `--port`), so the HMR
 websocket uses the same port.
@@ -236,7 +253,7 @@ The page comes from the dev server, API calls go to the daemon socket with
 | `src/components/` | Title bar, sidebar, status bar and the views: this PC, other PCs, server, settings, restore flow; `SetupGuide` (setup and key steps) and `CancelRun` |
 | `public/theme.js` | Applies the stored theme choice before the first paint (same-origin script; the CSP forbids inline scripts) |
 | `src/lib/theme.ts` | Theme choice System / Hell / Dunkel, kept in localStorage |
-| `src/lib/settings.ts`, `src/lib/settingsForm.ts` | Settings rules (same as the daemon) and the texts and helpers of the settings page |
+| `src/lib/settings.ts`, `src/lib/settingsForm.ts` | What the browser can check of a settings change (ranges, the "overdue after" cap, pattern spelling that does not depend on the machine) and the texts and helpers of the settings page |
 | `src/lib/session.ts` | Session token: taken from `#token=`, kept in `sessionStorage`, removed from the address bar |
 | `src/lib/api.ts` | API client (relative URLs, `Authorization: Bearer` header) |
 | `src/lib/check.ts` | Reading the connection check: passed / failed / not checked per item |

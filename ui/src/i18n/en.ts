@@ -496,8 +496,6 @@ const en = {
     automaticOff: "Backups only run when you start them yourself.",
     interval: "Rhythm",
     intervalHint: "How often a backup is due.",
-    intervalLimit: (max: number) =>
-      `Longer rhythms are not possible here: “overdue” may be at most ${max} hours here, and it must be longer than the rhythm. An administrator can set more in /etc/nestegg/config.toml.`,
     everyHours: (h: number) =>
       h === 1
         ? "Every hour"
@@ -557,20 +555,18 @@ const en = {
       overdueRange: (min: number, max: number) => `Allowed are ${min} to ${max} hours.`,
       overdueCapped: (min: number, max: number, current: number | null) =>
         `Allowed are ${min} to ${max} hours${max % 24 === 0 ? ` (${max / 24} days)` : ""} here.${
-          current === null ? "" : ` The current value of ${current} hours stands in the file like that and can only be shortened here, not made longer.`
+          current === null ? "" : ` The current value of ${current} hours is the longest that is possible here and can only be shortened, not made longer.`
         } A longer time can only be set by an administrator in /etc/nestegg/config.toml.`,
       overdueNotGreater: (interval: number) =>
         `Must be longer than the rhythm (${interval} hours). Otherwise every backup counts as overdue before the next one is due.`,
       excludeEmpty: "Please enter a pattern, for example **/.cache.",
-      excludeTooLong: (n: number) => `A pattern may have at most ${n} characters.`,
-      excludeControl: "The pattern contains a line break or another control character.",
+      excludeTooLong: (n: number) => `A pattern may be at most ${n} bytes long (umlauts and other special characters count for more than one).`,
+      excludeControl: "The pattern contains a line break, another control character or an invisible character.",
       excludeSpaces: "The pattern must not start or end with a space.",
       excludeDash: "The pattern must not start with a minus sign.",
       excludeEverything: "Nothing would be backed up any more. Please choose a narrower pattern.",
-      excludeSource: (what: string) =>
-        `That would leave the whole backed-up folder “${what}” out of the backup. nestegg does not allow that here. An administrator can still set it in /etc/nestegg/config.toml.`,
-      excludeTopLevel: (dir: string) =>
-        `That would leave everything in “${dir}” out of every backup. nestegg does not allow that here. An administrator can still set it in /etc/nestegg/config.toml.`,
+      excludeFolder: (folder: string) =>
+        `That would leave the whole folder “${folder}” out of the backup. nestegg does not allow that here. An administrator can still set it in /etc/nestegg/config.toml.`,
       excludeDuplicate: "This pattern is already in the list.",
       excludeTooMany: (n: number) => `More than ${n} patterns are not possible.`,
       wakeNotConfigured:

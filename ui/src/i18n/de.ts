@@ -500,8 +500,6 @@ const de = {
     automaticOn: "nestegg prüft stündlich, ob eine Sicherung fällig ist, und holt verpasste nach.",
     automaticOff: "Gesichert wird nur, wenn du es selbst startest.",
     interval: "Rhythmus",
-    intervalLimit: (max: number) =>
-      `Längere Rhythmen gehen hier nicht: „Überfällig“ darf hier höchstens ${max} Stunden betragen und muss länger sein als der Rhythmus. Ein Administrator kann mehr in /etc/nestegg/config.toml einstellen.`,
     intervalHint: "Wie oft eine Sicherung fällig ist.",
     everyHours: (h: number) =>
       h === 1
@@ -564,20 +562,18 @@ const de = {
       overdueRange: (min: number, max: number) => `Erlaubt sind ${min} bis ${max} Stunden.`,
       overdueCapped: (min: number, max: number, current: number | null) =>
         `Erlaubt sind hier ${min} bis ${max} Stunden${max % 24 === 0 ? ` (${max / 24} Tage)` : ""}.${
-          current === null ? "" : ` Der aktuelle Wert von ${current} Stunden steht so in der Datei und lässt sich hier nur verkürzen, nicht verlängern.`
+          current === null ? "" : ` Der aktuelle Wert von ${current} Stunden ist hier das Längste, was möglich ist, und lässt sich nur verkürzen, nicht verlängern.`
         } Eine längere Zeit kann nur ein Administrator in /etc/nestegg/config.toml einstellen.`,
       overdueNotGreater: (interval: number) =>
         `Muss länger sein als der Rhythmus (${interval} Stunden). Sonst gilt jede Sicherung schon als überfällig, bevor die nächste fällig ist.`,
       excludeEmpty: "Bitte ein Muster eingeben, zum Beispiel **/.cache.",
-      excludeTooLong: (n: number) => `Ein Muster darf höchstens ${n} Zeichen lang sein.`,
-      excludeControl: "Das Muster enthält einen Zeilenumbruch oder ein anderes Steuerzeichen.",
+      excludeTooLong: (n: number) => `Ein Muster darf höchstens ${n} Byte lang sein (Umlaute und andere Sonderzeichen zählen mehr als eins).`,
+      excludeControl: "Das Muster enthält einen Zeilenumbruch, ein anderes Steuerzeichen oder ein unsichtbares Zeichen.",
       excludeSpaces: "Das Muster darf nicht mit einem Leerzeichen beginnen oder enden.",
       excludeDash: "Das Muster darf nicht mit einem Minuszeichen beginnen.",
       excludeEverything: "Damit würde nichts mehr gesichert. Bitte ein engeres Muster wählen.",
-      excludeSource: (what: string) =>
-        `Damit würde der ganze gesicherte Ordner „${what}“ aus der Sicherung fallen. Das lässt nestegg hier nicht zu. Ein Administrator kann es in /etc/nestegg/config.toml trotzdem festlegen.`,
-      excludeTopLevel: (dir: string) =>
-        `Damit würde alles in „${dir}“ aus jeder Sicherung fallen. Das lässt nestegg hier nicht zu. Ein Administrator kann es in /etc/nestegg/config.toml trotzdem festlegen.`,
+      excludeFolder: (folder: string) =>
+        `Damit würde der ganze Ordner „${folder}“ aus der Sicherung fallen. Das lässt nestegg hier nicht zu. Ein Administrator kann es in /etc/nestegg/config.toml trotzdem festlegen.`,
       excludeDuplicate: "Dieses Muster ist schon in der Liste.",
       excludeTooMany: (n: number) => `Mehr als ${n} Muster sind nicht möglich.`,
       wakeNotConfigured:
