@@ -46,11 +46,14 @@ struct App {
 
 /// Key for the metadata cache. The blob a snapshot has, and whether it may
 /// be trusted, depends not only on the snapshot path but on the datastore
-/// and namespace it is read from and on whether encryption is configured.
+/// (address and port), datastore and namespace it is read from and on whether
+/// encryption is configured.
 /// All of these can change in the configuration file while the daemon runs,
 /// so a stale answer must not survive a configuration change (decision 0016).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct MetaKey {
+    server: String,
+    port: u16,
     datastore: String,
     namespace: String,
     encryption: bool,
@@ -60,6 +63,8 @@ struct MetaKey {
 impl MetaKey {
     fn new(config: &Config, snapshot: &str) -> MetaKey {
         MetaKey {
+            server: config.pbs.server.clone(),
+            port: config.pbs.port,
             datastore: config.pbs.datastore.clone(),
             namespace: config.pbs.namespace.clone().unwrap_or_default(),
             encryption: config.backup.encryption,
@@ -1416,6 +1421,13 @@ mod tests {
         );
         assert!(cache.get(&MetaKey::new(&config, SNAPSHOT)).is_some());
         assert!(cache.get(&MetaKey::new(&other, SNAPSHOT)).is_none());
+        // Another server with the same datastore and namespace names.
+        let mut moved = config.clone();
+        moved.pbs.server = "other.example.com".into();
+        assert!(cache.get(&MetaKey::new(&moved, SNAPSHOT)).is_none());
+        let mut port = config.clone();
+        port.pbs.port += 1;
+        assert!(cache.get(&MetaKey::new(&port, SNAPSHOT)).is_none());
 
         // The cache is bounded: inserting far more than MAX evicts the oldest.
         for i in 0..(MetadataCache::MAX as i64 + 100) {

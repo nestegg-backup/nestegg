@@ -56,9 +56,10 @@ The pause is measured from the failed run's recorded time. If that time lies
 in the future — the clock was ahead when the run failed and was corrected
 afterwards — the pause would last until the (still future) failure time plus
 the doubling, which can be arbitrarily long and freeze the automatic retries.
-`retry_not_before` now takes the current time and bounds the pause two ways:
-a failure time in the future counts as "now", and the next attempt can never
-be pushed out later than one backup interval from now. Both the timer check
+`retry_not_before` now takes the current time: a failure time in the future
+counts as "now". Since the pause itself is never longer than the backup
+interval, the next attempt can then never lie later than one interval from
+now (the code also states that bound explicitly; it cannot bind on its own). Both the timer check
 and the status view pass the same "now".
 
 ## Alternatives rejected

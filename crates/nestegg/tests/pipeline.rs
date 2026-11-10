@@ -38,18 +38,21 @@ case "$1" in
     # Keep what a server would store: the file list and the metadata blob.
     mode=encrypt
     case " $* " in *" --crypt-mode none "*) mode=none ;; esac
+    # An old server lists the files without their crypt mode.
+    cm=",\"crypt-mode\":\"$mode\""
+    if [ -n "$FAKE_NO_CRYPT_MODE" ]; then cm=""; fi
     mkdir -p "$FAKE_STORE"
     files=""
     for a in "$@"; do
       case "$a" in
         nestegg-meta.conf:*)
           cp "${a#nestegg-meta.conf:}" "$FAKE_STORE/meta"
-          files="$files{\"filename\":\"nestegg-meta.conf.blob\",\"crypt-mode\":\"$mode\",\"size\":300},"
+          files="$files{\"filename\":\"nestegg-meta.conf.blob\"$cm,\"size\":300},"
           ;;
         *.pxar:*)
           name="${a%%:*}"
           [ "$name" = "$FAKE_DROP_ARCHIVE" ] && continue
-          files="$files{\"filename\":\"$name.didx\",\"crypt-mode\":\"$mode\",\"size\":100},"
+          files="$files{\"filename\":\"$name.didx\"$cm,\"size\":100},"
           ;;
       esac
     done
@@ -1145,6 +1148,28 @@ fn key_import_stores_the_key_without_pcr_binding_and_needs_proof_for_a_local_fil
     assert_eq!(env.state()["key_exported_digest"], digest.as_str());
     assert_eq!(code(&env.run(&["run"])), 0);
     assert!(env.fake_log().contains(&format!("KEY {IMPORTED}")));
+}
+
+#[test]
+fn a_file_listing_without_crypt_modes_still_passes_the_read_back() {
+    // Older servers list the files of a snapshot without `crypt-mode`. The
+    // metadata blob must still be found and read back (with the key, which
+    // no longer depends on what the listing says).
+    let env = Env::new();
+    let out = env
+        .command(&["run", "--trigger", "cli"])
+        .env("FAKE_NO_CRYPT_MODE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let listing = fs::read_to_string(env.root().join("fake-store/files.json")).unwrap();
+    assert!(!listing.contains("crypt-mode\":\"encrypt"), "{listing}");
+    assert!(listing.contains("nestegg-meta.conf.blob"), "{listing}");
+    let state = env.state();
+    assert_eq!(state["last_success"]["state"], "succeeded");
+    assert_eq!(state["last_success"]["verified"], true);
+    let log = env.fake_log();
+    assert!(log.contains("ARGS restore host/test/"), "{log}");
 }
 
 #[test]
