@@ -27,8 +27,9 @@ often no longer serves to "get noticed".
    ends like "not due": exit code 0, no run record, the server is not
    contacted.
 3. The pause ends at once when something changes that can cure the failure:
-   the configuration file is written after the failed run started (by hand
-   or through the web UI),
+   the configuration file has other content than the failed run read (by
+   hand or through the web UI; compared by a fingerprint of the content, not
+   by file time),
    credentials are stored (`credentials set-password`), a key is created,
    imported or confirmed. A manually started run (`nestegg backup`, "Back
    up now") is never held back.

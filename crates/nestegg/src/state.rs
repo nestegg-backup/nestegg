@@ -222,6 +222,11 @@ pub struct State {
     /// ([`retry_not_before`]).
     #[serde(default)]
     pub consecutive_failures: u32,
+    /// Fingerprint ([`config_stamp`]) of the configuration file the last
+    /// failed run read. The pause between retries only holds while the file
+    /// is still that one.
+    #[serde(default)]
+    pub failed_config: Option<String>,
 }
 
 impl State {
@@ -297,14 +302,14 @@ const TIMER_SLACK_MINUTES: i64 = 30;
 /// server 24 times a day. Returns the earliest time for the next automatic
 /// attempt, or `None` when no pause applies.
 ///
-/// `config_changed`: when the configuration file was last written. A change
-/// after the failure (somebody is fixing it) ends the pause; so do the
-/// commands that store credentials or keys ([`Store::clear_failures`]) and
-/// every manually started run.
+/// `config_now`: [`config_stamp`] of the configuration file as it is now. If
+/// it differs from the one the failed run read (somebody is fixing it), the
+/// pause ends; so it does after the commands that store credentials or keys
+/// ([`Store::clear_failures`]) and for every manually started run.
 pub fn retry_not_before(
     state: &State,
     interval_hours: u32,
-    config_changed: Option<DateTime<Utc>>,
+    config_now: Option<&str>,
 ) -> Option<DateTime<Utc>> {
     let last = state
         .last_run
@@ -314,15 +319,22 @@ pub fn retry_not_before(
         return None;
     }
     let failed_at = last.finished_at.unwrap_or(last.started_at);
-    // The failed run read the configuration when it started. Run times are
-    // stored in whole seconds, so the file time is cut to seconds as well:
-    // a file written in the second the run started was read by that run.
-    if config_changed.is_some_and(|changed| changed.timestamp() > last.started_at.timestamp()) {
+    // Compared by content, not by time: file times and run times have
+    // different precision, and a clock can be wrong. A state without a
+    // recorded stamp (older version) never pauses.
+    if state.failed_config.is_none() || state.failed_config.as_deref() != config_now {
         return None;
     }
     let doubled = 1u32 << (state.consecutive_failures - 1).min(16);
     let hours = doubled.min(interval_hours.max(1));
     Some(failed_at + Duration::hours(i64::from(hours)) - Duration::minutes(TIMER_SLACK_MINUTES))
+}
+
+/// Fingerprint of the configuration file's content (SHA-256), `None` if it
+/// cannot be read. The file holds no secrets.
+pub fn config_stamp(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(crate::secrets::digest(&crate::secrets::Secret::new(bytes)))
 }
 
 pub fn next_due(state: &State, interval_hours: u32, now: DateTime<Utc>) -> DateTime<Utc> {
@@ -409,6 +421,23 @@ impl Store {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),
         }
+    }
+
+    /// Persist a finished run, update `state.json` and prune old records.
+    /// `config_stamp`: [`config_stamp`] of the configuration the run read.
+    pub fn record_finished_with_config(
+        &self,
+        run: &Run,
+        keep: usize,
+        config_stamp: Option<String>,
+    ) -> Result<()> {
+        self.record_finished(run, keep)?;
+        if run.state == RunState::Failed {
+            let mut state = self.load_state()?;
+            state.failed_config = config_stamp;
+            self.save_state(&state)?;
+        }
+        Ok(())
     }
 
     /// Persist a finished run, update `state.json` and prune old records.
@@ -691,8 +720,10 @@ mod tests {
         let mut state = State::default();
         let failed_at = t(10);
         state.last_run = Some(finished(RunState::Failed, failed_at));
+        state.failed_config = Some("stamp-a".into());
+        let same = Some("stamp-a");
         let pause = |state: &State| {
-            retry_not_before(state, 24, None).map(|at| (at - failed_at).num_minutes())
+            retry_not_before(state, 24, same).map(|at| (at - failed_at).num_minutes())
         };
         // The first failure is retried at the next hourly check as before.
         state.consecutive_failures = 1;
@@ -705,26 +736,22 @@ mod tests {
         }
         state.consecutive_failures = 4;
         assert_eq!(
-            retry_not_before(&state, 6, None).map(|at| (at - failed_at).num_minutes()),
+            retry_not_before(&state, 6, same).map(|at| (at - failed_at).num_minutes()),
             Some(6 * 60 - 30),
             "never longer than the interval"
         );
-        // A configuration change after the failed run started ends the
-        // pause, one before it does not; the second the run started in
-        // counts as "before" (run times have no fractions).
-        let started = state.last_run.as_ref().unwrap().started_at;
-        assert_eq!(retry_not_before(&state, 24, Some(t(11))), None);
-        assert_eq!(
-            retry_not_before(&state, 24, Some(started + Duration::seconds(1))),
-            None
-        );
-        assert!(retry_not_before(&state, 24, Some(t(9))).is_some());
-        assert!(
-            retry_not_before(&state, 24, Some(started + Duration::milliseconds(900))).is_some()
-        );
+        // A configuration file with other content than the failed run read
+        // ends the pause (also a file that cannot be read any more); a state
+        // of an older version without a stamp never pauses.
+        assert_eq!(retry_not_before(&state, 24, Some("stamp-b")), None);
+        assert_eq!(retry_not_before(&state, 24, None), None);
+        let mut old = state.clone();
+        old.failed_config = None;
+        assert_eq!(retry_not_before(&old, 24, same), None);
+        assert_eq!(retry_not_before(&old, 24, None), None);
         // An unreachable server or a cancelled run is not a failure.
         state.last_run = Some(finished(RunState::PbsUnreachable, t(11)));
-        assert_eq!(retry_not_before(&state, 24, None), None);
+        assert_eq!(retry_not_before(&state, 24, same), None);
     }
 
     #[test]

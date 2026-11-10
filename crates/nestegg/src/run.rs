@@ -261,6 +261,8 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     };
     crate::cancel::install_handler();
     let store = Store::new(paths);
+    // Taken before the file is parsed: this is what a failure is tied to.
+    let config_stamp = crate::state::config_stamp(&paths.config_file);
     let config = Config::load(&paths.config_file);
     let state = store.load_state()?;
 
@@ -276,13 +278,11 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     // After failures in a row the timer pauses longer and longer; manual
     // runs and a changed configuration are not held back.
     if let (Ok(cfg), Trigger::Timer, false) = (&config, options.trigger, options.force) {
-        let config_changed = fs::metadata(&paths.config_file)
-            .and_then(|m| m.modified())
-            .ok()
-            .map(chrono::DateTime::<Utc>::from);
-        if let Some(not_before) =
-            crate::state::retry_not_before(&state, cfg.schedule.interval_hours, config_changed)
-            && Utc::now() < not_before
+        if let Some(not_before) = crate::state::retry_not_before(
+            &state,
+            cfg.schedule.interval_hours,
+            config_stamp.as_deref(),
+        ) && Utc::now() < not_before
         {
             eprintln!(
                 "not retrying yet: {} failed runs in a row, next automatic attempt after {} \
@@ -365,7 +365,7 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     }
     let final_state = rep.run.state;
     rep.line(&format!("run finished: {:?}", final_state));
-    store.record_finished(&rep.run, keep)?;
+    store.record_finished_with_config(&rep.run, keep, config_stamp)?;
     store.clear_current_if(&rep.run.id)?;
     let _ = fs::remove_file(&pid_file);
     let _ = fs::remove_file(&cancel_note);

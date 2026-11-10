@@ -134,11 +134,8 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
             next_run: (timer && current.is_none()).then(|| {
                 let due = next_due(&state, interval, now);
                 // After failures in a row the timer pauses before it retries.
-                let config_changed = std::fs::metadata(&paths.config_file)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .map(DateTime::<Utc>::from);
-                match crate::state::retry_not_before(&state, interval, config_changed) {
+                let config_now = crate::state::config_stamp(&paths.config_file);
+                match crate::state::retry_not_before(&state, interval, config_now.as_deref()) {
                     Some(not_before) => due.max(not_before),
                     None => due,
                 }
