@@ -632,30 +632,48 @@ fn a_read_back_mismatch_counts_as_a_failure() {
 
 #[test]
 fn timer_retries_despite_a_failure_stamp_in_the_future() {
-    // The last run failed with a timestamp in the future (the clock was ahead
-    // and was corrected afterwards) and several failures in a row would mean a
-    // long pause. Capping the stamp at "now" would still push every attempt a
-    // full pause ahead and freeze the retries; a future stamp means no pause,
-    // so the timer must really start the run.
+    // Two real failures in a row put the timer into its pause (the state then
+    // carries the real configuration stamp, so nothing else ends the pause).
+    // Then the record of the last failure is moved into the future, as if the
+    // clock had been ahead when it was written and was corrected afterwards.
+    // Capping the stamp at "now" would still push every attempt a full pause
+    // ahead and freeze the retries; a future stamp means no pause, so the
+    // timer must really start the run.
     let env = Env::new();
+    let timer = ["run", "--trigger", "timer"];
+    let failing = || {
+        env.command(&timer)
+            .env("FAKE_FAIL_AUTH", "1")
+            .output()
+            .unwrap()
+    };
+    let attempts = || env.fake_log().matches("ARGS backup").count();
+    assert_eq!(code(&failing()), 1);
+    assert_eq!(code(&failing()), 1);
+    assert_eq!(attempts(), 2);
+    // The pause is really in force with the true stamps.
+    let out = env.run(&timer);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not retrying yet"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(attempts(), 2);
+
     let future = "2099-01-01T00:00:00Z";
     let mut state = env.state();
-    state["last_run"] = serde_json::json!({
-        "id": "20990101T000000Z-timer-0000",
-        "trigger": "timer",
-        "state": "failed",
-        "started_at": future,
-        "finished_at": future,
-    });
+    state["last_run"]["started_at"] = serde_json::json!(future);
+    state["last_run"]["finished_at"] = serde_json::json!(future);
     state["consecutive_failures"] = serde_json::json!(5);
-    state["failed_config"] = serde_json::json!("some-old-stamp");
     fs::write(env.root().join("state/state.json"), state.to_string()).unwrap();
 
-    let out = env.run(&["run", "--trigger", "timer"]);
+    let out = env.run(&timer);
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(
-        env.fake_log().contains("ARGS backup"),
-        "the timer run must really start, not stay frozen behind the future stamp"
+    assert_eq!(
+        attempts(),
+        3,
+        "the timer run must really start, not stay frozen behind the future stamp: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(env.state()["last_run"]["state"], "succeeded");
 }
