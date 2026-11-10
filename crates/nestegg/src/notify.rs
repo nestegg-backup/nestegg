@@ -1960,9 +1960,9 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
         }
         if redrain {
             for _ in 0..MAX_REDRAIN {
-                let before = state.settings.len();
-                drain_settings_inbox(paths, state);
-                if state.settings.len() == before {
+                // By what was moved, not by the length of the record: above
+                // its bound entries are combined and the length stays.
+                if drain_settings_inbox(paths, state) == 0 {
                     break;
                 }
                 let a = deliver_settings(
@@ -2155,6 +2155,32 @@ fn load_inbox(paths: &Paths) -> (Vec<SettingsAnnouncement>, Option<String>) {
     }
 }
 
+/// The inbox with a damaged file already dealt with: besides setting it aside
+/// (see [`load_inbox`]) a notice is put into the returned list, so that the
+/// loss is reported whichever process meets the damaged file first (the
+/// entries that were in it cannot be recovered).
+fn load_inbox_noting_damage(paths: &Paths) -> Vec<SettingsAnnouncement> {
+    let (mut inbox, damaged) = load_inbox(paths);
+    if damaged.is_some() {
+        inbox.push(SettingsAnnouncement {
+            user: String::new(),
+            reductions: Vec::new(),
+            at: Utc::now(),
+            users_done: BTreeSet::new(),
+            command_done: false,
+            id: 0,
+            provisional: true,
+        });
+    }
+    inbox
+}
+
+/// How long a write-ahead intent counts as "the request is still being
+/// handled": that long a check leaves it in the inbox, so that it is not
+/// delivered as a generic message (and then a second time with the details,
+/// or for a change that is refused in the end).
+const INTENT_IN_FLIGHT: Duration = Duration::seconds(60);
+
 /// A unique, non-zero id for a write-ahead intent. The requests that could
 /// overlap are serialised by the daemon's settings lock, so the nanosecond
 /// clock is unique enough.
@@ -2179,7 +2205,7 @@ pub fn record_settings_change(
         return Ok(());
     }
     let _lock = settings_inbox_lock(paths)?;
-    let (mut inbox, _) = load_inbox(paths);
+    let mut inbox = load_inbox_noting_damage(paths);
     inbox.push(SettingsAnnouncement {
         user: user.to_string(),
         reductions,
@@ -2203,7 +2229,7 @@ pub fn record_settings_change(
 /// were changed by …; details are in the journal" message.
 pub fn record_settings_intent(paths: &Paths, user: &str) -> Result<u64> {
     let _lock = settings_inbox_lock(paths)?;
-    let (mut inbox, _) = load_inbox(paths);
+    let mut inbox = load_inbox_noting_damage(paths);
     let id = new_intent_id();
     inbox.push(SettingsAnnouncement {
         user: user.to_string(),
@@ -2227,10 +2253,11 @@ pub fn record_settings_intent(paths: &Paths, user: &str) -> Result<u64> {
 pub fn finalize_settings_change(
     paths: &Paths,
     id: u64,
+    user: &str,
     reductions: Vec<crate::settings::Reduction>,
 ) -> Result<()> {
     let _lock = settings_inbox_lock(paths)?;
-    let (mut inbox, _) = load_inbox(paths);
+    let mut inbox = load_inbox_noting_damage(paths);
     if reductions.is_empty() {
         // The change raised the protection (or left it unchanged): no report.
         inbox.retain(|a| a.id != id);
@@ -2239,10 +2266,11 @@ pub fn finalize_settings_change(
         a.provisional = false;
         a.at = Utc::now();
     } else {
-        // The intent is gone (a check drained it, or it was coalesced): record
-        // the reductions afresh so the report is not lost.
+        // The intent is gone (it was older than a check waits for, or it was
+        // coalesced): record the reductions afresh, with the name, so the
+        // report is not lost.
         inbox.push(SettingsAnnouncement {
-            user: String::new(),
+            user: user.to_string(),
             reductions,
             at: Utc::now(),
             users_done: BTreeSet::new(),
@@ -2264,7 +2292,7 @@ pub fn finalize_settings_change(
 /// there is nothing to report (decision 0022, item 8).
 pub fn cancel_settings_intent(paths: &Paths, id: u64) -> Result<()> {
     let _lock = settings_inbox_lock(paths)?;
-    let (mut inbox, _) = load_inbox(paths);
+    let mut inbox = load_inbox_noting_damage(paths);
     inbox.retain(|a| a.id != id);
     let file = settings_inbox_file(paths);
     if inbox.is_empty() {
@@ -2280,43 +2308,51 @@ pub fn cancel_settings_intent(paths: &Paths, id: u64) -> Result<()> {
 /// is persisted before the inbox is cleared, so a crash in between re-delivers
 /// at worst, never drops a change. A damaged inbox is set aside and reported
 /// (decision 0022, items 4, 8).
-fn drain_settings_inbox(paths: &Paths, state: &mut NotifyState) {
+fn drain_settings_inbox(paths: &Paths, state: &mut NotifyState) -> usize {
+    drain_settings_inbox_at(paths, state, Utc::now())
+}
+
+/// [`drain_settings_inbox`] with the time it runs at given (tests).
+fn drain_settings_inbox_at(paths: &Paths, state: &mut NotifyState, now: DateTime<Utc>) -> usize {
     let file = settings_inbox_file(paths);
     if !file.exists() {
-        return;
+        return 0;
     }
     let _lock = match settings_inbox_lock(paths) {
         Ok(lock) => lock,
         Err(e) => {
             eprintln!("warning: cannot read the settings inbox: {e:#}");
-            return;
+            return 0;
         }
     };
-    let (inbox, damaged) = load_inbox(paths);
-    let was_damaged = damaged.is_some();
-    if was_damaged {
-        // Tell the owner the record was damaged (a generic settings message
-        // with no user); the detail is in the journal.
-        state.settings.push(SettingsAnnouncement {
-            user: String::new(),
-            reductions: Vec::new(),
-            at: Utc::now(),
-            users_done: BTreeSet::new(),
-            command_done: false,
-            id: 0,
-            provisional: true,
-        });
+    // A damaged inbox comes back with a notice in it (a generic settings
+    // message without a user; the detail is in the journal).
+    let inbox = load_inbox_noting_damage(paths);
+    // An intent whose request is still being handled stays in the inbox: the
+    // daemon completes or cancels it in a moment. Only when it is older (the
+    // daemon crashed in between) is it delivered as it is.
+    let (in_flight, ready): (Vec<_>, Vec<_>) = inbox
+        .into_iter()
+        .partition(|a| a.provisional && a.id != 0 && now - a.at < INTENT_IN_FLIGHT);
+    let moved = ready.len();
+    if moved == 0 {
+        if in_flight.is_empty() {
+            let _ = fs::remove_file(&file);
+        }
+        return 0;
     }
-    if inbox.is_empty() && !was_damaged {
-        let _ = fs::remove_file(&file);
-        return;
-    }
-    state.settings.extend(inbox);
+    state.settings.extend(ready);
     cap_settings(&mut state.settings);
-    // Persist the merged record first, then clear the inbox.
+    // Persist the merged record first, then take the moved entries out of
+    // the inbox.
     if write_json_atomic(&paths.notify_state_file(), state).is_ok() {
-        let _ = fs::remove_file(&file);
+        if in_flight.is_empty() {
+            let _ = fs::remove_file(&file);
+        } else if let Err(e) = write_json_atomic(&file, &in_flight) {
+            eprintln!("warning: cannot update the settings inbox: {e:#}");
+        }
     }
+    moved
 }
 
 fn send_test(mut channels: SystemChannels<'_>, dry_run: bool) -> Result<()> {
@@ -3264,9 +3300,18 @@ mod tests {
         let id = record_settings_intent(&paths, "alice").unwrap();
         assert_ne!(id, 0);
         let mut state = NotifyState::default();
-        drain_settings_inbox(&paths, &mut state);
+        // While the request may still be handled, a check leaves it alone:
+        // no generic message for a change that is completed (or refused) a
+        // moment later.
+        assert_eq!(drain_settings_inbox(&paths, &mut state), 0);
+        assert!(state.settings.is_empty());
+        assert!(settings_inbox_file(&paths).exists());
+        // The daemon never came back: later it is delivered as it is.
+        let later = Utc::now() + Duration::minutes(2);
+        assert_eq!(drain_settings_inbox_at(&paths, &mut state, later), 1);
         assert_eq!(state.settings.len(), 1);
         assert!(state.settings[0].provisional);
+        assert!(!settings_inbox_file(&paths).exists());
         let mut ch = Fake::new(&[(1000, "carol")], true);
         deliver(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
         assert_eq!(ch.hook, [Event::Settings]);
@@ -3279,12 +3324,77 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let paths2 = test_paths(&dir2);
         let id2 = record_settings_intent(&paths2, "alice").unwrap();
-        finalize_settings_change(&paths2, id2, vec![Reduction::WakeOnLanOff]).unwrap();
+        finalize_settings_change(&paths2, id2, "alice", vec![Reduction::WakeOnLanOff]).unwrap();
         let mut state2 = NotifyState::default();
         drain_settings_inbox(&paths2, &mut state2);
         assert_eq!(state2.settings.len(), 1);
         assert!(!state2.settings[0].provisional);
         assert_eq!(state2.settings[0].reductions, vec![Reduction::WakeOnLanOff]);
+    }
+
+    #[test]
+    fn a_check_between_intent_and_completion_reports_the_change_once_with_the_name() {
+        use crate::settings::Reduction;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let id = record_settings_intent(&paths, "alice").unwrap();
+        // A check (the end of a run with a slow hook) looks at the inbox now.
+        let mut state = NotifyState::default();
+        assert_eq!(drain_settings_inbox(&paths, &mut state), 0);
+        // The daemon completes the change.
+        finalize_settings_change(&paths, id, "alice", vec![Reduction::AutomaticBackupsOff])
+            .unwrap();
+        assert_eq!(drain_settings_inbox(&paths, &mut state), 1);
+        assert_eq!(state.settings.len(), 1, "one report, not two");
+        assert_eq!(state.settings[0].user, "alice");
+        assert!(!state.settings[0].provisional);
+
+        // An intent that a check did take (older than the wait) is completed
+        // as a new entry, and that one carries the name as well.
+        let id = record_settings_intent(&paths, "bob").unwrap();
+        let mut state = NotifyState::default();
+        let later = Utc::now() + Duration::minutes(2);
+        assert_eq!(drain_settings_inbox_at(&paths, &mut state, later), 1);
+        finalize_settings_change(&paths, id, "bob", vec![Reduction::WakeOnLanOff]).unwrap();
+        let mut second = NotifyState::default();
+        assert_eq!(drain_settings_inbox(&paths, &mut second), 1);
+        assert_eq!(second.settings[0].user, "bob");
+
+        // A refused change that a check looked at meanwhile reports nothing.
+        let id = record_settings_intent(&paths, "carol").unwrap();
+        let mut state = NotifyState::default();
+        assert_eq!(drain_settings_inbox(&paths, &mut state), 0);
+        cancel_settings_intent(&paths, id).unwrap();
+        assert_eq!(drain_settings_inbox(&paths, &mut state), 0);
+        assert!(state.settings.is_empty());
+    }
+
+    #[test]
+    fn a_damaged_inbox_met_by_the_daemon_is_reported_too() {
+        use crate::settings::Reduction;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(settings_inbox_file(&paths), b"{ this is not json").unwrap();
+        // The daemon records a change and meets the damaged file first.
+        record_settings_change(&paths, "alice", vec![Reduction::WakeOnLanOff]).unwrap();
+        let mut state = NotifyState::default();
+        assert_eq!(drain_settings_inbox(&paths, &mut state), 2);
+        // Alice's change and a notice that earlier entries were lost.
+        assert!(
+            state
+                .settings
+                .iter()
+                .any(|a| a.user == "alice" && !a.provisional)
+        );
+        assert!(
+            state
+                .settings
+                .iter()
+                .any(|a| a.user.is_empty() && a.provisional && a.id == 0),
+            "{:?}",
+            state.settings
+        );
     }
 
     #[test]
@@ -3296,7 +3406,7 @@ mod tests {
         cancel_settings_intent(&paths, id).unwrap();
         // A protection-raising change completes with no reductions: nothing left.
         let id2 = record_settings_intent(&paths, "bob").unwrap();
-        finalize_settings_change(&paths, id2, Vec::new()).unwrap();
+        finalize_settings_change(&paths, id2, "bob", Vec::new()).unwrap();
         let mut state = NotifyState::default();
         drain_settings_inbox(&paths, &mut state);
         assert!(state.settings.is_empty(), "no leftover intents");

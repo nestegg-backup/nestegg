@@ -502,6 +502,7 @@ async fn update_config(
                     if let Err(e) = crate::notify::finalize_settings_change(
                         &app.paths,
                         id,
+                        &record_user,
                         outcome.reductions.clone(),
                     ) {
                         eprintln!("warning: could not complete the settings report: {e:#}");

@@ -137,10 +137,21 @@ pub fn reductions(
     // Reordering the same patterns can lower the protection when a `!`
     // re-include is involved (later patterns win), so it is reported too. A
     // pure reorder of plain excludes changes nothing and is not reported.
-    if old.backup.excludes != new.backup.excludes
-        && same_multiset(&old.backup.excludes, &new.backup.excludes)
-        && new.backup.excludes.iter().any(|p| p.starts_with('!'))
-    {
+    // Compared on the patterns both lists have, so that it is also seen when
+    // something else was added or removed in the same request.
+    let kept_old: Vec<&String> = old
+        .backup
+        .excludes
+        .iter()
+        .filter(|p| new.backup.excludes.contains(p))
+        .collect();
+    let kept_new: Vec<&String> = new
+        .backup
+        .excludes
+        .iter()
+        .filter(|p| old.backup.excludes.contains(p))
+        .collect();
+    if kept_old != kept_new && kept_new.iter().any(|p| p.starts_with('!')) {
         out.push(Reduction::ExcludesReordered);
     }
     if new.overdue_after_hours > old.overdue_after_hours {
@@ -159,18 +170,6 @@ pub fn reductions(
         out.push(Reduction::WakeOnLanOff);
     }
     out
-}
-
-/// Whether two lists hold the same patterns, regardless of order.
-fn same_multiset(a: &[String], b: &[String]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut a: Vec<&String> = a.iter().collect();
-    let mut b: Vec<&String> = b.iter().collect();
-    a.sort();
-    b.sort();
-    a == b
 }
 
 /// Keys a settings change may contain.
@@ -531,7 +530,8 @@ pub fn unprintable(c: char) -> bool {
             | '\u{061c}'                    // arabic letter mark
             | '\u{115f}' | '\u{1160}'       // Hangul choseong/jungseong fillers
             | '\u{17b4}' | '\u{17b5}'       // Khmer inherent vowels
-            | '\u{180b}'..='\u{180e}'       // Mongolian variation selectors + MVS
+            | '\u{180b}'..='\u{180f}'       // Mongolian variation selectors + MVS
+            | '\u{13430}'..='\u{1343f}'   // Egyptian hieroglyph format controls
             | '\u{200b}'..='\u{200f}'       // zero-width space/joiners, LRM/RLM
             | '\u{2028}' | '\u{2029}'       // line / paragraph separators
             | '\u{202a}'..='\u{202e}'       // bidi embeddings / overrides
@@ -579,12 +579,25 @@ fn parse_entry(pattern: &str) -> Option<MatchEntry> {
 /// uppercase letter and contains a dot.
 const PROBE_A: &str = "0_nestegg_probe_one";
 const PROBE_B: &str = "Zq.keep-me_two";
+/// Further made-up names, one per kind of first character (digit and upper
+/// case are covered by the two above). They are used when the real entries of
+/// a folder are not known: only a list that leaves out ALL of them is taken
+/// to empty the folder.
+const PROBES_MORE: [&str; 4] = [
+    "_nestegg_probe_three",
+    ".nestegg_probe_four",
+    "nestegg_probe_five",
+    "\u{e4}nestegg_probe_six",
+];
 
 /// At most this many real top-level entries of a protected folder are read to
 /// judge whether the new list empties it (only the names, never the contents;
-/// the daemon is root). A folder with more entries falls back to the two
-/// synthetic probes alone (decision 0022, item 5).
-const MAX_PROBE_ENTRIES: usize = 64;
+/// the daemon is root). A folder with more entries is judged by the first
+/// this many (decision 0022): a home directory with a few hundred entries is
+/// normal, and a low bound would switch the real-entry test off exactly there.
+const MAX_PROBE_ENTRIES: usize = 4096;
+/// Reading the names must not hang the request on a dead network file system.
+const PROBE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The final match decision of the whole exclude list for one archive-relative
 /// path, exactly as the client applies it: the *last* entry whose pattern
@@ -621,21 +634,25 @@ fn list_empties_folder(
     }
     let base = if rel == "/" { "" } else { rel.as_str() };
     let probe = |name: &str| list_excludes_path(entries, &format!("{base}/{name}"), dir);
-    // A pattern that matches every possible name empties the folder.
-    if probe(PROBE_A) && probe(PROBE_B) {
-        return true;
+    if children.is_empty() {
+        // The real entries are not known (empty, unreadable or too slow to
+        // read): only a list that leaves out every kind of made-up name is
+        // taken to empty the folder.
+        return probe(PROBE_A) && probe(PROBE_B) && PROBES_MORE.iter().all(|p| probe(p));
     }
-    // Or every real top-level entry is excluded (each with its real file type,
-    // so a directory-only pattern does not wrongly count a file as removed).
-    !children.is_empty()
-        && children.iter().all(|(name, is_dir)| {
-            let mode = if *is_dir {
-                nix::libc::S_IFDIR
-            } else {
-                nix::libc::S_IFREG
-            };
-            list_excludes_path(entries, &format!("{base}/{name}"), mode)
-        })
+    // The real top-level entries decide (each with its real file type, so a
+    // directory-only pattern does not count a file as removed): the folder
+    // is emptied when every one of them is left out. Made-up names are not
+    // consulted then, so a list that keeps a real entry (`/alice/*` followed
+    // by `!/alice/Documents`) is not refused.
+    children.iter().all(|(name, is_dir)| {
+        let mode = if *is_dir {
+            nix::libc::S_IFDIR
+        } else {
+            nix::libc::S_IFREG
+        };
+        list_excludes_path(entries, &format!("{base}/{name}"), mode)
+    })
 }
 
 /// The path of `folder` inside an archive rooted at `root`, with a leading
@@ -718,15 +735,30 @@ fn protected_folders(
 /// empty list, so the guard then relies on the two synthetic probes alone
 /// (decision 0022, item 5).
 fn real_children(folder: &Path) -> Vec<(String, bool)> {
+    // In a helper thread with a time limit: a home directory on a network
+    // file system that does not answer must not hang the request (which
+    // holds the settings lock). On a timeout the entries count as unknown;
+    // the thread ends by itself when the file system answers.
+    let folder = folder.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_children(&folder, MAX_PROBE_ENTRIES));
+    });
+    rx.recv_timeout(PROBE_READ_TIMEOUT).unwrap_or_default()
+}
+
+/// The first `max` top-level entries of `folder` (name, is a directory).
+/// Unreadable folder: empty. Names that are not valid UTF-8 are skipped.
+fn read_children(folder: &Path, max: usize) -> Vec<(String, bool)> {
     let Ok(rd) = fs::read_dir(folder) else {
         return Vec::new();
     };
     let mut out: Vec<(String, bool)> = Vec::new();
     for entry in rd.flatten() {
-        if out.len() >= MAX_PROBE_ENTRIES {
-            // More entries than we read: we cannot prove the list empties the
-            // folder, so give up the real-entry test for it.
-            return Vec::new();
+        if out.len() >= max {
+            // Judged by what was read: a list that leaves out all of these
+            // is refused, which errs on the side of the guard.
+            break;
         }
         let Ok(name) = entry.file_name().into_string() else {
             continue;
@@ -1806,6 +1838,102 @@ interval_hours = 24
             .is_none(),
             "photos and notes.txt survive"
         );
+    }
+
+    #[test]
+    fn a_big_home_directory_is_judged_by_its_real_entries_too() {
+        // A normal desktop home has far more than a few dozen entries; the
+        // guard must not fall back to made-up names there (it did above 64).
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..200 {
+            fs::create_dir(dir.path().join(format!("Dir{n}"))).unwrap();
+        }
+        let read = read_children(dir.path(), MAX_PROBE_ENTRIES);
+        assert_eq!(read.len(), 200);
+        assert!(read.iter().all(|(_, is_dir)| *is_dir));
+        // More entries than the bound: judged by the ones that were read.
+        assert_eq!(read_children(dir.path(), 50).len(), 50);
+        assert!(real_children(dir.path()).len() == 200);
+        assert!(read_children(&dir.path().join("missing"), 10).is_empty());
+
+        let names: Vec<String> = (0..200).map(|n| format!("Dir{n}")).collect();
+        let entries: Vec<(&str, bool)> = names.iter().map(|n| (n.as_str(), true)).collect();
+        for list in [
+            &["/alice/[a-zA-Z.]*"][..],
+            &[
+                "/alice/[a-m]*",
+                "/alice/[n-z]*",
+                "/alice/[A-Z]*",
+                "/alice/.*",
+            ][..],
+        ] {
+            assert!(
+                guard_with(&[], list, false, &[("/home/alice", &entries)]).is_some(),
+                "{list:?} empties a home with 200 folders"
+            );
+        }
+        assert!(
+            guard_with(&[], &["/alice/Dir1*"], false, &[("/home/alice", &entries)]).is_none(),
+            "most folders stay"
+        );
+    }
+
+    #[test]
+    fn real_entries_decide_when_they_are_known_and_probes_only_otherwise() {
+        let entries: &[(&str, bool)] = &[("Documents", true), ("Music", true)];
+        // Everything below the home is left out, but a real folder is taken
+        // back in: not emptied, so not refused (made-up names say nothing
+        // when the real ones are known).
+        assert!(
+            guard_with(
+                &[],
+                &["/alice/*", "!/alice/Documents"],
+                false,
+                &[("/home/alice", entries)]
+            )
+            .is_none()
+        );
+        assert!(
+            guard_with(&[], &["/alice/*"], false, &[("/home/alice", entries)]).is_some(),
+            "nothing is taken back in"
+        );
+        // Entries unknown (unreadable or empty home): only a list that leaves
+        // out every kind of name counts as emptying it.
+        assert!(guard_with(&[], &["/alice/*"], false, &[]).is_some());
+        assert!(
+            guard_with(&[], &["/alice/[a-zA-Z.]*"], false, &[]).is_none(),
+            "names starting with a digit or an underscore would stay"
+        );
+    }
+
+    #[test]
+    fn reordering_next_to_another_change_is_reported() {
+        let cfg = |excludes: &[&str]| {
+            let mut c = current();
+            c.backup.excludes = excludes.iter().map(|s| s.to_string()).collect();
+            c
+        };
+        // The re-include moves in front of the exclude it tamed, and an
+        // unrelated pattern is removed in the same request.
+        let r = reductions(
+            &cfg(&["*.bak", "!keep.bak", "y"]),
+            &cfg(&["!keep.bak", "*.bak"]),
+            true,
+            true,
+        );
+        assert!(r.contains(&Reduction::ExcludesReordered), "{r:?}");
+        // The same order of what both lists have, with something removed: no
+        // reorder.
+        let r = reductions(
+            &cfg(&["*.bak", "!keep.bak", "y"]),
+            &cfg(&["*.bak", "!keep.bak"]),
+            true,
+            true,
+        );
+        assert!(!r.contains(&Reduction::ExcludesReordered), "{r:?}");
+        // Without a re-include the order of plain excludes means nothing.
+        let r = reductions(&cfg(&["a", "b", "c"]), &cfg(&["c", "a"]), true, true);
+        assert!(!r.contains(&Reduction::ExcludesReordered), "{r:?}");
     }
 
     #[test]

@@ -34,7 +34,9 @@ delivery, flood-control, locking and validation rules that make them hold up.
 After a successful `PATCH /config` by a group member, the daemon classifies the
 change (`settings::reductions`). A change **lowers the protection** when it
 switches automatic backups off, adds an exclude pattern, removes a `!`
-re-include, reorders the exclude list so a re-include no longer wins, raises
+re-include, changes the order of the patterns that stay while the list has a
+`!` re-include (later patterns win, so the order can decide what is kept; this
+is reported whenever the order changes, without working out the effect), raises
 "overdue after", raises the interval, or switches Wake-on-LAN off. Changes that
 raise the protection (more frequent backups, a lower threshold, a removed
 exclude, an added re-include, Wake-on-LAN on) are not reported.
@@ -84,9 +86,14 @@ thus reported calmly (weekly), but from the start, not only after weeks.
     mount) is tested separately.
 
   "Would empty the folder" means the list excludes the folder entry itself, or
-  excludes every child — tested against the folder's **real top-level entry
-  names** (read as root, names only, a bounded number) and two synthetic probe
-  names that catch a pattern matching every possible child. A change is refused
+  excludes every child. The children are the folder's **real top-level entry
+  names** (read as root, names only, at most 4096 of them, with a time limit of
+  two seconds so a dead network file system cannot hang the request): when
+  every one of them is left out, the folder is emptied. Only when the real
+  names are not known (the folder is empty, cannot be read or does not answer
+  in time) are made-up names used instead, one per kind of first character
+  (digit, upper and lower case letter, underscore, dot, non-ASCII), and the
+  folder counts as emptied when the list leaves out all of them. A change is refused
   only when the **new** list would empty a folder that the **old** list did not,
   so a dangerous pattern root already put in the file is grandfathered and a
   plain reorder is refused only when it changes the outcome.
@@ -113,12 +120,17 @@ the value as root in `/etc/nestegg/config.toml`.
   logged, and reported as such — never silently discarded. The HTTP answer is
   not "200 OK" unless the report was durably recorded.
 
-- **Delivered within seconds, and again at the end of the run.** After recording
-  the daemon starts `nestegg-notify.service` (`systemctl start --no-block`). The
-  check drains the inbox under its main lock and announces it. Before it
-  releases the lock it drains the inbox *again* (bounded), so a change recorded
-  while the check was running — its hook can be slow — is delivered by that same
-  run instead of waiting for the hourly timer.
+- **Delivered after a short quiet period, and again at the end of the run.**
+  After recording the daemon starts `nestegg-notify.service` (`systemctl start
+  --no-block`). The check waits for the quiet period described under "No flood"
+  (about 20 seconds after the last change, at most about two minutes), drains
+  the inbox under its main lock and announces it. Before it releases the lock
+  it drains the inbox *again* (at most five times, as long as something new was
+  moved), so a change recorded while the check was running — its hook can be
+  slow — is delivered by that same run instead of waiting for the hourly timer.
+  An intent whose request is still being handled (younger than a minute) is
+  left in the inbox by a check: the daemon completes or cancels it in a moment,
+  and it must not go out as a generic message first.
 
 - **No flood.** A check started for a settings change waits out a short quiet
   period before it takes the main lock (until the newest pending change is about
@@ -127,8 +139,12 @@ the value as root in `/etc/nestegg/config.toml`.
   sleeping instance (`StartLimitIntervalSec=0`, kept so a burst cannot trip the
   default start-rate limit and drop reports). Everything pending is combined
   into one message per recipient. After the first message a recipient is told at
-  most once every few minutes — later changes are combined and delivered once
-  that time is over, and nothing is dropped. The record is combined per user
+  most once every five minutes by later runs — later changes are combined and
+  delivered by the next check after that time, and nothing is dropped. Nothing
+  starts a check just for that moment: it is the next settings change or the
+  hourly check, so such a follow-up message can take up to about an hour. Within
+  one run the end-of-run drain may deliver again to a recipient it has just
+  told (at most five more times). The record is combined per user
   rather than truncated when it would grow large, so one member's flood can
   never push another member's unreported change out.
 
@@ -190,8 +206,8 @@ the value as root in `/etc/nestegg/config.toml`.
   `pathpatterns` 0.1.2; the backup client links 1.0.0 — the same code, an older
   release. The two behave the same on the cases that matter here (confirmed with
   `pxar create --exclude` in the e2e client image), but nestegg does not promise
-  byte-for-byte parity; it promises the same syntax and that a pattern it refuses
-  is one the client would also choke on.
+  byte-for-byte parity; it promises the same syntax. For the 36 malformed
+  patterns that were compared, both refuse the same ones.
 - **root is unbounded in the file.** Every limit above binds only changes made
   through the API by a group member. root can set anything in
   `/etc/nestegg/config.toml`, which is the intended trust boundary.
