@@ -693,26 +693,32 @@ components:
         overdue_after_hours:
           type: [integer, "null"]
           minimum: 2
-          maximum: 168
           description: |
             Must be greater than `interval_hours` (checked when either
-            changes). The web interface accepts at most 7 days (168 h); a
-            longer time can only be set as root in the file. A value already
-            in the file above 168 is kept and can only be lowered here
-            (decision 0022); `limits.overdue_after_hours.max` reports it.
+            changes). Through this API at most 168 h (7 days) or
+            `interval_hours` + 72 h, whichever is larger, evaluated against
+            the interval in effect after the same request (a weekly rhythm
+            may be overdue after up to 240 h); a longer time can only be set
+            as root in the file. A value above that cap is kept and can only
+            be lowered here (decision 0022). `limits.overdue_after_hours`
+            reports the numbers of this rule.
         excludes:
           type: [array, "null"]
           description: |
             The complete new list (replaces the old one; send the current
             list with items added or removed). `proxmox-backup-client
-            --exclude` syntax. At most 200 patterns, each 1-256 characters,
-            no control characters, no leading or trailing spaces, no
-            duplicates, and no pattern that matches everything (`*`, `**`,
-            `/`, `/*`, `**/*`, ...). A newly added pattern that would drop a
-            whole configured source or a whole top-level directory of an
-            archive is refused (`/home`, `/home/*`, `/etc`, a single anchored
-            component like `/alice`, or a bare source name like `home`); such
-            a pattern already in the file is kept (decision 0022).
+            --exclude` syntax. At most 200 patterns, each 1-256 bytes, no
+            control characters or invisible Unicode format characters, no
+            leading or trailing spaces, no duplicates, no leading `-`, and no
+            pattern that matches everything (`*`, `**`, `/`, `/*`, `**/*`,
+            ...). A newly added pattern is refused when it would leave out a
+            whole configured source, a whole home directory of a regular
+            user inside a source, or (full system backup) a whole top-level
+            system directory. This is evaluated with the backup client's own
+            matcher against the accounts of this computer, whatever the
+            spelling (`/alice`, `alice`, `**/alice`, `/[a-z]*`, ...); the
+            message names the folder. Such a pattern already in the file is
+            kept (decision 0022).
           maxItems: 200
           items: { type: string, minLength: 1, maxLength: 256 }
         wake_on_lan:
