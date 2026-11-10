@@ -18,6 +18,10 @@ pub enum Trigger {
     Timer,
     Manual,
     Cli,
+    /// A trigger written by a newer version this one does not know. Kept so
+    /// state.json and run records of a newer version stay readable.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,13 +36,22 @@ pub enum RunState {
     Failed,
     PbsUnreachable,
     Cancelled,
+    /// A run state written by a newer version this one does not know. Only
+    /// finished runs are ever persisted, so an unknown state read back from a
+    /// file is treated as finished.
+    #[serde(other)]
+    Unknown,
 }
 
 impl RunState {
     pub fn is_finished(self) -> bool {
         matches!(
             self,
-            RunState::Succeeded | RunState::Failed | RunState::PbsUnreachable | RunState::Cancelled
+            RunState::Succeeded
+                | RunState::Failed
+                | RunState::PbsUnreachable
+                | RunState::Cancelled
+                | RunState::Unknown
         )
     }
 }
@@ -61,6 +74,10 @@ pub enum ErrorKind {
     VerificationFailed,
     Cancelled,
     Internal,
+    /// An error kind written by a newer version this one does not know. Kept
+    /// so state.json and run records of a newer version stay readable.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -172,6 +189,7 @@ pub fn run_id(trigger: Trigger, now: DateTime<Utc>) -> String {
         Trigger::Timer => "timer",
         Trigger::Manual => "manual",
         Trigger::Cli => "cli",
+        Trigger::Unknown => "unknown",
     };
     // Random suffix: two runs started within the same second stay distinct.
     format!(
@@ -306,10 +324,16 @@ const TIMER_SLACK_MINUTES: i64 = 30;
 /// it differs from the one the failed run read (somebody is fixing it), the
 /// pause ends; so it does after the commands that store credentials or keys
 /// ([`Store::clear_failures`]) and for every manually started run.
+///
+/// `now` bounds the pause against a wrong clock (decision 0021): a failure
+/// time in the future (the clock was ahead and was corrected afterwards)
+/// counts as "now", and the pause can never end later than one backup
+/// interval from now.
 pub fn retry_not_before(
     state: &State,
     interval_hours: u32,
     config_now: Option<&str>,
+    now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
     let last = state
         .last_run
@@ -318,7 +342,9 @@ pub fn retry_not_before(
     if state.consecutive_failures < 2 {
         return None;
     }
-    let failed_at = last.finished_at.unwrap_or(last.started_at);
+    // A failure time in the future (clock was ahead, later corrected) would
+    // otherwise freeze the retries arbitrarily long; cap it at "now".
+    let failed_at = last.finished_at.unwrap_or(last.started_at).min(now);
     // Compared by content, not by time: file times and run times have
     // different precision, and a clock can be wrong. A state without a
     // recorded stamp (older version) never pauses.
@@ -327,7 +353,12 @@ pub fn retry_not_before(
     }
     let doubled = 1u32 << (state.consecutive_failures - 1).min(16);
     let hours = doubled.min(interval_hours.max(1));
-    Some(failed_at + Duration::hours(i64::from(hours)) - Duration::minutes(TIMER_SLACK_MINUTES))
+    let not_before =
+        failed_at + Duration::hours(i64::from(hours)) - Duration::minutes(TIMER_SLACK_MINUTES);
+    // Never longer than one backup interval from now, so the next attempt is
+    // never pushed arbitrarily far out.
+    let cap = now + Duration::hours(i64::from(interval_hours.max(1)));
+    Some(not_before.min(cap))
 }
 
 /// Fingerprint of the configuration file's content (SHA-256), `None` if it
@@ -722,8 +753,11 @@ mod tests {
         state.last_run = Some(finished(RunState::Failed, failed_at));
         state.failed_config = Some("stamp-a".into());
         let same = Some("stamp-a");
+        // "now" is the moment of the failure here, so the one-interval cap
+        // never shortens the computed pause.
+        let now = failed_at;
         let pause = |state: &State| {
-            retry_not_before(state, 24, same).map(|at| (at - failed_at).num_minutes())
+            retry_not_before(state, 24, same, now).map(|at| (at - failed_at).num_minutes())
         };
         // The first failure is retried at the next hourly check as before.
         state.consecutive_failures = 1;
@@ -736,22 +770,99 @@ mod tests {
         }
         state.consecutive_failures = 4;
         assert_eq!(
-            retry_not_before(&state, 6, same).map(|at| (at - failed_at).num_minutes()),
+            retry_not_before(&state, 6, same, now).map(|at| (at - failed_at).num_minutes()),
             Some(6 * 60 - 30),
             "never longer than the interval"
         );
         // A configuration file with other content than the failed run read
         // ends the pause (also a file that cannot be read any more); a state
         // of an older version without a stamp never pauses.
-        assert_eq!(retry_not_before(&state, 24, Some("stamp-b")), None);
-        assert_eq!(retry_not_before(&state, 24, None), None);
+        assert_eq!(retry_not_before(&state, 24, Some("stamp-b"), now), None);
+        assert_eq!(retry_not_before(&state, 24, None, now), None);
         let mut old = state.clone();
         old.failed_config = None;
-        assert_eq!(retry_not_before(&old, 24, same), None);
-        assert_eq!(retry_not_before(&old, 24, None), None);
+        assert_eq!(retry_not_before(&old, 24, same, now), None);
+        assert_eq!(retry_not_before(&old, 24, None, now), None);
         // An unreachable server or a cancelled run is not a failure.
         state.last_run = Some(finished(RunState::PbsUnreachable, t(11)));
-        assert_eq!(retry_not_before(&state, 24, same), None);
+        assert_eq!(retry_not_before(&state, 24, same, now), None);
+    }
+
+    #[test]
+    fn retry_pause_is_bounded_by_a_wrong_clock() {
+        let mut state = State {
+            failed_config: Some("stamp-a".into()),
+            consecutive_failures: 5, // would be a 16 h pause
+            ..State::default()
+        };
+        let same = Some("stamp-a");
+
+        // The failed run's time lies in the future (the clock was ahead and
+        // was corrected afterwards). It counts as "now", so the pause is
+        // measured from now, not from the bogus future time.
+        let now = t(2);
+        let future = t(12);
+        state.last_run = Some(finished(RunState::Failed, future));
+        let not_before = retry_not_before(&state, 24, same, now).unwrap();
+        // 16 h minus the 30 min tolerance from "now", and never beyond one
+        // interval from now.
+        assert_eq!((not_before - now).num_minutes(), 16 * 60 - 30);
+        assert!(not_before <= now + Duration::hours(24));
+
+        // Even a huge configured pause can never push the next attempt beyond
+        // one backup interval from now.
+        state.consecutive_failures = 40;
+        let now = t(2);
+        state.last_run = Some(finished(RunState::Failed, t(1)));
+        let not_before = retry_not_before(&state, 3, same, now).unwrap();
+        assert!(not_before <= now + Duration::hours(3));
+    }
+
+    #[test]
+    fn unknown_enum_values_from_a_newer_version_stay_readable() {
+        // A newer version can write enum values this one does not know; they
+        // must not make state.json or a run record unreadable.
+        assert_eq!(
+            serde_json::from_str::<ErrorKind>("\"future_kind\"").unwrap(),
+            ErrorKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<ErrorKind>("\"config\"").unwrap(),
+            ErrorKind::Config
+        );
+        assert_eq!(
+            serde_json::from_str::<RunState>("\"future_state\"").unwrap(),
+            RunState::Unknown
+        );
+        // Only finished runs are persisted, so an unknown state counts as
+        // finished.
+        assert!(RunState::Unknown.is_finished());
+        assert_eq!(
+            serde_json::from_str::<Trigger>("\"future_trigger\"").unwrap(),
+            Trigger::Unknown
+        );
+        // The catch-all round-trips back out as "unknown".
+        assert_eq!(
+            serde_json::to_value(ErrorKind::Unknown).unwrap(),
+            serde_json::json!("unknown")
+        );
+
+        // A whole state.json written by a newer version stays readable: the
+        // unknown run state, trigger and error kind all parse.
+        let json = r#"{
+            "last_run": {
+                "id": "20990101T000000Z-future-0000",
+                "trigger": "chrono",
+                "state": "replicating",
+                "started_at": "2099-01-01T00:00:00Z",
+                "error": { "kind": "quantum", "message": "from the future" }
+            }
+        }"#;
+        let state: State = serde_json::from_str(json).unwrap();
+        let run = state.last_run.unwrap();
+        assert_eq!(run.state, RunState::Unknown);
+        assert_eq!(run.trigger, Trigger::Unknown);
+        assert_eq!(run.error.unwrap().kind, ErrorKind::Unknown);
     }
 
     #[test]

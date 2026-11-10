@@ -424,6 +424,7 @@ on_client bash -c "f=\$(ls -t /var/lib/nestegg/runs/*.json | head -1) && sed -e 
 check "no metadata: the local run record is used" \
   bash -c "[[ \$($API 'http://localhost/api/v1/snapshots/$raw_time/browse?archive=home.pxar&path=/' | grep -o '\"name\":\"[^\"]*\"' | sort -u | tr -d '\n') == '\"name\":\"alice\"' ]]"
 on_client rm -f /var/lib/nestegg/runs/20000101T000000Z-cli-0000.json
+
 check "pbs info: reachable" bash -c "$API http://localhost/api/v1/pbs | grep -q '\"reachable\":true'"
 check "connection check via API" bash -c "$API -X POST http://localhost/api/v1/pbs/check | grep -q 'PBS login and datastore access'"
 
@@ -539,5 +540,62 @@ check "the run says the PBS answered after Wake-on-LAN" \
   bash -c "grep -q 'PBS reachable after Wake-on-LAN' <<<\"\$1\"" _ "$wake_out"
 check "the last run is recorded as succeeded" \
   bash -c "docker exec $client nestegg status --json | tr -d ' \n' | grep -q '\"last_run\":{[^}]*\"state\":\"succeeded\"'"
+
+echo "== forged metadata blob while encryption is on stays closed (decision 0016)"
+# This block runs last: it uploads snapshots with timestamps after the group's
+# newest one, so no real backup follows that the PBS would then refuse.
+# The backup token uploads an UNENCRYPTED snapshot into this machine's own
+# group, with a forged nestegg-meta.conf that claims etc.pxar was made from
+# alice's home. The blob names the correct snapshot and backup time, so only
+# the missing signature (the client is handed the key and refuses an unsigned
+# manifest) can keep it out.
+write_forged_blob() {
+  local file="$1" snap="$2" epoch="$3" sources="$4"
+  on_client bash -c "cat > '$file' <<JSON
+{
+  \"format\": 1,
+  \"nestegg_version\": \"forged\",
+  \"backup_id\": \"e2e-desktop\",
+  \"hostname\": \"desktop\",
+  \"backup_time\": $epoch,
+  \"snapshot\": \"$snap\",
+  \"archive_sources\": $sources,
+  \"sources\": [\"/home\"],
+  \"system_mode\": false,
+  \"incomplete\": []
+}
+JSON"
+}
+# Newer than the group's last snapshot: the PBS refuses a backup whose time
+# is older than the newest one in the group.
+forged_epoch=$(( $(date -u +%s) + 10 ))
+forged_snap="host/e2e-desktop/$(on_client date -u -d @$forged_epoch +%Y-%m-%dT%H:%M:%SZ)"
+forged_stime="${forged_snap##*/}"
+write_forged_blob /tmp/forged-meta.conf "$forged_snap" "$forged_epoch" \
+  '{"etc.pxar": "/home/alice", "home.pxar": "/"}'
+check "backup token uploads a forged unencrypted snapshot" \
+  bash -c "docker exec -e PBS_PASSWORD='$token_secret' -e PBS_FINGERPRINT='$fp' $client proxmox-backup-client backup nestegg-meta.conf:/tmp/forged-meta.conf etc.pxar:/etc home.pxar:/home --backup-type host --backup-id e2e-desktop --backup-time '$forged_epoch' --crypt-mode none --ns desktops --repository 'backup@pbs!desktop@pbs.e2e.test:store1'"
+check "forged unencrypted snapshot with a matching blob is on the server" \
+  bash -c "docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot files '$forged_snap' --ns desktops --repository admin@pbs@127.0.0.1:store1 | grep -q nestegg-meta.conf.blob"
+check "forged unencrypted blob does not open etc.pxar to alice" \
+  responds 403 'ask an administrator' alice "http://localhost/api/v1/snapshots/$forged_stime/browse?archive=etc.pxar&path=/"
+check "forged unencrypted blob does not let alice restore etc.pxar" \
+  responds 403 'ask an administrator' alice -X POST -H 'Content-Type: application/json' \
+  -d "{\"snapshot_time\":\"$forged_stime\",\"archive\":\"etc.pxar\",\"paths\":[],\"target_dir\":\"/home/alice/forged-blob\"}" \
+  http://localhost/api/v1/restores
+
+# The same, but signed with a DIFFERENT key than the configured one. The
+# client is handed the configured key, cannot verify the signature, and the
+# snapshot stays closed (an error, never a widened scope).
+other_epoch=$(( $(date -u +%s) + 20 ))
+other_snap="host/e2e-desktop/$(on_client date -u -d @$other_epoch +%Y-%m-%dT%H:%M:%SZ)"
+other_stime="${other_snap##*/}"
+write_forged_blob /tmp/other-meta.conf "$other_snap" "$other_epoch" '{"etc.pxar": "/home/alice"}'
+check "backup token uploads a snapshot signed with another key" \
+  bash -c "docker exec -e PBS_PASSWORD='$token_secret' -e PBS_FINGERPRINT='$fp' $client proxmox-backup-client backup nestegg-meta.conf:/tmp/other-meta.conf etc.pxar:/etc --backup-type host --backup-id e2e-desktop --backup-time '$other_epoch' --keyfile /root/other-key.json --crypt-mode encrypt --ns desktops --repository 'backup@pbs!desktop@pbs.e2e.test:store1'"
+check "snapshot signed with another key: blob stored encrypted" \
+  bash -c "docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot files '$other_snap' --ns desktops --repository admin@pbs@127.0.0.1:store1 --output-format json | grep -q '\"crypt-mode\":\"encrypt\"'"
+check "a snapshot signed with another key does not open etc.pxar to alice" \
+  responds 500 'cannot read the backup metadata' alice "http://localhost/api/v1/snapshots/$other_stime/browse?archive=etc.pxar&path=/"
 
 result

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::client::{Client, RestoreKey, RestoreRequest, SnapshotInfo};
+use crate::client::{Client, RestoreRequest, SnapshotInfo};
 
 /// What the run uploaded.
 pub struct Expected<'a> {
@@ -151,8 +151,10 @@ fn read_back_steps(
             expected.snapshot
         ))
     };
-    // 1. Every archive is listed.
-    let files = client.snapshot_files(expected.snapshot)?;
+    // 1. Every archive is listed. Bounded and cancellable so a server that
+    // fell asleep right after the upload cannot make the read-back hang.
+    let files =
+        client.snapshot_files_bounded(expected.snapshot, crate::client::readback_list_timeout())?;
     let mut archives = expected.archives.clone();
     archives.push(crate::metadata::ARCHIVE.to_string());
     let problems = listing_problems(&files, &archives, expected.encrypted);
@@ -188,15 +190,19 @@ fn read_back_steps(
     if let Some(local) = expected.inventory {
         let target = work.join("inventory");
         let mut client_log = Vec::new();
+        // The key is handed over explicitly when encryption is on, so the
+        // client verifies the manifest signature (decision 0016); bounded and
+        // cancellable (decision 0015).
         client
-            .restore(
+            .restore_bounded(
                 &RestoreRequest {
                     snapshot: expected.snapshot,
                     archive: "inventory.pxar",
                     target: &target,
                     patterns: &[],
-                    key: RestoreKey::Auto,
+                    key: client.configured_key()?,
                 },
+                crate::client::readback_restore_timeout(),
                 &mut client_log,
             )
             .context("restoring inventory.pxar failed")?;

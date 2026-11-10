@@ -15,7 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Client, RestoreKey, RestoreRequest};
+use crate::client::{Client, RestoreRequest};
 
 /// Archive name in the backup spec and for `restore`.
 pub const ARCHIVE: &str = "nestegg-meta.conf";
@@ -79,40 +79,69 @@ impl BackupMetadata {
 /// The metadata blob as read back from the server.
 pub struct Fetched {
     pub bytes: Vec<u8>,
-    /// `none`, `sign-only` or `encrypt`.
-    pub crypt_mode: String,
 }
 
-/// Read the metadata blob of `snapshot` with the configured key. `None` if
-/// the snapshot has none (made by an older version). `work` must be a
-/// private, root-only directory; the blob is restored into it.
+/// What a `snapshot files` listing says about the metadata blob, for
+/// [`fetch`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlobListing {
+    /// No blob at all (an older nestegg version made the snapshot).
+    Absent,
+    /// The blob is present and small enough to read.
+    Present,
+    /// The blob is listed with an implausible size; it is not read.
+    TooLarge(u64),
+}
+
+/// Decide from a `snapshot files` listing whether the metadata blob is there.
+/// The blob counts as present when the listing shows a crypt mode for it or,
+/// on an older server that lists no crypt modes, at least a size — the same
+/// reading as the read-back's listing check, so an old listing is not taken
+/// for "no blob".
+pub fn blob_listing(files_json: &str) -> BlobListing {
+    let size = crate::client::size_for_archive(files_json, ARCHIVE);
+    let present =
+        crate::client::crypt_mode_for_archive(files_json, ARCHIVE).is_some() || size.is_some();
+    if !present {
+        return BlobListing::Absent;
+    }
+    match size {
+        Some(s) if s > MAX_BYTES => BlobListing::TooLarge(s),
+        _ => BlobListing::Present,
+    }
+}
+
+/// Read the metadata blob of `snapshot`. `None` if the snapshot has none
+/// (made by an older version). `work` must be a private, root-only
+/// directory; the blob is restored into it.
+///
+/// With encryption configured, the client is always handed the key
+/// ([`Client::configured_key`]), so it verifies the manifest signature
+/// itself: the key is never withheld because the server lists the blob as
+/// `none` (decision 0016). The listing is used only to see whether the blob
+/// is present at all. The calls are time-bounded and cancellable so a server
+/// that fell asleep after the upload cannot make the read-back hang
+/// (decision 0015).
 pub fn fetch(client: &Client, snapshot: &str, work: &Path) -> Result<Option<Fetched>> {
-    let files = client.snapshot_files(snapshot)?;
-    let size = crate::client::size_for_archive(&files, ARCHIVE);
-    // A listing without crypt modes (an old server) still shows the blob;
-    // the same case is accepted by the listing check in `verify`. Without a
-    // stated mode it counts as not encrypted, the cautious reading for the
-    // daemon (which then prefers the local run record).
-    let crypt_mode = match crate::client::crypt_mode_for_archive(&files, ARCHIVE) {
-        Some(mode) => mode,
-        None if size.is_some() => "none".to_string(),
-        None => return Ok(None),
-    };
-    if let Some(size) = size
-        && size > MAX_BYTES
-    {
-        bail!("the backup metadata of {snapshot} is too large ({size} bytes)");
+    let files = client.snapshot_files_bounded(snapshot, crate::client::readback_list_timeout())?;
+    match blob_listing(&files) {
+        BlobListing::Absent => return Ok(None),
+        BlobListing::TooLarge(size) => {
+            bail!("the backup metadata of {snapshot} is too large ({size} bytes)")
+        }
+        BlobListing::Present => {}
     }
     let target = work.join(format!("meta-{:016x}", rand::random::<u64>()));
     let mut log = Vec::new();
-    let restored = client.restore(
+    let restored = client.restore_bounded(
         &RestoreRequest {
             snapshot,
             archive: ARCHIVE,
             target: &target,
             patterns: &[],
-            key: RestoreKey::Auto,
+            key: client.configured_key()?,
         },
+        crate::client::readback_list_timeout(),
         &mut log,
     );
     let result = restored.and_then(|()| {
@@ -125,10 +154,7 @@ pub fn fetch(client: &Client, snapshot: &str, work: &Path) -> Result<Option<Fetc
         std::fs::read(&target).with_context(|| format!("cannot read {}", target.display()))
     });
     let _ = std::fs::remove_file(&target);
-    Ok(Some(Fetched {
-        bytes: result?,
-        crypt_mode,
-    }))
+    Ok(Some(Fetched { bytes: result? }))
 }
 
 #[cfg(test)]
@@ -164,6 +190,35 @@ mod tests {
         assert!(!moved.belongs_to("host/desktop/2026-11-07T00:00:00Z"));
         assert_eq!(m.source_of("home.pxar"), Some("/home"));
         assert_eq!(m.source_of("etc.pxar"), None);
+    }
+
+    #[test]
+    fn blob_listing_detects_presence_old_server_and_size() {
+        // Modern server: crypt mode present.
+        assert_eq!(
+            blob_listing(
+                r#"[{"filename":"nestegg-meta.conf.blob","crypt-mode":"encrypt","size":300}]"#
+            ),
+            BlobListing::Present
+        );
+        // Older server: the blob is listed with a size but no crypt mode. It
+        // must count as present, not as "no blob" (item of commit 28d0133).
+        assert_eq!(
+            blob_listing(r#"[{"filename":"nestegg-meta.conf.blob","size":300}]"#),
+            BlobListing::Present
+        );
+        // No blob at all.
+        assert_eq!(
+            blob_listing(r#"[{"filename":"home.pxar.didx","crypt-mode":"encrypt","size":10}]"#),
+            BlobListing::Absent
+        );
+        assert_eq!(blob_listing("[]"), BlobListing::Absent);
+        // Implausibly large blobs are not read.
+        let huge = format!(
+            r#"[{{"filename":"nestegg-meta.conf.blob","crypt-mode":"encrypt","size":{}}}]"#,
+            MAX_BYTES + 1
+        );
+        assert_eq!(blob_listing(&huge), BlobListing::TooLarge(MAX_BYTES + 1));
     }
 
     #[test]

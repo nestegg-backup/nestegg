@@ -77,6 +77,55 @@ affected.
   cannot be made without the key, and an unencrypted blob is not trusted.
   Use encryption (the default) where this matters.
 
+## Update 2026-11-10: the key is always handed to the client
+
+The first implementation decided whether to pass the key from the server's
+file listing: `metadata::fetch` read the crypt mode from one `snapshot files`
+call, and the blob restore (`RestoreKey::Auto`) asked the server a second
+time and ran **without** the key when that answer said `none`. The daemon
+then trusted the blob when the first listing said `encrypt`. A server, or
+anyone who can write the datastore at file level, could therefore present a
+forged, unencrypted blob (first listing `encrypt`, second `none`): it was
+restored without the key, the client never checked a signature, and the
+forged `archive_sources` were trusted. That defeated the guarantee above.
+
+**Now, whenever encryption is configured, the key is always handed to the
+client for the metadata blob and for the inventory archive of the read-back
+(`Client::configured_key`). No decision about passing the key depends on what
+the server lists.** The client itself then verifies the snapshot's manifest
+signature with the key before it returns anything.
+
+Confirmed with the real `proxmox-backup-client` (restoring the blob with
+`--keyfd`):
+
+- **manifest signed with our key** (the normal case, blob `encrypt` or
+  `sign-only`): restores and returns the blob;
+- **manifest signed with another key:** fails, `wrong key - unable to verify
+  signature since manifest's key <A> does not match provided key <B>`;
+- **unsigned manifest** (an unencrypted, possibly forged snapshot): fails,
+  `manifest has no signature, but an encryption key is set - refusing to
+  trust a potentially tampered, unsigned backup`;
+- restoring **without** the key from a snapshot whose manifest was made with
+  a key fails too (`missing key - manifest was created with key <A>`), so a
+  forged `none` entry in the listing cannot trick a no-key restore of a
+  signed snapshot either.
+
+How the daemon maps this to the fallbacks above (`load_metadata`):
+
+- the blob restores and describes this snapshot → trusted;
+- the client refuses it as unsigned (`manifest has no signature …`) → the
+  snapshot is not signed with our key, so it could have been made without the
+  key: not trusted, fall back to the local run record (step 2), else `403`;
+- any other read failure (wrong key, transport, file system) → a blob that
+  cannot be read is an error;
+- a blob that parses but describes another snapshot → refused (`403`).
+
+With encryption **off** the behaviour is unchanged (`RestoreKey::Auto`); the
+residual risk below still applies. The end-to-end test uploads a forged,
+unencrypted snapshot into the machine's own group with the backup token while
+encryption is on and checks that browsing and restoring it as a non-root user
+stay forbidden.
+
 ## Alternatives rejected
 
 - **Keep using notes, sign them with a key on this computer:** another key

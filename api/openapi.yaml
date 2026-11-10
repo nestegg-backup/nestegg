@@ -507,10 +507,11 @@ components:
       required: [id, trigger, state, started_at]
       properties:
         id: { type: string }
-        trigger: { type: string, enum: [timer, manual, cli] }
+        trigger: { type: string, enum: [timer, manual, cli, unknown] }
         state:
           type: string
-          enum: [starting, waking_pbs, inventory, uploading, finishing, succeeded, failed, pbs_unreachable, cancelled]
+          description: "`unknown`: a value written by a newer version this one does not recognise (forward compatibility)."
+          enum: [starting, waking_pbs, inventory, uploading, finishing, succeeded, failed, pbs_unreachable, cancelled, unknown]
         started_at: { type: string, format: date-time }
         finished_at: { type: [string, "null"], format: date-time }
         duration_seconds: { type: [integer, "null"] }
@@ -551,8 +552,8 @@ components:
       properties:
         kind:
           type: string
-          description: "`verification_failed`: the upload finished, but reading the snapshot back from the server failed or did not match."
-          enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, credentials_unreadable, verification_failed, cancelled, internal]
+          description: "`verification_failed`: the upload finished, but reading the snapshot back from the server failed or did not match. `unknown`: a kind written by a newer version this one does not recognise (forward compatibility)."
+          enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, credentials_unreadable, verification_failed, cancelled, internal, unknown]
         message: { type: string }
     RunDetail:
       allOf:

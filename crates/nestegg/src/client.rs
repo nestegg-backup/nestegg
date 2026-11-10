@@ -21,6 +21,30 @@ use crate::state::{ErrorKind, RunError};
 const PASSWORD_FD: i32 = 10;
 const KEY_FD: i32 = 11;
 
+/// Time limit for the small listing calls of the read-back (`snapshot
+/// files`, metadata blob restore). They move a few hundred bytes; if the
+/// server fell asleep right after the upload they must not hang and hold the
+/// run lock for hours (decision 0015). Minutes, not hours.
+pub fn readback_list_timeout() -> std::time::Duration {
+    readback_timeout(std::time::Duration::from_secs(120))
+}
+
+/// Time limit for restoring the inventory archive during the read-back. It
+/// is larger than the blob (KiB, not hundreds of bytes) but still small.
+pub fn readback_restore_timeout() -> std::time::Duration {
+    readback_timeout(std::time::Duration::from_secs(300))
+}
+
+/// `NESTEGG_READBACK_TIMEOUT_SECS` overrides the read-back time limits (used
+/// by the tests to exercise a timeout without waiting minutes).
+fn readback_timeout(default: std::time::Duration) -> std::time::Duration {
+    std::env::var("NESTEGG_READBACK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(default)
+}
+
 pub fn client_binary() -> PathBuf {
     std::env::var_os("NESTEGG_PBS_CLIENT")
         .map(PathBuf::from)
@@ -177,6 +201,18 @@ pub fn classify_failure(output_tail: &[String]) -> ErrorKind {
     } else {
         ErrorKind::ClientFailed
     }
+}
+
+/// Whether a restore error means the snapshot's manifest is not signed with
+/// the key we handed to the client, as opposed to a transport or file-system
+/// error. The client prints these messages when a key is set but the
+/// manifest has no signature at all (an unencrypted, possibly forged
+/// snapshot). Used so the daemon can fall back to the local run record for
+/// such a snapshot instead of treating it as a hard error (decision 0016).
+pub fn manifest_unsigned_error(message: &str) -> bool {
+    message
+        .to_lowercase()
+        .contains("manifest has no signature, but an encryption key is set")
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -356,6 +392,33 @@ pub fn crypt_mode_for_archive(json: &str, archive: &str) -> Option<String> {
         }
     }
     modes.into_iter().next()
+}
+
+/// Whether an [`RestoreKey::Auto`] restore of an archive must pass the key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AutoKey {
+    /// Pass the stored encryption key (the archive is signed or encrypted).
+    Key,
+    /// No key: the archive is stored unencrypted, or an older server lists it
+    /// without a crypt mode but with a size, so it is present and read
+    /// without a key (the same reading as the read-back's listing check).
+    None,
+    /// The archive is not in the snapshot at all.
+    Missing,
+}
+
+/// Decide from a single `snapshot files` listing whether an `Auto` restore of
+/// `archive` needs the key. Taking both lookups from the same listing keeps
+/// the answer consistent: an older server that lists the archive without a
+/// crypt mode must not be read as "missing" by a crypt-mode-only lookup while
+/// a size lookup sees it (the regression behind commit 28d0133).
+pub fn auto_key_decision(files_json: &str, archive: &str) -> AutoKey {
+    match crypt_mode_for_archive(files_json, archive).as_deref() {
+        Some("none") => AutoKey::None,
+        Some(_) => AutoKey::Key,
+        None if size_for_archive(files_json, archive).is_some() => AutoKey::None,
+        None => AutoKey::Missing,
+    }
 }
 
 pub struct BackupOutcome {
@@ -587,12 +650,19 @@ impl<'a> Client<'a> {
         cmd.args(backup_args(spec));
         fds.apply(&mut cmd);
         let mut stats = Vec::new();
-        let (status, tail, killed) = run_streaming_cancellable(&mut cmd, log, |line| {
-            if let Some(s) = parse_archive_stats(line) {
-                on_archive(&s);
-                stats.push(s);
-            }
-        })
+        // No time limit on the upload itself (it may legitimately take hours);
+        // only a cancel stops it (decision 0015).
+        let (status, tail, stopped) = run_streaming_cancellable(
+            &mut cmd,
+            log,
+            |line| {
+                if let Some(s) = parse_archive_stats(line) {
+                    on_archive(&s);
+                    stats.push(s);
+                }
+            },
+            None,
+        )
         .map_err(|e| RunError {
             kind: ErrorKind::ClientMissing,
             message: format!("{e:#}"),
@@ -600,7 +670,7 @@ impl<'a> Client<'a> {
         // Only a client that was actually stopped counts as cancelled; if it
         // finished successfully first, the snapshot exists and the run
         // completes normally.
-        if killed && !status.success() {
+        if stopped == Stopped::Cancelled && !status.success() {
             return Err(RunError {
                 kind: ErrorKind::Cancelled,
                 message: "the backup was cancelled".into(),
@@ -676,13 +746,72 @@ impl<'a> Client<'a> {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    /// Like [`Client::snapshot_files`], but with a time limit and honouring a
+    /// cancel request while the client runs. Used by the read-back so a
+    /// server that fell asleep after the upload cannot make the run hang and
+    /// hold the run lock (decision 0015).
+    pub fn snapshot_files_bounded(
+        &self,
+        snapshot: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String> {
+        let mut fds = FdPassing::new();
+        let mut cmd = self.command(&mut fds)?;
+        cmd.args(["snapshot", "files", snapshot, "--output-format", "json"]);
+        self.add_namespace(&mut cmd);
+        fds.apply(&mut cmd);
+        let cap = run_capturing(&mut cmd, Some(timeout))?;
+        match cap.stopped {
+            Stopped::TimedOut => bail!(
+                "listing the files of {snapshot} timed out after {}s",
+                timeout.as_secs()
+            ),
+            Stopped::Cancelled => bail!("listing the files of {snapshot} was cancelled"),
+            Stopped::No => {}
+        }
+        if !cap.status.success() {
+            bail!("{}", String::from_utf8_lossy(&cap.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&cap.stdout).into_owned())
+    }
+
     /// Restore an archive (or the paths matching `patterns`) into `target`.
     ///
     /// The key is only passed when the archive is signed or encrypted (or
     /// an explicit key is given); passing a key for an unsigned archive makes
     /// the client reject it.
     pub fn restore(&self, request: &RestoreRequest<'_>, log: &mut dyn Write) -> Result<()> {
-        self.restore_with_args(request, &[], log)
+        self.restore_with_args(request, &[], None, log)
+    }
+
+    /// Like [`Client::restore`], but with a time limit (cancellation already
+    /// works while the client runs). Used by the read-back for the inventory
+    /// archive (decision 0015).
+    pub fn restore_bounded(
+        &self,
+        request: &RestoreRequest<'_>,
+        timeout: std::time::Duration,
+        log: &mut dyn Write,
+    ) -> Result<()> {
+        self.restore_with_args(request, &[], Some(timeout), log)
+    }
+
+    /// Key handling for the trusted read-back and the permission lookup of
+    /// the metadata blob and inventory (decisions 0015, 0016): with
+    /// encryption on, always hand the configured key to the client so it
+    /// verifies the manifest signature itself; the decision never depends on
+    /// what the server lists. With encryption off, behaviour is unchanged
+    /// (`Auto`, which reads an encrypted archive's key only when the listing
+    /// says it is signed).
+    pub fn configured_key(&self) -> Result<RestoreKey> {
+        if self.config.backup.encryption {
+            let key = self.secrets.load(secrets::ENCRYPTION_KEY).context(
+                "this snapshot is encrypted; the configured encryption key is needed to read it back",
+            )?;
+            Ok(RestoreKey::File(key))
+        } else {
+            Ok(RestoreKey::Auto)
+        }
     }
 
     /// Prove that `key` opens `snapshot`: restore its manifest (`index.json`)
@@ -729,30 +858,32 @@ impl<'a> Client<'a> {
         request: &RestoreRequest<'_>,
         log: &mut dyn Write,
     ) -> Result<()> {
-        self.restore_with_args(request, &["--allow-existing-dirs", "true"], log)
+        self.restore_with_args(request, &["--allow-existing-dirs", "true"], None, log)
     }
 
     fn restore_with_args(
         &self,
         request: &RestoreRequest<'_>,
         extra: &[&str],
+        timeout: Option<std::time::Duration>,
         log: &mut dyn Write,
     ) -> Result<()> {
         let key = match &request.key {
             RestoreKey::Without => None,
             RestoreKey::File(secret) => Some(Secret::new(secret.as_bytes().to_vec())),
             RestoreKey::Auto => {
-                let mode = self.archive_crypt_mode(request.snapshot, request.archive)?;
-                match mode.as_deref() {
-                    None => bail!(
+                // One listing, both lookups (see [`auto_key_decision`]).
+                let files = self.snapshot_files(request.snapshot)?;
+                match auto_key_decision(&files, request.archive) {
+                    AutoKey::None => None,
+                    AutoKey::Key => Some(self.secrets.load(secrets::ENCRYPTION_KEY).context(
+                        "this archive is encrypted or signed; pass the exported key with --keyfile",
+                    )?),
+                    AutoKey::Missing => bail!(
                         "archive {} not found in snapshot {}",
                         request.archive,
                         request.snapshot
                     ),
-                    Some("none") => None,
-                    Some(_) => Some(self.secrets.load(secrets::ENCRYPTION_KEY).context(
-                        "this archive is encrypted or signed; pass the exported key with --keyfile",
-                    )?),
                 }
             }
         };
@@ -773,7 +904,15 @@ impl<'a> Client<'a> {
         }
         self.add_namespace(&mut cmd);
         fds.apply(&mut cmd);
-        let (status, tail) = run_streaming(&mut cmd, log, |_| {})?;
+        let (status, tail, stopped) = run_streaming_cancellable(&mut cmd, log, |_| {}, timeout)?;
+        if stopped == Stopped::TimedOut {
+            bail!(
+                "restoring {} from {} timed out after {}s",
+                request.archive,
+                request.snapshot,
+                timeout.map(|t| t.as_secs()).unwrap_or(0)
+            );
+        }
         if !status.success() {
             bail!(
                 "{}",
@@ -929,23 +1068,27 @@ fn last_error_line(tail: &[String]) -> Option<String> {
         .map(|l| l.trim().to_string())
 }
 
-/// Run a command, forwarding stdout and stderr line by line into `log` and
-/// to `on_line`. Returns the exit status and the last 40 lines.
-fn run_streaming(
-    cmd: &mut Command,
-    log: &mut dyn Write,
-    on_line: impl FnMut(&str),
-) -> Result<(std::process::ExitStatus, Vec<String>)> {
-    run_streaming_cancellable(cmd, log, on_line).map(|(status, tail, _)| (status, tail))
+/// Why a streamed or captured client run stopped early (other than the
+/// client exiting on its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stopped {
+    No,
+    /// A cancel was requested and the client was killed.
+    Cancelled,
+    /// The time limit was reached and the client was killed.
+    TimedOut,
 }
 
-/// Like [`run_streaming`]; also reports whether the child was stopped
-/// because a cancel was requested.
+/// Run a command, forwarding stdout and stderr line by line into `log` and
+/// to `on_line`. Returns the exit status, the last 40 lines and why it was
+/// stopped (if it was). A cancel request always stops it; `timeout`, when
+/// set, is an upper bound on how long the client may run.
 fn run_streaming_cancellable(
     cmd: &mut Command,
     log: &mut dyn Write,
     mut on_line: impl FnMut(&str),
-) -> Result<(std::process::ExitStatus, Vec<String>, bool)> {
+    timeout: Option<std::time::Duration>,
+) -> Result<(std::process::ExitStatus, Vec<String>, Stopped)> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
@@ -969,8 +1112,9 @@ fn run_streaming_cancellable(
         }));
     }
     drop(tx);
+    let deadline = timeout.map(|t| std::time::Instant::now() + t);
     let mut tail: Vec<String> = Vec::new();
-    let mut killed = false;
+    let mut stopped = Stopped::No;
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(300)) {
             Ok(line) => {
@@ -984,10 +1128,15 @@ fn run_streaming_cancellable(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if !killed && crate::cancel::requested() {
+        if stopped == Stopped::No && crate::cancel::requested() {
             let _ = writeln!(log, "cancel requested, stopping proxmox-backup-client");
             let _ = child.kill();
-            killed = true;
+            stopped = Stopped::Cancelled;
+        }
+        if stopped == Stopped::No && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            let _ = writeln!(log, "time limit reached, stopping proxmox-backup-client");
+            let _ = child.kill();
+            stopped = Stopped::TimedOut;
         }
     }
     for r in readers {
@@ -995,7 +1144,63 @@ fn run_streaming_cancellable(
     }
     let status = child.wait()?;
     let _ = log.flush();
-    Ok((status, tail, killed))
+    Ok((status, tail, stopped))
+}
+
+/// Result of [`run_capturing`].
+struct Captured {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stopped: Stopped,
+}
+
+/// Run a command to completion, capturing stdout and stderr in full, while
+/// honouring a cancel request and an optional deadline. Used by the
+/// read-back's `snapshot files` call, which needs the whole JSON output but
+/// must not hang if the server fell asleep after the upload (decision 0015).
+fn run_capturing(cmd: &mut Command, timeout: Option<std::time::Duration>) -> Result<Captured> {
+    fn read_all<R: std::io::Read + Send + 'static>(
+        r: Option<R>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("cannot start {}", client_binary().display()))?;
+    let out_h = read_all(child.stdout.take());
+    let err_h = read_all(child.stderr.take());
+    let deadline = timeout.map(|t| std::time::Instant::now() + t);
+    let mut stopped = Stopped::No;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if stopped == Stopped::No && crate::cancel::requested() {
+            let _ = child.kill();
+            stopped = Stopped::Cancelled;
+        }
+        if stopped == Stopped::No && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            let _ = child.kill();
+            stopped = Stopped::TimedOut;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let stdout = out_h.join().unwrap_or_default();
+    let stderr = err_h.join().unwrap_or_default();
+    Ok(Captured {
+        status,
+        stdout,
+        stderr,
+        stopped,
+    })
 }
 
 /// Last `max` bytes of a file as text.
@@ -1201,6 +1406,68 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn auto_key_decision_from_one_listing() {
+        let enc = r#"[{"filename":"home.pxar.didx","crypt-mode":"encrypt","size":10}]"#;
+        assert_eq!(auto_key_decision(enc, "home.pxar"), AutoKey::Key);
+        let plain = r#"[{"filename":"home.pxar.didx","crypt-mode":"none","size":10}]"#;
+        assert_eq!(auto_key_decision(plain, "home.pxar"), AutoKey::None);
+        // An older server lists the archive with a size but no crypt mode:
+        // present, read without a key (not "missing"). This is the case that
+        // made a read-back/restore fail with "archive not found" (28d0133).
+        let old = r#"[{"filename":"nestegg-meta.conf.blob","size":300}]"#;
+        assert_eq!(auto_key_decision(old, "nestegg-meta.conf"), AutoKey::None);
+        // Genuinely absent.
+        assert_eq!(auto_key_decision(enc, "etc.pxar"), AutoKey::Missing);
+        assert_eq!(auto_key_decision("[]", "home.pxar"), AutoKey::Missing);
+    }
+
+    #[test]
+    fn run_capturing_times_out_and_kills_the_client() {
+        // A client that never returns is killed at the deadline, so a sleeping
+        // server cannot make the read-back hang (decision 0015).
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        let start = std::time::Instant::now();
+        let cap = run_capturing(&mut cmd, Some(std::time::Duration::from_millis(200))).unwrap();
+        assert_eq!(cap.stopped, Stopped::TimedOut);
+        assert!(!cap.status.success());
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn run_streaming_times_out_and_kills_the_client() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        let mut log = Vec::new();
+        let start = std::time::Instant::now();
+        let (status, _tail, stopped) = run_streaming_cancellable(
+            &mut cmd,
+            &mut log,
+            |_| {},
+            Some(std::time::Duration::from_millis(200)),
+        )
+        .unwrap();
+        assert_eq!(stopped, Stopped::TimedOut);
+        assert!(!status.success());
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn unsigned_manifest_error_is_recognised() {
+        assert!(manifest_unsigned_error(
+            "Error: manifest has no signature, but an encryption key is set - refusing to trust \
+             a potentially tampered, unsigned backup"
+        ));
+        // A wrong-key failure is not "unsigned": that is a real error, not a
+        // fall-back-to-the-local-record case.
+        assert!(!manifest_unsigned_error(
+            "Error: wrong key - unable to verify signature since manifest's key aa does not \
+             match provided key bb"
+        ));
+        assert!(!manifest_unsigned_error("Error: connection refused"));
     }
 
     #[test]

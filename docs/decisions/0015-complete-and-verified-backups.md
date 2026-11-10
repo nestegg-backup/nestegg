@@ -110,6 +110,25 @@ its cancel message, so it is in the run record and the run log.
 - A first run that fails verification leaves health at `never` (no success
   yet); later failures show `failing`.
 
+## Update 2026-11-10: the read-back cannot hang, and an unfinished run fails
+
+- **Time limit and cancellation.** The read-back's client calls (`snapshot
+  files`, the metadata-blob and inventory restores) now run with a time limit
+  that fits their size — a couple of minutes for the listing and the blob,
+  five minutes for the inventory, far below the hours an upload may take — and
+  honour a cancel request (`crate::cancel`) while the client runs. Without
+  this, a server that went to sleep right after the upload left the client
+  hanging and held the run lock indefinitely. Hitting the limit ends the run
+  as `verification_failed` with a message that names what timed out; a cancel
+  during the read-back still ends it as `cancelled` (as above). The time limit
+  applies only to the read-back, never to the upload. The limits can be
+  overridden for testing with `NESTEGG_READBACK_TIMEOUT_SECS`.
+- **An unfinished pipeline is a failure, not a success.** The run pipeline
+  always decides the outcome itself (the success path finishes the run, and
+  every failure path does too). As a safety net, a pipeline that returns
+  without having finished the run is recorded as `failed` with kind
+  `internal`, never silently as `succeeded`.
+
 ## Alternatives rejected
 
 - **Restore and compare every data archive:** as expensive as the backup.

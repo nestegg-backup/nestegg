@@ -278,11 +278,13 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     // After failures in a row the timer pauses longer and longer; manual
     // runs and a changed configuration are not held back.
     if let (Ok(cfg), Trigger::Timer, false) = (&config, options.trigger, options.force) {
+        let now = Utc::now();
         if let Some(not_before) = crate::state::retry_not_before(
             &state,
             cfg.schedule.interval_hours,
             config_stamp.as_deref(),
-        ) && Utc::now() < not_before
+            now,
+        ) && now < not_before
         {
             eprintln!(
                 "not retrying yet: {} failed runs in a row, next automatic attempt after {} \
@@ -361,7 +363,16 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
         );
     }
     if !rep.run.state.is_finished() {
-        rep.run.finish(RunState::Succeeded, Utc::now());
+        // The pipeline always finishes the run itself (success path and every
+        // failure path). Reaching this means a code path returned without
+        // deciding the outcome; that must never be reported as a success.
+        rep.fail(
+            RunState::Failed,
+            RunError {
+                kind: ErrorKind::Internal,
+                message: "the run pipeline returned without finishing the run".into(),
+            },
+        );
     }
     let final_state = rep.run.state;
     rep.line(&format!("run finished: {:?}", final_state));

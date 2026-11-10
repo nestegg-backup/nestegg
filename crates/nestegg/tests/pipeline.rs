@@ -64,6 +64,15 @@ case "$1" in
       echo '[{"backup-type":"host","backup-id":"test","backup-time":1794000000,"files":[{"filename":"home.pxar.didx","crypt-mode":"encrypt"}],"size":2048,"protected":false,"verification":{"state":"failed","upid":"x"}}]'
     fi
     if [ "$2" = "files" ]; then
+      # The read-back lists the files first; a test can make this call block
+      # (touch a sentinel, then wait to be killed) to exercise a hanging or
+      # cancelled read-back.
+      if [ -n "$FAKE_READBACK_BLOCK" ]; then
+        touch "$FAKE_READBACK_BLOCK"
+        # exec, so killing this pid kills the waiter and closes the pipes at
+        # once (a plain `sleep` child would be orphaned and hold them open).
+        exec sleep 30
+      fi
       # A test may dictate the file list; otherwise what "backup" stored.
       if [ -f "$FAKE_FILES_FILE" ]; then
         cat "$FAKE_FILES_FILE"
@@ -400,6 +409,99 @@ fn successful_run_records_state_and_passes_secrets_via_fds() {
     let history = env.run(&["history", "--json"]);
     let runs: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
     assert_eq!(runs.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn cancel_during_read_back_ends_cancelled_and_cleans_up() {
+    let env = Env::new();
+    let sentinel = env.root().join("readback-started");
+    let child = env
+        .command(&["run", "--trigger", "cli"])
+        .env("FAKE_READBACK_BLOCK", &sentinel)
+        .spawn()
+        .unwrap();
+    // Wait until the read-back's `snapshot files` call is running.
+    let start = Instant::now();
+    while !sentinel.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the read-back did not start"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Ask the run to cancel, the way the daemon does (SIGTERM).
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.code().is_some(),
+        "the run was killed instead of cancelling itself"
+    );
+
+    // The run is recorded as cancelled, not as a success.
+    let state = env.state();
+    assert_eq!(state["last_run"]["state"], "cancelled", "{state}");
+
+    // current.json is gone, the metadata file is removed, and the read-back
+    // staging directory holds no leftover copies (only its empty base dir,
+    // which always persists, may remain).
+    assert!(!env.root().join("state/current.json").exists());
+    let tmp = env.root().join("run/tmp");
+    let meta_leftovers: Vec<_> = fs::read_dir(&tmp)
+        .map(|d| {
+            d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".meta.json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        meta_leftovers.is_empty(),
+        "metadata leftovers: {meta_leftovers:?}"
+    );
+    let verify = tmp.join("verify");
+    if verify.exists() {
+        let inside: Vec<_> = fs::read_dir(&verify)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(inside.is_empty(), "read-back staging leftovers: {inside:?}");
+    }
+
+    // The run lock was released: a second run can start.
+    let out = env.run(&["run", "--trigger", "cli"]);
+    assert_eq!(
+        code(&out),
+        0,
+        "second run after cancel: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn read_back_that_hangs_times_out_as_verification_failed() {
+    let env = Env::new();
+    let sentinel = env.root().join("readback-started");
+    // The read-back's `snapshot files` call blocks; with a 1 s time limit the
+    // run must end as a failed verification that says what timed out, instead
+    // of hanging and holding the run lock (decision 0015).
+    let out = env
+        .command(&["run", "--trigger", "cli"])
+        .env("FAKE_READBACK_BLOCK", &sentinel)
+        .env("NESTEGG_READBACK_TIMEOUT_SECS", "1")
+        .output()
+        .unwrap();
+    assert_ne!(code(&out), 0);
+    let state = env.state();
+    assert_eq!(state["last_run"]["state"], "failed", "{state}");
+    assert_eq!(state["last_run"]["error"]["kind"], "verification_failed");
+    let message = state["last_run"]["error"]["message"].as_str().unwrap();
+    assert!(message.contains("timed out"), "message: {message}");
+    assert!(!env.root().join("state/current.json").exists());
 }
 
 #[test]

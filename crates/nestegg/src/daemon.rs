@@ -1,6 +1,6 @@
 //! `nestegg daemon`: local JSON API on a Unix socket (see `api/openapi.yaml`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,12 +34,68 @@ struct App {
     restores: Arc<Mutex<HashMap<String, RestoreJob>>>,
     /// Serialises catalog dumps (one dump per snapshot, no duplicates).
     catalog: Arc<Mutex<()>>,
-    /// Backup metadata of snapshots by snapshot path; `None` for snapshots
-    /// without trustworthy metadata (decision 0016). Snapshots do not
-    /// change once finished, so entries never go stale.
-    metadata: Arc<Mutex<HashMap<String, Option<crate::metadata::BackupMetadata>>>>,
+    /// Backup metadata of snapshots, keyed by everything the answer depends
+    /// on (datastore, namespace, encryption, snapshot); `None` for snapshots
+    /// without trustworthy metadata (decision 0016). Snapshots do not change
+    /// once finished, but the configuration can change in the file while the
+    /// daemon runs, so it is part of the key. Bounded in size.
+    metadata: Arc<Mutex<MetadataCache>>,
     /// Serialises settings changes (read, modify, write, switch the timer).
     settings: Arc<Mutex<()>>,
+}
+
+/// Key for the metadata cache. The blob a snapshot has, and whether it may
+/// be trusted, depends not only on the snapshot path but on the datastore
+/// and namespace it is read from and on whether encryption is configured.
+/// All of these can change in the configuration file while the daemon runs,
+/// so a stale answer must not survive a configuration change (decision 0016).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MetaKey {
+    datastore: String,
+    namespace: String,
+    encryption: bool,
+    snapshot: String,
+}
+
+impl MetaKey {
+    fn new(config: &Config, snapshot: &str) -> MetaKey {
+        MetaKey {
+            datastore: config.pbs.datastore.clone(),
+            namespace: config.pbs.namespace.clone().unwrap_or_default(),
+            encryption: config.backup.encryption,
+            snapshot: snapshot.to_string(),
+        }
+    }
+}
+
+/// Bounded cache of backup metadata. Finished snapshots do not change, so a
+/// hit never goes stale for its key; the bound only caps memory for a daemon
+/// that browses very many snapshots over its lifetime. Oldest inserted
+/// entries are evicted first.
+#[derive(Default)]
+struct MetadataCache {
+    entries: HashMap<MetaKey, Option<crate::metadata::BackupMetadata>>,
+    order: VecDeque<MetaKey>,
+}
+
+impl MetadataCache {
+    const MAX: usize = 512;
+
+    fn get(&self, key: &MetaKey) -> Option<Option<crate::metadata::BackupMetadata>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: MetaKey, value: Option<crate::metadata::BackupMetadata>) {
+        if !self.entries.contains_key(&key) {
+            self.order.push_back(key.clone());
+            while self.order.len() > Self::MAX {
+                if let Some(old) = self.order.pop_front() {
+                    self.entries.remove(&old);
+                }
+            }
+        }
+        self.entries.insert(key, value);
+    }
 }
 
 /// Credentials of the process on the other end of the socket.
@@ -452,12 +508,12 @@ fn snapshot_source(
     archive: &str,
 ) -> ApiResult<PathBuf> {
     let not_in_archive = || forbidden("this archive does not contain your home directory");
+    let key = MetaKey::new(config, snapshot);
     let cached = app
         .metadata
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(snapshot)
-        .cloned();
+        .get(&key);
     let meta = match cached {
         Some(m) => m,
         None => {
@@ -468,7 +524,7 @@ fn snapshot_source(
             app.metadata
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(snapshot.to_string(), m.clone());
+                .insert(key, m.clone());
             m
         }
     };
@@ -498,32 +554,40 @@ fn snapshot_source(
 }
 
 /// Read and check the metadata blob of `snapshot`. `None`: no blob, or a
-/// blob that cannot be trusted for permissions (not encrypted although
-/// encryption is on, so it could have been made without the key).
+/// blob that cannot be trusted for permissions (not signed with the
+/// configured key although encryption is on, so it could have been made
+/// without the key).
+///
+/// With encryption on, [`crate::metadata::fetch`] hands the key to the
+/// client, which verifies the manifest signature: a blob that is not signed
+/// with our key (an unencrypted, possibly forged snapshot) makes the client
+/// refuse it, and that refusal is treated as "not trustworthy" here rather
+/// than a hard error, so the caller falls back to the local run record
+/// (decision 0016). The decision never depends on the server's file listing.
 fn load_metadata(
     paths: &Paths,
     config: &Config,
     snapshot: &str,
 ) -> ApiResult<Option<crate::metadata::BackupMetadata>> {
     let client = crate::client::Client::new(config, SecretStore::new(&paths.credentials_dir));
-    let fetched = crate::secrets::create_private_dir(&paths.tmp_dir())
+    let work = crate::secrets::create_private_dir(&paths.tmp_dir())
         .and_then(|()| crate::staging::StagingDir::create(&paths.tmp_dir().join("metadata")))
-        .and_then(|work| crate::metadata::fetch(&client, snapshot, work.path()))
         .map_err(|e| {
             ApiError::internal(format!(
-                "cannot read the backup metadata of {snapshot}: {e:#}"
+                "cannot prepare to read the backup metadata of {snapshot}: {e:#}"
             ))
         })?;
-    let Some(fetched) = fetched else {
-        return Ok(None);
-    };
-    if config.backup.encryption && fetched.crypt_mode != "encrypt" {
-        eprintln!(
-            "backup metadata of {snapshot} is not encrypted although encryption is on; \
-             not used for permissions"
-        );
-        return Ok(None);
-    }
+    let fetched = crate::metadata::fetch(&client, snapshot, work.path());
+    interpret_metadata(fetched, config.backup.encryption, snapshot)
+}
+
+/// Turn the outcome of reading the blob into the permission decision. Pure
+/// (no I/O) so the documented fallbacks can be unit-tested without a server.
+fn interpret_metadata(
+    fetched: Result<Option<crate::metadata::Fetched>>,
+    encryption: bool,
+    snapshot: &str,
+) -> ApiResult<Option<crate::metadata::BackupMetadata>> {
     let untrusted = |why: String| {
         eprintln!("backup metadata of {snapshot} refused: {why}");
         forbidden(format!(
@@ -531,15 +595,40 @@ fn load_metadata(
              administrator to restore it with `sudo nestegg restore`"
         ))
     };
-    let meta = crate::metadata::BackupMetadata::parse(&fetched.bytes)
-        .map_err(|e| untrusted(format!("{e:#}")))?;
-    if !meta.belongs_to(snapshot) {
-        return Err(untrusted(format!(
-            "it describes {}, not this snapshot",
-            meta.snapshot
-        )));
+    match fetched {
+        // No blob at all (older nestegg version): fall back to the local run
+        // record.
+        Ok(None) => Ok(None),
+        // The blob was restored (with the key when encryption is on, so the
+        // client verified the manifest signature). It must still parse and
+        // describe exactly this snapshot.
+        Ok(Some(fetched)) => {
+            let meta = crate::metadata::BackupMetadata::parse(&fetched.bytes)
+                .map_err(|e| untrusted(format!("{e:#}")))?;
+            if !meta.belongs_to(snapshot) {
+                return Err(untrusted(format!(
+                    "it describes {}, not this snapshot",
+                    meta.snapshot
+                )));
+            }
+            Ok(Some(meta))
+        }
+        // Encryption is on but the snapshot's manifest is not signed with our
+        // key: it could have been made without the key, so it is not trusted.
+        // Fall back to the local run record (decision 0016).
+        Err(e) if encryption && crate::client::manifest_unsigned_error(&format!("{e:#}")) => {
+            eprintln!(
+                "backup metadata of {snapshot} is not signed with the configured key although \
+                 encryption is on; not used for permissions"
+            );
+            Ok(None)
+        }
+        // Anything else (wrong key, transport or file-system error): a blob
+        // that cannot be read is an error (decision 0016).
+        Err(e) => Err(ApiError::internal(format!(
+            "cannot read the backup metadata of {snapshot}: {e:#}"
+        ))),
     }
-    Ok(Some(meta))
 }
 
 fn user_scope_for(
@@ -1207,6 +1296,99 @@ mod tests {
 
     const SNAPSHOT: &str = "host/desktop/2026-11-06T21:20:00Z";
 
+    fn meta_for(backup_time: i64) -> crate::metadata::BackupMetadata {
+        crate::metadata::BackupMetadata {
+            format: crate::metadata::FORMAT,
+            nestegg_version: "0.1.0".into(),
+            backup_id: "desktop".into(),
+            hostname: "desktop".into(),
+            backup_time,
+            snapshot: crate::client::snapshot_path("desktop", backup_time),
+            archive_sources: [("home.pxar".to_string(), "/home".to_string())].into(),
+            sources: vec!["/home".into()],
+            system_mode: false,
+            incomplete: vec![],
+        }
+    }
+
+    #[test]
+    fn interpret_metadata_trusts_authentic_falls_back_and_refuses() {
+        // A blob that was restored with the key, parses and describes exactly
+        // this snapshot: trusted.
+        let good = meta_for(1_794_000_000);
+        assert_eq!(good.snapshot, SNAPSHOT);
+        let fetched = Ok(Some(crate::metadata::Fetched {
+            bytes: good.to_bytes(),
+        }));
+        assert_eq!(
+            interpret_metadata(fetched, true, SNAPSHOT).ok(),
+            Some(Some(good))
+        );
+
+        // No blob (older version): fall back to the local run record.
+        assert_eq!(
+            interpret_metadata(Ok(None), true, SNAPSHOT).ok(),
+            Some(None)
+        );
+
+        // Encryption on, but the snapshot's manifest is not signed with our
+        // key (an unencrypted, possibly forged snapshot): the client refuses
+        // it; that is not a hard error, it falls back to the local record.
+        let unsigned = Err(anyhow::anyhow!(
+            "Error: manifest has no signature, but an encryption key is set - refusing to trust \
+             a potentially tampered, unsigned backup"
+        ));
+        assert_eq!(
+            interpret_metadata(unsigned, true, SNAPSHOT).ok(),
+            Some(None)
+        );
+
+        // A blob that belongs to another snapshot: refused (403), never used.
+        let other = crate::metadata::Fetched {
+            bytes: meta_for(1_794_000_001).to_bytes(),
+        };
+        let err = interpret_metadata(Ok(Some(other)), true, SNAPSHOT).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // A blob that does not parse: refused (403).
+        let bad = crate::metadata::Fetched {
+            bytes: b"not json".to_vec(),
+        };
+        let err = interpret_metadata(Ok(Some(bad)), true, SNAPSHOT).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // Any other read failure (wrong key, transport, file system): a blob
+        // that cannot be read is an error, not a silent fall-back.
+        let io = Err(anyhow::anyhow!(
+            "Error: wrong key - unable to verify signature since manifest's key aa does not \
+             match provided key bb"
+        ));
+        let err = interpret_metadata(io, true, SNAPSHOT).unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn metadata_cache_is_keyed_by_config_and_bounded() {
+        let config = Config::parse(CONFIG).unwrap();
+        let mut other = config.clone();
+        // Same snapshot, different datastore -> different key -> no stale hit.
+        other.pbs.datastore = "other".into();
+        let mut cache = MetadataCache::default();
+        cache.insert(
+            MetaKey::new(&config, SNAPSHOT),
+            Some(meta_for(1_794_000_000)),
+        );
+        assert!(cache.get(&MetaKey::new(&config, SNAPSHOT)).is_some());
+        assert!(cache.get(&MetaKey::new(&other, SNAPSHOT)).is_none());
+
+        // The cache is bounded: inserting far more than MAX evicts the oldest.
+        for i in 0..(MetadataCache::MAX as i64 + 100) {
+            let snap = crate::client::snapshot_path("desktop", 1_000_000 + i);
+            cache.insert(MetaKey::new(&config, &snap), None);
+        }
+        assert!(cache.entries.len() <= MetadataCache::MAX);
+    }
+
     #[test]
     fn scope_comes_from_metadata_then_local_record_never_notes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1227,7 +1409,7 @@ mod tests {
         app.metadata
             .lock()
             .unwrap()
-            .insert(SNAPSHOT.into(), Some(meta));
+            .insert(MetaKey::new(&config, SNAPSHOT), Some(meta));
         // A local record that claims something else does not matter while
         // the snapshot has metadata.
         let store = Store::new(&app.paths);
@@ -1248,7 +1430,10 @@ mod tests {
         assert_eq!(err.status, StatusCode::FORBIDDEN);
 
         // Without metadata: the local record of exactly this snapshot.
-        app.metadata.lock().unwrap().insert(SNAPSHOT.into(), None);
+        app.metadata
+            .lock()
+            .unwrap()
+            .insert(MetaKey::new(&config, SNAPSHOT), None);
         assert_eq!(
             snapshot_source(&app, &config, SNAPSHOT, "etc.pxar").ok(),
             Some(PathBuf::from("/etc"))
@@ -1261,7 +1446,10 @@ mod tests {
         );
         // Neither: refused with a pointer to the administrator.
         let other = "host/desktop/2026-11-07T00:00:00Z";
-        app.metadata.lock().unwrap().insert(other.into(), None);
+        app.metadata
+            .lock()
+            .unwrap()
+            .insert(MetaKey::new(&config, other), None);
         let err = snapshot_source(&app, &config, other, "home.pxar").unwrap_err();
         assert_eq!(err.status, StatusCode::FORBIDDEN);
         assert!(
