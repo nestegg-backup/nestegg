@@ -1044,9 +1044,22 @@ fn caller_name(peer: &PeerInfo) -> String {
     }
 }
 
+/// What a cancel request found.
+enum CancelOutcome {
+    Signalled,
+    /// No run with this id has ever been recorded.
+    Unknown,
+    /// The run exists but has not published its process yet.
+    Starting,
+    /// The run exists and is over.
+    Finished,
+}
+
 /// `POST /api/v1/runs/{id}/cancel`: any group member may cancel (they
 /// operate the backups of this computer); who did it is logged and ends up
-/// in the run record.
+/// in the run record. 404 for an id that does not exist, 409
+/// `cannot_cancel` for a run that exists but cannot be cancelled (still
+/// starting, or already over).
 async fn cancel_run(
     AxState(app): AxState<App>,
     peer: PeerInfo,
@@ -1063,15 +1076,21 @@ async fn cancel_run(
     let paths = app.paths.clone();
     let who = caller.clone();
     let run_id = id.clone();
-    let found = blocking(move || {
+    let outcome = blocking(move || {
         let id = run_id;
+        if Store::new(&paths).get_run(&id)?.is_none() {
+            return Ok(CancelOutcome::Unknown);
+        }
+        if crate::run::active_run(&paths)?.is_none_or(|r| r.id != id) {
+            return Ok(CancelOutcome::Finished);
+        }
         let text = std::fs::read_to_string(paths.runtime_dir.join("run.pid")).unwrap_or_default();
         let mut parts = text.split_whitespace();
-        let (Some(pid), Some(run_id)) = (parts.next(), parts.next()) else {
-            return Ok(false);
+        let (Some(pid), Some(pid_run_id)) = (parts.next(), parts.next()) else {
+            return Ok(CancelOutcome::Starting);
         };
-        if run_id != id || crate::run::active_run(&paths)?.is_none_or(|r| r.id != id) {
-            return Ok(false);
+        if pid_run_id != id {
+            return Ok(CancelOutcome::Starting);
         }
         let pid: i32 = pid.parse()?;
         // Read by the run when it records the cancellation.
@@ -1085,20 +1104,37 @@ async fn cancel_run(
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGTERM,
         )?;
-        Ok(true)
+        Ok(CancelOutcome::Signalled)
     })
     .await?;
-    if found {
-        eprintln!("backup run {id} cancelled by {caller}");
-        Ok((StatusCode::ACCEPTED, Json(json!({ "cancelling": true }))))
-    } else {
-        eprintln!("cancel of backup run {id} by {caller}: no running backup with this id");
-        Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "no running backup with this id",
-        ))
-    }
+    let (log, message) = match outcome {
+        CancelOutcome::Signalled => {
+            eprintln!("backup run {id} cancelled by {caller}");
+            return Ok((StatusCode::ACCEPTED, Json(json!({ "cancelling": true }))));
+        }
+        CancelOutcome::Unknown => {
+            eprintln!("cancel of backup run {id} by {caller}: unknown run");
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "unknown run",
+            ));
+        }
+        CancelOutcome::Starting => (
+            "the run is still starting",
+            "the backup is still starting and cannot be cancelled yet; try again in a moment",
+        ),
+        CancelOutcome::Finished => (
+            "the run is already over",
+            "this backup has already finished and cannot be cancelled",
+        ),
+    };
+    eprintln!("cancel of backup run {id} by {caller}: {log}");
+    Err(ApiError::new(
+        StatusCode::CONFLICT,
+        "cannot_cancel",
+        message,
+    ))
 }
 
 #[derive(Deserialize)]

@@ -9,6 +9,8 @@ import type {
   DirEntry,
   Machine,
   MachinesResponse,
+  CheckStatus,
+  PbsCheckItem,
   PbsCheckResult,
   PbsInfo,
   Restore,
@@ -20,6 +22,11 @@ import type {
   Status,
 } from "../src/lib/types.ts";
 import { DEFAULT_LIMITS, SETTING_KEYS, settingsProblem } from "../src/lib/settings.ts";
+
+/** An item of the connection check, as `check::run` of the daemon builds it. */
+function item(name: string, status: CheckStatus, detail: string): PbsCheckItem {
+  return { name, ok: status === "passed", status, detail };
+}
 
 export const SCENARIOS = [
   "ok",
@@ -59,12 +66,15 @@ export type Flavor = "full" | "today";
  * - `no_wake`: the configuration has no `[wake]` section (Wake-on-LAN cannot be switched on)
  * - `timer_fails`: switching automatic backups fails like a missing systemd (500, nothing changes)
  * - `unverified`: runs carry no `verified` flag (records of older versions)
- * - `cancel_late`: cancelling a running backup answers 404 `not_found` although it runs (the daemon
- *   answers 404 whenever it cannot cancel: over, not begun or already finishing)
+ * - `cancel_late`: the backup has just ended when the cancel request arrives: 409 `cannot_cancel`
+ *   (the daemon answers 404 for a run id it does not know and 409 for a run that exists but is over
+ *   or still starting; the `daemon=today` flavour answers 404 for all of it, like older daemons)
  * - `check_slow`: `POST /pbs/check` takes 6 s (like a PBS that has to be woken up)
  * - `check_bad`: the connection check finds a problem (login refused)
  * - `check_down`: the backup server is switched off (it does not wake): the connection check answers
- *   200 like the daemon, with a failed or "not now" item "PBS reachable" and no login check
+ *   200 like the daemon. Without Wake-on-LAN "PBS reachable" fails; with it the item is `not_checked`
+ *   (nobody asked to wake it), or `failed` after a wake attempt (`wake=true`). The login and
+ *   datastore items are `not_checked` in every case
  * - `no_usage`: `GET /pbs` does not know the datastore usage
  * - `no_encryption`: encryption is switched off
  * - `unknown_stored`: `credentials_stored` and `key_present` are null (the daemon cannot tell)
@@ -847,11 +857,20 @@ export class World {
     }
     if (method === "POST" && (m = /^\/runs\/([^/]+)\/cancel$/.exec(path))) {
       const a = this.active;
-      // Like the daemon: one answer, 404, whenever there is nothing to cancel (finished, no process
-      // yet, or already past the point where it listens). The contract's 409 `cannot_cancel` does not exist.
-      if (!a || a.run.id !== decodeURIComponent(m[1]!)) return err(404, "not_found", "no running backup with this id");
+      const id = decodeURIComponent(m[1]!);
+      const known = a?.run.id === id || this.runs.some((r) => r.id === id);
+      // Like the daemon: 404 for an id that does not exist, 409 `cannot_cancel` for a run that exists
+      // but is over or has no process to signal yet. A daemon from before that (flavour `today`)
+      // answered 404 "no running backup with this id" for all of these.
+      const cannot = (message: string) =>
+        today ? err(404, "not_found", "no running backup with this id") : err(409, "cannot_cancel", message);
+      if (!known) return today ? err(404, "not_found", "no running backup with this id") : err(404, "not_found", "unknown run");
+      if (!a || a.run.id !== id) return cannot("this backup has already finished and cannot be cancelled");
       const el = now - a.startedMs;
-      if (this.faults.has("cancel_late") || el < 1_500 || el >= 18_000) return err(404, "not_found", "no running backup with this id");
+      if (this.faults.has("cancel_late")) return cannot("this backup has already finished and cannot be cancelled");
+      if (el < 1_500) return cannot("the backup is still starting and cannot be cancelled yet; try again in a moment");
+      // The daemon signals the run until it is gone, also while it finishes: it then ends as
+      // cancelled, or as succeeded if the read-back check was already through.
       a.cancelAtMs ??= now;
       return { status: 202, body: { cancelling: true } };
     }
@@ -881,27 +900,27 @@ export class World {
       if (!this.configured) {
         const none: PbsCheckResult = {
           checked_at: checkedAt,
-          checks: [{ name: "configuration", ok: false, detail: "cannot read /etc/nestegg/config.toml: No such file or directory (os error 2)" }],
+          checks: [item("configuration", "failed", "cannot read /etc/nestegg/config.toml: No such file or directory (os error 2)")],
         };
         return { status: 200, body: none, delayMs };
       }
       const checks: PbsCheckResult["checks"] = [
-        { name: "configuration", ok: true, detail: "/etc/nestegg/config.toml" },
-        { name: "proxmox-backup-client", ok: true, detail: "proxmox-backup-client 3.4.1" },
+        item("configuration", "passed", "/etc/nestegg/config.toml"),
+        item("proxmox-backup-client", "passed", "proxmox-backup-client 3.4.1"),
         this.credentialsStored
-          ? { name: "password / token secret", ok: true, detail: "" }
-          : { name: "password / token secret", ok: false, detail: "cannot read /etc/nestegg/credentials/password.cred: No such file or directory (os error 2)" },
+          ? item("password / token secret", "passed", "")
+          : item("password / token secret", "failed", "cannot read /etc/nestegg/credentials/password.cred: No such file or directory (os error 2)"),
       ];
       if (this.encryptionOn()) {
         checks.push(
           this.keyCreated
-            ? { name: "encryption key", ok: true, detail: "" }
-            : { name: "encryption key", ok: false, detail: "cannot read /etc/nestegg/credentials/encryption-key.cred: No such file or directory (os error 2)" },
-          {
-            name: "encryption key exported",
-            ok: this.keyExported,
-            detail: this.keyExported ? "" : "export the key, then run `nestegg key confirm-exported --file <copy>` (or `--paper-code <code>`)",
-          },
+            ? item("encryption key", "passed", "")
+            : item("encryption key", "failed", "cannot read /etc/nestegg/credentials/encryption-key.cred: No such file or directory (os error 2)"),
+          item(
+            "encryption key exported",
+            this.keyExported ? "passed" : "failed",
+            this.keyExported ? "" : "export the key, then run `nestegg key confirm-exported --file <copy>` (or `--paper-code <code>`)",
+          ),
         );
       }
       const sources = [
@@ -910,25 +929,39 @@ export class World {
       ];
       for (const src of sources) {
         const missing = src.archive === "fotos" && this.scenario === "failing";
-        checks.push({ name: `source ${src.archive}`, ok: !missing, detail: `${src.path}${missing ? " (missing)" : ""}` });
+        checks.push(item(`source ${src.archive}`, missing ? "failed" : "passed", `${src.path}${missing ? " (missing)" : ""}`));
       }
-      // A server that is off but can be woken is "ok" for the daemon ("a run will wake it"); without
-      // Wake-on-LAN it is a problem. A wake attempt (wake=true) that finds nobody changes nothing.
+      // Like `check::run`: a server that does not answer is a failed item without Wake-on-LAN. With it,
+      // and without a wake request, nothing is known ("not_checked"); after a wake attempt (wake=true)
+      // that finds nobody, it is a failed item. What needs the server is "not_checked" then.
       const wakeOn = this.wakeOn();
-      checks.push({
-        name: "PBS reachable",
-        ok: !serverOff || wakeOn,
-        detail: !serverOff ? "pbs.example.com:8007" : wakeOn ? "not now (Wake-on-LAN configured; a run will wake it)" : "no answer",
-      });
       if (!serverOff) {
+        checks.push(item("PBS reachable", "passed", "pbs.example.com:8007"));
+      } else if (wakeOn && wakeParam) {
+        checks.push(item("PBS reachable", "failed", "no answer, not even after the Wake-on-LAN attempt"));
+      } else if (wakeOn) {
+        checks.push(
+          item(
+            "PBS reachable",
+            "not_checked",
+            "no answer; the server may be asleep (Wake-on-LAN is configured). `nestegg check --wake` wakes it and checks again; a backup run wakes it by itself",
+          ),
+        );
+      } else {
+        checks.push(item("PBS reachable", "failed", "no answer"));
+      }
+      if (serverOff) {
+        const why = wakeOn && !wakeParam ? "not checked: the server did not answer" : "not checked: the server is not reachable";
+        checks.push(item("PBS login and datastore access", "not_checked", why), item("overview access", "not_checked", why));
+      } else {
         checks.push(
           this.faults.has("check_bad")
-            ? { name: "PBS login and datastore access", ok: false, detail: "authentication failed: 401 invalid credentials for backup@pbs!desktop" }
-            : { name: "PBS login and datastore access", ok: true, detail: `${this.snapshots.length} snapshots` },
-          { name: "overview access", ok: true, detail: "4 machines" },
+            ? item("PBS login and datastore access", "failed", "authentication failed: 401 invalid credentials for backup@pbs!desktop")
+            : item("PBS login and datastore access", "passed", `${this.snapshots.length} snapshots`),
+          item("overview access", "passed", "4 machines"),
         );
       }
-      checks.push({ name: "backup timer enabled", ok: this.timerOn(), detail: "nestegg-backup.timer" });
+      checks.push(item("backup timer enabled", this.timerOn() ? "passed" : "failed", "nestegg-backup.timer"));
       const body: PbsCheckResult = { checked_at: checkedAt, checks };
       return { status: 200, body, delayMs };
     }
@@ -984,7 +1017,8 @@ export class World {
     }
     if (route === "PATCH /config") return this.updateConfig(body);
     // Proposed endpoints (API-REQUESTS.md).
-    if (route === "GET /machines" && !today) return { status: 200, body: this.machines(now) };
+    // Like the daemon: it reads the server first, which needs the configuration (500 without it).
+    if (route === "GET /machines" && !today) return this.configured ? { status: 200, body: this.machines(now) } : notConfigured();
     if (route === "GET /session" && !today) return { status: 200, body: { user: "alice", home: "/home/alice" } };
     return err(404, "not_found", "unknown endpoint");
   }

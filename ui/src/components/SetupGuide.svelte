@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import Cmd from "./Cmd.svelte";
+  import { reveal } from "../lib/reveal";
   import {
     CHECK_COMMAND,
     ENABLE_TIMERS_COMMAND,
@@ -145,7 +146,7 @@
                       aria-describedby={stickBad ? "g-stick-hint g-stick-bad" : "g-stick-hint"}
                     />
                     <p class="hint" id="g-stick-hint">{g.stickHint}</p>
-                    {#if stickBad}<p class="hint bad" id="g-stick-bad">{g.stickInvalid}</p>{/if}
+                    {#if stickBad}<p class="hint bad" id="g-stick-bad" use:reveal>{g.stickInvalid}</p>{/if}
                   </div>
                   <Cmd command={keyExportCommand(stick)} missing={g.fillStick} />
                   <p class="hint">{g.usbConfirm}</p>
@@ -165,7 +166,7 @@
                       aria-describedby={codeBad ? "g-code-hint g-code-bad" : "g-code-hint"}
                     />
                     <p class="hint" id="g-code-hint">{g.codeHint}</p>
-                    {#if codeBad}<p class="hint bad" id="g-code-bad">{g.codeInvalid}</p>{/if}
+                    {#if codeBad}<p class="hint bad" id="g-code-bad" use:reveal>{g.codeInvalid}</p>{/if}
                   </div>
                   <Cmd command={keyConfirmCodeCommand(code)} missing={g.fillCode} />
                 </section>

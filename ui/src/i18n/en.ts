@@ -194,6 +194,11 @@ const en = {
     factNext: "Next backup",
     nextAt: (m: Moment) => cap(at(m)),
     nextDue: "Due, starts shortly",
+    nextBlocked: {
+      credentials: "None yet, the token secret is missing",
+      key_create: "None yet, there is no key",
+      key_confirm: "None yet, the key copy is not confirmed",
+    },
     nextOff: "None, automatic backups are off",
     onServer: (size: string, count: number) =>
       `${size} in the latest backup, ${count} ${plural(count, "backup", "backups")} in total`,
@@ -225,6 +230,8 @@ const en = {
     cancelling: "Cancelling …",
     cancelGone:
       "Cancelling did not work: the backup is no longer running, or it is only just starting or already finishing. If it is still running, try again in a few seconds.",
+    cancelCannot:
+      "Cancelling is not possible right now: the backup is only just starting, or it has already finished. If it is still running, try again in a few seconds.",
     cancelFailed: (msg: string) => `Cancelling did not work. ${msg}`,
     factInterval: "Rhythm",
     factVerified: "Check",
@@ -448,9 +455,19 @@ const en = {
     checkBadLabel: "problem",
     checkPbs: "The backup server did not answer. Is it switched on?",
     checkPbsWol: "Wake-on-LAN is switched on, so nestegg tried to wake it. Try again later.",
+    checkIncomplete: "Not everything could be checked.",
+    checkSkipped: (n: number) => `${n} not checked.`,
+    checkNotCheckedLabel: "not checked",
+    checkAsleep:
+      "The backup server did not answer. It may be asleep. Whether the login and the access to the datastore work was not checked.",
+    checkWakeAgain: "Wake the server and check again",
     checkRunning: "Running: checking the connection.",
-    checkFinished: (problems: number) =>
-      problems ? `Check finished, ${problems} ${plural(problems, "item has", "items have")} a problem.` : "Check finished, everything is fine.",
+    checkFinished: (problems: number, skipped = 0) =>
+      problems
+        ? `Check finished, ${problems} ${plural(problems, "item has", "items have")} a problem.`
+        : skipped
+          ? "Check finished, but not everything could be checked."
+          : "Check finished, everything is fine.",
     checkFailed: (msg: string) => `The check could not be run. ${msg}`,
   },
   settings: {

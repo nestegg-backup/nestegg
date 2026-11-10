@@ -26,7 +26,13 @@
 }
 
 * { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
+html {
+  -webkit-text-size-adjust: 100%;
+  /* The title bar (sticky) and the status bar (sticky, fixed on a phone) cover the edges of the
+     viewport; whatever is scrolled into view (focus, anchors, src/lib/reveal.ts) stops short of them. */
+  scroll-padding-top: calc(var(--title-h) + 12px);
+  scroll-padding-bottom: calc(var(--sbar-h) + 16px);
+}
 body {
   margin: 0;
   background: var(--win);

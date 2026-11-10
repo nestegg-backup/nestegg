@@ -37,9 +37,16 @@ local API described in [`../api/openapi.yaml`](../api/openapi.yaml).
   has a placeholder (`<NAME>`) cannot be copied** (the copy button is
   `aria-disabled` with a short reason next to it) and is written so that a
   shell fails on it.
-- **Server view:** "Check connection" (`POST /pbs/check`, with Wake-on-LAN it
-  may take minutes: waiting state, then the list of checks and the time),
-  datastore usage from `GET /pbs` when the daemon knows it.
+- **Server view:** "Check connection" (`POST /pbs/check`: the list of checks
+  and the time; datastore usage from `GET /pbs` when the daemon knows it). An
+  item is passed, failed or **not checked** (`status`; `ok` stays for old
+  clients and is `false` for a check that was not made). The first check never
+  wakes the server: when it sleeps and Wake-on-LAN is on, "PBS reachable" and
+  everything that needs the server (login, datastore access) are "not
+  checked", the page says so and offers "wake the server and check again"
+  (`?wake=true`, may take minutes: waiting state; a server that still does not
+  answer is a failed check). Answers without `status` (older daemons) are read
+  by `ok`.
 - **Restore:** browse a snapshot, select files/folders in one or several
   areas (several `archives` go into one subfolder each), restore into a new
   directory with progress in bytes (`/snapshots/{time}/browse`,
@@ -155,10 +162,10 @@ Add faults to any scenario with `&fault=a,b`:
 | `no_wake` | no `[wake]` section: Wake-on-LAN cannot be switched on (`PATCH` answers 400) |
 | `timer_fails` | switching automatic backups answers 500, nothing changes |
 | `unverified` | runs carry no `verified` flag (records of older versions) |
-| `cancel_late` | cancelling a running backup answers `404 not_found` although it runs (the daemon answers 404 whenever it cannot cancel; it never sends the contract's `409 cannot_cancel`) |
+| `cancel_late` | the backup has just ended when the cancel request arrives: `409 cannot_cancel` (the daemon answers `404 not_found` for an unknown run id and `409` for a run that exists but is over or still starting) |
 | `check_slow` | `POST /pbs/check` takes 6 s (it does so anyway with `wake=true`, like a PBS that has to wake up) |
 | `check_bad` | the connection check finds a problem (login refused) |
-| `check_down` | the backup server is switched off: the connection check answers `200` as the daemon does (item "PBS reachable" `ok: false` / "not now" with Wake-on-LAN, no login item), never `503`; the scenarios `overdue` and `pbs_unreachable` behave the same |
+| `check_down` | the backup server is switched off: the connection check answers `200` as the daemon does, never `503`. Without Wake-on-LAN "PBS reachable" is `failed`; with it `not_checked` (nobody asked to wake it) or `failed` after a wake attempt (`wake=true`); login and datastore are `not_checked`. The scenarios `overdue` and `pbs_unreachable` behave the same |
 | `no_encryption` | encryption is switched off (no key steps in the guide) |
 | `unknown_stored` | `credentials_stored` and `key_present` are `null` (the daemon cannot tell) |
 | `no_usage` | `GET /pbs` does not know the datastore usage |
@@ -168,15 +175,19 @@ Add faults to any scenario with `&fault=a,b`:
 applies to the current scenario.
 
 Add `&daemon=today` to get what an older daemon offers: no `/machines`,
-`/session`, `/pbs` and `/pbs/check` (404), browse and restore answer 501.
+`/session`, `/pbs` and `/pbs/check` (404), browse and restore answer 501, and
+cancelling answers `404` in every case it cannot cancel.
 
 "Back up now" in the mock runs through all phases in about 20 s; in
 `pbs_unreachable` and `overdue` it ends with "server not reachable". While
-it uploads, "Cancel backup" works; in the first seconds and in the last two
-it answers `404` like the daemon (see `API-REQUESTS.md`), otherwise the run
-ends as `cancelled` after about a second. `POST /pbs/check` answers like
-`check::run` of the daemon (never fails, real item names) and does not
-change `/status`.
+it uploads, "Cancel backup" works (the run ends as `cancelled` after about a
+second); in the first seconds it answers `409 cannot_cancel` ("still
+starting"), for a run that is over `409` ("already finished"), and `404` for an
+id that does not exist, like the daemon (see `API-REQUESTS.md`).
+`POST /pbs/check` answers like `check::run` of the daemon (never fails, real
+item names, `status` per item) and does not change `/status`. Without a
+configuration (`unconfigured`) `/machines` answers `500` like the daemon, so
+the list of other computers is empty and the sidebar shows no note.
 Restoring into `/home/alice/Dokumente` (or another existing folder of the
 mock) answers `409 target_exists`. A restore takes about 4 s and reports
 `restored_bytes` and `total_bytes` while it runs.
@@ -217,6 +228,8 @@ The page comes from the dev server, API calls go to the daemon socket with
 | `src/lib/settings.ts`, `src/lib/settingsForm.ts` | Settings rules (same as the daemon) and the texts and helpers of the settings page |
 | `src/lib/session.ts` | Session token: taken from `#token=`, kept in `sessionStorage`, removed from the address bar |
 | `src/lib/api.ts` | API client (relative URLs, `Authorization: Bearer` header) |
+| `src/lib/check.ts` | Reading the connection check: passed / failed / not checked per item |
+| `src/lib/reveal.ts` | Svelte action that scrolls a message that appears below the fold into view, above the status bar (`scroll-padding-bottom` in `app.css` keeps its height free) |
 | `src/lib/store.svelte.ts` | Polling of `/status`; state of the cancel action and of the connection check |
 | `src/lib/derive.ts`, `src/lib/text.ts` | State derivation (including the setup guide step and the `nestegg init` command) and status sentences (unit-tested) |
 | `src/lib/format.ts` | Date, size and duration formatting |

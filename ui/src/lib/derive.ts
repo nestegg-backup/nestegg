@@ -453,6 +453,21 @@ export function keyMissing(s: Status): boolean {
 }
 
 /**
+ * Why no backup can run at the moment (so "next backup: 02:00" would be untrue), or null.
+ * Same order as the setup guide: the token secret, then the key, then the key copy. Unknown
+ * values (null or absent) never count as missing.
+ */
+export type Blocked = "unconfigured" | "credentials" | "key_create" | "key_confirm";
+
+export function backupBlocked(s: Status): Blocked | null {
+  if (s.health === "unconfigured") return "unconfigured";
+  if (s.pbs.credentials_stored === false) return "credentials";
+  if (s.encryption.enabled && keyMissing(s)) return "key_create";
+  if (s.encryption.enabled && s.encryption.key_exported === false) return "key_confirm";
+  return null;
+}
+
+/**
  * Where the user is on the way from a fresh install to the first backup, or
  * null once there is nothing (more) to guide. Setup and key work happen in a
  * terminal as root; the page only tells which step is next and moves on by

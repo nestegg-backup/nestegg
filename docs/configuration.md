@@ -16,7 +16,7 @@ On the desktop:
 
 ```sh
 sudo apt install proxmox-backup-client-static # see "Installing the backup client" below
-sudo apt install ./nestegg_<version>_amd64.deb
+sudo apt install ./nestegg_<version>_amd64.deb # the file: see "Getting the package" below the box
 
 sudo nestegg init --server pbs.example.com --datastore backups \
      --namespace desktops --auth-id 'backup@pbs!desktop' \
@@ -40,6 +40,12 @@ certificate. It is shown on the PBS dashboard ("Show Fingerprint").
 
 Then make the first backup right away instead of waiting for the timer: see
 "The first backup" below.
+
+**Getting the package.** The `.deb` file comes from the release page of the
+repository once a release exists. Until then, build it yourself on a machine
+with the Rust and Node.js toolchains (see `README.md`; `cargo install
+cargo-deb` once): `(cd ui && npm ci && npm run build) && cargo build --release
+&& cargo deb -p nestegg --no-build`. The package is written to `target/debian/`.
 
 ## Installing the backup client
 

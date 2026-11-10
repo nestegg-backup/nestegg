@@ -4,6 +4,7 @@
   import LoadError from "./LoadError.svelte";
   import Switch from "./Switch.svelte";
   import { app } from "../lib/store.svelte";
+  import { reveal } from "../lib/reveal";
   import { href } from "../lib/router.svelte";
   import { statusBar } from "../lib/statusbar.svelte";
   import { ApiFailure } from "../lib/api";
@@ -197,7 +198,7 @@
 
 {#snippet problemLine(row: Row, id: string)}
   {#if problems[row]}
-    <p class="e" id={id}>
+    <p class="e" id={id} use:reveal>
       {s.notSaved(problems[row]!.text)}
       {#if problems[row]!.detail}<span class="detail">{t.errors.detail(problems[row]!.detail!)}</span>{/if}
     </p>

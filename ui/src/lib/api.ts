@@ -93,10 +93,10 @@ export const api = {
   runs: (limit = 200) => request<{ runs: Run[] }>(`runs?limit=${limit}`).then((r) => r.runs),
   run: (id: string) => request<RunDetail>(`runs/${q(id)}`),
   startRun: () => request<Run>("runs", { method: "POST" }),
-  /** Ask the daemon to stop a running backup. Rejects with kind `conflict` (`cannot_cancel`) or `not_found`. */
+  /** Ask the daemon to stop a running backup. Rejects with kind `conflict` (`cannot_cancel`: still starting, or already over) or `not_found` (unknown run; older daemons also answered 404 for the former). */
   cancelRun: (id: string) => request<{ cancelling?: boolean }>(`runs/${q(id)}/cancel`, { method: "POST" }),
   pbs: () => request<PbsInfo>("pbs"),
-  /** Runs the checks of `nestegg check`; with `wake` the PBS is woken first if it sleeps (can take minutes). */
+  /** Runs the checks of `nestegg check`; without `wake` a sleeping PBS is reported as not checked; with `wake` it is woken first (can take minutes). */
   checkPbs: (wake: boolean) => request<PbsCheckResult>(`pbs/check${wake ? "?wake=true" : ""}`, { method: "POST" }),
   snapshots: () => request<{ snapshots: Snapshot[] }>("snapshots").then((r) => r.snapshots),
   browse: (time: string, archive: string, path: string) =>

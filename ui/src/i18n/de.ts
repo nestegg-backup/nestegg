@@ -195,6 +195,11 @@ const de = {
     factNext: "Nächste Sicherung",
     nextAt: (m: Moment) => cap(at(m)),
     nextDue: "Fällig, startet in Kürze",
+    nextBlocked: {
+      credentials: "Noch keine, das Secret des Tokens fehlt",
+      key_create: "Noch keine, es gibt keinen Schlüssel",
+      key_confirm: "Noch keine, die Schlüsselkopie ist nicht bestätigt",
+    },
     nextOff: "Keine, automatisch sichern ist aus",
     onServer: (size: string, count: number) =>
       `${size} im letzten Stand, ${count} ${plural(count, "Stand", "Stände")} insgesamt`,
@@ -226,6 +231,8 @@ const de = {
     cancelling: "Wird abgebrochen …",
     cancelGone:
       "Das Abbrechen ging nicht: Die Sicherung läuft nicht mehr, oder sie startet gerade erst oder schließt schon ab. Läuft sie noch, versuch es in ein paar Sekunden noch einmal.",
+    cancelCannot:
+      "Das Abbrechen geht gerade nicht: Die Sicherung startet erst oder ist schon zu Ende. Läuft sie noch, versuch es in ein paar Sekunden noch einmal.",
     cancelFailed: (msg: string) => `Das Abbrechen hat nicht geklappt. ${msg}`,
     factInterval: "Rhythmus",
     factVerified: "Kontrolle",
@@ -453,9 +460,19 @@ const de = {
     checkPbs: "Der Backup-Server hat nicht geantwortet. Ist er eingeschaltet?",
     checkPbsWol:
       "Wake-on-LAN ist eingeschaltet, nestegg hat also versucht, ihn zu wecken. Versuch es später noch einmal.",
+    checkIncomplete: "Es ließ sich nicht alles prüfen.",
+    checkSkipped: (n: number) => `${n} nicht geprüft.`,
+    checkNotCheckedLabel: "nicht geprüft",
+    checkAsleep:
+      "Der Backup-Server hat nicht geantwortet, vielleicht schläft er. Ob die Anmeldung und der Zugriff auf den Datastore klappen, wurde deshalb nicht geprüft.",
+    checkWakeAgain: "Server wecken und noch einmal prüfen",
     checkRunning: "Läuft: Verbindung wird geprüft.",
-    checkFinished: (problems: number) =>
-      problems ? `Prüfung fertig, ${problems} ${plural(problems, "Punkt hat", "Punkte haben")} ein Problem.` : "Prüfung fertig, alles in Ordnung.",
+    checkFinished: (problems: number, skipped = 0) =>
+      problems
+        ? `Prüfung fertig, ${problems} ${plural(problems, "Punkt hat", "Punkte haben")} ein Problem.`
+        : skipped
+          ? "Prüfung fertig, es ließ sich aber nicht alles prüfen."
+          : "Prüfung fertig, alles in Ordnung.",
     checkFailed: (msg: string) => `Die Prüfung ließ sich nicht ausführen. ${msg}`,
   },
   settings: {

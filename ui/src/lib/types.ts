@@ -190,9 +190,20 @@ export interface PbsInfo {
 }
 
 /** Result of `POST /api/v1/pbs/check`. */
+export type CheckStatus = "passed" | "failed" | "not_checked";
+
+export interface PbsCheckItem {
+  name: string;
+  /** `status == passed`; a check that was not made has `ok: false`. */
+  ok: boolean;
+  /** Absent in answers of older daemons: `ok` then means passed or failed. */
+  status?: CheckStatus;
+  detail: string;
+}
+
 export interface PbsCheckResult {
   checked_at: string;
-  checks: { name: string; ok: boolean; detail: string }[];
+  checks: PbsCheckItem[];
 }
 
 export interface HealthInfo {

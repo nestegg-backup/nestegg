@@ -446,6 +446,11 @@ check "cancelled run recorded as cancelled" bash -c "$API http://localhost/api/v
 check "run record names who cancelled" bash -c "$API http://localhost/api/v1/runs/$run_id | grep -q 'cancel requested by alice (uid $alice_uid)'"
 check "daemon log names who cancelled" on_client grep -q "backup run $run_id cancelled by alice (uid $alice_uid)" /var/log/nestegg-daemon.log
 check "no backup client left running" exits_with 1 on_client pgrep -f 'proxmox-backup-client backup'
+# A run that exists but is over cannot be cancelled (409); an id that does not exist is 404.
+check "cancelling a finished run: 409 cannot_cancel" \
+  responds 409 '"code":"cannot_cancel".*already finished' alice -X POST "http://localhost/api/v1/runs/$run_id/cancel"
+check "cancelling an unknown run: 404 not_found" \
+  responds 404 '"code":"not_found"' alice -X POST http://localhost/api/v1/runs/no-such-run/cancel
 on_client sed -i '/^rate_limit = "100KiB"$/d' /etc/nestegg/config.toml
 on_client rm -f /home/alice/big-new-file.bin
 
@@ -489,6 +494,17 @@ check "status text shows the failed server check" bash -c "docker exec $client n
 
 echo "== PBS unreachable"
 docker stop "$pbs" >/dev/null
+# The connection check with the PBS stopped and no Wake-on-LAN: the server did not answer (failed),
+# so the login could not be tried (not checked); neither is reported as fine.
+set +e
+check_out="$(on_client nestegg check 2>&1)"
+check_code=$?
+set -e
+check "nestegg check: exit code 1 when the PBS does not answer" test "$check_code" -eq 1
+check "nestegg check: PBS reachable is a FAIL, the login is skipped" \
+  bash -c "grep -q '^\[FAIL\] PBS reachable' <<<\"\$1\" && grep -q '^\[skip\] PBS login and datastore access' <<<\"\$1\"" _ "$check_out"
+check "POST /pbs/check (PBS down, no Wake-on-LAN): reachable failed, login not checked" \
+  responds 200 '"name":"PBS reachable","ok":false,"status":"failed".*"name":"PBS login and datastore access","ok":false,"status":"not_checked"' alice -X POST http://localhost/api/v1/pbs/check
 set +e
 on_client nestegg run --trigger manual >/dev/null 2>&1
 code=$?
@@ -516,6 +532,21 @@ broadcast = "$bcast"
 port = 9
 timeout_seconds = 120
 WAKE
+# The PBS is stopped and Wake-on-LAN is configured. Without a wake request nothing was checked:
+# "not checked" (API status not_checked), never "fine" and not a failure either. (The exit code 2 for
+# "nothing failed, but not everything was checked" is covered by unit tests: this container has no
+# systemd timer, so `nestegg check` fails here for that reason anyway.)
+check_out="$(on_client nestegg check 2>&1 || true)"
+check "nestegg check: PBS reachable and the login are skip, neither ok nor FAIL" \
+  bash -c "grep -q '^\[skip\] PBS reachable' <<<\"\$1\" && grep -q '^\[skip\] PBS login and datastore access' <<<\"\$1\" && ! grep -q '^\[FAIL\] PBS' <<<\"\$1\"" _ "$check_out"
+check "POST /pbs/check (PBS asleep, Wake-on-LAN): not_checked, ok false for old clients" \
+  responds 200 '"name":"PBS reachable","ok":false,"status":"not_checked".*"name":"PBS login and datastore access","ok":false,"status":"not_checked"' alice -X POST http://localhost/api/v1/pbs/check
+# Asked to wake it and nobody answers: a failed check. A packet for another MAC address goes out, so
+# the stand-in mainboard below does not switch the PBS on, and the wait is short.
+on_client sed -i 's/^mac = "00:00:5e:00:53:01"$/mac = "00:00:5e:00:53:02"/; s/^timeout_seconds = 120$/timeout_seconds = 6/' /etc/nestegg/config.toml
+check "POST /pbs/check?wake=true (the PBS does not come up): reachable failed" \
+  responds 200 'no answer, not even after the Wake-on-LAN attempt","name":"PBS reachable","ok":false,"status":"failed"' alice -X POST 'http://localhost/api/v1/pbs/check?wake=true'
+on_client sed -i 's/^mac = "00:00:5e:00:53:02"$/mac = "00:00:5e:00:53:01"/; s/^timeout_seconds = 6$/timeout_seconds = 120/' /etc/nestegg/config.toml
 magic="ffffffffffff$(printf '00005e005301%.0s' $(seq 1 16))"
 (
   for _ in $(seq 1 200); do

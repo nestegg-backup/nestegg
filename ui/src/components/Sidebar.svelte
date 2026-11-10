@@ -82,7 +82,8 @@
       {/each}
       <p class="note">{t.nav.othersNote}</p>
     {/if}
-    {#if app.machinesError}
+    <!-- Before the setup the daemon cannot read the server (no configuration): nothing to report. -->
+    {#if app.machinesError && status.health !== "unconfigured"}
       {#if !others.length}<h2 class="grp">{t.nav.others}</h2>{/if}
       <p class="note">
         {t.load.othersFailed}

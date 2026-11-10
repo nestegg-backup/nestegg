@@ -131,9 +131,9 @@ describe("scenarios for every step of the guide", () => {
 });
 
 describe("cancel a run", () => {
-  // The daemon answers 404 "no running backup with this id" in every case it cannot cancel
-  // (crates/nestegg/src/daemon.rs, cancel_run). The contract's 409 cannot_cancel does not exist there.
-  it("answers 404 for an unknown run and while the run is still starting", () => {
+  // crates/nestegg/src/daemon.rs, cancel_run: 404 for an id that does not exist, 409 `cannot_cancel`
+  // for a run that exists but is still starting or already over (the contract in api/openapi.yaml).
+  it("answers 404 for an unknown run and 409 while the run is still starting", () => {
     const t0 = Date.now();
     const w = new World("ok", "full", t0);
     const unknown = w.handle("POST", "/runs/nope/cancel", params, null, t0);
@@ -141,8 +141,9 @@ describe("cancel a run", () => {
     expect((unknown.body as { code: string }).code).toBe("not_found");
     const run = w.handle("POST", "/runs", params, null, t0).body as Run;
     const early = w.handle("POST", `/runs/${run.id}/cancel`, params, null, t0 + 500);
-    expect(early.status).toBe(404);
-    expect((early.body as { code: string }).code).toBe("not_found");
+    expect(early.status).toBe(409);
+    expect((early.body as { code: string }).code).toBe("cannot_cancel");
+    expect((early.body as { message: string }).message).toMatch(/still starting/);
   });
 
   it("202 while uploading, then the run ends as cancelled and is no longer current", () => {
@@ -160,16 +161,28 @@ describe("cancel a run", () => {
     expect(after.health).toBe("ok");
   });
 
-  it("answers 404 when the run is already finishing, and with the cancel_late fault; never 409", () => {
+  it("answers 409 for a run that is over, and with the cancel_late fault", () => {
     const t0 = Date.now();
     const w = new World("ok", "full", t0);
     const run = w.handle("POST", "/runs", params, null, t0).body as Run;
-    expect(w.handle("POST", `/runs/${run.id}/cancel`, params, null, t0 + 19_000).status).toBe(404);
     const late = new World("ok", "full", t0);
     late.faults.add("cancel_late");
     const r2 = late.handle("POST", "/runs", params, null, t0).body as Run;
-    expect(late.handle("POST", `/runs/${r2.id}/cancel`, params, null, t0 + 10_000).status).toBe(404);
-    // A run that has finished: also 404.
+    const r = late.handle("POST", `/runs/${r2.id}/cancel`, params, null, t0 + 10_000);
+    expect(r.status).toBe(409);
+    expect((r.body as { message: string }).message).toMatch(/already finished/);
+    // A run that has finished: also 409, not 404, because the run exists.
+    const done = w.handle("POST", `/runs/${run.id}/cancel`, params, null, t0 + 30_000);
+    expect(done.status).toBe(409);
+    expect((done.body as { code: string }).code).toBe("cannot_cancel");
+  });
+
+  it("the 'today' flavour answers 404 in every case, like a daemon from before", () => {
+    const t0 = Date.now();
+    const w = new World("ok", "today", t0);
+    const run = w.handle("POST", "/runs", params, null, t0).body as Run;
+    expect(w.handle("POST", `/runs/${run.id}/cancel`, params, null, t0 + 500).status).toBe(404);
+    expect(w.handle("POST", "/runs/nope/cancel", params, null, t0).status).toBe(404);
     expect(w.handle("POST", `/runs/${run.id}/cancel`, params, null, t0 + 30_000).status).toBe(404);
   });
 });
@@ -193,21 +206,27 @@ describe("POST /pbs/check", () => {
     expect(check(w, "wake=true").delayMs).toBeGreaterThan(1000);
   });
 
-  it("a server that is off is an answer, not an error: 200 with a failed item, never 503", () => {
-    // No Wake-on-LAN: "no answer" is a problem, and nothing can log in.
+  it("a server that is off is an answer, not an error: 200, never 503", () => {
+    // No Wake-on-LAN: "no answer" is a failed check, and the login was not checked.
     const off = new World("overdue", "full");
     off.faults.add("no_wake");
     const r = check(off);
     expect(r.status).toBe(200);
-    expect(item(r, "PBS reachable")).toMatchObject({ ok: false, detail: "no answer" });
-    expect(item(r, "PBS login and datastore access")).toBeUndefined();
-    // With Wake-on-LAN the daemon calls it fine ("a run will wake it"), still without a login item.
+    expect(item(r, "PBS reachable")).toMatchObject({ ok: false, status: "failed", detail: "no answer" });
+    expect(item(r, "PBS login and datastore access")).toMatchObject({ ok: false, status: "not_checked" });
+    expect(item(r, "overview access")).toMatchObject({ status: "not_checked" });
+    // With Wake-on-LAN and no wake request nothing was checked: not_checked, never "fine".
     const wol = check(new World("overdue", "full"));
     expect(wol.status).toBe(200);
-    expect(item(wol, "PBS reachable")).toMatchObject({ ok: true });
-    expect(item(wol, "PBS reachable")!.detail).toMatch(/Wake-on-LAN/);
-    expect(item(wol, "PBS login and datastore access")).toBeUndefined();
-    // The fault switches a healthy scenario's server off; waking it does not help.
+    expect(item(wol, "PBS reachable")).toMatchObject({ ok: false, status: "not_checked" });
+    expect(item(wol, "PBS reachable")!.detail).toMatch(/asleep/);
+    expect(item(wol, "PBS login and datastore access")).toMatchObject({ status: "not_checked" });
+    // Asked to wake it, and nobody answers: that is a failed check.
+    const woken = check(new World("overdue", "full"), "wake=true");
+    expect(item(woken, "PBS reachable")).toMatchObject({ ok: false, status: "failed" });
+    expect(item(woken, "PBS reachable")!.detail).toMatch(/Wake-on-LAN attempt/);
+    expect(item(woken, "PBS login and datastore access")).toMatchObject({ status: "not_checked" });
+    // The fault switches a healthy scenario's server off.
     const down = new World("ok", "full");
     down.faults.add("check_down");
     down.faults.add("no_wake");
@@ -215,6 +234,15 @@ describe("POST /pbs/check", () => {
       const d = check(down, q);
       expect(d.status).toBe(200);
       expect(item(d, "PBS reachable")?.ok).toBe(false);
+    }
+  });
+
+  it("every item carries a status that matches ok", () => {
+    for (const sc of ["ok", "overdue", "no_credentials"] as const) {
+      for (const c of (check(new World(sc, "full")).body as PbsCheckResult).checks) {
+        expect(c.status).toBeDefined();
+        expect(c.ok).toBe(c.status === "passed");
+      }
     }
   });
 
@@ -300,5 +328,15 @@ describe("run progress", () => {
     expect(s.state).toBe("uploading");
     expect(s.expected_bytes).toBeGreaterThan(0);
     expect(s.processed_bytes).toBeLessThanOrEqual(s.expected_bytes!);
+  });
+});
+
+describe("GET /machines without a configuration", () => {
+  it("answers 500 like the daemon (it cannot read the server), with data once configured", () => {
+    const none = new World("unconfigured", "full").handle("GET", "/machines", params, null);
+    expect(none.status).toBe(500);
+    expect((none.body as { code: string }).code).toBe("internal");
+    const ok = new World("ok", "full").handle("GET", "/machines", params, null);
+    expect(ok.status).toBe(200);
   });
 });

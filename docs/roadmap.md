@@ -22,8 +22,11 @@ Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
   exclusions, optional Wake-on-LAN target.
 - Credentials outside the configuration file (systemd credentials, with a
   root-only file as fallback); never in logs.
-- Commands: `init`, `backup`, `status`, `list`, `restore` (file or directory),
-  `check` (configuration and PBS reachability).
+- Commands: `init`, `backup`, `status`, `snapshots`, `history`, `restore`
+  (file or directory), `check` (configuration, PBS reachability and login;
+  a check that could not be made, such as the login while the PBS is
+  asleep, counts as "not checked", never as passed: exit code 0 passed,
+  1 failed, 2 not everything could be checked).
 - Scheduling via systemd timer with catch-up after the machine was off.
 - PBS availability: optional Wake-on-LAN, wait with a timeout, the wake-up
   packet repeated with growing pauses, "PBS unreachable" reported as its own

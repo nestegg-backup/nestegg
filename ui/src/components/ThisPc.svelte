@@ -9,7 +9,8 @@
   import SetupGuide from "./SetupGuide.svelte";
   import { app } from "../lib/store.svelte";
   import { href } from "../lib/router.svelte";
-  import { damagedSnapshots, damagedTimes, historyRows, restoreOffer, scheduleHours, selfStrip, selfTone, serverBackups, setupGuide } from "../lib/derive";
+  import { reveal } from "../lib/reveal";
+  import { backupBlocked, damagedSnapshots, damagedTimes, historyRows, restoreOffer, scheduleHours, selfStrip, selfTone, serverBackups, setupGuide } from "../lib/derive";
   import { selfSummary } from "../lib/text";
   import { f, t } from "../lib/locale";
   import type { Status } from "../lib/types";
@@ -36,6 +37,8 @@
   const sources = $derived((app.config.value?.sources ?? []).filter((s) => s.archive !== "inventory.pxar"));
   const latest = $derived(app.snapshots.state === "ok" ? (app.snapshots.list[0] ?? null) : null);
   const next = $derived(status.schedule.next_run ?? null);
+  // No backup can run: the facts must not promise a time.
+  const blocked = $derived(backupBlocked(status));
 
   // The run ends and the cancel block disappears. If the focus is in it, it would fall to <body>:
   // the new status sentence takes it. (Before the DOM changes, so the block is still there to ask.)
@@ -72,7 +75,7 @@
     </div>
     {#if running}<CancelRun />{/if}
     {#if app.startError}
-      <p class="hint" class:bad={app.startError.kind !== "conflict"} role="status">
+      <p class="hint" class:bad={app.startError.kind !== "conflict"} role="status" use:reveal>
         {app.startError.kind === "conflict" ? t.self.runConflict : t.self.runStartFailed(app.startError.message)}
       </p>
     {/if}
@@ -183,7 +186,9 @@
         {/if}
         <dt>{t.self.factNext}</dt>
         <dd>
-          {#if !status.schedule.enabled}
+          {#if blocked && blocked !== "unconfigured"}
+            {t.self.nextBlocked[blocked]}
+          {:else if !status.schedule.enabled}
             {t.self.nextOff}
           {:else if running}
             {t.self.runningLead}

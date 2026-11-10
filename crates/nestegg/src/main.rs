@@ -35,7 +35,13 @@ enum Cmd {
     #[command(subcommand)]
     Key(KeyCmd),
     /// Check configuration, secrets, client and server access.
-    Check,
+    Check {
+        /// Wake the backup server (Wake-on-LAN) if it does not answer, and
+        /// check again. Without it a sleeping server is reported as "not
+        /// checked".
+        #[arg(long)]
+        wake: bool,
+    },
     /// Start a backup now.
     Backup,
     /// Show the backup status of this computer.
@@ -292,7 +298,7 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
             overview,
         }) => set_password(paths, allow_plain, overview),
         Cmd::Key(k) => key(paths, k),
-        Cmd::Check => check(paths),
+        Cmd::Check { wake } => check(paths, wake),
         Cmd::Rescue { command } => nestegg::rescue::cli::run(command),
         Cmd::Backup => backup_now(paths),
         Cmd::Status { json } => status(paths, json),
@@ -1109,18 +1115,23 @@ fn write_user_file(path: &Path, data: &[u8]) -> Result<()> {
     }
 }
 
-fn check(paths: &Paths) -> Result<u8> {
+fn check(paths: &Paths, wake: bool) -> Result<u8> {
+    use nestegg::check::{CheckStatus, Outcome};
     let items = nestegg::check::run(
         paths,
         &nestegg::check::CheckOptions {
-            wake: false,
+            wake,
             login: is_root(),
         },
     );
     for item in &items {
         println!(
             "[{}] {}{}",
-            if item.ok { " ok " } else { "FAIL" },
+            match item.status {
+                CheckStatus::Passed => " ok ",
+                CheckStatus::Failed => "FAIL",
+                CheckStatus::NotChecked => "skip",
+            },
             item.name,
             if item.detail.is_empty() {
                 String::new()
@@ -1129,7 +1140,16 @@ fn check(paths: &Paths) -> Result<u8> {
             }
         );
     }
-    Ok(u8::from(!nestegg::check::passed(&items)?))
+    let outcome = nestegg::check::outcome(&items);
+    match outcome {
+        Outcome::Passed => {}
+        Outcome::Failed => println!("\nSomething failed (see FAIL above)."),
+        Outcome::Incomplete => println!(
+            "\nNot everything could be checked (see skip above). That is not a pass: \
+             the skipped checks say nothing about whether they would succeed."
+        ),
+    }
+    Ok(outcome.exit_code())
 }
 
 // ---------- commands that work through the daemon for non-root users ----------

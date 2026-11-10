@@ -66,7 +66,7 @@ class AppState {
     | { state: "asking" }
     | { state: "sending" }
     | { state: "requested"; runId: string }
-    | { state: "error"; kind: "gone" | "other"; message: string }
+    | { state: "error"; kind: "gone" | "cannot" | "other"; message: string }
   >({ state: "idle" });
   now = $state(new Date());
   starting = $state(false);
@@ -230,10 +230,10 @@ class AppState {
       this.cancel = { state: "requested", runId: run.id };
     } catch (e) {
       const f = asFailure(e);
-      // The daemon answers 404 "no running backup with this id" whenever it cannot cancel: the run
-      // is over, has not begun yet or is already finishing. The contract also names a 409
-      // `cannot_cancel` for the latter; no daemon sends it, but it means the same for the user.
-      if (f.kind === "not_found" || f.kind === "conflict") this.cancel = { state: "error", kind: "gone", message: f.message };
+      // 409 `cannot_cancel`: the run exists but is only just starting or already over. 404: no such
+      // run; an older daemon also answered 404 for those two cases, so its text covers all of them.
+      if (f.kind === "conflict") this.cancel = { state: "error", kind: "cannot", message: f.message };
+      else if (f.kind === "not_found") this.cancel = { state: "error", kind: "gone", message: f.message };
       else this.cancel = { state: "error", kind: "other", message: f.message };
     }
     await this.poll();
@@ -249,12 +249,13 @@ class AppState {
   }
 
   /**
-   * "Check connection": runs the checks of `nestegg check`. With Wake-on-LAN
-   * switched on the daemon may wake the server first, which can take minutes.
+   * "Check connection": runs the checks of `nestegg check`. Without `wake` a
+   * server that sleeps is reported as "not checked" and nothing is woken; the
+   * page then offers to wake it, which runs the check again with `wake` (the
+   * daemon wakes the server first, which can take minutes).
    */
-  async checkPbs() {
+  async checkPbs(wake = false) {
     if (this.pbsCheck.state === "running") return;
-    const wake = !!this.status?.pbs.wake_on_lan;
     this.pbsCheck = { state: "running", wake };
     try {
       // An unreachable server is a normal answer (200 with a failed "PBS reachable" item), not an error.

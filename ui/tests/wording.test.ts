@@ -120,8 +120,9 @@ describe("words", () => {
     expect(de.self.stepUploadProgress("a", "b")).not.toContain("durchgesehen");
   });
 
-  it("cancel texts follow the daemon: one 404 answer, no 'cannot_cancel' wording", () => {
-    expect("cancelCannot" in de.self).toBe(false);
+  it("cancel texts: 409 cannot_cancel (starting or over) and the broad 404 text of older daemons", () => {
+    expect(en.self.cancelCannot).toMatch(/only just starting/);
+    expect(de.self.cancelCannot).toMatch(/startet erst/);
     expect(en.self.cancelGone).toMatch(/no longer running/);
   });
 });

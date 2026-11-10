@@ -4,6 +4,7 @@ import de from "../src/i18n/de";
 import en from "../src/i18n/en";
 import {
   ENABLE_TIMERS_COMMAND,
+  backupBlocked,
   PAPER_KEY_COMMAND,
   hasPlaceholder,
   initCommand,
@@ -348,5 +349,21 @@ describe("guide wording", () => {
     const text = JSON.stringify(de.guide);
     expect(text).not.toMatch(/Geheimnis/);
     expect(de.guide.setupIntro).toContain("Secret");
+  });
+});
+
+describe("backupBlocked: no promised time while no backup can run", () => {
+  it("token secret, key and key copy block, in the order of the guide", () => {
+    expect(backupBlocked(status({ health: "unconfigured" }))).toBe("unconfigured");
+    expect(backupBlocked(status({}, {}, { credentials_stored: false }))).toBe("credentials");
+    expect(backupBlocked(status({}, { key_present: false, key_fingerprint: null, key_exported: false }))).toBe("key_create");
+    expect(backupBlocked(status({}, { key_present: true, key_exported: false }))).toBe("key_confirm");
+    // The secret is named first when both are missing.
+    expect(backupBlocked(status({}, { key_present: false, key_exported: false }, { credentials_stored: false }))).toBe("credentials");
+  });
+  it("unknown values, a working set-up and switched-off encryption block nothing", () => {
+    expect(backupBlocked(status())).toBeNull();
+    expect(backupBlocked(status({}, { key_present: null }, { credentials_stored: null }))).toBeNull();
+    expect(backupBlocked(status({}, { enabled: false, key_present: false, key_exported: false }))).toBeNull();
   });
 });

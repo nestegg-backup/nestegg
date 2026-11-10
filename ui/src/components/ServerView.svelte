@@ -4,6 +4,7 @@
   import { app } from "../lib/store.svelte";
   import { tick, untrack } from "svelte";
   import { historyRows, serverContact } from "../lib/derive";
+  import { itemStatus, summarizeCheck } from "../lib/check";
   import { f, t } from "../lib/locale";
   import type { Status } from "../lib/types";
 
@@ -12,9 +13,10 @@
   const p = $derived(status.pbs);
   const check = $derived(app.pbsCheck);
   const info = $derived(app.pbs);
-  const bad = $derived(check.state === "done" ? check.result.checks.filter((c) => !c.ok).length : 0);
-  // The daemon names this item; a server that does not answer is a failed item, not an error.
-  const reachFailed = $derived(check.state === "done" && check.result.checks.some((c) => c.name === "PBS reachable" && !c.ok));
+  // A server that does not answer is an item (failed, or not checked while it sleeps), not an error.
+  const sum = $derived(check.state === "done" ? summarizeCheck(check.result) : null);
+  const bad = $derived(sum?.failed ?? 0);
+  const skipped = $derived(sum?.notChecked ?? 0);
 
   let button: HTMLButtonElement | undefined = $state();
   let resultEl: HTMLElement | undefined = $state();
@@ -22,10 +24,10 @@
   /** Said once through the live region when the focus was elsewhere at the end of the check. */
   let announced = $state("");
 
-  async function run() {
+  async function run(wake = false) {
     if (app.pbsCheck.state === "running" || app.offline) return;
     announced = "";
-    await app.checkPbs();
+    await app.checkPbs(wake);
     await tick();
     const a = document.activeElement;
     // The button is "busy" and keeps the focus. At the end the focus goes to the result, unless
@@ -34,7 +36,10 @@
     const end = app.pbsCheck;
     if (here && end.state === "done") resultEl?.focus();
     else if (here && end.state === "error") errorEl?.focus();
-    else if (end.state === "done") announced = t.server.checkFinished(end.result.checks.filter((c) => !c.ok).length);
+    else if (end.state === "done") {
+      const s = summarizeCheck(end.result);
+      announced = t.server.checkFinished(s.failed, s.notChecked);
+    }
     else if (end.state === "error") announced = t.server.checkFailed(end.message);
   }
 
@@ -81,7 +86,7 @@
       bind:this={button}
       disabled={app.offline}
       aria-disabled={check.state === "running" ? "true" : undefined}
-      onclick={run}
+      onclick={() => run()}
     >
       {check.state === "running" ? t.server.checking : t.server.check}
     </button>
@@ -93,20 +98,36 @@
     <h2 id="h-check">{t.server.checkTitle}</h2>
     <p class="hint" id="check-sum">
       {t.server.checkedAt(f.moment(check.result.checked_at, app.now))}
-      {bad ? t.server.checkProblems(bad) : t.server.checkAllOk}
+      {bad ? t.server.checkProblems(bad) : skipped ? t.server.checkIncomplete : t.server.checkAllOk}
+      {bad && skipped ? t.server.checkSkipped(skipped) : ""}
     </p>
-    {#if reachFailed}
+    {#if sum?.unreachable}
       <p class="hint bad">{t.server.checkPbs}{check.wake ? ` ${t.server.checkPbsWol}` : ""}</p>
+    {:else if sum?.asleep}
+      <p class="hint">{t.server.checkAsleep}</p>
+      {#if p.wake_on_lan}
+        <p class="again">
+          <button
+            class="btn small"
+            type="button"
+            disabled={app.offline}
+            onclick={() => run(true)}
+          >
+            {t.server.checkWakeAgain}
+          </button>
+        </p>
+      {/if}
     {/if}
     <ul>
       {#each check.result.checks as c}
+        {@const st = itemStatus(c)}
         <li>
           <span class="res">
-            <Dot tone={c.ok ? "neutral" : "bad"} />
+            <Dot tone={st === "passed" ? "neutral" : st === "failed" ? "bad" : "pbs"} />
             <span>
               <strong>{c.name}</strong>
-              <span class="sr">: {c.ok ? t.server.checkOkLabel : t.server.checkBadLabel}</span>
-              {#if c.detail}<span class="detail" class:bad={!c.ok}>{c.detail}</span>{/if}
+              <span class="sr">: {st === "passed" ? t.server.checkOkLabel : st === "failed" ? t.server.checkBadLabel : t.server.checkNotCheckedLabel}</span>
+              {#if c.detail}<span class="detail" class:bad={st === "failed"}>{c.detail}</span>{/if}
             </span>
           </span>
         </li>
@@ -187,6 +208,7 @@
   .live:empty { position: absolute; margin: 0; }
   .result { margin-top: 22px; max-width: 720px; padding: 14px 16px 16px; }
   .result h2 { font-size: var(--fs-m); font-weight: 600; }
+  .again { margin-top: 8px; }
   .result ul { margin-top: 8px; display: grid; gap: 6px; }
   .result .detail { display: block; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
   .result .detail.bad { color: var(--bad); }

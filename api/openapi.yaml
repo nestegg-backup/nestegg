@@ -128,12 +128,16 @@ paths:
                 properties:
                   cancelling: { type: boolean }
         "404":
-          description: No running backup with this ID.
+          description: "`not_found`: no run with this ID exists (or it is not a valid run ID)."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
-          description: "`cannot_cancel`: still starting (retry) or already finishing."
+          description: |
+            `cannot_cancel`: the run exists but cannot be cancelled. Either it
+            is still starting and has not published its process yet (try
+            again in a moment), or it is already over (succeeded, failed,
+            cancelled). The message says which of the two.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -161,6 +165,16 @@ paths:
     post:
       operationId: checkPbs
       summary: Run the checks of `nestegg check` (configuration, client, secrets, sources, reachability, login).
+      description: |
+        Always answers 200; problems are items. An item is `passed`,
+        `failed`, or `not_checked`. A check that could not be made is
+        never reported as passed: a server that does not answer while
+        Wake-on-LAN is configured and no wake was requested is
+        `not_checked` ("PBS reachable"), and so are the checks that need
+        the server ("PBS login and datastore access", "overview access").
+        With `wake=true` the server is woken first (this may take minutes);
+        if it still does not answer, "PBS reachable" is `failed`. Without
+        Wake-on-LAN, a server that does not answer is `failed`.
       parameters:
         - name: wake
           in: query
@@ -183,7 +197,19 @@ paths:
                       required: [name, ok, detail]
                       properties:
                         name: { type: string, examples: ["PBS reachable"] }
-                        ok: { type: boolean }
+                        status:
+                          type: string
+                          enum: [passed, failed, not_checked]
+                          description: |
+                            Absent in answers of older daemons, which knew
+                            only `ok`; treat `ok: true` as `passed` and
+                            `ok: false` as `failed` then.
+                        ok:
+                          type: boolean
+                          description: |
+                            `status == passed`. A check that was not made
+                            has `ok: false`, so a client that only knows
+                            `ok` shows it as a problem, never as fine.
                         detail: { type: string }
   /machines:
     get:

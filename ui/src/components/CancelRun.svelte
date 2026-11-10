@@ -65,7 +65,7 @@
     <button class="btn small" type="button" bind:this={ask} disabled={app.offline} onclick={open}>{t.self.cancel}</button>
     {#if c.state === "error"}
       <p class="hint" class:bad={c.kind === "other"} role="status" tabindex="-1" bind:this={status}>
-        {c.kind === "gone" ? t.self.cancelGone : t.self.cancelFailed(c.message)}
+        {c.kind === "gone" ? t.self.cancelGone : c.kind === "cannot" ? t.self.cancelCannot : t.self.cancelFailed(c.message)}
       </p>
     {/if}
   {/if}

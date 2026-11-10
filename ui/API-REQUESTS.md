@@ -80,24 +80,18 @@ is needed.
 - **Cancelling:** after `202` the run has no state that says "cancelling"; the
   UI waits for `cancelled` (or `succeeded`) in `/status`. A `cancelling` flag on
   `Run` would let a second tab show the same thing. Optional.
-- **Contract and daemon disagree on cancelling.** `api/openapi.yaml` lists
-  `409 cannot_cancel` ("still starting or already finishing") for
-  `POST /runs/{id}/cancel`. The daemon (`cancel_run` in
-  `crates/nestegg/src/daemon.rs`) never sends it: whenever it has nothing to
-  signal (run over, no `run.pid` yet, other run id) it answers
-  `404 not_found` "no running backup with this id". The UI and the mock follow
-  the daemon: 404 and 409 both end in the same text ("no longer running, or
-  only just starting or already finishing; try again in a few seconds").
-  Either remove the 409 from the contract or let the daemon send it.
-- **`POST /pbs/check` says "ok" for a server that is off.** In
-  `check::run` the item "PBS reachable" is `ok` when the server answers *or*
-  Wake-on-LAN is configured (detail "not now (Wake-on-LAN configured; a run
-  will wake it)"). With Wake-on-LAN the whole check therefore reads
-  "everything is fine" although the login was never tried. The UI shows the
-  detail text of every item, but it cannot tell the two cases apart without
-  parsing English text. A separate machine-readable field (for example
-  `reachable: false` next to `checks`) would let the page say "the server is
-  off" in plain words.
+- **Cancelling (settled):** the daemon follows the contract. `404 not_found`
+  for a run id that does not exist, `409 cannot_cancel` for a run that exists
+  but cannot be cancelled (still starting, or already over; the message says
+  which). The UI shows its own text for 409 and keeps the broad text for a 404,
+  because a daemon from before this change answered 404 for every case.
+- **`POST /pbs/check` and checks that were not made (settled):** every item
+  has `status` = `passed`, `failed` or `not_checked` (`ok` stays: `status ==
+  passed`, so `false` for a check that was not made). A server that does not
+  answer while Wake-on-LAN is on and no wake was requested is `not_checked`,
+  and so is everything that needs the server. The UI therefore checks
+  without `wake` first and offers "wake the server and check again". Items
+  without `status` (older daemons) are read by `ok`.
 - **Who may cancel:** `POST /runs/{id}/cancel` does not mention permissions.
   The UI offers the button to every user of the page and shows the daemon's
   message for any other error.
@@ -122,11 +116,11 @@ All of these are in `api/openapi.yaml` and the UI uses them:
   `<target>/<archive name>/`), the stable `409 target_exists`, and progress
   (`restored_bytes`, `total_bytes`, `warnings`).
 - `POST /pbs/check` ("Check connection" on the server view; the UI passes
-  `wake=true` only when Wake-on-LAN is switched on) and `GET /pbs` (datastore
-  usage on the server view).
-- `POST /runs/{id}/cancel` ("Cancel backup" with a confirmation; the daemon
-  answers `404` for every case it cannot cancel, the contract's `409
-  cannot_cancel` is handled like it).
+  `wake=true` only when the user asks to wake the server after a check found
+  it asleep) and `GET /pbs` (datastore usage on the server view).
+- `POST /runs/{id}/cancel` ("Cancel backup" with a confirmation; `404` for an
+  unknown run, `409 cannot_cancel` for one that is starting or over; a `404`
+  from an older daemon is handled like any not-cancellable case).
 - Run progress: `expected_bytes` and `processed_bytes` (a bar under "Upload
   changed files").
 - `interval_hours` in `Status.schedule` and `ConfigView`; the UI no longer
