@@ -173,10 +173,18 @@ pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
     let mut reachable = crate::wake::is_reachable(&cfg, Duration::from_secs(5));
     let wake_on = cfg.active_wake().is_some();
     let mut wake_tried = false;
+    // Set when the wake-up packet could not even be sent (no network).
+    let mut wake_send_problem: Option<String> = None;
     if !reachable && options.wake && wake_on {
         wake_tried = true;
         reachable = matches!(
-            crate::wake::ensure_available(&cfg, |_| {}),
+            crate::wake::ensure_available(&cfg, |event| match event {
+                crate::wake::WakeEvent::SendFailed(why) => {
+                    wake_send_problem = Some(why.to_string())
+                }
+                crate::wake::WakeEvent::SendRecovered => wake_send_problem = None,
+                crate::wake::WakeEvent::Info(_) => {}
+            }),
             Ok(crate::wake::Availability::ReachableAfterWake { .. })
                 | Ok(crate::wake::Availability::Reachable)
         );
@@ -189,14 +197,27 @@ pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
         r.report(
             false,
             "PBS reachable",
-            "no answer, not even after the Wake-on-LAN attempt".into(),
+            match &wake_send_problem {
+                // Say why, instead of claiming a wake-up attempt that never
+                // left this computer.
+                Some(why) => {
+                    format!("no answer, and the Wake-on-LAN packet could not be sent: {why}")
+                }
+                None => "no answer, not even after the Wake-on-LAN attempt".into(),
+            },
         );
     } else if wake_on {
         // Asleep or off, and nobody asked to wake it: nothing is known.
         r.not_checked(
             "PBS reachable",
-            "no answer; the server may be asleep (Wake-on-LAN is configured). \
-             `nestegg check --wake` wakes it and checks again; a backup run wakes it by itself",
+            "no answer; the server may be asleep (Wake-on-LAN is configured, a backup run \
+             wakes it by itself)",
+        );
+    } else if options.wake {
+        r.report(
+            false,
+            "PBS reachable",
+            "no answer (Wake-on-LAN is not configured, so the server could not be woken)".into(),
         );
     } else {
         r.report(false, "PBS reachable", "no answer".into());

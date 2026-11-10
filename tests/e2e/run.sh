@@ -116,6 +116,10 @@ check "nothing was recorded by the failed attempts" \
 check "paper code of the printed key confirms" on_client nestegg key confirm-exported --paper-code "$paper_code"
 check "config contains no secret" exits_with 1 on_client grep -qF "$token_secret" /etc/nestegg/config.toml
 on_client nestegg check || true
+# This container has no systemd, so the timer check always fails; with a
+# stand-in `systemctl` that says "enabled" the exit code is the real verdict.
+check "nestegg check passes when everything is set up (exit code 0)" \
+  docker exec -e NESTEGG_SYSTEMCTL=/bin/true "$client" nestegg check
 
 echo "== first backup"
 check "backup succeeds" on_client nestegg backup
@@ -501,6 +505,9 @@ check_out="$(on_client nestegg check 2>&1)"
 check_code=$?
 set -e
 check "nestegg check: exit code 1 when the PBS does not answer" test "$check_code" -eq 1
+# The same without the timer failure of this container: still 1, for the server.
+check "nestegg check: exit code 1 for the server alone" \
+  exits_with 1 docker exec -e NESTEGG_SYSTEMCTL=/bin/true "$client" nestegg check
 check "nestegg check: PBS reachable is a FAIL, the login is skipped" \
   bash -c "grep -q '^\[FAIL\] PBS reachable' <<<\"\$1\" && grep -q '^\[skip\] PBS login and datastore access' <<<\"\$1\"" _ "$check_out"
 check "POST /pbs/check (PBS down, no Wake-on-LAN): reachable failed, login not checked" \
@@ -539,6 +546,10 @@ WAKE
 check_out="$(on_client nestegg check 2>&1 || true)"
 check "nestegg check: PBS reachable and the login are skip, neither ok nor FAIL" \
   bash -c "grep -q '^\[skip\] PBS reachable' <<<\"\$1\" && grep -q '^\[skip\] PBS login and datastore access' <<<\"\$1\" && ! grep -q '^\[FAIL\] PBS' <<<\"\$1\"" _ "$check_out"
+check "nestegg check: exit code 2 when nothing failed but the sleeping server was not checked" \
+  exits_with 2 docker exec -e NESTEGG_SYSTEMCTL=/bin/true "$client" nestegg check
+check "nestegg check: says how to wake the server and check everything" \
+  bash -c "grep -q 'sudo nestegg check --wake' <<<\"\$1\"" _ "$check_out"
 check "POST /pbs/check (PBS asleep, Wake-on-LAN): not_checked, ok false for old clients" \
   responds 200 '"name":"PBS reachable","ok":false,"status":"not_checked".*"name":"PBS login and datastore access","ok":false,"status":"not_checked"' alice -X POST http://localhost/api/v1/pbs/check
 # Asked to wake it and nobody answers: a failed check. A packet for another MAC address goes out, so

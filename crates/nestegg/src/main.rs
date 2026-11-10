@@ -1149,6 +1149,13 @@ fn check(paths: &Paths, wake: bool) -> Result<u8> {
              the skipped checks say nothing about whether they would succeed."
         ),
     }
+    // The server did not answer and nobody asked to wake it.
+    let asleep = items
+        .iter()
+        .any(|i| i.name == "PBS reachable" && i.status == nestegg::check::CheckStatus::NotChecked);
+    if asleep && !wake {
+        println!("To wake the server and check everything: sudo nestegg check --wake");
+    }
     Ok(outcome.exit_code())
 }
 
