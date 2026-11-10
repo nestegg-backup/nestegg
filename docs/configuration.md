@@ -116,7 +116,11 @@ sudo nestegg key verify /media/usb/nestegg-key.json   # your copy opens that bac
 
 ## `/etc/nestegg/config.toml`
 
-The file never contains secrets. Unknown keys are rejected.
+The file never contains secrets. Unknown keys are rejected. It is owned by
+`root:nestegg` with mode 0640, so members of group `nestegg` can read it (for
+`nestegg status`) but others cannot; a token a `[notify] command` needs
+belongs in a separate root-only file (mode 0600) that the command reads, not
+here (see "Notifications").
 
 ```toml
 # Backup ID on the PBS (default: host name)
@@ -248,8 +252,8 @@ The daemon identifies the caller by the socket credentials:
   | Setting | Key in `config.toml` | Allowed |
   |---|---|---|
   | Backup rhythm | `schedule.interval_hours` | 1 to 168 hours |
-  | "Overdue" after | `overdue_after_hours` | 2 to 744 hours, more than the rhythm |
-  | Excludes | `backup.excludes` | up to 200 patterns, none that excludes everything (`*`, `**`, `/`, ...) |
+  | "Overdue" after | `overdue_after_hours` | 2 to 168 hours (7 days), more than the rhythm |
+  | Excludes | `backup.excludes` | up to 200 patterns, none that excludes everything (`*`, `**`, `/`, ...) or a whole source / top-level directory (`/home`, `/etc`, `/alice`, `home`) |
   | Wake-on-LAN on/off | `wake.enabled` | only with a `[wake]` section; switching off keeps the MAC |
   | Automatic backups on/off | `nestegg-backup.timer` | `systemctl enable/disable --now` |
 
@@ -257,6 +261,16 @@ The daemon identifies the caller by the socket credentials:
   keeps your comments and layout. Each change is logged with the user who
   made it: `journalctl -u nestegg.service`. Changes made during a backup
   apply from the next run on.
+
+  These are the limits a group member may set. root is not bound by them in
+  the file: a longer "overdue after" (above 168 h) or a broad exclude set in
+  `/etc/nestegg/config.toml` is kept, and can then only be lowered or
+  narrowed through the web interface, never widened past it
+  ([decision 0022](decisions/0022-settings-changes-that-reduce-protection.md)).
+  A change by a group member that lowers the protection (automatic backups
+  off, an exclude added, "overdue after" or the interval raised, Wake-on-LAN
+  off) is reported to the logged-in users and the notification hook (see
+  "Notifications"); a change made as root in the file is not.
 - Everything else stays terminal-only (root): server, port, datastore,
   namespace, auth id, fingerprint, backup id, credentials, encryption and
   the key, sources, the `[wake]` details, the overview credentials and the
@@ -291,19 +305,31 @@ Switch it off with `sudo systemctl disable --now nestegg-notify.timer`.
 | Message | When | Repeated |
 |---|---|---|
 | `failing` – "Backup failed" | The last backup failed. The message names the reason. | every 24 h |
-| `overdue` – "Backups are overdue" | No successful backup within `overdue_after_hours` (this includes a server that stays unreachable, and a setup that never succeeded). | every 24 h; every 7 days while automatic backups are switched off |
+| `overdue` – "Backups are overdue" | No successful backup within `overdue_after_hours` (this includes a server that stays unreachable, and a setup that never succeeded). | every 24 h |
+| `automatic_off` – "Automatic backups are off" | The backup timer is switched off while nestegg is set up. Reported at once, independent of the overdue threshold. The text says how old the last backup is. | every 7 days |
 | `incomplete` – "Backup is incomplete" | The last backup worked but left something out (for example the full system backup was skipped). | every 7 days |
 | `damaged` – "Damaged backups on the server" | The server's own verification reports damaged snapshots of this computer. | every 24 h |
-| `recovered` – "Backups work again" | Everything is fine again after one of the above was reported. | once |
+| `settings` – "Backup settings changed" | A group member lowered the protection through the web interface (automatic backups off, an exclude added, "overdue after" or the interval raised, Wake-on-LAN off). Names who changed what. A change made as root in the file is not reported. | once |
+| `recovered` – "Backups work again" | Everything is fine again after one of the above problems was reported. | once |
 
 A different problem (another error, another kind) is reported at once. Each
 message goes to every logged-in user and, if configured, to your command;
 someone who logs in later still gets it once. Nothing is reported while a
-backup is running. An unreachable server alone is not reported on every
-attempt, only when it becomes `overdue`.
+backup is running (the settings change waits for the next check). An
+unreachable server alone is not reported on every attempt, only when it
+becomes `overdue`.
 A configuration file that cannot be read (a typo, an unknown key) is reported
 as `failing` with the parser's message; the `[notify]` section is still
 honoured in that case, if it is valid.
+
+**Who sees what.** The desktop message to a member of group `nestegg` (and to
+root) carries the full detail — the error text, the paths, who changed a
+setting. Everyone else who is logged in gets only the kind of problem ("the
+backup of this computer failed / is overdue / is incomplete / automatic
+backups are off / the settings were changed") and the hint to tell whoever
+looks after the computer, because the detail can contain file names and paths.
+The command hook always gets the full text
+([decision 0022](decisions/0022-settings-changes-that-reduce-protection.md)).
 
 **Desktop** (`[notify] desktop = true`, the default): every logged-in user
 with a session bus gets a notification (`notify-send` from the package
@@ -318,14 +344,20 @@ English. No `notify-send`, no session: nothing is sent and the check logs it
 
 | Variable | Content |
 |---|---|
-| `NESTEGG_EVENT` | `failing`, `overdue`, `incomplete`, `damaged`, `recovered` or `test` |
+| `NESTEGG_EVENT` | `failing`, `overdue`, `automatic_off`, `incomplete`, `damaged`, `settings`, `recovered` or `test` |
 | `NESTEGG_TITLE`, `NESTEGG_MESSAGE` | The short title and the text (also on stdin) |
 | `NESTEGG_HOSTNAME` | Host name of this computer |
 | `NESTEGG_LAST_SUCCESS` | Time of the last successful backup (RFC 3339), or empty |
 
-If the command fails or does not finish, the check logs it and tries again
-an hour later; the desktop message is not held back. Example with a push
-service (ntfy; the host name is a placeholder):
+If the command fails or does not finish, the check logs it, `nestegg notify`
+ends with a non-zero exit code so `systemctl --failed` shows it, and the
+delivery is tried again an hour later; the desktop message is not held back.
+
+**Keep secrets out of `config.toml`.** The file is readable by group `nestegg`
+(mode 0640, so members can run `nestegg status`), so do not put an access
+token in `[notify] command`. Put it in a root-only file (mode 0600) that the
+script reads. Example with a push service (ntfy; the host name is a
+placeholder), reading its token from `/etc/nestegg/ntfy-token`:
 
 ```toml
 [notify]
@@ -335,12 +367,16 @@ command = ["/usr/local/bin/nestegg-ntfy"]
 ```sh
 #!/bin/sh
 # /usr/local/bin/nestegg-ntfy  (chmod 755)
+# Token in a root-only file, created with:
+#   printf 'tk_...' > /etc/nestegg/ntfy-token && chmod 600 /etc/nestegg/ntfy-token
+token="$(cat /etc/nestegg/ntfy-token)"
 case "$NESTEGG_EVENT" in
-  failing|overdue|damaged) priority=high ;;
+  failing|overdue|automatic_off|damaged) priority=high ;;
   *) priority=default ;;
 esac
 { printf '%s: %s\n\n' "$NESTEGG_HOSTNAME" "$NESTEGG_TITLE"; cat; } |
-  curl -fsS --max-time 30 -H "Title: nestegg" -H "Priority: $priority" \
+  curl -fsS --max-time 30 -H "Authorization: Bearer $token" \
+       -H "Title: nestegg" -H "Priority: $priority" \
        --data-binary @- https://ntfy.example.com/my-backups
 ```
 
@@ -519,6 +555,7 @@ made with the current key then need its exported copy to be restored.
 
 | Path | Content |
 |---|---|
+| `/etc/nestegg/config.toml` | Configuration (no secrets), `root:nestegg` mode 0640 |
 | `/var/lib/nestegg/state.json` | Last run, last success, key status |
 | `/var/lib/nestegg/notify.json` | What `nestegg notify` has already reported to whom (can be deleted) |
 | `/var/lib/nestegg/runs/` | Run history (`<id>.json`) and logs (`<id>.log`) |

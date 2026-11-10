@@ -310,8 +310,9 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
         Cmd::Status { json } => status(paths, json),
         Cmd::Notify { test, dry_run } => {
             require_root("nestegg notify")?;
-            nestegg::notify::run(paths, &nestegg::notify::Options { test, dry_run })?;
-            Ok(0)
+            // A non-zero code (a hook that failed) makes the systemd unit
+            // fail, so the trouble is visible (decision 0022).
+            nestegg::notify::run(paths, &nestegg::notify::Options { test, dry_run })
         }
         Cmd::History { limit, json } => history(paths, limit, json),
         Cmd::Snapshots { json } => snapshots(paths, json),
@@ -445,11 +446,21 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
     if let Some(dir) = paths.config_file.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    let group = ensure_group();
     std::fs::write(&paths.config_file, config_header() + &cfg.to_toml()?)?;
-    std::fs::set_permissions(&paths.config_file, std::fs::Permissions::from_mode(0o644))?;
+    // 0640 root:nestegg: group members read it (for `nestegg status`), but a
+    // user outside the group cannot, because `[notify] command` may carry a
+    // token (decision 0022). The settings writer keeps this mode.
+    std::fs::set_permissions(&paths.config_file, std::fs::Permissions::from_mode(0o640))?;
+    if let Some(gid) = group {
+        let _ = nix::unistd::chown(
+            &paths.config_file,
+            Some(nix::unistd::Uid::from_raw(0)),
+            Some(gid),
+        );
+    }
     secrets::create_private_dir(&paths.credentials_dir)?;
     std::fs::create_dir_all(paths.runs_dir())?;
-    let group = ensure_group();
     for dir in [paths.state_dir.clone(), paths.runs_dir()] {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750))?;
         if let Some(gid) = group {
@@ -483,6 +494,9 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
 
 fn config_header() -> String {
     "# nestegg configuration. Contains no secrets.\n\
+     # Readable by group 'nestegg' (mode 0640): do not put a token here. A\n\
+     # secret that a [notify] command needs belongs in a root-only file or\n\
+     # script (mode 0600) that the command reads.\n\
      # Reference: docs/configuration.md\n\n"
         .to_string()
 }

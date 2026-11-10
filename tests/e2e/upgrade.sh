@@ -116,6 +116,9 @@ pid_after="$(daemon_pid)"
 check "daemon restarted by the upgrade" bash -c "[[ '$pid_after' != '$pid_before' && '$pid_after' != 0 ]]"
 check "daemon runs the new binary" bash -c "[[ \$(docker exec $client readlink /proc/$pid_after/exe) == /usr/bin/nestegg ]]"
 check "configuration and credentials unchanged" test "$(config_sums)" == "$sums_before"
+# The old package created config.toml world-readable (0644 root:root); the
+# upgrade's postinst corrects it to group-readable only (decision 0022).
+check "config.toml is 0640 root:nestegg after the upgrade" bash -c "[[ \$(docker exec $client stat -c '%a %U:%G' /etc/nestegg/config.toml) == '640 root:nestegg' ]]"
 check "password still stored with systemd-creds" on_client test -f /etc/nestegg/credentials/password.cred
 check "earlier run record unchanged" test "$(on_client sha256sum "/var/lib/nestegg/runs/$old_run.json")" == "$run_record_before"
 check "earlier run in nestegg history" bash -c "docker exec $client nestegg history --json | grep -q '\"id\": \"$old_run\"'"

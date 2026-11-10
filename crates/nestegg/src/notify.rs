@@ -72,9 +72,14 @@ pub fn regular_uids() -> std::ops::RangeInclusive<u32> {
 pub enum Event {
     Failing,
     Overdue,
+    /// The backup timer is switched off while nestegg is configured (its own
+    /// condition, decision 0022). Independent of the overdue threshold.
+    AutomaticOff,
     Incomplete,
     Damaged,
     Recovered,
+    /// A group member lowered the protection through the API (decision 0022).
+    Settings,
     Test,
 }
 
@@ -83,16 +88,21 @@ impl Event {
         match self {
             Event::Failing => "failing",
             Event::Overdue => "overdue",
+            Event::AutomaticOff => "automatic_off",
             Event::Incomplete => "incomplete",
             Event::Damaged => "damaged",
             Event::Recovered => "recovered",
+            Event::Settings => "settings",
             Event::Test => "test",
         }
     }
 
     /// Critical desktop notifications stay on screen until dismissed.
     pub fn urgent(self) -> bool {
-        matches!(self, Event::Failing | Event::Overdue | Event::Damaged)
+        matches!(
+            self,
+            Event::Failing | Event::Overdue | Event::AutomaticOff | Event::Damaged
+        )
     }
 }
 
@@ -131,8 +141,8 @@ impl Condition {
     /// Minimum time between two announcements of an unchanged problem.
     fn repeat_after(&self) -> Duration {
         match self.kind {
-            Event::Incomplete => Duration::days(7),
-            Event::Overdue if self.timer_off => Duration::days(7),
+            // Switched off on purpose: a weekly reminder, not a daily nag.
+            Event::Incomplete | Event::AutomaticOff => Duration::days(7),
             _ => Duration::hours(24),
         }
     }
@@ -207,21 +217,25 @@ pub fn evaluate(
         c.age_hours = age_hours;
         conditions.push(c);
     } else {
+        // The backup timer is switched off while nestegg is configured: its
+        // own condition, reported at once and repeated weekly, independent of
+        // the overdue threshold (decision 0022). It replaces the "overdue
+        // while the timer is off" variant; the text still says how old the
+        // last successful backup is.
+        if !timer_enabled {
+            let mut c = Condition::new(Event::AutomaticOff, "off".to_string());
+            c.age_hours = age_hours;
+            c.timer_off = true;
+            conditions.push(c);
+        }
         let overdue_limit = Duration::hours(i64::from(status.overdue_after_hours));
         let never_and_old = status.health == Health::Never
             && unbacked_since.is_some_and(|since| now - since > overdue_limit);
-        if status.health == Health::Overdue || never_and_old {
-            let mut c = Condition::new(
-                Event::Overdue,
-                if timer_enabled {
-                    "timer on"
-                } else {
-                    "timer off"
-                }
-                .to_string(),
-            );
+        // Overdue only while the timer is on; a switched-off timer is covered
+        // by `automatic_off` above. Incomplete is reported either way.
+        if timer_enabled && (status.health == Health::Overdue || never_and_old) {
+            let mut c = Condition::new(Event::Overdue, "timer on".to_string());
             c.age_hours = age_hours;
-            c.timer_off = !timer_enabled;
             conditions.push(c);
         } else if status.health == Health::Incomplete {
             let reasons = status
@@ -285,6 +299,17 @@ pub fn lenient_notify_config(text: &str) -> Option<NotifyConfig> {
 pub enum Lang {
     En,
     De,
+}
+
+/// How much of a message a recipient may see (decision 0022). Members of
+/// group `nestegg` and root get the full text (error messages, paths, the
+/// user who changed a setting); everyone else gets a short version that only
+/// names the kind of problem and asks them to tell whoever looks after the
+/// computer. The hook always gets the full text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    Full,
+    Generic,
 }
 
 /// `de`, `de_DE.UTF-8`, `de_AT` ... mean German, everything else English.
@@ -369,11 +394,58 @@ fn span(lang: Lang, hours: i64) -> String {
     }
 }
 
-/// Words for a message. `condition` is needed for the problem events.
-pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>) -> Message {
+/// The short "tell the admin" sentence for the generic (non-member) version.
+fn tell_admin(lang: Lang) -> String {
+    tr(
+        lang,
+        "Please tell whoever looks after this computer.",
+        "Bitte sag der Person Bescheid, die sich um diesen Computer kümmert.",
+    )
+}
+
+/// The generic body for a problem event (decision 0022): the kind of problem
+/// without any detail, plus the "tell the admin" sentence. Events without
+/// private detail (`damaged`, `recovered`, `test`) keep their full body and
+/// return `None` here.
+fn generic_body(lang: Lang, event: Event) -> Option<String> {
+    let kind = match event {
+        Event::Failing => tr(
+            lang,
+            "The last backup of this computer failed.",
+            "Die letzte Datensicherung dieses Computers ist fehlgeschlagen.",
+        ),
+        Event::Overdue => tr(
+            lang,
+            "The backups of this computer are overdue.",
+            "Die Datensicherung dieses Computers ist überfällig.",
+        ),
+        Event::AutomaticOff => tr(
+            lang,
+            "Automatic backups of this computer are switched off.",
+            "Die automatischen Sicherungen dieses Computers sind ausgeschaltet.",
+        ),
+        Event::Incomplete => tr(
+            lang,
+            "The last backup of this computer is incomplete.",
+            "Die letzte Datensicherung dieses Computers ist unvollständig.",
+        ),
+        Event::Settings => tr(
+            lang,
+            "The backup protection settings of this computer were changed.",
+            "Die Schutzeinstellungen der Datensicherung dieses Computers wurden geändert.",
+        ),
+        Event::Damaged | Event::Recovered | Event::Test => return None,
+    };
+    Some(format!("{kind} {}", tell_admin(lang)))
+}
+
+/// Words for a message. `condition` is needed for the problem events;
+/// `detail` chooses the full or the short "tell the admin" version
+/// (decision 0022). Use [`compose_settings`] for [`Event::Settings`].
+pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>, detail: Detail) -> Message {
     let fallback = Condition::new(event, String::new());
     let c = condition.unwrap_or(&fallback);
-    let (title, body) = match event {
+    let (title, full_body) = match event {
         Event::Failing => {
             let error = c
                 .error
@@ -396,49 +468,8 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>) -> Messa
         }
         Event::Overdue => {
             let age = c.age_hours.map(|h| span(lang, h));
-            let (title, first, last) = match (c.timer_off, &age) {
-                (true, Some(age)) => (
-                    tr(
-                        lang,
-                        "Automatic backups are off",
-                        "Automatische Sicherungen sind aus",
-                    ),
-                    match lang {
-                        Lang::En => format!(
-                            "Automatic backups are switched off, and the last successful \
-                             backup was {age} ago."
-                        ),
-                        Lang::De => format!(
-                            "Automatische Sicherungen sind ausgeschaltet; die letzte \
-                             erfolgreiche Sicherung ist {age} her."
-                        ),
-                    },
-                    tr(
-                        lang,
-                        "Switch them on again: \"nestegg ui\".",
-                        "Wieder einschalten: \"nestegg ui\".",
-                    ),
-                ),
-                (true, None) => (
-                    tr(
-                        lang,
-                        "Automatic backups are off",
-                        "Automatische Sicherungen sind aus",
-                    ),
-                    tr(
-                        lang,
-                        "Automatic backups are switched off, and this computer has not been \
-                         backed up yet.",
-                        "Automatische Sicherungen sind ausgeschaltet, und dieser Computer \
-                         wurde noch nie gesichert.",
-                    ),
-                    tr(
-                        lang,
-                        "Switch them on again: \"nestegg ui\".",
-                        "Wieder einschalten: \"nestegg ui\".",
-                    ),
-                ),
-                (false, Some(age)) => (
+            let (title, first, last) = match &age {
+                Some(age) => (
                     tr(lang, "Backups are overdue", "Datensicherung überfällig"),
                     match lang {
                         Lang::En => format!(
@@ -456,7 +487,7 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>) -> Messa
                         "Mehr dazu: \"nestegg ui\".",
                     ),
                 ),
-                (false, None) => (
+                None => (
                     tr(lang, "No backup yet", "Noch keine Datensicherung"),
                     tr(
                         lang,
@@ -474,6 +505,48 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>) -> Messa
             };
             (title, format!("{first} {last}"))
         }
+        Event::AutomaticOff => {
+            let title = tr(
+                lang,
+                "Automatic backups are off",
+                "Automatische Sicherungen sind aus",
+            );
+            let last = tr(
+                lang,
+                "Switch them on again: \"nestegg ui\".",
+                "Wieder einschalten: \"nestegg ui\".",
+            );
+            let first = match c.age_hours.map(|h| span(lang, h)) {
+                Some(age) => match lang {
+                    Lang::En => format!(
+                        "Automatic backups are switched off, and the last successful \
+                         backup was {age} ago."
+                    ),
+                    Lang::De => format!(
+                        "Automatische Sicherungen sind ausgeschaltet; die letzte \
+                         erfolgreiche Sicherung ist {age} her."
+                    ),
+                },
+                None => tr(
+                    lang,
+                    "Automatic backups are switched off, and this computer has not been \
+                     backed up yet.",
+                    "Automatische Sicherungen sind ausgeschaltet, und dieser Computer \
+                     wurde noch nie gesichert.",
+                ),
+            };
+            (title, format!("{first} {last}"))
+        }
+        Event::Settings => (
+            // Reached only through the fallback (no condition); the real text
+            // comes from compose_settings.
+            tr(
+                lang,
+                "Backup settings changed",
+                "Sicherungseinstellungen geändert",
+            ),
+            generic_body(lang, Event::Settings).unwrap_or_default(),
+        ),
         Event::Incomplete => {
             let reasons = Some(
                 c.reasons
@@ -550,7 +623,101 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>) -> Messa
             ),
         ),
     };
+    let body = match detail {
+        Detail::Generic => generic_body(lang, event).unwrap_or(full_body),
+        Detail::Full => full_body,
+    };
     Message { event, title, body }
+}
+
+/// Words for a `settings` message: who lowered the protection and how
+/// (decision 0022). The full version names the user and each change; the
+/// generic version only says the settings were changed.
+pub fn compose_settings(
+    lang: Lang,
+    user: &str,
+    reductions: &[crate::settings::Reduction],
+    detail: Detail,
+) -> Message {
+    let title = tr(
+        lang,
+        "Backup settings changed",
+        "Sicherungseinstellungen geändert",
+    );
+    if detail == Detail::Generic {
+        return Message {
+            event: Event::Settings,
+            title,
+            body: generic_body(lang, Event::Settings).unwrap_or_default(),
+        };
+    }
+    let parts: Vec<String> = reductions
+        .iter()
+        .map(|r| reduction_phrase(lang, r))
+        .collect();
+    let list = parts.join(match lang {
+        Lang::En => "; ",
+        Lang::De => "; ",
+    });
+    let body = match lang {
+        Lang::En => format!(
+            "{user} changed the backup settings of this computer so that it is protected less: \
+             {list}. If that was not meant to happen, check it: \"nestegg ui\"."
+        ),
+        Lang::De => format!(
+            "{user} hat die Sicherungseinstellungen dieses Computers so geändert, dass es \
+             weniger geschützt ist: {list}. Falls das nicht gewollt war, bitte prüfen: \
+             \"nestegg ui\"."
+        ),
+    };
+    Message {
+        event: Event::Settings,
+        title,
+        body,
+    }
+}
+
+/// One phrase for a single protection-reducing change (full version).
+fn reduction_phrase(lang: Lang, reduction: &crate::settings::Reduction) -> String {
+    use crate::settings::Reduction;
+    match reduction {
+        Reduction::AutomaticBackupsOff => tr(
+            lang,
+            "automatic backups were switched off",
+            "automatische Sicherungen wurden ausgeschaltet",
+        ),
+        Reduction::ExcludesAdded { patterns } => {
+            let shown: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
+            let joined = shown.join(", ");
+            match lang {
+                Lang::En => format!("these patterns are no longer backed up: {joined}"),
+                Lang::De => format!("diese Muster werden nicht mehr gesichert: {joined}"),
+            }
+        }
+        Reduction::OverdueRaised { from, to } => match lang {
+            Lang::En => format!(
+                "the time before a stopped backup is reported was raised from {from} to {to} hours"
+            ),
+            Lang::De => format!(
+                "die Zeit bis eine ausbleibende Sicherung gemeldet wird, wurde von {from} auf \
+                 {to} Stunden erhöht"
+            ),
+        },
+        Reduction::IntervalRaised { from, to } => match lang {
+            Lang::En => {
+                format!("backups now run less often, every {to} instead of every {from} hours")
+            }
+            Lang::De => {
+                format!("Sicherungen laufen jetzt seltener, alle {to} statt alle {from} Stunden")
+            }
+        },
+        Reduction::WakeOnLanOff => tr(
+            lang,
+            "Wake-on-LAN was switched off, so a sleeping backup server is no longer woken",
+            "Wake-on-LAN wurde ausgeschaltet, ein schlafender Backup-Server wird also nicht \
+             mehr geweckt",
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +758,25 @@ pub struct PendingRecovery {
     pub command: bool,
 }
 
+/// A protection-reducing settings change, recorded by the daemon for
+/// `nestegg notify` to deliver (decision 0022). Delivered once to each user
+/// and to the hook, then kept for a few days so a late login still sees it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettingsAnnouncement {
+    /// Who made the change (user name).
+    pub user: String,
+    /// What was lowered.
+    pub reductions: Vec<crate::settings::Reduction>,
+    #[serde(with = "crate::state::rfc3339")]
+    pub at: DateTime<Utc>,
+    /// Users (by uid) who already received it.
+    #[serde(default)]
+    pub users_done: BTreeSet<u32>,
+    /// The hook already received it.
+    #[serde(default)]
+    pub command_done: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NotifyState {
     #[serde(default)]
@@ -600,6 +786,9 @@ pub struct NotifyState {
     /// First check that found nestegg set up without any successful backup.
     #[serde(default, with = "crate::state::rfc3339_opt")]
     pub unbacked_since: Option<DateTime<Utc>>,
+    /// Protection-reducing settings changes still to be delivered (0022).
+    #[serde(default)]
+    pub settings: Vec<SettingsAnnouncement>,
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +800,19 @@ pub struct NotifyState {
 pub struct Session {
     pub uid: u32,
     pub name: String,
+    /// Member of group `nestegg` (or root): may see the full message text.
+    /// Everyone else gets the short "tell the admin" version (decision 0022).
+    pub privileged: bool,
+}
+
+impl Session {
+    fn detail(&self) -> Detail {
+        if self.privileged {
+            Detail::Full
+        } else {
+            Detail::Generic
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -628,13 +830,26 @@ pub trait Channels {
     fn send_command(&mut self, message: &Message) -> Result<()>;
 }
 
+/// What a policy round did, beyond the journal lines.
+#[derive(Debug, Default)]
+pub struct ApplyOutcome {
+    /// A line per action for the journal / `--dry-run`.
+    pub log: Vec<String>,
+    /// At least one hook delivery failed this round, so `nestegg notify`
+    /// should end with a non-zero exit code (decision 0022). The delivery is
+    /// retried at the next check.
+    pub hook_failed: bool,
+}
+
 /// Run the policy for the current problems.
 ///
 /// `carry_failing`: the last run was neither a success nor a failure
 /// (server unreachable, cancelled), so an announced `failing` problem stays
 /// open instead of being closed.
 ///
-/// Returns a line per action for the journal / `--dry-run`.
+/// `save` persists the record; it is called after each delivery so a check
+/// that is killed halfway (unit timeout, reboot) does not redeliver what it
+/// already sent (decision 0022).
 pub fn apply(
     state: &mut NotifyState,
     conditions: &[Condition],
@@ -642,8 +857,10 @@ pub fn apply(
     now: DateTime<Utc>,
     lang: Lang,
     channels: &mut dyn Channels,
-) -> Vec<String> {
+    save: &mut dyn FnMut(&NotifyState),
+) -> ApplyOutcome {
     let mut log = Vec::new();
+    let mut hook_failed = false;
     let sessions = channels.sessions();
     let command = channels.command_enabled();
 
@@ -714,16 +931,34 @@ pub fn apply(
     }
 
     // Deliver what has not reached its audience yet (a user who logs in
-    // later, a hook that failed).
-    for (kind, entry) in state.active.iter_mut() {
-        let message = compose(lang, *kind, Some(&entry.condition));
+    // later, a hook that failed). The record is saved after each delivery, so
+    // a check that is killed halfway does not send the same thing twice.
+    let kinds: Vec<Event> = state.active.keys().copied().collect();
+    for kind in kinds {
+        let (condition, seq) = {
+            let entry = &state.active[&kind];
+            (entry.condition.clone(), entry.seq)
+        };
         for session in &sessions {
-            if entry.users.get(&session.uid).copied().unwrap_or(0) >= entry.seq {
+            if state.active[&kind]
+                .users
+                .get(&session.uid)
+                .copied()
+                .unwrap_or(0)
+                >= seq
+            {
                 continue;
             }
+            let message = compose(lang, kind, Some(&condition), session.detail());
             match channels.send_desktop(session, &message) {
                 Ok(Delivery::Sent) => {
-                    entry.users.insert(session.uid, entry.seq);
+                    state
+                        .active
+                        .get_mut(&kind)
+                        .unwrap()
+                        .users
+                        .insert(session.uid, seq);
+                    save(state);
                     log.push(format!(
                         "{}: desktop notification to {}",
                         kind.as_str(),
@@ -742,16 +977,22 @@ pub fn apply(
                 )),
             }
         }
-        if command && entry.command_seq < entry.seq {
+        if command && state.active[&kind].command_seq < seq {
+            // The hook always gets the full text.
+            let message = compose(lang, kind, Some(&condition), Detail::Full);
             match channels.send_command(&message) {
                 Ok(()) => {
-                    entry.command_seq = entry.seq;
+                    state.active.get_mut(&kind).unwrap().command_seq = seq;
+                    save(state);
                     log.push(format!("{}: command ran", kind.as_str()));
                 }
-                Err(e) => log.push(format!(
-                    "{}: command failed, trying again at the next check: {e:#}",
-                    kind.as_str()
-                )),
+                Err(e) => {
+                    hook_failed = true;
+                    log.push(format!(
+                        "{}: command failed, trying again at the next check: {e:#}",
+                        kind.as_str()
+                    ));
+                }
             }
         }
     }
@@ -768,17 +1009,28 @@ pub fn apply(
             pending.users.extend(told_users);
             pending.command |= told_command;
         }
-        if let Some(pending) = &mut state.recovery {
-            let message = compose(lang, Event::Recovered, None);
+        if state.recovery.is_some() {
+            let message = compose(lang, Event::Recovered, None, Detail::Full);
+            let users: Vec<u32> = state
+                .recovery
+                .as_ref()
+                .map(|p| p.users.iter().copied().collect())
+                .unwrap_or_default();
             for session in &sessions {
-                if !pending.users.contains(&session.uid)
-                    || pending.users_done.contains(&session.uid)
+                if !users.contains(&session.uid)
+                    || state
+                        .recovery
+                        .as_ref()
+                        .is_some_and(|p| p.users_done.contains(&session.uid))
                 {
                     continue;
                 }
                 match channels.send_desktop(session, &message) {
                     Ok(Delivery::Sent) => {
-                        pending.users_done.insert(session.uid);
+                        if let Some(p) = &mut state.recovery {
+                            p.users_done.insert(session.uid);
+                        }
+                        save(state);
                         log.push(format!(
                             "recovered: desktop notification to {}",
                             session.name
@@ -794,28 +1046,113 @@ pub fn apply(
                     )),
                 }
             }
-            if pending.command && command {
+            let command_pending = state.recovery.as_ref().is_some_and(|p| p.command);
+            if command_pending && command {
                 match channels.send_command(&message) {
                     Ok(()) => {
-                        pending.command = false;
+                        if let Some(p) = &mut state.recovery {
+                            p.command = false;
+                        }
+                        save(state);
                         log.push("recovered: command ran".to_string());
                     }
-                    Err(e) => log.push(format!(
-                        "recovered: command failed, trying again at the next check: {e:#}"
-                    )),
+                    Err(e) => {
+                        hook_failed = true;
+                        log.push(format!(
+                            "recovered: command failed, trying again at the next check: {e:#}"
+                        ));
+                    }
                 }
             }
-            let command_open = pending.command && command;
-            let users_open = pending
-                .users
-                .iter()
-                .any(|u| !pending.users_done.contains(u));
-            if (!command_open && !users_open) || now - pending.since > RECOVERY_KEEP {
-                state.recovery = None;
+            if let Some(pending) = &state.recovery {
+                let command_open = pending.command && command;
+                let users_open = pending
+                    .users
+                    .iter()
+                    .any(|u| !pending.users_done.contains(u));
+                if (!command_open && !users_open) || now - pending.since > RECOVERY_KEEP {
+                    state.recovery = None;
+                    save(state);
+                }
             }
         }
     }
-    log
+    ApplyOutcome { log, hook_failed }
+}
+
+/// Deliver the recorded protection-reducing settings changes (decision 0022):
+/// once to every logged-in user (per-user bookkeeping, so a late login still
+/// gets it) and once to the hook (retried on failure). Independent of the
+/// problem conditions, so it runs even while a backup is in progress. The
+/// record is saved after each delivery.
+pub fn deliver_settings(
+    state: &mut NotifyState,
+    now: DateTime<Utc>,
+    lang: Lang,
+    channels: &mut dyn Channels,
+    save: &mut dyn FnMut(&NotifyState),
+) -> ApplyOutcome {
+    let mut log = Vec::new();
+    let mut hook_failed = false;
+    if state.settings.is_empty() {
+        return ApplyOutcome { log, hook_failed };
+    }
+    let sessions = channels.sessions();
+    let command = channels.command_enabled();
+    for i in 0..state.settings.len() {
+        let (user, reductions) = {
+            let a = &state.settings[i];
+            (a.user.clone(), a.reductions.clone())
+        };
+        for session in &sessions {
+            if state.settings[i].users_done.contains(&session.uid) {
+                continue;
+            }
+            let message = compose_settings(lang, &user, &reductions, session.detail());
+            match channels.send_desktop(session, &message) {
+                Ok(Delivery::Sent) => {
+                    state.settings[i].users_done.insert(session.uid);
+                    save(state);
+                    log.push(format!(
+                        "settings: desktop notification to {}",
+                        session.name
+                    ));
+                }
+                Ok(Delivery::Unavailable(why)) => log.push(format!(
+                    "settings: no desktop notification to {} ({why})",
+                    session.name
+                )),
+                Err(e) => log.push(format!(
+                    "settings: desktop notification to {} failed: {e:#}",
+                    session.name
+                )),
+            }
+        }
+        if command && !state.settings[i].command_done {
+            let message = compose_settings(lang, &user, &reductions, Detail::Full);
+            match channels.send_command(&message) {
+                Ok(()) => {
+                    state.settings[i].command_done = true;
+                    save(state);
+                    log.push("settings: command ran".to_string());
+                }
+                Err(e) => {
+                    hook_failed = true;
+                    log.push(format!(
+                        "settings: command failed, trying again at the next check: {e:#}"
+                    ));
+                }
+            }
+        }
+    }
+    // Stop after a few days: a late login is caught within the keep window,
+    // and a hook that keeps failing is not retried forever.
+    let before = state.settings.len();
+    state.settings.retain(|a| now - a.at <= RECOVERY_KEEP);
+    if state.settings.len() != before {
+        save(state);
+    }
+    ApplyOutcome { log, hook_failed }
 }
 
 // ---------------------------------------------------------------------------
@@ -845,11 +1182,14 @@ pub fn runtime_root() -> PathBuf {
 
 /// Users in the uid range `regular` that have a session bus below `root`
 /// (`<root>/<uid>/bus`).
-/// `user_name` maps a uid to an account name (`None`: no such account).
+/// `user_name` maps a uid to an account name (`None`: no such account);
+/// `privileged` tells whether that user may see the full message text
+/// (member of group `nestegg`, or root; decision 0022).
 pub fn find_sessions(
     root: &Path,
     regular: std::ops::RangeInclusive<u32>,
     user_name: impl Fn(u32) -> Option<String>,
+    privileged: impl Fn(u32) -> bool,
 ) -> Vec<Session> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
@@ -868,6 +1208,7 @@ pub fn find_sessions(
             Some(Session {
                 uid,
                 name: user_name(uid)?,
+                privileged: privileged(uid),
             })
         })
         .collect();
@@ -880,6 +1221,23 @@ fn system_user_name(uid: u32) -> Option<String> {
         .ok()
         .flatten()
         .map(|u| u.name)
+}
+
+/// Whether `uid` is root or a member of group `nestegg`, and so may see the
+/// full detail of a message (decision 0022).
+pub fn system_privileged(uid: u32) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    let Some(group) = nix::unistd::Group::from_name(crate::daemon::GROUP)
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    crate::identity::UserIdentity::from_uid(uid)
+        .map(|id| id.groups.contains(&group.gid.as_raw()))
+        .unwrap_or(false)
 }
 
 fn default_path() -> String {
@@ -1016,7 +1374,12 @@ impl Channels for SystemChannels<'_> {
         if !self.config.desktop {
             return Vec::new();
         }
-        find_sessions(&self.runtime_root, regular_uids(), system_user_name)
+        find_sessions(
+            &self.runtime_root,
+            regular_uids(),
+            system_user_name,
+            system_privileged,
+        )
     }
 
     fn command_enabled(&self) -> bool {
@@ -1156,7 +1519,7 @@ fn load_state(paths: &Paths) -> NotifyState {
     }
 }
 
-pub fn run(paths: &Paths, options: &Options) -> Result<()> {
+pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
     let mut config_error = None;
     let config = match Config::load(&paths.config_file) {
         Ok(config) => Some(config),
@@ -1208,7 +1571,7 @@ pub fn run(paths: &Paths, options: &Options) -> Result<()> {
     };
 
     if options.test {
-        return send_test(channels, options.dry_run);
+        return send_test(channels, options.dry_run).map(|()| 0);
     }
 
     let mut state = load_state(paths);
@@ -1227,7 +1590,7 @@ pub fn run(paths: &Paths, options: &Options) -> Result<()> {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    let save = |state: &NotifyState| {
+    let mut save = |state: &NotifyState| {
         if options.dry_run {
             return;
         }
@@ -1237,81 +1600,120 @@ pub fn run(paths: &Paths, options: &Options) -> Result<()> {
             eprintln!("warning: cannot save the notification record: {e:#}");
         }
     };
-    let (conditions, settled) = if let Some(error) = &config_error {
-        (vec![config_problem(error)], true)
+    // Problem conditions this round, or `None` when there is nothing to judge
+    // (not configured, backup running). The recorded settings changes are
+    // delivered either way (decision 0022).
+    let problem: Option<(Vec<Condition>, bool)> = if let Some(error) = &config_error {
+        Some((vec![config_problem(error)], true))
     } else if let Some(error) = &state_error {
-        (vec![state_problem(error)], true)
+        Some((vec![state_problem(error)], true))
     } else {
         let status = status.as_ref().expect("status or state_error is set");
         match evaluate(status, timer, unbacked_since, now) {
             Evaluation::Skip(why) => {
                 println!("nothing to check: {why}");
-                save(&state);
-                return Ok(());
+                None
             }
             Evaluation::Checked {
                 conditions,
                 settled,
-            } => (conditions, settled),
+            } => Some((conditions, settled)),
         }
     };
-    // Last run neither success nor failure and no problem found: nothing is
-    // confirmed either way, so the record stays as it is.
-    if conditions.is_empty() && !settled {
-        println!("nothing new: the last run ended without a result (server unreachable?)");
-        save(&state);
-        return Ok(());
-    }
-    // A failure that is not the last run any more (the last run was
-    // cancelled, for example) stays open.
-    let carry_failing = !settled;
 
-    let lines = if options.dry_run {
+    // Deliver the settings changes first, then judge the problems; `apply` is
+    // skipped when there is nothing to judge or when the last run gave no
+    // result (an announced failure then stays open, nothing new to say).
+    fn drive(
+        state: &mut NotifyState,
+        problem: &Option<(Vec<Condition>, bool)>,
+        now: DateTime<Utc>,
+        lang: Lang,
+        channels: &mut dyn Channels,
+        save: &mut dyn FnMut(&NotifyState),
+    ) -> ApplyOutcome {
+        let mut out = deliver_settings(state, now, lang, channels, save);
+        if let Some((conditions, settled)) = problem
+            && !(conditions.is_empty() && !settled)
+        {
+            let a = apply(state, conditions, !settled, now, lang, channels, save);
+            out.log.extend(a.log);
+            out.hook_failed |= a.hook_failed;
+        }
+        out
+    }
+
+    let outcome = if options.dry_run {
         let mut dry = DryChannels {
             inner: channels,
             log: Vec::new(),
         };
-        let mut lines = apply(
-            &mut state,
-            &conditions,
-            carry_failing,
-            now,
-            context.lang,
-            &mut dry,
-        );
-        lines.extend(dry.log);
-        lines
+        let mut out = drive(&mut state, &problem, now, context.lang, &mut dry, &mut save);
+        out.log.extend(dry.log);
+        out
     } else {
         let mut channels = channels;
-        let lines = apply(
+        let out = drive(
             &mut state,
-            &conditions,
-            carry_failing,
+            &problem,
             now,
             context.lang,
             &mut channels,
+            &mut save,
         );
         save(&state);
-        lines
+        out
     };
-    if lines.is_empty() {
+    if outcome.log.is_empty()
+        && let Some((conditions, settled)) = &problem
+    {
         println!(
             "{}",
-            if conditions.is_empty() {
+            if conditions.is_empty() && !settled {
+                "nothing new: the last run ended without a result (server unreachable?)"
+            } else if conditions.is_empty() {
                 "everything is fine, nothing to report"
             } else {
                 "known problems, nothing new to report"
             }
         );
     }
-    for line in lines {
+    for line in outcome.log {
         println!("{line}");
     }
-    Ok(())
+    // A hook that failed makes the unit fail, so systemctl --failed and the
+    // journal priority show it; the delivery is retried next check (0022).
+    Ok(u8::from(outcome.hook_failed))
+}
+
+/// Record a protection-reducing settings change for `nestegg notify` to
+/// deliver (decision 0022). The daemon calls this under the notification lock
+/// after a settings change through the API; the hourly check and the trigger
+/// right after then announce it. Root's own changes are not recorded by the
+/// caller (root is trusted).
+pub fn record_settings_change(
+    paths: &Paths,
+    user: &str,
+    reductions: Vec<crate::settings::Reduction>,
+) -> Result<()> {
+    if reductions.is_empty() {
+        return Ok(());
+    }
+    let _lock = lock(paths)?;
+    let mut state = load_state(paths);
+    state.settings.push(SettingsAnnouncement {
+        user: user.to_string(),
+        reductions,
+        at: Utc::now(),
+        users_done: BTreeSet::new(),
+        command_done: false,
+    });
+    write_json_atomic(&paths.notify_state_file(), &state)
+        .context("cannot record the settings change for the health check")
 }
 
 fn send_test(mut channels: SystemChannels<'_>, dry_run: bool) -> Result<()> {
-    let message = compose(channels.context.lang, Event::Test, None);
+    let message = compose(channels.context.lang, Event::Test, None, Detail::Full);
     println!("{} | {}", message.title, message.body);
     let sessions = channels.sessions();
     if !channels.config.desktop {
@@ -1372,6 +1774,7 @@ mod tests {
         desktop: Vec<(u32, Event)>,
         hook: Vec<Event>,
         bodies: Vec<String>,
+        hook_bodies: Vec<String>,
     }
 
     impl Fake {
@@ -1382,6 +1785,7 @@ mod tests {
                     .map(|(uid, name)| Session {
                         uid: *uid,
                         name: name.to_string(),
+                        privileged: true,
                     })
                     .collect(),
                 command,
@@ -1390,6 +1794,7 @@ mod tests {
                 desktop: Vec::new(),
                 hook: Vec::new(),
                 bodies: Vec::new(),
+                hook_bodies: Vec::new(),
             }
         }
 
@@ -1397,6 +1802,15 @@ mod tests {
             self.sessions.push(Session {
                 uid,
                 name: name.into(),
+                privileged: true,
+            });
+        }
+
+        fn login_plain(&mut self, uid: u32, name: &str) {
+            self.sessions.push(Session {
+                uid,
+                name: name.into(),
+                privileged: false,
             });
         }
 
@@ -1404,6 +1818,7 @@ mod tests {
             self.desktop.clear();
             self.hook.clear();
             self.bodies.clear();
+            self.hook_bodies.clear();
         }
     }
 
@@ -1427,6 +1842,7 @@ mod tests {
                 anyhow::bail!("hook exited with status 1");
             }
             self.hook.push(message.event);
+            self.hook_bodies.push(message.body.clone());
             Ok(())
         }
     }
@@ -1437,14 +1853,19 @@ mod tests {
         c
     }
 
+    /// `timer_off` now selects the separate `automatic_off` condition
+    /// (decision 0022); `false` is a threshold-based overdue (timer on).
     fn overdue(timer_off: bool, age: Option<i64>) -> Condition {
-        let mut c = Condition::new(
-            Event::Overdue,
-            if timer_off { "timer off" } else { "timer on" }.into(),
-        );
-        c.timer_off = timer_off;
-        c.age_hours = age;
-        c
+        if timer_off {
+            let mut c = Condition::new(Event::AutomaticOff, "off".into());
+            c.timer_off = true;
+            c.age_hours = age;
+            c
+        } else {
+            let mut c = Condition::new(Event::Overdue, "timer on".into());
+            c.age_hours = age;
+            c
+        }
     }
 
     fn incomplete(reason: &str) -> Condition {
@@ -1466,7 +1887,7 @@ mod tests {
         ch: &mut Fake,
     ) -> Vec<String> {
         ch.clear();
-        apply(state, conditions, false, at, Lang::En, ch)
+        apply(state, conditions, false, at, Lang::En, ch, &mut |_| {}).log
     }
 
     #[test]
@@ -1712,14 +2133,191 @@ mod tests {
         // The last run ended with "server unreachable": another problem is
         // known, the failure is neither confirmed nor over.
         ch.clear();
-        apply(&mut state, &[damaged(1)], true, hours(1), Lang::En, &mut ch);
+        apply(
+            &mut state,
+            &[damaged(1)],
+            true,
+            hours(1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
         assert_eq!(ch.desktop, [(1000, Event::Damaged)]);
         assert!(state.active.contains_key(&Event::Failing));
         assert!(state.recovery.is_none());
         // Back to normal runs: the failure is gone for real.
         ch.clear();
-        apply(&mut state, &[], false, hours(2), Lang::En, &mut ch);
+        apply(
+            &mut state,
+            &[],
+            false,
+            hours(2),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
         assert_eq!(ch.desktop, [(1000, Event::Recovered)]);
+    }
+
+    #[test]
+    fn the_record_is_saved_after_each_delivery() {
+        // A check that is killed halfway must not resend what it already sent
+        // (decision 0022): the record is saved after every delivery, not only
+        // at the end.
+        let mut state = NotifyState::default();
+        let mut ch = Fake::new(&[(1000, "alice"), (1001, "bob")], true);
+        let mut saves = 0usize;
+        {
+            let mut save = |_: &NotifyState| saves += 1;
+            apply(
+                &mut state,
+                &[failing("x")],
+                false,
+                hours(0),
+                Lang::En,
+                &mut ch,
+                &mut save,
+            );
+        }
+        // Two desktop notifications and one hook: at least three saves.
+        assert_eq!(ch.desktop.len(), 2);
+        assert!(saves >= 3, "saved only {saves} times");
+    }
+
+    #[test]
+    fn a_failing_hook_makes_the_round_report_it_for_the_exit_code() {
+        let mut state = NotifyState::default();
+        let mut ch = Fake::new(&[(1000, "alice")], true);
+        ch.command_fails = true;
+        let out = apply(
+            &mut state,
+            &[failing("x")],
+            false,
+            hours(0),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(out.hook_failed, "a failing hook must be reported");
+        // The desktop still got the message.
+        assert_eq!(ch.desktop, [(1000, Event::Failing)]);
+        // Next check: the hook works, so the round is clean.
+        ch.command_fails = false;
+        ch.clear();
+        let out = apply(
+            &mut state,
+            &[failing("x")],
+            false,
+            hours(2),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(!out.hook_failed);
+        assert_eq!(ch.hook, [Event::Failing]);
+    }
+
+    #[test]
+    fn members_see_the_detail_others_only_the_kind() {
+        let mut state = NotifyState::default();
+        let mut ch = Fake::new(&[(1000, "alice")], true); // alice: group member
+        ch.login_plain(1001, "guest"); // not a member
+        step(
+            &mut state,
+            &[failing("the file /home/alice/secret broke")],
+            hours(0),
+            &mut ch,
+        );
+        assert_eq!(ch.desktop, [(1000, Event::Failing), (1001, Event::Failing)]);
+        assert!(
+            ch.bodies[0].contains("/home/alice/secret"),
+            "{}",
+            ch.bodies[0]
+        );
+        assert!(
+            !ch.bodies[1].contains("/home/alice/secret"),
+            "{}",
+            ch.bodies[1]
+        );
+        assert!(ch.bodies[1].contains("tell whoever looks after"));
+        // The hook always gets the full text.
+        assert!(ch.hook_bodies[0].contains("/home/alice/secret"));
+    }
+
+    #[test]
+    fn settings_changes_are_announced_to_users_and_the_hook() {
+        use crate::settings::Reduction;
+        let mut state = NotifyState::default();
+        state.settings.push(SettingsAnnouncement {
+            user: "alice".into(),
+            reductions: vec![
+                Reduction::AutomaticBackupsOff,
+                Reduction::ExcludesAdded {
+                    patterns: vec!["/home/alice/secret".into()],
+                },
+            ],
+            at: hours(0),
+            users_done: BTreeSet::new(),
+            command_done: false,
+        });
+        let mut ch = Fake::new(&[(1000, "carol")], true); // carol: group member
+        ch.login_plain(1001, "guest");
+        let out = deliver_settings(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        assert!(!out.hook_failed);
+        assert_eq!(
+            ch.desktop,
+            [(1000, Event::Settings), (1001, Event::Settings)]
+        );
+        assert_eq!(ch.hook, [Event::Settings]);
+        // The member sees who changed what; the guest only the generic note.
+        assert!(ch.bodies[0].contains("alice") && ch.bodies[0].contains("secret"));
+        assert!(!ch.bodies[1].contains("secret"), "{}", ch.bodies[1]);
+        assert!(ch.bodies[1].contains("tell whoever looks after"));
+        assert!(ch.hook_bodies[0].contains("alice") && ch.hook_bodies[0].contains("secret"));
+
+        // Delivered once: a later check sends nothing again.
+        ch.clear();
+        deliver_settings(&mut state, hours(1), Lang::En, &mut ch, &mut |_| {});
+        assert!(ch.desktop.is_empty() && ch.hook.is_empty());
+        // A user who logs in later still gets it, within the keep window.
+        ch.clear();
+        ch.login(1002, "dave");
+        deliver_settings(&mut state, hours(2), Lang::En, &mut ch, &mut |_| {});
+        assert_eq!(ch.desktop, [(1002, Event::Settings)]);
+        // After a few days the announcement is dropped.
+        ch.clear();
+        deliver_settings(
+            &mut state,
+            hours(24 * 3 + 1),
+            Lang::En,
+            &mut ch,
+            &mut |_| {},
+        );
+        assert!(state.settings.is_empty());
+    }
+
+    #[test]
+    fn a_failing_hook_keeps_a_settings_announcement_for_retry() {
+        use crate::settings::Reduction;
+        let mut state = NotifyState::default();
+        state.settings.push(SettingsAnnouncement {
+            user: "alice".into(),
+            reductions: vec![Reduction::WakeOnLanOff],
+            at: hours(0),
+            users_done: BTreeSet::new(),
+            command_done: false,
+        });
+        let mut ch = Fake::new(&[], true);
+        ch.command_fails = true;
+        let out = deliver_settings(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        assert!(out.hook_failed);
+        assert!(!state.settings[0].command_done);
+        // Retried at the next check.
+        ch.command_fails = false;
+        ch.clear();
+        let out = deliver_settings(&mut state, hours(1), Lang::En, &mut ch, &mut |_| {});
+        assert!(!out.hook_failed);
+        assert_eq!(ch.hook, [Event::Settings]);
     }
 
     #[test]
@@ -1853,8 +2451,9 @@ mod tests {
         assert_eq!(list[0].kind, Event::Overdue);
         assert_eq!(list[0].age_hours, Some(50));
         assert!(!list[0].timer_off);
-        // The timer is off: another key and a note in the condition.
+        // The timer is off: its own condition, not a threshold overdue.
         let (off, _) = checked(evaluate(&s, false, None, t0()));
+        assert_eq!(off[0].kind, Event::AutomaticOff);
         assert!(off[0].timer_off);
         assert_ne!(off[0].key, list[0].key);
 
@@ -1867,6 +2466,26 @@ mod tests {
         let (list, _) = checked(evaluate(&never, true, old_setup, t0()));
         assert_eq!(list[0].kind, Event::Overdue);
         assert_eq!(list[0].age_hours, None);
+    }
+
+    #[test]
+    fn automatic_off_is_reported_independent_of_the_overdue_threshold() {
+        // The timer is off but the last success is recent (well within the
+        // overdue threshold): it is still reported (decision 0022), unlike the
+        // old behaviour that waited for "overdue".
+        let recent = run_with(RunState::Succeeded, hours(-1));
+        let s = status(Health::Ok, Some(recent.clone()), Some(recent), &[]);
+        let (on, _) = checked(evaluate(&s, true, None, t0()));
+        assert!(on.is_empty(), "timer on and healthy: nothing");
+        let (off, _) = checked(evaluate(&s, false, None, t0()));
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].kind, Event::AutomaticOff);
+        assert_eq!(off[0].age_hours, Some(1));
+        // Its repeat is weekly, not daily.
+        let mut c = off[0].clone();
+        assert_eq!(c.repeat_after(), Duration::days(7));
+        c.kind = Event::Overdue;
+        assert_eq!(c.repeat_after(), Duration::hours(24));
     }
 
     #[test]
@@ -1903,7 +2522,7 @@ mod tests {
     fn a_broken_configuration_is_a_failure_and_keeps_the_hook() {
         let c = config_problem("invalid configuration /etc/nestegg/config.toml: unknown field");
         assert_eq!(c.kind, Event::Failing);
-        let m = compose(Lang::En, c.kind, Some(&c));
+        let m = compose(Lang::En, c.kind, Some(&c), Detail::Full);
         assert!(m.body.contains("unknown field"), "{}", m.body);
         // The error text is part of the key: fixing it, or breaking it
         // differently, is a change.
@@ -1960,13 +2579,13 @@ mod tests {
         ];
         for lang in [Lang::En, Lang::De] {
             for c in &conditions {
-                let m = compose(lang, c.kind, Some(c));
+                let m = compose(lang, c.kind, Some(c), Detail::Full);
                 assert!(!m.title.is_empty() && !m.body.is_empty());
                 assert!(m.body.contains("nestegg ui"), "{lang:?} {c:?}: {}", m.body);
                 assert!(m.body.ends_with('.'), "{}", m.body);
             }
             for event in [Event::Recovered, Event::Test] {
-                let m = compose(lang, event, None);
+                let m = compose(lang, event, None, Detail::Full);
                 assert!(m.body.contains("nestegg ui"), "{}", m.body);
             }
         }
@@ -1974,46 +2593,119 @@ mod tests {
 
     #[test]
     fn the_texts_say_what_happened() {
-        let en = compose(Lang::En, Event::Failing, Some(&failing("disk full")));
+        let en = compose(
+            Lang::En,
+            Event::Failing,
+            Some(&failing("disk full")),
+            Detail::Full,
+        );
         assert_eq!(en.title, "Backup failed");
         assert!(en.body.contains("disk full"));
-        let de = compose(Lang::De, Event::Failing, Some(&failing("disk full")));
+        let de = compose(
+            Lang::De,
+            Event::Failing,
+            Some(&failing("disk full")),
+            Detail::Full,
+        );
         assert_eq!(de.title, "Datensicherung fehlgeschlagen");
         assert!(de.body.contains("disk full"));
 
-        let m = compose(Lang::De, Event::Overdue, Some(&overdue(false, Some(100))));
+        let m = compose(
+            Lang::De,
+            Event::Overdue,
+            Some(&overdue(false, Some(100))),
+            Detail::Full,
+        );
         assert!(m.body.contains("4 Tage"), "{}", m.body);
-        let m = compose(Lang::De, Event::Overdue, Some(&overdue(false, Some(40))));
+        let m = compose(
+            Lang::De,
+            Event::Overdue,
+            Some(&overdue(false, Some(40))),
+            Detail::Full,
+        );
         assert!(m.body.contains("40 Stunden"), "{}", m.body);
-        let m = compose(Lang::En, Event::Overdue, Some(&overdue(false, Some(100))));
+        let m = compose(
+            Lang::En,
+            Event::Overdue,
+            Some(&overdue(false, Some(100))),
+            Detail::Full,
+        );
         assert!(m.body.contains("4 days"), "{}", m.body);
-        let m = compose(Lang::En, Event::Overdue, Some(&overdue(true, Some(300))));
+        // Timer off is now the separate automatic_off event.
+        let m = compose(
+            Lang::En,
+            Event::AutomaticOff,
+            Some(&overdue(true, Some(300))),
+            Detail::Full,
+        );
         assert_eq!(m.title, "Automatic backups are off");
         assert!(m.body.contains("12 days"));
-        let m = compose(Lang::De, Event::Overdue, Some(&overdue(true, None)));
+        let m = compose(
+            Lang::De,
+            Event::AutomaticOff,
+            Some(&overdue(true, None)),
+            Detail::Full,
+        );
         assert!(m.body.contains("ausgeschaltet"));
-        let m = compose(Lang::En, Event::Overdue, Some(&overdue(false, None)));
+        let m = compose(
+            Lang::En,
+            Event::Overdue,
+            Some(&overdue(false, None)),
+            Detail::Full,
+        );
         assert_eq!(m.title, "No backup yet");
 
-        let one = compose(Lang::En, Event::Damaged, Some(&damaged(1)));
+        let one = compose(Lang::En, Event::Damaged, Some(&damaged(1)), Detail::Full);
         assert!(
             one.body
                 .contains("1 saved backup of this computer is damaged")
         );
-        let many = compose(Lang::En, Event::Damaged, Some(&damaged(3)));
+        let many = compose(Lang::En, Event::Damaged, Some(&damaged(3)), Detail::Full);
         assert!(
             many.body
                 .contains("3 saved backups of this computer are damaged")
         );
-        let de = compose(Lang::De, Event::Damaged, Some(&damaged(2)));
+        let de = compose(Lang::De, Event::Damaged, Some(&damaged(2)), Detail::Full);
         assert!(de.body.contains("2 gespeicherte Sicherungen") && de.body.contains("sind"));
 
         // A long, multi-line error is cut to its first line.
         let long = format!("first line\nsecond line\n{}", "x".repeat(1000));
-        let m = compose(Lang::En, Event::Failing, Some(&failing(&long)));
+        let m = compose(
+            Lang::En,
+            Event::Failing,
+            Some(&failing(&long)),
+            Detail::Full,
+        );
         assert!(m.body.contains("first line") && !m.body.contains("second line"));
-        let m = compose(Lang::En, Event::Failing, Some(&failing(&"y".repeat(1000))));
+        let m = compose(
+            Lang::En,
+            Event::Failing,
+            Some(&failing(&"y".repeat(1000))),
+            Detail::Full,
+        );
         assert!(m.body.len() < 500);
+
+        // The generic version drops the detail and asks to tell the admin.
+        let g = compose(
+            Lang::En,
+            Event::Failing,
+            Some(&failing("disk full")),
+            Detail::Generic,
+        );
+        assert!(!g.body.contains("disk full"), "{}", g.body);
+        assert!(g.body.contains("tell whoever looks after"), "{}", g.body);
+        assert_eq!(g.title, "Backup failed");
+        let g = compose(
+            Lang::De,
+            Event::Incomplete,
+            Some(&incomplete("/home/alice/x")),
+            Detail::Generic,
+        );
+        assert!(!g.body.contains("/home/alice"), "{}", g.body);
+        // Damaged has no private detail, so the generic body equals the full one.
+        let full = compose(Lang::En, Event::Damaged, Some(&damaged(2)), Detail::Full);
+        let plain = compose(Lang::En, Event::Damaged, Some(&damaged(2)), Detail::Generic);
+        assert_eq!(full.body, plain.body);
     }
 
     #[test]
@@ -2087,7 +2779,12 @@ mod tests {
 
     #[test]
     fn an_error_that_ends_with_a_full_stop_gets_no_second_one() {
-        let message = compose(Lang::En, Event::Failing, Some(&failing("no space left.")));
+        let message = compose(
+            Lang::En,
+            Event::Failing,
+            Some(&failing("no space left.")),
+            Detail::Full,
+        );
         assert!(
             message.body.contains("no space left. Details"),
             "{}",
@@ -2111,7 +2808,7 @@ mod tests {
     fn an_unreadable_state_is_reported_as_a_failure() {
         let c = state_problem("cannot parse state.json: expected value");
         assert_eq!(c.kind, Event::Failing);
-        let body = compose(Lang::De, Event::Failing, Some(&c)).body;
+        let body = compose(Lang::De, Event::Failing, Some(&c), Detail::Full).body;
         assert!(body.contains("cannot parse state.json"), "{body}");
     }
 
@@ -2143,21 +2840,31 @@ mod tests {
             999 | 61184 | 65534 | 0 | 1002 | 1003 => Some("system".to_string()),
             _ => None,
         };
-        let found = find_sessions(dir.path(), DEFAULT_UID_MIN..=REGULAR_UID_MAX, names);
+        // Only alice and carol are group members (and so privileged).
+        let privileged = |uid: u32| matches!(uid, 1000 | 60100);
+        let found = find_sessions(
+            dir.path(),
+            DEFAULT_UID_MIN..=REGULAR_UID_MAX,
+            names,
+            privileged,
+        );
         assert_eq!(
             found,
             [
                 Session {
                     uid: 1000,
-                    name: "alice".into()
+                    name: "alice".into(),
+                    privileged: true,
                 },
                 Session {
                     uid: 1001,
-                    name: "bob".into()
+                    name: "bob".into(),
+                    privileged: false,
                 },
                 Session {
                     uid: 60100,
-                    name: "carol".into()
+                    name: "carol".into(),
+                    privileged: true,
                 }
             ]
         );
@@ -2165,7 +2872,8 @@ mod tests {
             find_sessions(
                 &dir.path().join("missing"),
                 DEFAULT_UID_MIN..=REGULAR_UID_MAX,
-                |_| None
+                |_| None,
+                |_| false,
             )
             .is_empty()
         );
@@ -2199,7 +2907,12 @@ mod tests {
             context: &context,
             runtime_root: dir.path().to_path_buf(),
         };
-        let message = compose(Lang::En, Event::Failing, Some(&failing("disk full")));
+        let message = compose(
+            Lang::En,
+            Event::Failing,
+            Some(&failing("disk full")),
+            Detail::Full,
+        );
         channels.send_command(&message).unwrap();
         let text = fs::read_to_string(&out).unwrap();
         let mut lines = text.lines();
@@ -2219,7 +2932,7 @@ mod tests {
             hostname: "desktop".into(),
             last_success: None,
         };
-        let message = compose(Lang::En, Event::Test, None);
+        let message = compose(Lang::En, Event::Test, None, Detail::Full);
         let fails = NotifyConfig {
             desktop: true,
             command: Some(
@@ -2302,9 +3015,15 @@ mod tests {
         let session = Session {
             uid,
             name: "me".into(),
+            privileged: true,
         };
         for (event, urgency) in [(Event::Failing, "critical"), (Event::Incomplete, "normal")] {
-            let message = compose(Lang::En, event, Some(&incomplete("something is missing")));
+            let message = compose(
+                Lang::En,
+                event,
+                Some(&incomplete("something is missing")),
+                Detail::Full,
+            );
             let cmd = channels.desktop_command(&stub, &session, &message).unwrap();
             let outcome = run_with_timeout(cmd, b"", DESKTOP_TIMEOUT).unwrap();
             assert!(outcome.status.unwrap().success(), "{}", outcome.output);

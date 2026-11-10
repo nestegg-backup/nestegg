@@ -2,6 +2,12 @@
 Description=nestegg backup health check (tells users when backups fail or stop)
 Documentation=file:/usr/share/doc/nestegg/README.md
 After=network-online.target
+# This oneshot is started on demand - the hourly timer, after every backup
+# (OnSuccess=/OnFailure=) and right after a protection-reducing settings
+# change (decision 0022). Several of these can land within seconds, which is
+# normal, not a crash loop, so the default start rate limit must not trip.
+# The unit has no OnFailure= of its own, so it cannot loop.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

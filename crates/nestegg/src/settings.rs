@@ -14,11 +14,11 @@ use std::fs;
 use std::io::Write;
 use std::ops::RangeInclusive;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 
 use crate::config::Config;
@@ -26,12 +26,83 @@ use crate::status::TIMER_UNIT;
 
 /// Allowed backup interval: one hour to one week.
 pub const INTERVAL_HOURS: RangeInclusive<u32> = 1..=168;
-/// Allowed overdue threshold: two hours to 31 days. It must also be greater
-/// than the backup interval.
-pub const OVERDUE_AFTER_HOURS: RangeInclusive<u32> = 2..=744;
+/// Smallest overdue threshold the API accepts (two hours). It must also be
+/// greater than the backup interval.
+pub const OVERDUE_MIN_HOURS: u32 = 2;
+/// Largest overdue threshold the API accepts: seven days. A larger value set
+/// by root in the file is kept and can only be lowered through the API
+/// (decision 0022), so the extreme "a month without a message" stays out of
+/// reach of a group member.
+pub const OVERDUE_API_MAX_HOURS: u32 = 168;
 pub const MAX_EXCLUDES: usize = 200;
 /// Maximum length of one exclude pattern, in characters.
 pub const MAX_EXCLUDE_LEN: usize = 256;
+
+/// A change, made through the API, that lowers the protection of the backups
+/// (decision 0022). Each variant carries enough to name the change to the
+/// user in a notification. Changes that raise the protection (more frequent
+/// backups, a lower overdue threshold, a removed exclude, Wake-on-LAN on)
+/// are not reported and have no variant here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Reduction {
+    /// Automatic backups (the timer) were switched off.
+    AutomaticBackupsOff,
+    /// Patterns were added to the exclude list, so that data is no longer
+    /// backed up.
+    ExcludesAdded { patterns: Vec<String> },
+    /// The "overdue after" threshold was raised, so a stopped backup is
+    /// noticed later.
+    OverdueRaised { from: u32, to: u32 },
+    /// The backup interval was raised, so backups run less often.
+    IntervalRaised { from: u32, to: u32 },
+    /// Wake-on-LAN was switched off, so a sleeping backup server is no longer
+    /// woken for a run.
+    WakeOnLanOff,
+}
+
+/// Which protection-reducing changes a settings change made (empty if it
+/// only raised the protection or changed nothing relevant). `was_enabled`
+/// and `now_enabled` are the backup timer before and after the change.
+pub fn reductions(
+    old: &Config,
+    new: &Config,
+    was_enabled: bool,
+    now_enabled: bool,
+) -> Vec<Reduction> {
+    let mut out = Vec::new();
+    if was_enabled && !now_enabled {
+        out.push(Reduction::AutomaticBackupsOff);
+    }
+    // Added patterns only (a `!` re-include widens the backup, so it is not a
+    // reduction). Reordering or removing patterns is not reported either.
+    let added: Vec<String> = new
+        .backup
+        .excludes
+        .iter()
+        .filter(|p| !p.starts_with('!') && !old.backup.excludes.contains(p))
+        .cloned()
+        .collect();
+    if !added.is_empty() {
+        out.push(Reduction::ExcludesAdded { patterns: added });
+    }
+    if new.overdue_after_hours > old.overdue_after_hours {
+        out.push(Reduction::OverdueRaised {
+            from: old.overdue_after_hours,
+            to: new.overdue_after_hours,
+        });
+    }
+    if new.schedule.interval_hours > old.schedule.interval_hours {
+        out.push(Reduction::IntervalRaised {
+            from: old.schedule.interval_hours,
+            to: new.schedule.interval_hours,
+        });
+    }
+    if old.active_wake().is_some() && new.active_wake().is_none() {
+        out.push(Reduction::WakeOnLanOff);
+    }
+    out
+}
 
 /// Keys a settings change may contain.
 pub const EDITABLE: [&str; 5] = [
@@ -132,13 +203,15 @@ impl SettingsPatch {
     }
 }
 
-/// Allowed values, for `GET /api/v1/config` (`limits`).
-pub fn limits_json() -> serde_json::Value {
+/// Allowed values, for `GET /api/v1/config` (`limits`). The overdue maximum
+/// is the API cap, or a larger value already in the file (which can then only
+/// be lowered through the API, decision 0022).
+pub fn limits_json(current: &Config) -> serde_json::Value {
     serde_json::json!({
         "interval_hours": { "min": INTERVAL_HOURS.start(), "max": INTERVAL_HOURS.end() },
         "overdue_after_hours": {
-            "min": OVERDUE_AFTER_HOURS.start(),
-            "max": OVERDUE_AFTER_HOURS.end(),
+            "min": OVERDUE_MIN_HOURS,
+            "max": OVERDUE_API_MAX_HOURS.max(current.overdue_after_hours),
             "greater_than_interval": true,
         },
         "excludes": { "max_items": MAX_EXCLUDES, "max_length": MAX_EXCLUDE_LEN },
@@ -156,14 +229,26 @@ pub fn validate(patch: &SettingsPatch, current: &Config) -> Result<(), SettingsE
             INTERVAL_HOURS.end()
         )));
     }
-    if let Some(h) = patch.overdue_after_hours
-        && !OVERDUE_AFTER_HOURS.contains(&h)
-    {
-        return Err(invalid(format!(
-            "overdue_after_hours must be between {} and {} (31 days)",
-            OVERDUE_AFTER_HOURS.start(),
-            OVERDUE_AFTER_HOURS.end()
-        )));
+    if let Some(h) = patch.overdue_after_hours {
+        // The API accepts at most 7 days, so automatic backups cannot be
+        // switched off together with a month-long silence. A larger value
+        // that root put in the file is kept and can only be lowered here.
+        let max = OVERDUE_API_MAX_HOURS.max(current.overdue_after_hours);
+        if h < OVERDUE_MIN_HOURS || h > max {
+            let extra = if current.overdue_after_hours > OVERDUE_API_MAX_HOURS {
+                format!(
+                    "; the current value of {} can only be lowered here",
+                    current.overdue_after_hours
+                )
+            } else {
+                String::new()
+            };
+            return Err(invalid(format!(
+                "overdue_after_hours must be between {OVERDUE_MIN_HOURS} and \
+                 {OVERDUE_API_MAX_HOURS} hours (7 days) through the web interface{extra}. \
+                 A longer time can only be set as root in /etc/nestegg/config.toml."
+            )));
+        }
     }
     // Only checked when one of the two changes, so an existing file that
     // does not follow the rule can still get other changes.
@@ -184,6 +269,17 @@ pub fn validate(patch: &SettingsPatch, current: &Config) -> Result<(), SettingsE
     }
     if let Some(list) = &patch.excludes {
         validate_excludes(list).map_err(invalid)?;
+        // A pattern that removes a whole source or a whole top-level
+        // directory of an archive is refused when it is newly added; one that
+        // root already put in the file is kept (decision 0022).
+        for pattern in list {
+            if current.backup.excludes.contains(pattern) {
+                continue;
+            }
+            if let Some(why) = removes_whole_source(pattern, &current.backup.sources) {
+                return Err(invalid(why));
+            }
+        }
     }
     if patch.wake_on_lan == Some(true) && current.wake.is_none() {
         return Err(invalid(
@@ -258,6 +354,82 @@ fn excludes_everything(pattern: &str) -> bool {
         .split('/')
         .filter(|part| !part.is_empty())
         .all(|part| part.contains('*') && part.chars().all(|c| matches!(c, '*' | '?')))
+}
+
+/// Whether a path component is made only of the wildcards `*`/`**`/`?`.
+fn is_all_wildcards(part: &str) -> bool {
+    !part.is_empty() && part.chars().all(|c| matches!(c, '*' | '?'))
+}
+
+/// Whether a path component contains a wildcard at all.
+fn has_wildcard(part: &str) -> bool {
+    part.chars().any(|c| matches!(c, '*' | '?'))
+}
+
+/// Split a pattern into its anchor, the leading components before the first
+/// one that contains a wildcard (the "fixed part"), and whether every
+/// component after the fixed part is made of wildcards only (so the pattern
+/// takes out everything below the fixed part).
+fn fixed_prefix(pattern: &str) -> (bool, Vec<&str>, bool) {
+    let anchored = pattern.starts_with('/');
+    let parts: Vec<&str> = pattern.split('/').filter(|p| !p.is_empty()).collect();
+    let cut = parts
+        .iter()
+        .position(|p| has_wildcard(p))
+        .unwrap_or(parts.len());
+    let only_wildcards_after = parts[cut..].iter().all(|p| is_all_wildcards(p));
+    (anchored, parts[..cut].to_vec(), only_wildcards_after)
+}
+
+/// Reject an exclude that would drop a whole configured source or a whole
+/// top-level directory of an archive (decision 0022). Returns the plain-words
+/// reason, or `None` when the pattern is fine. Ordinary patterns
+/// (`**/.cache`, `**/node_modules`, `/alice/Downloads`) pass.
+fn removes_whole_source(pattern: &str, sources: &[crate::config::Source]) -> Option<String> {
+    if pattern.starts_with('!') {
+        // Re-includes widen the backup; they never drop anything.
+        return None;
+    }
+    let advice = "; an administrator can still set it as root in /etc/nestegg/config.toml";
+    let (anchored, fixed, only_wildcards_after) = fixed_prefix(pattern);
+    // A bare name (one fixed component, no slash, no wildcard) equal to the
+    // last component of a source path matches that directory in every
+    // archive, e.g. `home` or `etc`.
+    if !anchored && fixed.len() == 1 && only_wildcards_after && !has_wildcard(pattern) {
+        let name = fixed[0];
+        if sources
+            .iter()
+            .any(|s| s.path.file_name().and_then(|n| n.to_str()) == Some(name))
+        {
+            return Some(format!(
+                "exclude pattern `{pattern}` matches the whole backup source `{name}` in every \
+                 archive, which would leave it out of the backup{advice}."
+            ));
+        }
+        return None;
+    }
+    // Anchored patterns whose fixed part is a whole directory (nothing, or
+    // only wildcards, below it).
+    if anchored && !fixed.is_empty() && only_wildcards_after {
+        if fixed.len() == 1 {
+            return Some(format!(
+                "exclude pattern `{pattern}` would drop the whole top-level directory `/{}` from \
+                 every archive that contains it{advice}.",
+                fixed[0]
+            ));
+        }
+        let fixed_path = PathBuf::from(format!("/{}", fixed.join("/")));
+        if sources
+            .iter()
+            .any(|s| s.path == fixed_path || s.path.starts_with(&fixed_path))
+        {
+            return Some(format!(
+                "exclude pattern `{pattern}` would drop the whole backup source `{}`{advice}.",
+                fixed_path.display()
+            ));
+        }
+    }
+    None
 }
 
 /// Apply `patch` to the text of the configuration file. Only the touched
@@ -454,6 +626,9 @@ pub struct Outcome {
     /// Human-readable list of what changed (for the journal), empty if
     /// nothing did.
     pub changes: Vec<String>,
+    /// Changes that lowered the protection, for the `settings` notification
+    /// (decision 0022). Empty if the change only raised it.
+    pub reductions: Vec<Reduction>,
 }
 
 /// Validate and apply a change: rewrite the configuration file, then switch
@@ -518,10 +693,12 @@ pub fn update(
             on_off(on)
         ));
     }
+    let reductions = reductions(&current, &new, was_enabled, timer_enabled);
     Ok(Outcome {
         config: new,
         timer_enabled,
         changes,
+        reductions,
     })
 }
 
@@ -738,12 +915,12 @@ interval_hours = 24
 
     #[test]
     fn ranges_are_enforced() {
-        let c = current();
+        let c = current(); // interval 24, overdue 36
         let check = |p: SettingsPatch| validate(&p, &c);
         for h in [0, 169, 1000] {
             let p = SettingsPatch {
                 interval_hours: Some(h),
-                overdue_after_hours: Some(744),
+                overdue_after_hours: Some(168),
                 ..patch()
             };
             assert!(check(p).is_err(), "interval {h}");
@@ -756,9 +933,17 @@ interval_hours = 24
             };
             assert_eq!(check(p).is_ok(), h == 2 || h == 168, "overdue {h}");
         }
+        // The API cap is 7 days (168 h): a larger value is refused.
         assert!(
             check(SettingsPatch {
-                overdue_after_hours: Some(745),
+                overdue_after_hours: Some(169),
+                ..patch()
+            })
+            .is_err()
+        );
+        assert!(
+            check(SettingsPatch {
+                overdue_after_hours: Some(744),
                 ..patch()
             })
             .is_err()
@@ -766,10 +951,47 @@ interval_hours = 24
         assert!(
             check(SettingsPatch {
                 interval_hours: Some(168),
-                overdue_after_hours: Some(200),
+                overdue_after_hours: Some(169),
                 ..patch()
             })
-            .is_ok()
+            .is_err()
+        );
+        // A larger value already in the file can be lowered, even above the
+        // cap, but not raised past what the file already has (decision 0022).
+        let mut grandfathered = current();
+        grandfathered.overdue_after_hours = 744;
+        assert!(
+            validate(
+                &SettingsPatch {
+                    overdue_after_hours: Some(500),
+                    ..patch()
+                },
+                &grandfathered,
+            )
+            .is_ok(),
+            "lowering a grandfathered value stays allowed"
+        );
+        assert!(
+            validate(
+                &SettingsPatch {
+                    overdue_after_hours: Some(745),
+                    ..patch()
+                },
+                &grandfathered,
+            )
+            .is_err(),
+            "raising above the file value is refused"
+        );
+        assert!(
+            validate(
+                &SettingsPatch {
+                    overdue_after_hours: Some(100),
+                    ..patch()
+                },
+                &grandfathered,
+            )
+            .is_ok(),
+            "lowering back into the normal range is allowed"
         );
     }
 
@@ -850,6 +1072,137 @@ interval_hours = 24
         assert!(validate_excludes(&many).is_err());
         assert!(validate_excludes(&many[..MAX_EXCLUDES]).is_ok());
         assert!(validate_excludes(&[]).is_ok());
+    }
+
+    #[test]
+    fn whole_source_excludes_are_refused_but_ordinary_ones_pass() {
+        // current() has the default sources: /home, /etc, /root, /usr/local.
+        let sources = &current().backup.sources;
+        for bad in [
+            "/home",
+            "/home/",
+            "/home/*",
+            "/home/**", // a source, with wildcards
+            "/etc",
+            "/root",
+            "/usr",
+            "/var",   // a top-level directory of an archive
+            "/alice", // a whole home inside home.pxar
+            "/usr/local",
+            "/usr/local/*",
+            "/usr/local/**", // a source with sub-dirs
+            "home",
+            "etc",
+            "local", // a bare name = a source's last part
+        ] {
+            assert!(
+                removes_whole_source(bad, sources).is_some(),
+                "{bad} should be refused"
+            );
+        }
+        for ok in [
+            "**/.cache",
+            "**/node_modules",
+            "**/lost+found",
+            "/alice/Downloads", // not a whole top-level entry
+            "/home/*/Videos",   // a sub-directory, not the whole source
+            "*.iso",
+            "node_modules", // not a source's last part
+            "/usr/lib",     // not a source nor its parent
+            "!/home",       // a re-include widens the backup
+        ] {
+            assert!(
+                removes_whole_source(ok, sources).is_none(),
+                "{ok} should pass"
+            );
+        }
+    }
+
+    #[test]
+    fn an_added_whole_source_exclude_is_refused_but_an_existing_one_is_kept() {
+        let c = current();
+        let e = validate(
+            &SettingsPatch {
+                excludes: Some(strings(&["/home"])),
+                ..patch()
+            },
+            &c,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("/etc/nestegg/config.toml"), "{e}");
+        // Root already put /home in the file: a change that keeps it passes
+        // and may add ordinary patterns.
+        let mut with = c.clone();
+        with.backup.excludes = strings(&["/home"]);
+        assert!(
+            validate(
+                &SettingsPatch {
+                    excludes: Some(strings(&["/home", "*.iso"])),
+                    ..patch()
+                },
+                &with,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn reductions_report_only_what_lowers_the_protection() {
+        let old = current(); // interval 24, overdue 36, Wake-on-LAN on
+        assert!(reductions(&old, &old, true, true).is_empty());
+        assert_eq!(
+            reductions(&old, &old, true, false),
+            vec![Reduction::AutomaticBackupsOff]
+        );
+        // Switching the timer on is not a reduction.
+        assert!(reductions(&old, &old, false, true).is_empty());
+
+        let mut slower = old.clone();
+        slower.schedule.interval_hours = 48;
+        slower.overdue_after_hours = 100;
+        let r = reductions(&old, &slower, true, true);
+        assert!(r.contains(&Reduction::IntervalRaised { from: 24, to: 48 }));
+        assert!(r.contains(&Reduction::OverdueRaised { from: 36, to: 100 }));
+
+        // Lowering the interval / overdue raises the protection.
+        let mut faster = old.clone();
+        faster.schedule.interval_hours = 12;
+        faster.overdue_after_hours = 30;
+        assert!(reductions(&old, &faster, true, true).is_empty());
+
+        // An added exclude is reported; a removed one or a re-include is not.
+        let mut more = old.clone();
+        more.backup.excludes.push("*.iso".into());
+        assert_eq!(
+            reductions(&old, &more, true, true),
+            vec![Reduction::ExcludesAdded {
+                patterns: vec!["*.iso".into()]
+            }]
+        );
+        let mut reinclude = old.clone();
+        reinclude.backup.excludes.push("!**/keep".into());
+        assert!(reductions(&old, &reinclude, true, true).is_empty());
+        let mut fewer = old.clone();
+        fewer.backup.excludes.pop();
+        assert!(reductions(&old, &fewer, true, true).is_empty());
+
+        // Wake-on-LAN off is a reduction; on is not.
+        let mut nowake = old.clone();
+        nowake.wake.as_mut().unwrap().enabled = false;
+        assert_eq!(
+            reductions(&old, &nowake, true, true),
+            vec![Reduction::WakeOnLanOff]
+        );
+        assert!(reductions(&nowake, &old, true, true).is_empty());
+    }
+
+    #[test]
+    fn limits_report_the_api_cap_and_a_grandfathered_value() {
+        let c = current();
+        assert_eq!(limits_json(&c)["overdue_after_hours"]["max"], 168);
+        let mut g = c.clone();
+        g.overdue_after_hours = 744;
+        assert_eq!(limits_json(&g)["overdue_after_hours"]["max"], 744);
     }
 
     #[test]

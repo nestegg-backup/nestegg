@@ -62,6 +62,9 @@ echo "== setup"
 # system.pxar; system mode would make every backup "incomplete".
 on_client nestegg init --server pbs.e2e.test --datastore store1 --namespace desktops \
   --auth-id 'backup@pbs!desktop' --fingerprint "$fp" --backup-id sd-desktop --no-system >/dev/null
+# The configuration may carry a token in [notify] command, so it is readable
+# by the group only, not world (decision 0022).
+check "config file created 0640 root:nestegg" bash -c "[[ \$(docker exec $client stat -c '%a %U:%G' /etc/nestegg/config.toml) == '640 root:nestegg' ]]"
 # The health check reports to a hook command (root-only configuration).
 docker exec -i "$client" tee /usr/local/bin/nestegg-test-hook >/dev/null <<'HOOK'
 #!/bin/sh
@@ -117,6 +120,10 @@ done
 check "manual run finished" test "${runs:-0}" -ge 2
 check "user can list snapshots via daemon" bash -c "[[ \$(docker exec -u alice $client nestegg snapshots --json | grep -c '\"snapshot\"') -ge 2 ]]"
 check "non-member is refused" bash -c "docker exec $client useradd -m bob && ! docker exec -u bob $client nestegg snapshots >/dev/null 2>&1"
+# bob is not in group nestegg: he cannot read the configuration (0640), a
+# group member can (decision 0022).
+check "a user outside the group cannot read the config" bash -c "! docker exec -u bob $client cat /etc/nestegg/config.toml >/dev/null 2>&1"
+check "a group member can read the config" bash -c "docker exec -u alice $client cat /etc/nestegg/config.toml >/dev/null"
 
 echo "== restore through the daemon unit (its sandbox applies to restores)"
 # Start an API restore of alice's home; prints the final state.
@@ -174,7 +181,7 @@ check "config.toml has the new excludes" on_client grep -q '"\*\.iso"' "$cfg"
 check "config.toml keeps the header comment" bash -c "docker exec $client head -1 $cfg | grep -q '^# nestegg configuration'"
 check "config.toml keeps the hand-added source" on_client grep -q 'archive = "e2e-modules"' "$cfg"
 check "config.toml keeps the [notify] section" on_client grep -q 'nestegg-test-hook' "$cfg"
-check "config.toml keeps owner and mode" bash -c "[[ \$(docker exec $client stat -c '%a %U:%G' $cfg) == '644 root:root' ]]"
+check "config.toml keeps owner and mode" bash -c "[[ \$(docker exec $client stat -c '%a %U:%G' $cfg) == '640 root:nestegg' ]]"
 check "no temporary files left in /etc/nestegg" no_output on_client find /etc/nestegg -maxdepth 1 -name '.*.tmp'
 check "timer disabled" exits_with 1 on_client systemctl is-enabled --quiet nestegg-backup.timer
 check "timer stopped" exits_with 3 on_client systemctl is-active --quiet nestegg-backup.timer
@@ -236,6 +243,10 @@ desktop_count() { desktop_log | grep -c '^uid=' || true; }
 # Timer runs only start a backup when the last success is old.
 age_state() { on_client sed -Ei 's/("finished_at": ?")[^"]*"/\12000-01-01T00:00:00Z"/g' /var/lib/nestegg/state.json; }
 
+# The settings changes in the previous section now notify too (decision 0022);
+# flush any pending check and start these notification tests from a clean slate.
+on_client systemctl start nestegg-notify.service >/dev/null 2>&1 || true
+on_client rm -f /root/hook-events /var/lib/nestegg/notify.json
 check "healthy backups so far produced no message" test -z "$(hook_events)"
 check "health check says all is well" bash -c "docker exec $client nestegg notify | grep -q 'everything is fine'"
 
@@ -300,6 +311,24 @@ check "good news is not critical" test "$(on_client grep -c -x 'arg=--urgency=cr
 on_client systemctl start nestegg-notify.service
 check "nothing more is sent" bash -c "[[ $(count_events recovered) == 1 && $(count_events failing) == 1 && $(desktop_count) == 3 ]]"
 check "status ok again" bash -c "docker exec -u alice $client nestegg status | grep -q 'Health:       ok'"
+
+echo "-- a group member lowering the protection is reported at once (decision 0022)"
+on_client rm -f /root/hook-events
+# alice switches automatic backups off through the API. The daemon starts the
+# health check at once, so the hook hears about it without the hourly timer.
+out="$(patch_config as_alice '{"automatic_backups":false}')"
+check "group member switches automatic backups off" test "$(tail -1 <<<"$out")" = 200
+check "the change reaches the hook as a settings event" wait_for_event settings 1
+check "the settings event names the user who made it" bash -c "docker exec $client grep -Eq '^settings[|][^|]*[|][^|]*[|].*alice' /root/hook-events"
+check "the switched-off timer is reported as its own condition" wait_for_event automatic_off 1
+# An exclude that drops a whole source is refused with a plain message.
+out="$(patch_config as_alice '{"excludes":["/home"]}')"
+check "an exclude of a whole source is refused" test "$(tail -1 <<<"$out")" = 400
+check "the refusal points to the file for an administrator" contains "$out" '/etc/nestegg/config.toml'
+check "config.toml still 0640 root:nestegg after the change" bash -c "[[ \$(docker exec $client stat -c '%a %U:%G' $cfg) == '640 root:nestegg' ]]"
+# Put automatic backups back (an increase in protection, not reported).
+patch_config as_alice '{"automatic_backups":true}' >/dev/null
+check "automatic backups on again" on_client systemctl is-enabled --quiet nestegg-backup.timer
 
 echo "== removal keeps credentials"
 check "package removes cleanly" on_client bash -c 'DEBIAN_FRONTEND=noninteractive apt-get remove -y -q nestegg >/tmp/apt-rm.log 2>&1'

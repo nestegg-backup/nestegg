@@ -395,6 +395,11 @@ paths:
         fingerprint, credentials, encryption and sources are rejected with
         400: they can only be changed by root in the terminal
         (decision 0013).
+        A change by a group member that lowers the protection (automatic
+        backups off, an exclude added, "overdue after" or the interval
+        raised, Wake-on-LAN off) is reported to the logged-in users and the
+        notification hook, naming who changed what (decision 0022); a change
+        by root is not.
       requestBody:
         required: true
         content:
@@ -688,8 +693,13 @@ components:
         overdue_after_hours:
           type: [integer, "null"]
           minimum: 2
-          maximum: 744
-          description: Must be greater than `interval_hours` (checked when either changes).
+          maximum: 168
+          description: |
+            Must be greater than `interval_hours` (checked when either
+            changes). The web interface accepts at most 7 days (168 h); a
+            longer time can only be set as root in the file. A value already
+            in the file above 168 is kept and can only be lowered here
+            (decision 0022); `limits.overdue_after_hours.max` reports it.
         excludes:
           type: [array, "null"]
           description: |
@@ -698,7 +708,11 @@ components:
             --exclude` syntax. At most 200 patterns, each 1-256 characters,
             no control characters, no leading or trailing spaces, no
             duplicates, and no pattern that matches everything (`*`, `**`,
-            `/`, `/*`, `**/*`, ...).
+            `/`, `/*`, `**/*`, ...). A newly added pattern that would drop a
+            whole configured source or a whole top-level directory of an
+            archive is refused (`/home`, `/home/*`, `/etc`, a single anchored
+            component like `/alice`, or a bare source name like `home`); such
+            a pattern already in the file is kept (decision 0022).
           maxItems: 200
           items: { type: string, minLength: 1, maxLength: 256 }
         wake_on_lan:
@@ -715,6 +729,9 @@ components:
           properties: { min: { type: integer }, max: { type: integer } }
         overdue_after_hours:
           type: object
+          description: |
+            `max` is the API cap (168), or a larger value already in the file
+            (which can then only be lowered through the API; decision 0022).
           properties:
             min: { type: integer }
             max: { type: integer }

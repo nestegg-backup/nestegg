@@ -10,6 +10,9 @@ use crate::config::{Config, Paths};
 use crate::state::{Health, Run, State, Store, health, next_due};
 
 pub const TIMER_UNIT: &str = "nestegg-backup.timer";
+/// The health-check oneshot, started right after a settings change so the
+/// change is reported without waiting for the hourly timer (decision 0022).
+pub const NOTIFY_UNIT: &str = "nestegg-notify.service";
 
 #[derive(Debug, Serialize)]
 pub struct Status {
@@ -185,6 +188,6 @@ pub fn config_view(config: &Config, timer_enabled: bool) -> serde_json::Value {
         "wake_on_lan": config.active_wake().is_some(),
         "wake_on_lan_configured": wake_configured,
         "editable": editable,
-        "limits": crate::settings::limits_json(),
+        "limits": crate::settings::limits_json(config),
     })
 }

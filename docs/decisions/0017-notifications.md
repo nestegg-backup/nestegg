@@ -168,3 +168,48 @@ prints what would be sent and changes nothing.
 - **Editing `[notify]` in the web UI.** Anyone in group `nestegg` could then
   run commands as root.
 - **Repeating a problem every hour.** Alert fatigue; people stop reading.
+
+## Update 2026-11-10 (decision 0022): hardening and two new events
+
+Review of the health check and the editable settings
+([decision 0022](0022-settings-changes-that-reduce-protection.md)) changed five
+things on the notification side. The policy and the two channels are otherwise
+as above.
+
+- **Two new events.** `automatic_off` ("Automatic backups are off") is now its
+  own condition, announced at once and repeated every seven days, independent
+  of the overdue threshold; it replaces the old "overdue while the timer is
+  off" variant, and the text still says how old the last backup is. `settings`
+  ("Backup settings changed") reports a group member lowering the protection
+  through the web UI; the daemon records it in `notify.json` and starts the
+  check at once. Both are also hook events (`NESTEGG_EVENT`).
+
+- **Two detail levels.** `find_sessions` reaches every regular user, not only
+  members of group `nestegg`, and a failure or settings text can contain paths
+  and file names. Members of group `nestegg` and root now get the full desktop
+  text; every other logged-in user gets a short version that only names the
+  kind of problem ("the backup of this computer failed / is overdue / is
+  incomplete / automatic backups are off / the settings were changed") and
+  asks them to tell whoever looks after the computer. The hook always gets the
+  full text.
+
+- **The record is saved after each delivery.** `notify.json` was written only
+  at the end of a check; a check killed halfway (unit timeout, reboot)
+  redelivered everything it had already sent. It is now saved after every
+  desktop and hook delivery.
+
+- **A failing hook makes the unit fail.** A hook that failed was only logged,
+  so `systemctl --failed` and the journal priority showed nothing. After
+  delivering everything else, `nestegg notify` now ends with a non-zero exit
+  code when a hook delivery failed (the retry at the next check stays). This
+  cannot loop or block the backup unit: `nestegg-notify.service` has no
+  `OnFailure=`, and the backup unit only *starts* it through `OnSuccess=` /
+  `OnFailure=`, so the check's own failure does not propagate back.
+
+- **The configuration file is group-readable, not world-readable.** Because a
+  `[notify] command` may carry a token, `/etc/nestegg/config.toml` is now
+  created `root:nestegg` mode 0640 by `nestegg init` (group members still read
+  it for `nestegg status`); the settings writer keeps that owner, group and
+  mode, and the package's `postinst` corrects an existing 0644 file on upgrade.
+  A secret a hook needs belongs in a root-only file that the command reads; the
+  ntfy example in `docs/configuration.md` shows this.

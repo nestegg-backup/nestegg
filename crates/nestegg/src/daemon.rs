@@ -371,6 +371,40 @@ fn spawn_run(run_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Start the health check outside the daemon so a protection-reducing
+/// settings change is reported right away, not only at the next hourly timer
+/// (decision 0022). Best effort: under systemd it starts the oneshot unit
+/// (`--no-block`, so the daemon does not wait for the hook); otherwise it
+/// spawns a detached `nestegg notify`. A failure only delays the report to
+/// the next hourly check, so it is logged, not raised.
+fn spawn_notify(paths: &Paths) {
+    let under_systemd =
+        Path::new("/run/systemd/system").exists() && nix::unistd::geteuid().is_root();
+    let result = if under_systemd {
+        Command::new(&paths.systemctl)
+            .args(["start", "--no-block", crate::status::NOTIFY_UNIT])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|_| ())
+    } else {
+        match std::env::current_exe() {
+            Ok(exe) => Command::new(exe)
+                .arg("notify")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(|_| ()),
+            Err(e) => Err(e),
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("warning: could not start the health check after a settings change: {e}");
+    }
+}
+
 async fn list_snapshots(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Value>> {
     let result = tokio::task::spawn_blocking(
         move || -> Result<std::result::Result<serde_json::Value, String>> {
@@ -418,9 +452,14 @@ async fn update_config(
         .as_ref()
         .and_then(|Extension(ConnectInfo(p))| p.uid)
         .ok_or_else(|| forbidden("unknown caller"))?;
-    let caller = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
-        Ok(Some(user)) => format!("{} (uid {uid})", user.name),
+    let user_name = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+        Ok(Some(user)) => user.name,
         _ => format!("uid {uid}"),
+    };
+    let caller = if user_name.starts_with("uid ") {
+        user_name.clone()
+    } else {
+        format!("{user_name} (uid {uid})")
     };
     let refuse = |msg: String| {
         eprintln!("settings change by {caller} refused: {msg}");
@@ -429,6 +468,7 @@ async fn update_config(
     let Json(body) = body.map_err(|e| refuse(e.body_text()))?;
     let patch =
         crate::settings::SettingsPatch::from_json(body).map_err(|e| refuse(e.to_string()))?;
+    let paths = app.paths.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _one_change_at_a_time = app.settings.lock().unwrap_or_else(|e| e.into_inner());
         let timer = crate::settings::SystemdTimer {
@@ -447,6 +487,20 @@ async fn update_config(
                     "settings changed by {caller}: {}",
                     outcome.changes.join("; ")
                 );
+            }
+            // A group member who lowered the protection is reported to the
+            // users and the hook; root is trusted and not reported (decision
+            // 0022). Done after the settings lock is released and detached
+            // from the response: recording takes the notification lock, which
+            // a slow in-progress check may hold.
+            if uid != 0 && !outcome.reductions.is_empty() {
+                let reductions = outcome.reductions.clone();
+                tokio::task::spawn_blocking(move || {
+                    match crate::notify::record_settings_change(&paths, &user_name, reductions) {
+                        Ok(()) => spawn_notify(&paths),
+                        Err(e) => eprintln!("warning: {e:#}"),
+                    }
+                });
             }
             Ok(Json(crate::status::config_view(
                 &outcome.config,

@@ -100,3 +100,23 @@ attacker controls.
   the switch did not change.
 - `tests/e2e/systemd.sh` changes settings through the socket of a real
   systemd installation and checks the file and the timer.
+
+## Update 2026-11-10 (decision 0022): the API refuses the extremes
+
+The editable settings stay as above, but two of them are now capped more
+tightly through the API, so a group member cannot switch the protection off
+quietly (see [decision 0022](0022-settings-changes-that-reduce-protection.md)):
+
+- **`overdue_after_hours`** is capped at **168 hours (7 days)** through the API
+  (was 744). A larger value that root set in the file is kept and can only be
+  *lowered* through the API; `limits.overdue_after_hours.max` reports the
+  effective maximum (168, or the file's value if larger).
+- **`excludes`:** a *newly added* pattern that would drop a whole configured
+  source or a whole top-level directory of an archive is refused (`/home`,
+  `/home/*`, `/etc`, an anchored single component such as `/alice`, a bare
+  source name such as `home`). A dangerous pattern already in the file is
+  grandfathered. The "matches everything" rule stays as before.
+
+A change by a group member that lowers the protection is now also **reported**
+to the users and the hook (decision 0022); the journal log of every change
+stays.
