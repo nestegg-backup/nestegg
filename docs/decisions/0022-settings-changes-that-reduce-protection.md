@@ -98,14 +98,32 @@ thus reported calmly (weekly), but from the start, not only after weeks.
   "entries unknown". The guard's answer therefore never depends on a name the
   requester cannot see anyway — a group member cannot learn from it which files
   exist in another user's `0700` home directory or in `/root`. The read is
-  bounded: names only, at most 4096 of them, a two-second limit after which the
-  child is killed and reaped without blocking the request (which holds the
-  settings lock), and no more than a fixed number of such reads at once — a
-  further read while that bound is reached counts the folder as unknown rather
-  than waiting, so a reader hung on a dead file system cannot make requests pile
-  up readers without end. The child runs a standard tool (`find`, part of the
+  bounded: names only, at most 4096 of them, a two-second limit for one folder
+  and **one deadline of four seconds for all the reads of a request together**
+  (the clock starts with the first read; a folder that is not read by then
+  counts as unknown, and no read is started after it), so a request holds the
+  settings lock for a few seconds at most, however many home directories there
+  are. After the limit the child is killed and reaped without blocking the
+  request: the read waits for data with `poll` on the request's own thread, so
+  no reader thread can be left behind, and waiting for the child to end has the
+  same deadline — a child that closed its output but does not die (one stuck in
+  uninterruptible sleep on a dead file system) is reaped on a detached thread
+  that keeps its slot until it is gone. No more than a fixed number of such
+  reads run at once: a further read while that bound is reached counts the
+  folder as unknown rather than waiting, so a reader hung on a dead file system
+  cannot make requests pile up readers without end. The child runs a standard tool (`find`, part of the
   required `findutils` package on Debian/Ubuntu), not nestegg code; a missing
-  tool is handled as "unknown". For a folder with more than 4096 entries the
+  tool is handled as "unknown". A protected folder is read by the path the
+  configuration (or the account database) gives, and `find` does not follow a
+  symbolic link at that path: such a folder counts as unknown and is judged by
+  computation and made-up names. That matches the backup client, which does not
+  follow a link either (`pxar create`, the archive code the client uses, refuses
+  a link as the archive root with `ELOOP`, so a source that is a link cannot be
+  backed up at all, and a link inside a source is stored as a link with nothing
+  below it): the entries behind a link are not in the archive and must not
+  decide anything. The protected folders are not resolved before the read
+  (resolving would run as root and could depend on what the requester cannot
+  see). For a folder with more than 4096 entries the
   first 4096 decide, so such a list can be refused although a later entry would
   stay; that errs on the side of the guard. When the real names are not known
   (the folder is empty, the requester cannot read it, it does not answer in
@@ -117,14 +135,26 @@ thus reported calmly (weekly), but from the start, not only after weeks.
   already put in the file is grandfathered and a plain reorder is refused only
   when it changes the outcome.
 
-  The folder guard is the **last** validation step. Everything that can refuse a
-  request for another reason — a value out of range, an invalid pattern,
-  Wake-on-LAN without a `[wake]` section — is checked before any folder is read.
-  A refusal for another reason therefore never depends on folder contents, so it
-  cannot be combined with the folder read to probe for names while leaving no
-  trace (the earlier order read the folder first, then refused for the other
-  reason, which told the requester whether a name existed without writing or
-  reporting anything).
+  The folder guard is the **last validation of the request's values**. Everything
+  that can refuse a request for another reason — a value out of range, an
+  invalid pattern, Wake-on-LAN without a `[wake]` section — is checked before
+  any folder is read. A refusal for another reason therefore never depends on
+  folder contents, so it cannot be combined with the folder read to probe for
+  names while leaving no trace (the earlier order read the folder first, then
+  refused for the other reason, which told the requester whether a name existed
+  without writing or reporting anything). Steps do follow it — rewriting the
+  file text, parsing the result with `Config::parse` and checking that the
+  change landed where the configuration reads it — and they can still refuse a
+  request in principle (a configuration that does not parse after the change).
+  None of them looks at folder contents; they act on the request's values and
+  the file text, which the checks before it already cover, so they are safety
+  nets that a request that passed the guard does not trip in practice. If one
+  did, the refusal changes nothing and its message carries no folder
+  information; the requester only learns that the guard let the request pass,
+  and the guard reads with the requester's own identity, so that tells them
+  about folders they can list themselves anyway. Writing the file and switching
+  the timer come after that and are failures of carrying out an accepted
+  request, not refusals.
 
   A pattern the matcher cannot parse is refused up front with a plain message:
   an unclosed `[`…`]` character class, a trailing `\`, a malformed range
@@ -273,6 +303,15 @@ the value as root in `/etc/nestegg/config.toml`.
   byte-for-byte parity; it promises the same syntax. For the malformed
   patterns compared by hand when this was written, both refused the same
   ones (the comparison is not part of the test suite).
+- **The requester can write into the answer the guard reads.** The folder is
+  listed by a child running as the requester, so the requester can open that
+  child's output pipe (`/proc/<pid>/fd/1`) and add entries of their own to the
+  list (confirmed by trying it), which can only make the guard more permissive
+  for their own request — as a list built around the made-up names in the public
+  source can too. The injected data is read under the same bounds (4096 entries,
+  a fixed number of bytes) and cannot keep a read open past the deadline, since
+  the daemon closes its end and waits only until the deadline, so it cannot hang
+  the daemon, crash it, or change what the guard says to another user.
 - **root is unbounded in the file.** Every limit above binds only changes made
   through the API by a group member. root can set anything in
   `/etc/nestegg/config.toml`, which is the intended trust boundary.
@@ -331,3 +370,10 @@ the value as root in `/etc/nestegg/config.toml`.
   announcements are no longer dropped by time alone and a clock that was ahead
   can neither suppress nor stall them (section 4); old `0644` lock files are
   replaced and every lock wait is bounded (section 5).
+- **Fourth review (2026-11-10).** All folder reads of one request now share one
+  deadline of four seconds (a folder not read by then is unknown), the read no
+  longer uses a reader thread and the wait for the child has the same
+  deadline; a folder that is a symbolic link is unknown on purpose, as the
+  client does not follow links; the wording of "the last step" is made precise
+  (the last validation of the request's values); and what a requester can do by
+  writing into the child's output is recorded in the limits.

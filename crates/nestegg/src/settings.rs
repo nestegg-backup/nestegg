@@ -11,7 +11,7 @@
 //! [`Config::parse`] before it atomically replaces the file.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 use std::ops::RangeInclusive;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -315,7 +315,10 @@ pub fn validate(
     identity: Option<PeerIdentity>,
 ) -> Result<(), SettingsError> {
     let reader: Box<FolderReader> = match identity {
-        Some(id) => Box::new(move |folder: &Path| real_children(folder, id)),
+        Some(id) => Box::new(with_shared_deadline(
+            GUARD_READ_BUDGET,
+            move |folder, until| real_children(folder, id, until),
+        )),
         None => Box::new(|_: &Path| Vec::new()),
     };
     validate_with_reader(patch, current, home_dirs, reader.as_ref())
@@ -632,8 +635,13 @@ const PROBES_MORE: [&str; 4] = [
 /// this many (decision 0022): a home directory with a few hundred entries is
 /// normal, and a low bound would switch the real-entry test off exactly there.
 const MAX_PROBE_ENTRIES: usize = 4096;
-/// Reading the names must not hang the request on a dead network file system.
+/// Reading the names of ONE folder must not hang the request on a dead network
+/// file system.
 const PROBE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// All folder reads of one request together (the settings lock is held while
+/// they run): one deadline, started with the first read. A folder not read by
+/// then counts as unknown, like one that does not answer (decision 0022).
+const GUARD_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 /// At most this many folder reads (child processes) may run at once. A read
 /// requested while the cap is reached is not started: the folder counts as
 /// unknown and the guard falls back to computation, so a reader hung on a dead
@@ -842,21 +850,49 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Wraps a folder reader that takes a deadline into one that does not: the
+/// clock starts with the first read and every later read gets the SAME
+/// deadline, so all reads of one request together stay within `budget` and a
+/// folder not read by then is unknown (an expired deadline reads nothing).
+fn with_shared_deadline(
+    budget: std::time::Duration,
+    read: impl Fn(&Path, std::time::Instant) -> Vec<(String, bool)>,
+) -> impl Fn(&Path) -> Vec<(String, bool)> {
+    let started: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+    move |folder: &Path| {
+        let until = started.get().unwrap_or_else(|| {
+            let until = std::time::Instant::now() + budget;
+            started.set(Some(until));
+            until
+        });
+        read(folder, until)
+    }
+}
+
 /// Real top-level entry names (and whether each is a directory) of `folder`,
 /// read with the requester's own identity and never as root, so the guard only
 /// ever sees names the requester could list themselves (decision 0022). The
-/// read runs in a child process (`find`) dropped to `identity`. A folder the
-/// requester cannot list, an empty one, a read that does not finish within
-/// [`PROBE_READ_TIMEOUT`], a missing `find`, or more than
-/// [`MAX_READS_IN_FLIGHT`] reads already in flight all yield an empty list;
-/// the guard then falls back to the made-up names. At most
+/// read runs in a child process (`find`) dropped to `identity` and ends at the
+/// latest at `deadline` (the one deadline all reads of a request share, further
+/// capped by [`PROBE_READ_TIMEOUT`] for this folder). A folder the requester
+/// cannot list, an empty one, a read that does not finish in time, a missing
+/// `find`, a folder path that is itself a symbolic link (see [`spawn_find`]) or
+/// more than [`MAX_READS_IN_FLIGHT`] reads already in flight all yield an empty
+/// list; the guard then falls back to the made-up names. At most
 /// [`MAX_PROBE_ENTRIES`] names are read, only the names, never the contents.
-fn real_children(folder: &Path, identity: PeerIdentity) -> Vec<(String, bool)> {
+fn real_children(
+    folder: &Path,
+    identity: PeerIdentity,
+    deadline: std::time::Instant,
+) -> Vec<(String, bool)> {
+    if std::time::Instant::now() >= deadline {
+        return Vec::new();
+    }
     let Some(guard) = InFlightGuard::acquire() else {
         return Vec::new();
     };
     match spawn_find(folder, identity) {
-        Ok(child) => collect_with_timeout(child, guard),
+        Ok(child) => collect_with_timeout(child, guard, deadline),
         Err(_) => Vec::new(),
     }
 }
@@ -873,6 +909,13 @@ const FIND_PATHS: [&str; 2] = ["/usr/bin/find", "/bin/find"];
 /// (the caller then treats the folder as unknown). The child runs no nestegg
 /// code; `find` is part of the required `findutils` package on Debian/Ubuntu,
 /// and a missing one is handled as "unknown".
+///
+/// `find` is started without `-H`/`-L`, so a folder whose own path is a
+/// symbolic link prints nothing and counts as unknown. That is deliberate: the
+/// backup client does not follow a symbolic link either (`pxar create` refuses
+/// one as the archive root with ELOOP, and a link inside a source is stored as
+/// a link, with nothing below it), so the entries behind such a link are not in
+/// the archive and must not decide anything (decision 0022, item 3).
 fn spawn_find(folder: &Path, identity: PeerIdentity) -> std::io::Result<std::process::Child> {
     // A fixed path, not a lookup in the daemon's `PATH`: whether the guard
     // can read real entries must not depend on the environment the daemon
@@ -922,46 +965,120 @@ fn spawn_find(folder: &Path, identity: PeerIdentity) -> std::io::Result<std::pro
     cmd.spawn()
 }
 
-/// Read a spawned `find`'s output with a time limit. On time-out the child is
-/// killed and reaped on a detached thread, so a reader hung on a dead file
-/// system neither blocks the request (which holds the settings lock) nor leaks
-/// a thread; the in-flight slot (`guard`) is released only once the child is
-/// finally reaped, so the bound keeps such stuck reads from piling up.
+/// The most raw bytes taken from a child, enough for [`MAX_PROBE_ENTRIES`]
+/// records (see [`parse_find_output`]).
+fn max_find_bytes() -> usize {
+    MAX_PROBE_ENTRIES.saturating_mul(MAX_EXCLUDE_LEN.max(512))
+}
+
+/// Read a spawned `find`'s output until it ends, but not past `deadline` (and
+/// not past [`PROBE_READ_TIMEOUT`] from now), then stop and reap the child
+/// within the same deadline. Everything runs on the calling thread: it waits in
+/// `poll(2)` for data and never blocks in `read`, so no reader thread can be
+/// left behind. The child and the in-flight slot (`guard`) are handled by
+/// [`stop_and_reap`], which hands a child that does not die in time to a
+/// background thread; the slot is released only once the child is really
+/// reaped, so such stuck reads cannot pile up beyond [`MAX_READS_IN_FLIGHT`].
+/// A read that does not finish in time yields nothing (unknown).
 fn collect_with_timeout(
     mut child: std::process::Child,
     guard: InFlightGuard,
+    deadline: std::time::Instant,
 ) -> Vec<(String, bool)> {
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Vec::new();
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let _ = tx.send(parse_find_output(BufReader::new(stdout)));
-    });
-    match rx.recv_timeout(PROBE_READ_TIMEOUT) {
-        Ok(entries) => {
-            // The reader hit EOF or the entry bound: the child is done or will
-            // get EPIPE on its next write; reap it so no zombie is left.
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            drop(guard);
-            entries
+    let deadline = deadline.min(std::time::Instant::now() + PROBE_READ_TIMEOUT);
+    let raw = child
+        .stdout
+        .take()
+        .and_then(|mut stdout| read_until_deadline(&mut stdout, deadline));
+    // `stdout` is closed by now: a writer that got hold of the pipe through
+    // `/proc/<pid>/fd/1` (the child runs as the requester, who may open it)
+    // gets EPIPE instead of keeping this read open (decision 0022).
+    stop_and_reap(child, guard, deadline);
+    raw.map(|raw| parse_find_output(&raw[..]))
+        .unwrap_or_default()
+}
+
+/// Raw bytes from `out` up to end of file or [`max_find_bytes`], or `None`
+/// when `deadline` passes first or the read fails. Waits with `poll(2)` so the
+/// deadline holds even when the writer keeps the pipe open and silent.
+fn read_until_deadline(
+    out: &mut std::process::ChildStdout,
+    deadline: std::time::Instant,
+) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let max_bytes = max_find_bytes();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let left = deadline.checked_duration_since(std::time::Instant::now())?;
+        if left.is_zero() {
+            return None;
         }
-        Err(_) => {
-            // Timed out: kill now, reap in the background so the request is not
-            // slowed down by a child stuck on a dead file system.
-            let _ = child.kill();
-            std::thread::spawn(move || {
-                let _ = reader.join();
-                let _ = child.wait();
-                drop(guard);
-            });
-            Vec::new()
+        let mut pfd = nix::libc::pollfd {
+            fd: out.as_raw_fd(),
+            events: nix::libc::POLLIN,
+            revents: 0,
+        };
+        // Round up so a sub-millisecond rest does not spin.
+        let ms = left.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+        // SAFETY: `pfd` is a valid pollfd that lives for the call; one entry.
+        let n = unsafe { nix::libc::poll(&mut pfd, 1, ms) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if n == 0 {
+            continue; // nothing yet; the deadline is checked at the top
+        }
+        match out.read(&mut chunk) {
+            Ok(0) => return Some(buf),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > max_bytes {
+                    return Some(buf); // the entry bound; the rest is not read
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
         }
     }
+}
+
+/// Kill `child` and reap it, waiting no longer than `deadline`. A child that is
+/// not gone by then (stuck in uninterruptible sleep on a dead file system, the
+/// one case in which a kill does not end it) is reaped on a detached thread,
+/// which keeps the in-flight slot until it is: the request does not wait for it
+/// and no thread is left behind except for such a child, at most
+/// [`MAX_READS_IN_FLIGHT`] of them.
+fn stop_and_reap(
+    mut child: std::process::Child,
+    guard: InFlightGuard,
+    deadline: std::time::Instant,
+) {
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => {
+                drop(guard);
+                return;
+            }
+        }
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(left.min(std::time::Duration::from_millis(2)));
+    }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        drop(guard);
+    });
 }
 
 /// Parse `find … -printf '%y%f\0'`: one NUL-terminated record per entry, the
@@ -1645,6 +1762,11 @@ interval_hours = 24
         }
     }
 
+    /// A deadline far enough away that it never decides a test.
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(30)
+    }
+
     /// Serialises the tests that take in-flight reader slots, so the global
     /// in-flight counter is not disturbed by a concurrent reader test.
     static READER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2156,7 +2278,7 @@ interval_hours = 24
         // Read as the current user (the daemon reads as root; a unit test runs
         // unprivileged, so the identity is the current user, which `spawn_find`
         // runs as without a privilege change).
-        let read = real_children(dir.path(), current_ids());
+        let read = real_children(dir.path(), current_ids(), soon());
         assert_eq!(read.len(), 201, "200 folders and one file");
         assert_eq!(read.iter().filter(|(_, is_dir)| *is_dir).count(), 200);
         assert!(
@@ -2164,7 +2286,7 @@ interval_hours = 24
             "the file is seen as a non-directory"
         );
         // A folder that does not exist yields "unknown" (empty).
-        assert!(real_children(&dir.path().join("missing"), current_ids()).is_empty());
+        assert!(real_children(&dir.path().join("missing"), current_ids(), soon()).is_empty());
 
         // A folder the requester cannot list counts as "unknown". Only
         // meaningful unprivileged: root bypasses the mode bits.
@@ -2175,7 +2297,7 @@ interval_hours = 24
             fs::create_dir(&locked).unwrap();
             fs::create_dir(locked.join("inside")).unwrap();
             fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-            let got = real_children(&locked, current_ids());
+            let got = real_children(&locked, current_ids(), soon());
             fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
             assert!(got.is_empty(), "an unreadable folder is unknown, not read");
         }
@@ -2229,7 +2351,7 @@ interval_hours = 24
         };
         let guard = InFlightGuard::acquire().expect("a slot is free");
         let start = std::time::Instant::now();
-        let out = collect_with_timeout(child, guard);
+        let out = collect_with_timeout(child, guard, soon());
         let elapsed = start.elapsed();
         assert!(out.is_empty());
         assert!(
@@ -2245,6 +2367,176 @@ interval_hours = 24
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(READS_IN_FLIGHT.load(Ordering::Relaxed), 0);
+    }
+
+    /// A piped child running `script` with `sh -c`, or `None` (with a message)
+    /// when there is no `sh`.
+    fn sh_child(script: &str) -> Option<std::process::Child> {
+        match Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => Some(c),
+            Err(_) => {
+                eprintln!("skipping: `sh` is not available");
+                None
+            }
+        }
+    }
+
+    /// Wait (bounded) until every in-flight slot is free again.
+    fn wait_for_free_slots() {
+        for _ in 0..1000 {
+            if READS_IN_FLIGHT.load(Ordering::Relaxed) == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(READS_IN_FLIGHT.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn all_reads_of_a_request_share_one_deadline() {
+        let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The wrapper hands every read of a request the same deadline, started
+        // with the first read, however many folders are read.
+        let seen: RefCell<Vec<std::time::Instant>> = RefCell::new(Vec::new());
+        let before = std::time::Instant::now();
+        let read = with_shared_deadline(std::time::Duration::from_millis(400), |_, until| {
+            seen.borrow_mut().push(until);
+            Vec::new()
+        });
+        for folder in ["/home/alice", "/home/bob", "/etc"] {
+            read(Path::new(folder));
+        }
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|d| *d == seen[0]), "one deadline for all");
+        assert!(seen[0] >= before + std::time::Duration::from_millis(400));
+
+        // The real reader: a first folder that hangs uses the whole budget
+        // (cut off at the deadline, unknown); the next folder, which could be
+        // read at once, then counts as unknown without a read being started.
+        let Some(hung) = sh_child("sleep 30") else {
+            return;
+        };
+        if !find_available() {
+            eprintln!("skipping the second read: `find` (findutils) is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Documents")).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        let start = std::time::Instant::now();
+        let first = collect_with_timeout(hung, InFlightGuard::acquire().unwrap(), until);
+        assert!(first.is_empty());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        let second = real_children(dir.path(), current_ids(), until);
+        assert!(second.is_empty(), "no time left: unknown, nothing read");
+        assert!(
+            !real_children(dir.path(), current_ids(), soon()).is_empty(),
+            "with time left the same folder is read"
+        );
+        wait_for_free_slots();
+    }
+
+    #[test]
+    fn a_child_that_closes_its_output_and_keeps_running_does_not_block() {
+        let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The output is complete and closed, the process lives on: the entries
+        // are taken at once and the child is killed and reaped, not waited for.
+        let Some(child) = sh_child("printf 'dDocuments\\0'; exec >&-; exec sleep 30") else {
+            return;
+        };
+        let start = std::time::Instant::now();
+        let out = collect_with_timeout(child, InFlightGuard::acquire().unwrap(), soon());
+        assert_eq!(out, vec![("Documents".to_string(), true)]);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        wait_for_free_slots();
+
+        // Reaping has the same deadline: with none left the call does not wait
+        // for the child to die; a detached thread reaps it and frees the slot.
+        let Some(child) = sh_child("exec sleep 30") else {
+            return;
+        };
+        let start = std::time::Instant::now();
+        stop_and_reap(
+            child,
+            InFlightGuard::acquire().unwrap(),
+            std::time::Instant::now(),
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        wait_for_free_slots();
+    }
+
+    #[test]
+    fn output_written_into_the_childs_pipe_by_the_requester_is_bounded() {
+        let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The child runs as the requester, who can open `/proc/<pid>/fd/1` of
+        // it and write into the answer the daemon reads (decision 0022,
+        // limits). Confirmed here: the written record is read as an entry.
+        // Data only flows to the daemon, is parsed under the same bounds, and
+        // cannot hold a read open past the deadline.
+        let write_into = |pid: u32| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(format!("/proc/{pid}/fd/1"))
+        };
+        let Some(child) = sh_child("sleep 0.4") else {
+            return;
+        };
+        let Ok(mut injector) = write_into(child.id()) else {
+            eprintln!("skipping: /proc/<pid>/fd/1 of a child cannot be opened here");
+            return;
+        };
+        injector.write_all(b"dMadeUpByRequester\0").unwrap();
+        drop(injector);
+        let out = collect_with_timeout(child, InFlightGuard::acquire().unwrap(), soon());
+        assert_eq!(out, vec![("MadeUpByRequester".to_string(), true)]);
+        wait_for_free_slots();
+
+        // The requester keeps the pipe open and silent: no end of output ever
+        // comes. The read is cut off at the deadline, answers "unknown", the
+        // child is reaped and the in-flight slot is free again although the
+        // requester still holds the pipe; the daemon's end is closed, so a
+        // further write fails instead of being read.
+        let Some(child) = sh_child("printf 'dDocuments\\0'; sleep 0.2") else {
+            return;
+        };
+        let mut injector = write_into(child.id()).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let start = std::time::Instant::now();
+        let out = collect_with_timeout(child, InFlightGuard::acquire().unwrap(), until);
+        assert!(out.is_empty(), "no end of output: unknown");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        wait_for_free_slots();
+        assert!(
+            injector.write_all(b"dLate\0").is_err(),
+            "the daemon's end of the pipe is closed"
+        );
+    }
+
+    #[test]
+    fn a_folder_that_is_itself_a_symlink_is_unknown() {
+        let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !find_available() {
+            eprintln!("skipping: `find` (findutils) is not installed");
+            return;
+        }
+        // The backup client does not follow a link as the archive root and
+        // stores a link inside a source as a link, so what lies behind one is
+        // not in the archive: it is not read (decision 0022, item 3).
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::create_dir(real.join("Documents")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(real_children(&real, current_ids(), soon()).len(), 1);
+        assert!(real_children(&link, current_ids(), soon()).is_empty());
     }
 
     #[test]

@@ -273,6 +273,10 @@ The daemon identifies the caller by the socket credentials:
   empties a folder the daemon may read that folder's top-level entry names, and
   it does so with the requesting user's own permissions, never as root, so the
   guard's answer never reveals a name the requester could not list themselves.
+  All such reads of one request together get a few seconds (four); a folder
+  that cannot be read in that time, or whose path is a symbolic link (the
+  backup client does not follow links either), counts as unread and is judged
+  by made-up names instead.
   nestegg matches patterns with
   the same `pathpatterns` library the backup client uses (an older release of
   the same code), so a pattern that the client cannot parse — an unclosed
