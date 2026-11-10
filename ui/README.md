@@ -216,10 +216,12 @@ resets them. Decision 0022:
   real accounts. The mock cannot do that: `mock/folderRule.ts` is a **stand-in**
   that refuses a small fixed set of patterns the daemon refuses on a default
   installation, with the daemon's message, and accepts everything else. For the
-  home directory `alice` that is `/alice`, `alice`, `**/alice` and `/[a-z]*`;
-  for each backed-up folder it is the folder itself (`/home`, `/etc`, ...) and
-  the folder followed by `/`, `/*` or `/**`. A pattern already in the list is
-  not judged again. The page itself only checks what a browser can know (empty,
+  home directory `alice` that is `/alice`, `alice`, `**/alice` and `/[a-z]*`.
+  Patterns are relative to the root of each archive, so `/home` or `/etc/**`
+  match nothing in the archives of the mock's setup and are accepted, as by
+  the daemon. A pattern the backup client cannot parse (an unclosed `[`, a
+  trailing backslash) is refused with the daemon's message. A pattern already
+  in the list is not judged again. The page itself only checks what a browser can know (empty,
   too long in bytes, control and invisible characters, spaces at the ends, a
   leading `-`, a pattern that matches everything, duplicates).
 
