@@ -290,10 +290,18 @@ first.
   which for the client means `--include-dev`. nestegg's `mounts.rs` already
   relies on that. The rule for the configured sources is therefore the one the
   system mode already used: a path is inside the backup if it lies under a
-  source (or `include_dev` path) with no other mount point between them. A
-  stick mounted below `/home` is outside, as is a data disk that is not
-  listed; a file system that is itself a source or `include_dev` entry is a
-  root of its own. If the mount table cannot be read, everything below a
+  source (or `include_dev` path) with no other file system mounted between
+  them. A stick mounted below `/home` is outside, as is a data disk that is
+  not listed; a file system that is itself a source or `include_dev` entry is
+  a root of its own. If the mount table cannot be read, everything below a
   source counts as inside (the previous behaviour).
+  The archiver tells file systems apart by the device number, not by the
+  mount point (checked the same way: with a bind mount of a folder of the
+  source and a tmpfs below the source, `pxar create` archives the content of
+  the bind mount and skips only the tmpfs). So a mount below a source counts
+  as a boundary only when the mount table gives it another device number
+  than the source's file system; a second mount of the same file system is
+  inside the backup. If the device of the source is not in the table,
+  everything below it counts as inside.
 - **Rescue console.** `show_network()` passes the output of `ip` through the
   same `printable` filter as the rest of the console.

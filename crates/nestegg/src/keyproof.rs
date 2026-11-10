@@ -388,31 +388,55 @@ pub struct BackupScope {
     /// no disk layout in system mode): a copy on removable media can then
     /// not be told apart from one inside the backup.
     pub unknown: Option<String>,
-    /// Every mount point of the running system (the mount table). The backup
-    /// client does not cross mount points: a file system mounted below a
-    /// source is not part of the backup unless it is a source or listed in
-    /// `include_dev` itself. `None` when the table could not be read; every
+    /// Every mount point of the running system with the device number of its
+    /// file system (the mount table, in its order). The backup client stays
+    /// on the file system of a source: another file system mounted below it
+    /// is not part of the backup unless it is a source or listed in
+    /// `include_dev` itself. It tells file systems apart by the device
+    /// number, so a second mount of the source's own file system (a bind
+    /// mount) IS backed up. `None` when the table could not be read; every
     /// path below a source then counts as inside (the safe side).
-    pub mount_points: Option<Vec<PathBuf>>,
+    pub mount_points: Option<Vec<(PathBuf, String)>>,
 }
 
 impl BackupScope {
-    /// The same scope, knowing the mount points of the running system.
-    pub fn with_mount_points(mut self, points: Vec<PathBuf>) -> BackupScope {
+    /// The same scope, knowing the mounts of the running system (mount
+    /// point, device number), in the order of the mount table.
+    pub fn with_mount_points(mut self, points: Vec<(PathBuf, String)>) -> BackupScope {
         self.mount_points = Some(points);
         self
     }
 
-    /// Whether a file system is mounted between `root` (a source or an
-    /// `include_dev` path) and `path`: then `path` is on another file system
-    /// than `root`, which the backup client skips. A mount point that is
+    /// Whether another file system is mounted between `root` (a source or an
+    /// `include_dev` path) and `path`: then `path` is not on the file system
+    /// of `root`, and the backup client skips it. A mount point that is
     /// `root` itself is the file system of `root`; a path that is itself a
-    /// source or `include_dev` entry is a root of its own.
+    /// source or `include_dev` entry is a root of its own. A mount of the
+    /// same device (a bind mount of the source's own file system) is not a
+    /// boundary for the client. If the device of `root` is not known, nothing
+    /// counts as crossed (the safe side: inside the backup).
     fn crosses_mount(&self, root: &Path, path: &Path) -> bool {
-        self.mount_points.as_ref().is_some_and(|points| {
+        let Some(points) = self.mount_points.as_ref() else {
+            return false;
+        };
+        // The device a path is on: the deepest mount point at or above it;
+        // of several mounts on the same point the last one is on top.
+        let device_at = |p: &Path| {
             points
                 .iter()
-                .any(|m| m != root && m.starts_with(root) && path.starts_with(m))
+                .enumerate()
+                .filter(|(_, (m, _))| p.starts_with(m))
+                .max_by_key(|(i, (m, _))| (m.components().count(), *i))
+                .map(|(_, (_, device))| device.as_str())
+        };
+        let Some(root_device) = device_at(root) else {
+            return false;
+        };
+        points.iter().any(|(m, _)| {
+            m != root
+                && m.starts_with(root)
+                && path.starts_with(m)
+                && device_at(m) != Some(root_device)
         })
     }
 
@@ -1287,14 +1311,78 @@ mod tests {
         }
     }
 
-    fn mounted(points: &[&str]) -> Vec<PathBuf> {
-        points.iter().map(PathBuf::from).collect()
+    /// Mount points, each a file system of its own (its own device number).
+    fn mounted(points: &[&str]) -> Vec<(PathBuf, String)> {
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (PathBuf::from(p), format!("8:{i}")))
+            .collect()
+    }
+
+    #[test]
+    fn a_bind_mount_of_the_same_file_system_below_a_source_is_inside_the_backup() {
+        // The client tells file systems apart by the device number: a second
+        // mount of the source's own file system below the source is backed
+        // up with it, so a copy of the key there is inside the backup.
+        let dev = |p: &str, d: &str| (PathBuf::from(p), d.to_string());
+        let scope = scope_with(&["/home"], None).with_mount_points(vec![
+            dev("/", "8:1"),
+            dev("/home", "8:2"),
+            dev("/home/alice/bind", "8:2"),
+            dev("/home/alice/STICK", "8:17"),
+        ]);
+        assert!(
+            scope
+                .contains(Path::new("/home/alice/bind/key.json"))
+                .is_some()
+        );
+        assert!(
+            scope
+                .contains(Path::new("/home/alice/STICK/key.json"))
+                .is_none()
+        );
+        // Another file system mounted inside the bind mount is outside again.
+        let nested = scope_with(&["/home"], None).with_mount_points(vec![
+            dev("/", "8:1"),
+            dev("/home/alice/bind", "8:1"),
+            dev("/home/alice/bind/usb", "8:17"),
+        ]);
+        assert!(nested.contains(Path::new("/home/alice/bind/k")).is_some());
+        assert!(
+            nested
+                .contains(Path::new("/home/alice/bind/usb/k"))
+                .is_none()
+        );
+        // Behind another file system the same device does not come back in:
+        // the client never gets there.
+        let behind = scope_with(&["/home"], None).with_mount_points(vec![
+            dev("/", "8:1"),
+            dev("/home/alice/STICK", "8:17"),
+            dev("/home/alice/STICK/back", "8:1"),
+        ]);
+        assert!(
+            behind
+                .contains(Path::new("/home/alice/STICK/back/k"))
+                .is_none()
+        );
+        // Mounted over: the mount on top decides.
+        let over = scope_with(&["/home"], None).with_mount_points(vec![
+            dev("/", "8:1"),
+            dev("/home/alice/m", "8:1"),
+            dev("/home/alice/m", "8:17"),
+        ]);
+        assert!(over.contains(Path::new("/home/alice/m/k")).is_none());
+        // The device of the source is not known: inside (the safe side).
+        let unknown =
+            scope_with(&["/home"], None).with_mount_points(vec![dev("/home/alice/STICK", "8:17")]);
+        assert!(unknown.contains(Path::new("/home/alice/STICK/k")).is_some());
     }
 
     #[test]
     fn a_stick_mounted_below_a_source_is_outside_the_backup() {
-        // The client does not cross mount points: /home/alice/STICK is a
-        // file system of its own and is not backed up with /home.
+        // The client stays on the file system of the source: /home/alice/STICK
+        // is a file system of its own and is not backed up with /home.
         let scope = scope_with(&["/home"], None).with_mount_points(mounted(&[
             "/",
             "/home/alice/STICK",
@@ -1338,8 +1426,11 @@ mod tests {
         }
         assert!(scope.contains(Path::new("/home/alice/STICK/k")).is_none());
         // A mount below the data disk is again its own file system.
-        let nested = scope_with(&["/home/alice/data"], None)
-            .with_mount_points(mounted(&["/home/alice/data", "/home/alice/data/usb"]));
+        let nested = scope_with(&["/home/alice/data"], None).with_mount_points(mounted(&[
+            "/",
+            "/home/alice/data",
+            "/home/alice/data/usb",
+        ]));
         assert!(
             nested
                 .contains(Path::new("/home/alice/data/usb/k"))
@@ -1347,7 +1438,8 @@ mod tests {
         );
         assert!(nested.contains(Path::new("/home/alice/data/k")).is_some());
         // Component-wise, not by prefix.
-        let by_name = scope_with(&["/home"], None).with_mount_points(mounted(&["/home/alice/US"]));
+        let by_name =
+            scope_with(&["/home"], None).with_mount_points(mounted(&["/", "/home/alice/US"]));
         assert!(by_name.contains(Path::new("/home/alice/USB/k")).is_some());
     }
 

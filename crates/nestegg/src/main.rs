@@ -1051,12 +1051,11 @@ fn backup_scope(paths: &Paths) -> nestegg::keyproof::BackupScope {
             };
             let scope = BackupScope::for_config(&cfg, layout.as_ref());
             // The mount table tells which file systems below a source are
-            // not part of the backup (the client does not cross mount
-            // points). Unreadable: everything below a source counts.
+            // not part of the backup (the client stays on the device of the
+            // source). Unreadable: everything below a source counts.
             match nestegg::mounts::load() {
-                Ok((mounts, _)) => {
-                    scope.with_mount_points(mounts.into_iter().map(|m| m.point).collect())
-                }
+                Ok((mounts, _)) => scope
+                    .with_mount_points(mounts.into_iter().map(|m| (m.point, m.device)).collect()),
                 Err(_) => scope,
             }
         }

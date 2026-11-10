@@ -1782,8 +1782,8 @@ fn key_paperkey_takes_the_run_lock_and_says_to_try_again_while_a_backup_runs() {
 
 #[test]
 fn a_stick_mounted_below_a_source_is_not_inside_the_backup() {
-    // The client does not cross mount points. With a file system mounted
-    // below the source, a copy there is not "part of the backup" (the
+    // The client stays on the file system of a source. With another file
+    // system mounted below the source, a copy there is not "part of the backup" (the
     // device then decides, here a disk of this computer or unknown); a copy
     // elsewhere in the source still is.
     let env = Env::new();
@@ -1834,6 +1834,27 @@ fn a_stick_mounted_below_a_source_is_not_inside_the_backup() {
     cmd.env("NESTEGG_ALLOW_NON_ROOT", "1")
         .env_remove("SUDO_UID")
         .env("NESTEGG_MOUNTINFO", &plain);
+    assert!(stderr(&cmd.output().unwrap()).contains("lies inside"));
+    // A second mount of the source's own file system there (a bind mount: the
+    // same device number): the client backs it up, so the copy is inside.
+    let bind = env.root().join("mountinfo-bind");
+    fs::write(
+        &bind,
+        format!(
+            "22 1 259:2 / / rw - ext4 /dev/sda1 rw\n40 22 259:2 /x {} rw - ext4 /dev/sda1 rw\n",
+            canonical_name(&stick)
+        ),
+    )
+    .unwrap();
+    let mut cmd = env.command(&[
+        "key",
+        "confirm-exported",
+        "--file",
+        on_stick.to_str().unwrap(),
+    ]);
+    cmd.env("NESTEGG_ALLOW_NON_ROOT", "1")
+        .env_remove("SUDO_UID")
+        .env("NESTEGG_MOUNTINFO", &bind);
     assert!(stderr(&cmd.output().unwrap()).contains("lies inside"));
 }
 
