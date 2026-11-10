@@ -897,6 +897,23 @@ fn real_children(
     }
 }
 
+/// `path` with a trailing slash: for `find` (as for any path lookup) that
+/// names the directory a symbolic link points to instead of the link itself.
+/// The reader's child runs as the requester, so it still lists only what the
+/// requester may list.
+fn through_a_link(path: &Path) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    if !raw.as_encoded_bytes().ends_with(b"/") {
+        raw.push("/");
+    }
+    PathBuf::from(raw)
+}
+
+/// How many readers the tests have started (to prove that none is started
+/// where none may be).
+#[cfg(test)]
+static FIND_SPAWNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Where `find` (package `findutils`) is installed on Debian and Ubuntu.
 const FIND_PATHS: [&str; 2] = ["/usr/bin/find", "/bin/find"];
 
@@ -911,11 +928,13 @@ const FIND_PATHS: [&str; 2] = ["/usr/bin/find", "/bin/find"];
 /// and a missing one is handled as "unknown".
 ///
 /// `find` is started without `-H`/`-L`, so a folder whose own path is a
-/// symbolic link prints nothing and counts as unknown. That is deliberate: the
-/// backup client does not follow a symbolic link either (`pxar create` refuses
-/// one as the archive root with ELOOP, and a link inside a source is stored as
-/// a link, with nothing below it), so the entries behind such a link are not in
-/// the archive and must not decide anything (decision 0022, item 3).
+/// symbolic link prints nothing and counts as unknown. That is right for a
+/// folder inside a source: the backup client stores such a link as a link,
+/// with nothing below it, so the entries behind it are not in the archive
+/// and must not decide anything. A source that is itself a link is different
+/// (`proxmox-backup-client backup` follows it and archives what it points
+/// to): the caller passes such a path with a trailing slash, see
+/// [`through_a_link`] (decision 0022, item 3).
 fn spawn_find(folder: &Path, identity: PeerIdentity) -> std::io::Result<std::process::Child> {
     // A fixed path, not a lookup in the daemon's `PATH`: whether the guard
     // can read real entries must not depend on the environment the daemon
@@ -927,6 +946,8 @@ fn spawn_find(folder: &Path, identity: PeerIdentity) -> std::io::Result<std::pro
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "find is not installed")
         })?;
+    #[cfg(test)]
+    FIND_SPAWNS.fetch_add(1, Ordering::SeqCst);
     let mut cmd = Command::new(find);
     // Only the direct children, printed as `<type><name>\0`: the type is one
     // byte (`d` for a directory) and the NUL separates records, so a name with
@@ -1047,18 +1068,24 @@ fn read_until_deadline(
     }
 }
 
-/// Kill `child` and reap it, waiting no longer than `deadline`. A child that is
-/// not gone by then (stuck in uninterruptible sleep on a dead file system, the
-/// one case in which a kill does not end it) is reaped on a detached thread,
-/// which keeps the in-flight slot until it is: the request does not wait for it
-/// and no thread is left behind except for such a child, at most
-/// [`MAX_READS_IN_FLIGHT`] of them.
+/// How long a killed child gets to disappear even when the deadline has
+/// already passed: the kill needs a moment to take effect.
+const REAP_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Kill `child` and reap it, waiting no longer than `deadline` (but at least
+/// [`REAP_GRACE`], so the ordinary case of a child cut off at the deadline is
+/// reaped right here). A child that is not gone by then (stuck in
+/// uninterruptible sleep on a dead file system, the one case in which a kill
+/// does not end it) is reaped on a detached thread, which keeps the in-flight
+/// slot until it is: the request does not wait for it, and there are at most
+/// [`MAX_READS_IN_FLIGHT`] such threads.
 fn stop_and_reap(
     mut child: std::process::Child,
     guard: InFlightGuard,
     deadline: std::time::Instant,
 ) {
     let _ = child.kill();
+    let deadline = deadline.max(std::time::Instant::now() + REAP_GRACE);
     loop {
         match child.try_wait() {
             Ok(None) => {}
@@ -1075,10 +1102,21 @@ fn stop_and_reap(
         }
         std::thread::sleep(left.min(std::time::Duration::from_millis(2)));
     }
-    std::thread::spawn(move || {
-        let _ = child.wait();
-        drop(guard);
-    });
+    // `Builder::spawn` reports a failure instead of panicking as
+    // `thread::spawn` would. If no thread can be started (the process is out
+    // of threads or memory) nobody waits for the child: it stays in the
+    // process table until the daemon ends, and its slot is released with the
+    // closure. That is logged; the request itself is not affected.
+    let reaper = std::thread::Builder::new().name("nestegg-reap".into());
+    if reaper
+        .spawn(move || {
+            let _ = child.wait();
+            drop(guard);
+        })
+        .is_err()
+    {
+        eprintln!("warning: could not start a thread to wait for a folder reader");
+    }
 }
 
 /// Parse `find … -printf '%y%f\0'`: one NUL-terminated record per entry, the
@@ -1137,7 +1175,15 @@ fn excludes_reduce_protection(
     let old = match_entries(old_list);
     let new = match_entries(new_list);
     for (archive_root, folder) in protected_folders(sources, home_dirs, system) {
-        let children = read_children(&folder);
+        // A source that is itself a symbolic link is followed by the backup
+        // client (its content is what gets archived), so the guard reads
+        // through the link too; a folder *inside* a source that is a link is
+        // stored as a link with nothing below it and stays unread.
+        let children = if folder == archive_root {
+            read_children(&through_a_link(&folder))
+        } else {
+            read_children(&folder)
+        };
         if !list_empties_folder(&new, &archive_root, &folder, &children) {
             continue;
         }
@@ -2537,6 +2583,91 @@ interval_hours = 24
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert_eq!(real_children(&real, current_ids(), soon()).len(), 1);
         assert!(real_children(&link, current_ids(), soon()).is_empty());
+        // A source that is itself a link is followed by the client, so the
+        // guard reads through it (the caller adds the trailing slash).
+        let through = real_children(&through_a_link(&link), current_ids(), soon());
+        assert_eq!(through, vec![("Documents".to_string(), true)]);
+        assert_eq!(through_a_link(Path::new("/a/")), PathBuf::from("/a/"));
+    }
+
+    #[test]
+    fn a_source_that_is_a_link_is_read_through_but_a_folder_inside_a_source_is_not() {
+        // The reader is asked for the source itself with a trailing slash
+        // (follow the link) and for a home directory inside a source without
+        // one (a link there is stored as a link).
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let reader = {
+            let asked = asked.clone();
+            move |p: &Path| {
+                asked.lock().unwrap().push(p.to_string_lossy().into_owned());
+                Vec::new()
+            }
+        };
+        let sources = vec![crate::config::Source {
+            archive: "home".into(),
+            path: PathBuf::from("/home"),
+            optional: false,
+            require_mount: false,
+        }];
+        let homes = vec![PathBuf::from("/home/alice")];
+        let _ =
+            excludes_reduce_protection(&[], &["/alice/x".into()], &sources, &homes, false, &reader);
+        let asked = asked.lock().unwrap().clone();
+        assert!(asked.contains(&"/home/".to_string()), "{asked:?}");
+        assert!(asked.contains(&"/home/alice".to_string()), "{asked:?}");
+    }
+
+    #[test]
+    fn a_child_that_writes_without_end_is_cut_at_the_bounds() {
+        let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Records without end (a huge folder, or data the requester writes
+        // into the pipe): the read stops at the bound on entries and bytes
+        // long before the deadline.
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "yes dAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA | tr '\\n' '\\0'",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let guard = InFlightGuard::acquire().expect("a free slot");
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(20);
+        let got = collect_with_timeout(child, guard, deadline);
+        assert_eq!(got.len(), MAX_PROBE_ENTRIES);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "stopped by the bound, not by the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn after_the_deadline_no_child_is_started() {
+        let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !find_available() {
+            eprintln!("skipping: `find` (findutils) is not installed");
+            return;
+        }
+        // With every slot taken a read cannot start a child; with the deadline
+        // over it must not even try, so it does not matter that a slot is free:
+        // the folder is unknown and no slot was used in between.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Documents")).unwrap();
+        let over = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let before = FIND_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(real_children(dir.path(), current_ids(), over).is_empty());
+        let after = FIND_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(before, after, "no reader was started after the deadline");
+        // In time, the same folder is read (and a reader is counted).
+        assert_eq!(real_children(dir.path(), current_ids(), soon()).len(), 1);
+        assert_eq!(
+            FIND_SPAWNS.load(std::sync::atomic::Ordering::SeqCst),
+            after + 1
+        );
     }
 
     #[test]

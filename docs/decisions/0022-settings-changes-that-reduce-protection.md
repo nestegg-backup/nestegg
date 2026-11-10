@@ -111,19 +111,22 @@ thus reported calmly (weekly), but from the start, not only after weeks.
   that keeps its slot until it is gone. No more than a fixed number of such
   reads run at once: a further read while that bound is reached counts the
   folder as unknown rather than waiting, so a reader hung on a dead file system
-  cannot make requests pile up readers without end. The child runs a standard tool (`find`, part of the
-  required `findutils` package on Debian/Ubuntu), not nestegg code; a missing
-  tool is handled as "unknown". A protected folder is read by the path the
-  configuration (or the account database) gives, and `find` does not follow a
-  symbolic link at that path: such a folder counts as unknown and is judged by
-  computation and made-up names. That matches the backup client, which does not
-  follow a link either (`pxar create`, the archive code the client uses, refuses
-  a link as the archive root with `ELOOP`, so a source that is a link cannot be
-  backed up at all, and a link inside a source is stored as a link with nothing
-  below it): the entries behind a link are not in the archive and must not
-  decide anything. The protected folders are not resolved before the read
-  (resolving would run as root and could depend on what the requester cannot
-  see). For a folder with more than 4096 entries the
+  cannot make requests pile up readers without end. The child runs a standard
+  tool (`find`, part of the required `findutils` package on Debian/Ubuntu),
+  not nestegg code; a missing tool is handled as "unknown". A protected folder
+  is read by the path the configuration (or the account database) gives. For
+  a symbolic link at that path the guard does what the backup client does,
+  checked with the real client against a real server: a folder *inside* a
+  source that is a link is stored as a link with nothing below it, so the
+  entries behind it are not in the archive, are not read, and the folder
+  counts as unknown (judged by computation and made-up names); a *source*
+  that is itself a link is followed by `proxmox-backup-client backup`, which
+  archives what it points to, so the guard reads through that link too. (The
+  `pxar create` command line tool refuses a link as the archive root; the
+  client does not, which an earlier version of this record got wrong.) The
+  protected folders are not resolved by the daemon before the read: resolving
+  would run as root and could depend on what the requester cannot see; the
+  link is followed by the reader's child, with the requester's permissions. For a folder with more than 4096 entries the
   first 4096 decide, so such a list can be refused although a later entry would
   stay; that errs on the side of the guard. When the real names are not known
   (the folder is empty, the requester cannot read it, it does not answer in
@@ -386,10 +389,12 @@ the value as root in `/etc/nestegg/config.toml`.
 - **Fourth review (2026-11-10).** All folder reads of one request now share one
   deadline of four seconds (a folder not read by then is unknown), the read no
   longer uses a reader thread and the wait for the child has the same
-  deadline; a folder that is a symbolic link is unknown on purpose, as the
-  client does not follow links; the wording of "the last step" is made precise
-  (the last validation of the request's values); and what a requester can do by
-  writing into the child's output is recorded in the limits.
+  deadline; a folder inside a source that is a symbolic link is unknown on
+  purpose (the client stores it as a link), while a source that is itself a
+  link is read through it (the client follows it); the wording of "the last
+  step" is made precise (the last validation of the request's values); and
+  what a requester can do by writing into the child's output is recorded in
+  the limits.
   The replacement of old `0644` lock files was removed again: it was faulty (a
   `/proc/locks` line of a process that was gone stopped it for good, two
   processes could each end up with "the" lock, and the device numbers of
