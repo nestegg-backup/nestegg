@@ -97,6 +97,14 @@ sleep 1
 check "daemon active" on_client systemctl is-active --quiet nestegg.service
 check "timer active" on_client systemctl is-active --quiet nestegg-backup.timer
 check "check passes" on_client nestegg check
+# A member of group nestegg may not read the stored secret, so the check
+# goes through the daemon: the login is really checked, nothing is skipped
+# with "needs root", and the exit code is 0 (2 would mean "not everything
+# could be checked").
+member_check="$(as_alice nestegg check 2>&1)" && member_rc=0 || member_rc=$?
+check "check as a group member passes (exit code 0)" test "$member_rc" = 0
+check "check as a group member really checks the login" grep -q '^\[ ok \] PBS login' <<<"$member_check"
+check "check as a group member skips nothing" bash -c '! grep -q "needs root\|^\[skip\]" <<<"$1"' _ "$member_check"
 
 echo "== backup through the systemd unit"
 check "timer unit run succeeds" on_client systemctl start nestegg-backup.service

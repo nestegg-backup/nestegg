@@ -620,6 +620,34 @@ esac
     }
 
     #[test]
+    fn a_busy_program_file_is_waited_out() {
+        // While the program file is open for writing, starting it fails with
+        // "Text file busy" (as during a package upgrade). That is waited out;
+        // it must not count as "systemd-creds does not work" and lead to the
+        // fallback or to an error.
+        let dir = tempfile::tempdir().unwrap();
+        let creds = fake_creds(dir.path());
+        let writer = fs::OpenOptions::new().append(true).open(&creds).unwrap();
+        // Really busy now: a start attempt fails with that error.
+        let busy = Command::new(&creds).arg("--version").output().unwrap_err();
+        assert_eq!(busy.raw_os_error(), Some(nix::libc::ETXTBSY), "{busy}");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            drop(writer);
+        });
+        let store = SecretStore::new(&dir.path().join("cred")).with_creds_binary(&creds);
+        let storage = store
+            .store(PASSWORD, &Secret::new(b"tok".to_vec()), false)
+            .unwrap();
+        release.join().unwrap();
+        assert_eq!(storage, Storage::SystemdCreds);
+        // The first way of sealing worked: no fallback to the host key.
+        let log = fs::read_to_string(dir.path().join("args.log")).unwrap();
+        assert!(!log.contains("--with-key=host"), "{log}");
+        assert_eq!(store.load(PASSWORD).unwrap().as_bytes(), b"tok");
+    }
+
+    #[test]
     fn store_falls_back_to_host_key_when_the_tpm_fails() {
         let dir = tempfile::tempdir().unwrap();
         let creds = fake_creds(dir.path());

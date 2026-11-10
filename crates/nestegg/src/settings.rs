@@ -861,6 +861,9 @@ fn real_children(folder: &Path, identity: PeerIdentity) -> Vec<(String, bool)> {
     }
 }
 
+/// Where `find` (package `findutils`) is installed on Debian and Ubuntu.
+const FIND_PATHS: [&str; 2] = ["/usr/bin/find", "/bin/find"];
+
 /// Start `find` listing the top-level entries of `folder` as `identity`. When
 /// the daemon runs as root it drops the child to `identity`'s uid and primary
 /// gid and clears the supplementary groups (as `std::process::Command` does
@@ -871,7 +874,17 @@ fn real_children(folder: &Path, identity: PeerIdentity) -> Vec<(String, bool)> {
 /// code; `find` is part of the required `findutils` package on Debian/Ubuntu,
 /// and a missing one is handled as "unknown".
 fn spawn_find(folder: &Path, identity: PeerIdentity) -> std::io::Result<std::process::Child> {
-    let mut cmd = Command::new("find");
+    // A fixed path, not a lookup in the daemon's `PATH`: whether the guard
+    // can read real entries must not depend on the environment the daemon
+    // happened to be started with.
+    let find = FIND_PATHS
+        .iter()
+        .map(Path::new)
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "find is not installed")
+        })?;
+    let mut cmd = Command::new(find);
     // Only the direct children, printed as `<type><name>\0`: the type is one
     // byte (`d` for a directory) and the NUL separates records, so a name with
     // spaces or newlines cannot confuse the parse.
@@ -1639,13 +1652,7 @@ interval_hours = 24
     /// Whether `find` (findutils) is on this host; the reader tests skip
     /// without it, since a missing tool is handled as "unknown".
     fn find_available() -> bool {
-        Command::new("find")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        FIND_PATHS.iter().any(|p| Path::new(p).is_file())
     }
 
     #[test]
