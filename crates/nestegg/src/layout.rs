@@ -19,6 +19,9 @@ pub const LAYOUT_FILE: &str = "layout.json";
 pub const LAYOUT_VERSION: u32 = 1;
 /// Archive name (without `.pxar`) of the full system backup.
 pub const SYSTEM_ARCHIVE: &str = "system";
+/// Start of the note of [`system_mode_config`] when `system.pxar` cannot be
+/// made; the run records it as a reason why the backup is incomplete.
+pub const SYSTEM_SKIPPED: &str = "full system backup skipped";
 
 /// File system types the rescue system can recreate.
 pub const RECREATABLE_FS: &[&str] = &["ext4", "ext3", "ext2", "btrfs", "xfs", "vfat"];
@@ -305,7 +308,7 @@ pub fn system_mode_config(
         Some(root) if RECREATABLE_FS.contains(&root.fstype.as_str()) && root.fstype != "vfat" => {}
         other => {
             notes.push(format!(
-                "warning: full system backup skipped: the root file system ({}) cannot be \
+                "warning: {SYSTEM_SKIPPED}: the root file system ({}) cannot be \
                  recreated by the rescue stick; only the configured folders are backed up",
                 other.map_or("unknown", |r| r.fstype.as_str())
             ));

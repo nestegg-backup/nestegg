@@ -107,6 +107,9 @@ pub struct Job<'a> {
     pub layout: &'a Layout,
     pub client: &'a Client<'a>,
     pub snapshot: &'a str,
+    /// How to read `system.pxar`, as decided by the key check
+    /// ([`super::Protection::restore_key`]).
+    pub key: &'a RestoreKey,
     pub luks_passphrase: Option<&'a Secret>,
     /// Package selections of the backed-up system (from the inventory).
     pub dpkg_selections: Option<&'a str>,
@@ -285,27 +288,14 @@ pub fn check_disk_free(disk: &str) -> Result<()> {
     Ok(())
 }
 
-/// What is on the disk now (shown before the confirmation), and the UUIDs
-/// of its file systems.
-pub fn disk_contents(disk: &str) -> (String, Vec<String>) {
-    let out = std::process::Command::new("lsblk")
+/// What is on the disk now (shown before the confirmation). Whether it
+/// holds data is decided by `guard::assess`.
+pub fn disk_contents(disk: &str) -> String {
+    std::process::Command::new("lsblk")
         .args(["-n", "-o", "NAME,SIZE,FSTYPE,LABEL", disk])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    let uuids = std::process::Command::new("lsblk")
-        .args(["-n", "-l", "-o", "UUID", disk])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    (out, uuids)
+        .unwrap_or_default()
 }
 
 fn wait_for(path: &str) -> Result<()> {
@@ -548,7 +538,7 @@ fn execute_inner(job: &Job<'_>, runner: &mut Runner, say: &mut dyn FnMut(&str)) 
         archive: &archive,
         target: &target,
         patterns: &[],
-        key: RestoreKey::Auto,
+        key: job.key.duplicate(),
     };
     let restored = job.client.restore_into_existing(&request, &mut *runner.log);
     stop.store(true, Ordering::Relaxed);

@@ -35,13 +35,30 @@ enum Cmd {
     #[command(subcommand)]
     Key(KeyCmd),
     /// Check configuration, secrets, client and server access.
-    Check,
+    Check {
+        /// Wake the backup server (Wake-on-LAN) if it does not answer, and
+        /// check again. Without it a sleeping server is reported as "not
+        /// checked".
+        #[arg(long)]
+        wake: bool,
+    },
     /// Start a backup now.
     Backup,
     /// Show the backup status of this computer.
     Status {
         #[arg(long)]
         json: bool,
+    },
+    /// Tell logged-in users (and an optional command) about failed,
+    /// overdue, incomplete or damaged backups (root; used by
+    /// nestegg-notify.timer).
+    Notify {
+        /// Send a test message through all configured channels.
+        #[arg(long)]
+        test: bool,
+        /// Print what would be sent; send and record nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show recent backup runs.
     History {
@@ -186,19 +203,62 @@ enum KeyCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Print a paper key (QR code) for safe offline storage.
+    /// Write a paper key (QR code, check code) for safe offline storage.
+    /// Print it, or pipe it to a printer; a terminal needs --output.
     Paperkey {
         #[arg(long, value_enum, default_value_t = PaperFormat::Text)]
         format: PaperFormat,
+        /// Write to this file (e.g. key.html) instead of stdout.
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Store an exported key file again (e.g. after new hardware). A new key
+    /// counts as exported only when the file comes from a removable medium
+    /// that is not part of the backup.
+    Import {
+        /// The key file written by `nestegg key export` (no password).
+        file: PathBuf,
+        #[arg(long)]
+        allow_plain: bool,
+        /// Replace a different existing key (old backups stay readable only
+        /// with the old key!).
+        #[arg(long)]
+        force: bool,
+    },
     /// Write the key file to a location of your choice (e.g. a USB stick).
+    /// The file is read back and compared with the key.
     Export { file: PathBuf },
-    /// Confirm that the key is stored safely outside this computer.
-    ConfirmExported,
+    /// Confirm that the key is stored safely outside this computer. Needs
+    /// proof: a copy of the key or the check code of the paper key.
+    ConfirmExported(ConfirmArgs),
+    /// Check that a copy of the key still matches the stored key and opens
+    /// the newest backup.
+    Verify {
+        /// A key file or a saved paper key (text or HTML).
+        file: PathBuf,
+    },
     /// Show key fingerprint and export status.
     Show,
+}
+
+#[derive(clap::Args)]
+struct ConfirmArgs {
+    /// A copy of the key: the file written by `key export`, or a saved
+    /// paper key (text or HTML). Compared with the stored key.
+    #[arg(long, conflicts_with = "paper_code")]
+    file: Option<PathBuf>,
+    /// The check code printed at the top of the paper key (XXXX-XXXX).
+    #[arg(long, value_name = "XXXX-XXXX")]
+    paper_code: Option<String>,
+    /// The copy given with --file lies on a disk of this computer; state
+    /// without a terminal that another copy exists outside this computer.
+    #[arg(long, requires = "file", conflicts_with = "paper_code")]
+    accept_local_copy: bool,
+    /// The paper key given with --paper-code is printed and stored away
+    /// from this computer. Needed without a terminal, because nestegg
+    /// cannot see a sheet of paper.
+    #[arg(long, requires = "paper_code", conflicts_with = "file")]
+    printed: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -244,10 +304,16 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
             overview,
         }) => set_password(paths, allow_plain, overview),
         Cmd::Key(k) => key(paths, k),
-        Cmd::Check => check(paths),
+        Cmd::Check { wake } => check(paths, wake),
         Cmd::Rescue { command } => nestegg::rescue::cli::run(command),
         Cmd::Backup => backup_now(paths),
         Cmd::Status { json } => status(paths, json),
+        Cmd::Notify { test, dry_run } => {
+            require_root("nestegg notify")?;
+            // A non-zero code (a hook that failed) makes the systemd unit
+            // fail, so the trouble is visible (decision 0022).
+            nestegg::notify::run(paths, &nestegg::notify::Options { test, dry_run })
+        }
         Cmd::History { limit, json } => history(paths, limit, json),
         Cmd::Snapshots { json } => snapshots(paths, json),
         Cmd::Restore {
@@ -301,8 +367,11 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
             Ok(0)
         }
         Cmd::ReadFile { path } => {
-            let data =
-                std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+            // Only ever used for key files named by the user.
+            let data = nestegg::restore::read_small_regular_file(
+                &path,
+                nestegg::restore::MAX_KEY_FILE_BYTES,
+            )?;
             std::io::stdout().write_all(&data)?;
             Ok(0)
         }
@@ -370,17 +439,49 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
             broadcast: std::net::Ipv4Addr::BROADCAST,
             port: 9,
             timeout_seconds: 180,
+            enabled: true,
         });
     }
     cfg.validate()?;
     if let Some(dir) = paths.config_file.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&paths.config_file, config_header() + &cfg.to_toml()?)?;
-    std::fs::set_permissions(&paths.config_file, std::fs::Permissions::from_mode(0o644))?;
+    let group = ensure_group();
+    // 0640 root:nestegg from the start (no window at the umask default, and no
+    // window at a looser mode on `--force`): group members read it (for
+    // `nestegg status`), but a user outside the group cannot, because
+    // `[notify] command` may carry a token. Written like the settings writer —
+    // a new file with the final mode, then rename — so a symlink at the path is
+    // refused rather than followed and truncated (decision 0022, item 14).
+    nestegg::settings::write_file_atomic(
+        &paths.config_file,
+        &(config_header() + &cfg.to_toml()?),
+        0o640,
+    )?;
+    if let Some(gid) = group {
+        let _ = nix::unistd::chown(
+            &paths.config_file,
+            Some(nix::unistd::Uid::from_raw(0)),
+            Some(gid),
+        );
+    } else {
+        // Without the group, the file stays root:root 0640: only root can read
+        // it, which is safe but means `nestegg status` as a group member cannot
+        // until the group exists. The package creates it; a build without the
+        // package may not have it.
+        eprintln!(
+            "note: group '{}' does not exist, so {} stays root-only (mode 0640). \
+             Install the package or create the group, then re-run 'nestegg init --force' \
+             (or: chgrp {} {} && chmod 0640 {}) to let group members read the status.",
+            nestegg::daemon::GROUP,
+            paths.config_file.display(),
+            nestegg::daemon::GROUP,
+            paths.config_file.display(),
+            paths.config_file.display(),
+        );
+    }
     secrets::create_private_dir(&paths.credentials_dir)?;
     std::fs::create_dir_all(paths.runs_dir())?;
-    let group = ensure_group();
     for dir in [paths.state_dir.clone(), paths.runs_dir()] {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750))?;
         if let Some(gid) = group {
@@ -392,14 +493,20 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
     println!("Next steps:");
     println!("  1. sudo nestegg credentials set-password      # API token secret, read from stdin");
     if cfg.backup.encryption {
-        println!("  2. sudo nestegg key create");
         println!(
-            "     sudo nestegg key paperkey                  # print it, or: sudo nestegg key export <file>"
+            "  2. sudo nestegg key create                    # or, to keep an exported key: sudo nestegg key import <file>"
         );
-        println!("     sudo nestegg key confirm-exported");
+        println!(
+            "     sudo nestegg key paperkey --output key.html   # print it - or: sudo nestegg key export <file> (USB stick)"
+        );
+        println!(
+            "     sudo nestegg key confirm-exported --file <copy>   # or: --paper-code <code on the paper key> (add --printed without a terminal)"
+        );
     }
     println!("  3. sudo nestegg check");
-    println!("  4. sudo systemctl enable --now nestegg.service nestegg-backup.timer");
+    println!(
+        "  4. sudo systemctl enable --now nestegg.service nestegg-backup.timer nestegg-notify.timer"
+    );
     println!(
         "  5. sudo usermod -aG nestegg $USER             # then log out and in for `nestegg ui`"
     );
@@ -408,6 +515,9 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
 
 fn config_header() -> String {
     "# nestegg configuration. Contains no secrets.\n\
+     # Readable by group 'nestegg' (mode 0640): do not put a token here. A\n\
+     # secret that a [notify] command needs belongs in a root-only file or\n\
+     # script (mode 0600) that the command reads.\n\
      # Reference: docs/configuration.md\n\n"
         .to_string()
 }
@@ -439,13 +549,14 @@ fn read_secret_line(prompt: &str) -> Result<Secret> {
     use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
     let stdin = std::io::stdin();
     let tty = nix::unistd::isatty(&stdin).unwrap_or(false);
+    // Echo off before the prompt is shown (no window for echoed input).
     let saved = if tty {
-        eprint!("{prompt}");
-        let _ = std::io::stderr().flush();
         let original = tcgetattr(&stdin)?;
         let mut silent = original.clone();
         silent.local_flags.remove(LocalFlags::ECHO);
         tcsetattr(&stdin, SetArg::TCSANOW, &silent)?;
+        eprint!("{prompt}");
+        let _ = std::io::stderr().flush();
         Some(original)
     } else {
         None
@@ -476,6 +587,10 @@ fn set_password(paths: &Paths, allow_plain: bool, overview: bool) -> Result<u8> 
     match store.store(name, &secret, allow_plain)? {
         Storage::SystemdCreds => println!("Stored encrypted with systemd-creds."),
         Storage::PlainFile => println!("Stored as root-only file."),
+    }
+    // New credentials may cure a failing backup: let the timer retry at once.
+    if let Err(e) = Store::new(paths).clear_failures() {
+        eprintln!("warning: {e:#}");
     }
     Ok(0)
 }
@@ -509,12 +624,10 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
     let store = Store::new(paths);
     let secrets_store = SecretStore::new(&paths.credentials_dir);
     // Key changes and backup runs exclude each other (same lock), so a run
-    // never sees a half-replaced key or overwrites the key state.
+    // never sees a half-replaced key or overwrites the key state. (`key
+    // paperkey` takes the lock itself, only around what changes the state.)
     let _lock = match &cmd {
-        KeyCmd::Create { .. }
-        | KeyCmd::ConfirmExported
-        | KeyCmd::Export { .. }
-        | KeyCmd::Paperkey { .. } => Some(
+        KeyCmd::Create { .. } | KeyCmd::Import { .. } | KeyCmd::Export { .. } => Some(
             nestegg::run::RunLock::try_acquire(paths)?
                 .context("a backup is running; try again when it has finished")?,
         ),
@@ -549,63 +662,320 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             let storage = secrets_store.store(secrets::ENCRYPTION_KEY, &key, allow_plain)?;
             state.key_fingerprint = Some(fingerprint.clone());
             state.key_digest = Some(secrets::digest(&key));
+            state.consecutive_failures = 0;
             store.save_state(&state)?;
             println!("Encryption key created (fingerprint {fingerprint}).");
             if storage == Storage::SystemdCreds {
                 println!("It is stored encrypted on this computer and is lost if this disk fails.");
             }
             println!(
-                "Export it now: sudo nestegg key paperkey   or   sudo nestegg key export <file>"
+                "Export it now: sudo nestegg key paperkey --output key.html   (then print it)\n\
+                 \x20         or: sudo nestegg key export <file>                 (then move it to a USB stick)"
             );
-            println!("Then confirm:  sudo nestegg key confirm-exported");
+            println!(
+                "Then prove you hold a copy: sudo nestegg key confirm-exported --file <copy>\n\
+                 \x20                      or: sudo nestegg key confirm-exported --paper-code <code on the paper key>\n\
+                 \x20                      (the paper key needs your statement that the sheet is printed and\n\
+                 \x20                      stored away from this computer; without a terminal add --printed)"
+            );
+        }
+        KeyCmd::Import {
+            file,
+            allow_plain,
+            force,
+        } => {
+            let path = absolute_user_path(&file)?;
+            // Through sudo the file is read with the invoking user's rights.
+            let sudo = nestegg::identity::UserIdentity::from_sudo()?;
+            let key = nestegg::restore::read_user_key(&path, sudo.as_ref())?;
+            // Validate a private copy: `key show` needs a path.
+            secrets::create_private_dir(&paths.tmp_dir())?;
+            let tmp = TempKey(
+                paths
+                    .tmp_dir()
+                    .join(format!("import-key-{}.json", std::process::id())),
+            );
+            secrets::write_private_file(&tmp.0, key.as_bytes())?;
+            let info = client::local::key_info(&tmp.0)
+                .with_context(|| format!("{} is not a usable key file", path.display()))?;
+            drop(tmp);
+            info.require_unprotected()?;
+            let mut state = store.load_state()?;
+            // Importing the key that is already recorded (e.g. after a
+            // restore onto new hardware, where the stored copy cannot be
+            // decrypted any more) replaces nothing.
+            let same_key = state.key_fingerprint.as_deref() == Some(info.fingerprint.as_str());
+            if secrets_store.exists(secrets::ENCRYPTION_KEY) && !force && !same_key {
+                bail!(
+                    "a different encryption key is stored (fingerprint {}). Replacing it makes \
+                     backups made with it unreadable without that key. Use --force only if you \
+                     exported that key.",
+                    state.key_fingerprint.as_deref().unwrap_or("unknown")
+                );
+            }
+            let digest = secrets::digest(&key);
+            // Does this import prove a copy outside this computer? For the
+            // key that is already stored it proves nothing new (it could be
+            // the file `key export` just wrote): an earlier confirmation
+            // stays, none is created. For a new key the file counts when it
+            // comes from a removable medium; a file on this computer's own
+            // disk needs `key confirm-exported` like any other copy.
+            let location = nestegg::keyproof::locate_in(&path, &backup_scope(paths));
+            let counts_as_exported = nestegg::keyproof::import_counts_as_exported(
+                same_key,
+                state.key_exported_digest.as_deref() == Some(digest.as_str()),
+                &location,
+            );
+            // Same order as `key create`: no confirmation may survive for a
+            // key that is about to be replaced.
+            state.key_exported_digest = None;
+            state.key_digest = None;
+            state.key_fingerprint = None;
+            store.save_state(&state)?;
+            let storage = secrets_store.store(secrets::ENCRYPTION_KEY, &key, allow_plain)?;
+            state.key_fingerprint = Some(info.fingerprint.clone());
+            state.key_digest = Some(digest.clone());
+            state.key_last_exported_digest = Some(digest.clone());
+            state.key_exported_digest = counts_as_exported.then_some(digest);
+            state.consecutive_failures = 0;
+            store.save_state(&state)?;
+            println!(
+                "Encryption key imported (fingerprint {}) and stored {}.",
+                info.fingerprint,
+                match storage {
+                    Storage::SystemdCreds => "encrypted with systemd-creds",
+                    Storage::PlainFile => "as a root-only file",
+                }
+            );
+            if counts_as_exported {
+                println!(
+                    "It counts as exported: you hold a copy on a removable medium. Now unplug it \
+                     and keep it away from this computer."
+                );
+            } else {
+                println!(
+                    "It does NOT count as exported yet: {} {}, and a copy that is lost together \
+                     with the computer is no protection.",
+                    path.display(),
+                    location.describe()
+                );
+                println!(
+                    "Backups start after: sudo nestegg key confirm-exported --file <copy on a USB \
+                     stick>   (or --paper-code <code on the paper key>, with your statement that \
+                     the sheet is printed and stored away from this computer)"
+                );
+            }
         }
         KeyCmd::Paperkey { format, output } => {
+            if !nestegg::keyproof::paperkey_stdout_allowed(output.is_some(), stdout_is_terminal()) {
+                bail!(
+                    "a paper key scrolling past in a terminal is not a copy of the key. Write it \
+                     to a file and print that: nestegg key paperkey --format html --output key.html \
+                     (or pipe it to a printer: nestegg key paperkey | lpr)"
+                );
+            }
+            // Where the paper key goes is found out before anything is
+            // written. The path of a file is remembered in the state (text):
+            // a name that cannot be stored is refused now, because the shell
+            // has already created a file that is redirected to.
+            use nestegg::keyproof::StdoutTarget;
+            let redirected = match &output {
+                Some(file) => {
+                    if absolute_user_path(file)?.to_str().is_none() {
+                        bail!(
+                            "the name of the output file contains characters that are not valid \
+                             UTF-8; choose another name"
+                        );
+                    }
+                    StdoutTarget::Other
+                }
+                None => match nestegg::keyproof::stdout_target() {
+                    StdoutTarget::Unstorable(why) => bail!(
+                        "the paper key goes to a file, but {why}. Nothing was written (the \
+                         empty file your shell created can be deleted). Redirect to a file \
+                         with a plain name, or use --output <file>."
+                    ),
+                    other => other,
+                },
+            };
+            // The part that takes time (the client renders the paper key)
+            // runs without the run lock.
+            let cfg = Config::load(&paths.config_file)?;
             let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;
+            let material = nestegg::keyproof::KeyMaterial::from_key_json(&String::from_utf8_lossy(
+                key.as_bytes(),
+            ))
+            .context("the stored encryption key is damaged")?;
             let tmp = temp_key(paths)?;
+            let fingerprint = client::local::key_fingerprint(&tmp.0)?;
             let fmt = match format {
                 PaperFormat::Text => "text",
                 PaperFormat::Html => "html",
             };
-            let data = client::local::paperkey(&tmp.0, fmt)?;
-            match output {
-                Some(file) => {
+            let raw = client::local::paperkey(&tmp.0, fmt)?;
+            let header = nestegg::keyproof::PaperHeader {
+                backup_id: cfg.effective_backup_id(),
+                hostname: config::hostname(),
+                date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                server: format!("{}:{}", cfg.pbs.server, cfg.pbs.port),
+                datastore: cfg.pbs.datastore.clone(),
+                fingerprint,
+                check_code: material.check_code(),
+            };
+            let data = match format {
+                PaperFormat::Text => nestegg::keyproof::compose_text(&header, &raw),
+                PaperFormat::Html => nestegg::keyproof::compose_html(&header, &raw)?,
+            };
+            // The state is changed under the run lock, like the other key
+            // commands do, so that a backup run cannot overwrite it at the
+            // same moment. The lock is taken before anything is written
+            // (a running backup: nothing happened, try again), and it is
+            // not held while the output goes into a pipe (a printer queue
+            // can take its time).
+            let lock = nestegg::run::RunLock::try_acquire(paths)?.context(
+                "a backup is running; try again when it has finished. Nothing was written",
+            )?;
+            let digest = secrets::digest(&key);
+            if secrets::digest(&secrets_store.load(secrets::ENCRYPTION_KEY)?) != digest {
+                bail!("the stored key changed while the paper key was made; nothing was written");
+            }
+            let to_file = output.is_some() || matches!(redirected, StdoutTarget::File(_));
+            let mut state = store.load_state()?;
+            if to_file {
+                // Never forget a file that still exists: only entries whose
+                // file is gone make room; otherwise refuse another one.
+                state.prune_paperkey_files(&digest, nestegg::state::paperkey_file_exists);
+                // A file that is already remembered is no new entry: the limit
+                // refuses only another file, never one it already keeps track of.
+                let target = match (&output, &redirected) {
+                    (Some(file), _) => paperkey_target(file),
+                    (None, StdoutTarget::File(written)) => written.clone(),
+                    _ => PathBuf::new(),
+                };
+                if nestegg::keyproof::paperkey_files_full_for(&state.paperkey_files, &target) {
+                    bail!(
+                        "{}",
+                        nestegg::keyproof::paperkey_limit_message(&state.paperkey_files)
+                    );
+                }
+            }
+            match (output, redirected) {
+                (Some(file), _) => {
                     write_user_file(&file, &data)?;
+                    // Remember where it is: confirming with the check code is
+                    // refused while this file lies on this computer's disk.
+                    let written = paperkey_target(&file);
+                    state.remember_paperkey_file(written, &digest);
+                    state.key_last_exported_digest = Some(digest);
+                    store.save_state(&state)?;
+                    // The check code stays on the paper: it is not shown here.
                     println!(
-                        "Paper key written to {}. Print it and store it safely.",
+                        "Paper key written to {}.\n\
+                         Print it, then delete the file (or move it to a USB stick). Confirming \
+                         with the check code is refused while the file lies on this computer.\n\
+                         Then: sudo nestegg key confirm-exported --paper-code <check code at the \
+                         top of the paper>\n\
+                         You will be asked to state that the sheet is printed and stored away \
+                         from this computer (without a terminal: add --printed).",
                         file.display()
                     );
                 }
-                None => std::io::stdout().write_all(&data)?,
+                (None, StdoutTarget::File(written)) => {
+                    // `nestegg key paperkey > file` writes a file just like
+                    // --output does: remember it the same way.
+                    std::io::stdout().write_all(&data)?;
+                    std::io::stdout().flush()?;
+                    state.remember_paperkey_file(written.clone(), &digest);
+                    state.key_last_exported_digest = Some(digest);
+                    store.save_state(&state)?;
+                    eprintln!(
+                        "Paper key written to {}.\n\
+                         Print it, then delete the file (or move it to a USB stick). \
+                         Confirming with the check code is refused while the file lies on \
+                         this computer.",
+                        written.display()
+                    );
+                }
+                (None, _) => {
+                    // A pipe (a printer), /dev/null, ...: nothing stays on
+                    // this computer that could be remembered. The run lock
+                    // is let go before the output goes out (a printer queue
+                    // can take its time), and the export is recorded only
+                    // after all of it was written and flushed without an
+                    // error (a closed pipe is one): otherwise the state would
+                    // say "exported" for a paper key that never arrived.
+                    drop(lock);
+                    let sent = {
+                        let mut out = std::io::stdout().lock();
+                        out.write_all(&data).and_then(|()| out.flush())
+                    };
+                    if let Err(e) = sent {
+                        bail!(
+                            "the paper key could not be written completely to standard output \
+                             ({e}); nothing was recorded as exported. Run the command again"
+                        );
+                    }
+                    if let Err(why) = nestegg::keyproof::record_piped_paperkey(
+                        paths,
+                        nestegg::keyproof::PAPERKEY_RECORD_WAIT,
+                        &digest,
+                    ) {
+                        bail!(
+                            "the paper key was written to standard output, but it was NOT \
+                             recorded as exported: {why}. Once the paper key is printed and \
+                             stored away from this computer, record it with: sudo nestegg key \
+                             confirm-exported --paper-code <check code at the top of the paper> \
+                             (with your statement that the sheet is printed and stored away; \
+                             without a terminal add --printed)"
+                        );
+                    }
+                }
             }
-            record_export(&store, &key)?;
         }
         KeyCmd::Export { file } => {
             let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;
             write_user_file(&file, key.as_bytes())?;
-            record_export(&store, &key)?;
-            println!(
-                "Key written to {}. Move it to a safe place outside this computer.",
-                file.display()
-            );
-        }
-        KeyCmd::ConfirmExported => {
-            if !secrets_store.exists(secrets::ENCRYPTION_KEY) {
-                bail!("no encryption key exists yet");
-            }
-            // Only confirm the key that was actually written out.
-            let digest = secrets::digest(&secrets_store.load(secrets::ENCRYPTION_KEY)?);
-            let mut state = store.load_state()?;
-            if state.key_last_exported_digest.as_deref() != Some(digest.as_str()) {
+            // Read the file back with the invoking user's rights: what is
+            // on disk must be the key, or the "copy" is worthless.
+            let path = absolute_user_path(&file)?;
+            let sudo = nestegg::identity::UserIdentity::from_sudo()?;
+            let back =
+                nestegg::restore::read_user_key(&path, sudo.as_ref()).with_context(|| {
+                    format!("{} was written but cannot be read back", path.display())
+                })?;
+            if back.as_bytes() != key.as_bytes() {
                 bail!(
-                    "the current key has not been exported yet; run `nestegg key paperkey` or \
-                     `nestegg key export <file>` first"
+                    "{} was written, but reading it back gave different content. Do not rely on \
+                     this file; delete it and export again to another location.",
+                    path.display()
                 );
             }
-            state.key_digest = Some(digest.clone());
-            state.key_exported_digest = Some(digest);
-            store.save_state(&state)?;
-            println!("Noted. Backups can run now.");
+            record_export(&store, &key)?;
+            println!(
+                "Key written to {} and read back: the file matches the stored key.",
+                path.display()
+            );
+            match nestegg::keyproof::locate_in(&path, &backup_scope(paths)) {
+                nestegg::keyproof::Location::Removable => println!(
+                    "It is on a removable medium. Keep that medium somewhere safe, away from \
+                     this computer, and unplug it when you are done."
+                ),
+                other => {
+                    println!();
+                    println!("WARNING: this copy is not safe yet.");
+                    println!("The file {}.", other.describe());
+                    println!(
+                        "It is lost together with this computer, and it is useless inside the \
+                         backup, because the backup is encrypted with this very key.\n\
+                         Move it to a USB stick (not one that is part of the backup) or into a \
+                         password manager, then run:\n\
+                         \x20 sudo nestegg key confirm-exported --file <the copy>"
+                    );
+                }
+            }
         }
+        KeyCmd::ConfirmExported(args) => confirm_exported(paths, &store, &secrets_store, args)?,
+        KeyCmd::Verify { file } => return key_verify(paths, &secrets_store, &file),
         KeyCmd::Show => {
             let state = store.load_state()?;
             println!(
@@ -629,6 +999,355 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
     Ok(0)
 }
 
+fn stdin_is_terminal() -> bool {
+    nix::unistd::isatty(std::io::stdin()).unwrap_or(false)
+}
+
+fn stdout_is_terminal() -> bool {
+    nix::unistd::isatty(std::io::stdout()).unwrap_or(false)
+}
+
+/// Ask one question on the terminal; the prompt goes to stderr.
+fn prompt_line(question: &str) -> Result<String> {
+    eprint!("{question}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+/// The stored key as key material, for comparisons.
+fn stored_key_material(
+    secrets_store: &SecretStore,
+) -> Result<(Secret, nestegg::keyproof::KeyMaterial)> {
+    if !secrets_store.exists(secrets::ENCRYPTION_KEY) {
+        bail!("no encryption key exists yet");
+    }
+    let key = secrets_store.load(secrets::ENCRYPTION_KEY)?;
+    let material =
+        nestegg::keyproof::KeyMaterial::from_key_json(&String::from_utf8_lossy(key.as_bytes()))
+            .context("the stored encryption key is damaged")?;
+    Ok((key, material))
+}
+
+/// Read a copy of the key (key file or saved paper key) with the invoking
+/// user's rights. Returns the path, the key JSON and its material.
+fn read_key_copy(file: &Path) -> Result<(PathBuf, String, nestegg::keyproof::KeyMaterial)> {
+    let path = absolute_user_path(file)?;
+    let sudo = nestegg::identity::UserIdentity::from_sudo()?;
+    let bytes = nestegg::restore::read_user_key(&path, sudo.as_ref())?;
+    let json = nestegg::keyproof::key_json_of_copy(bytes.as_bytes())
+        .with_context(|| format!("{}", path.display()))?;
+    let material = nestegg::keyproof::KeyMaterial::from_key_json(&json)
+        .with_context(|| format!("{}", path.display()))?;
+    Ok((path, json, material))
+}
+
+/// A leading `~/` typed at a prompt (no shell expands it there): the home
+/// directory of the user who called sudo, else of the current user.
+fn expand_home(input: &str) -> PathBuf {
+    let Some(rest) = input.strip_prefix("~/") else {
+        return PathBuf::from(input);
+    };
+    let home = match nestegg::identity::UserIdentity::from_sudo() {
+        Ok(Some(user)) => Some(user.home),
+        _ => std::env::var_os("HOME").map(PathBuf::from),
+    };
+    match home {
+        Some(home) => home.join(rest),
+        None => PathBuf::from(input),
+    }
+}
+
+/// What the backup contains, for judging where a copy of the key lies. A
+/// missing configuration means nothing is configured to be backed up; one
+/// that cannot be read makes the scope unknown.
+fn backup_scope(paths: &Paths) -> nestegg::keyproof::BackupScope {
+    use nestegg::keyproof::BackupScope;
+    if !paths.config_file.exists() {
+        return BackupScope::default();
+    }
+    match Config::load(&paths.config_file) {
+        Ok(cfg) => {
+            // Touch the sources first: that triggers automounts, so the
+            // mount table read by capture() shows them (as in a run).
+            for s in &cfg.backup.sources {
+                let _ = std::fs::canonicalize(&s.path);
+            }
+            let layout = if cfg.backup.system {
+                nestegg::layout::capture().ok()
+            } else {
+                None
+            };
+            let scope = BackupScope::for_config(&cfg, layout.as_ref());
+            // The mount table tells which file systems below a source are
+            // not part of the backup (the client stays on the device of the
+            // source). Unreadable: everything below a source counts.
+            match nestegg::mounts::load() {
+                Ok((mounts, _)) => scope
+                    .with_mount_points(mounts.into_iter().map(|m| (m.point, m.device)).collect()),
+                Err(_) => scope,
+            }
+        }
+        Err(e) => BackupScope {
+            unknown: Some(format!("the configuration cannot be read: {e:#}")),
+            ..BackupScope::default()
+        },
+    }
+}
+
+/// `nestegg key confirm-exported`: record that the key is safe outside this
+/// computer, but only against proof and, where proof is impossible, the
+/// user's statement (see docs/decisions/0018).
+fn confirm_exported(
+    paths: &Paths,
+    store: &Store,
+    secrets_store: &SecretStore,
+    args: ConfirmArgs,
+) -> Result<()> {
+    use nestegg::keyproof::{self, LocalCopy, Statement};
+    let (key, stored) = stored_key_material(secrets_store)?;
+    let terminal = stdin_is_terminal();
+    // The backup scope (what the backup contains, which mounts exist) is
+    // read where it is used, after the questions: a stick plugged in while
+    // the prompt waits must be seen.
+    // The copy is on a removable medium that may still be plugged in.
+    let mut on_removable = false;
+    let (file, code) = match (args.file, args.paper_code) {
+        (Some(file), _) => (Some(file), None),
+        (None, Some(code)) => (None, Some(code)),
+        (None, None) if terminal => {
+            eprintln!("The backups are worthless without this key. How do you hold a copy of it");
+            eprintln!("outside this computer?");
+            eprintln!("  1) as a file (from `key export`, or a saved paper key)");
+            eprintln!("  2) as a printed paper key");
+            match prompt_line("Choose 1 or 2: ")?.as_str() {
+                "1" => (Some(expand_home(&prompt_line("Path of the file: ")?)), None),
+                "2" => (
+                    None,
+                    Some(prompt_line("Check code at the top of the paper key: ")?),
+                ),
+                _ => bail!("no proof given; nothing was recorded"),
+            }
+        }
+        (None, None) => bail!(
+            "proof needed: give a copy of the key with --file <path> (the exported file or a saved \
+             paper key), or the check code of the paper key with --paper-code <XXXX-XXXX> --printed"
+        ),
+    };
+    if let Some(file) = file {
+        let (path, _, copy) = read_key_copy(&file)?;
+        // The place nestegg itself keeps the key in is not a copy.
+        let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        for own in [&paths.credentials_dir, &paths.tmp_dir()] {
+            let own = std::fs::canonicalize(own).unwrap_or_else(|_| own.clone());
+            if resolved.starts_with(&own) {
+                bail!(
+                    "{} is where nestegg itself stores the key, not a copy of it; nothing was \
+                     recorded. Export a copy: sudo nestegg key export <file>",
+                    path.display()
+                );
+            }
+        }
+        if copy != stored {
+            bail!(
+                "{} does not contain the key stored on this computer; nothing was recorded. \
+                 Export the current key again.",
+                path.display()
+            );
+        }
+        let location = keyproof::locate_in(&path, &backup_scope(paths));
+        on_removable = matches!(location, keyproof::Location::Removable);
+        match keyproof::decide_local_copy(&location, args.accept_local_copy, terminal) {
+            LocalCopy::Accept => {}
+            LocalCopy::Ask => {
+                eprintln!("The file matches the key, but it {}.", location.describe());
+                eprintln!("A copy that is lost together with this computer, or that exists only");
+                eprintln!("inside the backup (encrypted with this very key), is no protection.");
+                let answer = prompt_line(
+                    "Type yes if another copy exists outside this computer (USB stick, \
+                     password manager, paper): ",
+                )?;
+                if answer != "yes" {
+                    bail!("not confirmed; nothing was recorded");
+                }
+            }
+            LocalCopy::Refuse => bail!(
+                "{} {}. A copy that is lost together with the computer, or that exists only \
+                 inside the backup, is no protection. Move it to a USB stick (not one that is \
+                 part of the backup) or a password manager and give that file, or, if another \
+                 copy exists outside this computer, add --accept-local-copy. Nothing was recorded.",
+                path.display(),
+                location.describe()
+            ),
+        }
+    } else if let Some(code) = code {
+        let given = keyproof::normalize_check_code(&code).context(
+            "that is not a check code; it looks like ABCD-0123 and is printed at the top of \
+             the paper key",
+        )?;
+        if given != stored.check_code() {
+            bail!(
+                "this check code does not belong to the key stored on this computer; nothing was \
+                 recorded. Print a new paper key and use its code."
+            );
+        }
+        // The code proves nothing about where the paper key is: `key paperkey
+        // --output` writes it to a file, and anyone can read it off the
+        // screen. A file written by nestegg that still lies on this
+        // computer's disk is in the way ...
+        let digest = secrets::digest(&key);
+        let remembered = store.load_state()?.paperkey_files;
+        let existing = keyproof::existing_paperkey_files(
+            &remembered,
+            &digest,
+            nestegg::state::paperkey_file_exists,
+            |p| keyproof::locate_in(p, &backup_scope(paths)),
+        );
+        let in_the_way = keyproof::paperkey_files_in_the_way(&existing);
+        if !in_the_way.is_empty() {
+            bail!("{}", keyproof::paperkey_in_the_way_message(&in_the_way));
+        }
+        on_removable = !existing.is_empty();
+        // ... and then the user has to say that the sheet exists.
+        match keyproof::decide_paper_statement(args.printed, terminal) {
+            Statement::Given => {}
+            Statement::Ask => {
+                eprintln!("The check code is right. nestegg cannot see a sheet of paper, so it");
+                eprintln!("needs your word that the paper key is printed and kept away from this");
+                eprintln!("computer (not only shown on its screen or saved on its disk).");
+                let answer = prompt_line(
+                    "Type yes to state that the sheet is printed and stored away from this \
+                     computer: ",
+                )?;
+                if answer != "yes" {
+                    bail!("not confirmed; nothing was recorded");
+                }
+            }
+            Statement::Missing => bail!(
+                "the check code is right, but it does not prove that the paper key is printed \
+                 and kept away from this computer. State that with --printed (or run this at a \
+                 terminal, where you are asked). Nothing was recorded."
+            ),
+        }
+    }
+    // Key changes and backup runs exclude each other. Take the lock only
+    // now, so that waiting for the user does not block the backup timer.
+    let _lock = nestegg::run::RunLock::try_acquire(paths)?
+        .context("a backup is running; try again when it has finished")?;
+    let digest = secrets::digest(&key);
+    if secrets::digest(&secrets_store.load(secrets::ENCRYPTION_KEY)?) != digest {
+        bail!("the stored key changed while waiting; nothing was recorded");
+    }
+    let mut state = store.load_state()?;
+    state.key_digest = Some(digest.clone());
+    state.key_last_exported_digest = Some(digest.clone());
+    state.key_exported_digest = Some(digest);
+    // Backups were failing for want of this confirmation: retry at once.
+    state.consecutive_failures = 0;
+    store.save_state(&state)?;
+    println!("Confirmed: your copy is the stored key. Backups can run now.");
+    if on_removable {
+        println!(
+            "The copy is on a removable medium. Now unplug it and keep it away from this \
+             computer: nestegg cannot tell a medium that stays plugged in from one that was \
+             removed, and one that stays is lost or damaged together with this computer."
+        );
+    }
+    println!("Check it again at any time: sudo nestegg key verify <copy>");
+    Ok(())
+}
+
+/// `nestegg key verify`: does this copy still match the stored key, and does
+/// it open the newest snapshot of this computer? Exit code 1 if not.
+fn key_verify(paths: &Paths, secrets_store: &SecretStore, file: &Path) -> Result<u8> {
+    let (_, stored) = stored_key_material(secrets_store)?;
+    let (path, json, copy) = match read_key_copy(file) {
+        Ok(read) => read,
+        Err(e) => {
+            println!("Copy matches the stored key:  NO - {e:#}");
+            println!("Copy opens the newest backup: not tried");
+            return Ok(1);
+        }
+    };
+    if copy != stored {
+        println!(
+            "Copy matches the stored key:  NO - {} is a key, but not the one stored on this \
+             computer",
+            path.display()
+        );
+        println!("Copy opens the newest backup: not tried");
+        return Ok(1);
+    }
+    println!("Copy matches the stored key:  yes");
+    let opened = verify_opens_newest(paths, json);
+    match &opened {
+        Ok(text) => println!("Copy opens the newest backup: {text}"),
+        Err((fatal, text)) => println!(
+            "Copy opens the newest backup: {}{text}",
+            if *fatal { "NO - " } else { "not checked - " }
+        ),
+    }
+    Ok(if matches!(opened, Err((true, _))) {
+        1
+    } else {
+        0
+    })
+}
+
+/// Err((true, ..)): the check ran and failed; Err((false, ..)): it could not
+/// be tried (nothing wrong with the copy).
+fn verify_opens_newest(paths: &Paths, json: String) -> Result<String, (bool, String)> {
+    let cfg = Config::load(&paths.config_file).map_err(|e| (false, format!("{e:#}")))?;
+    if !cfg.backup.encryption {
+        return Err((
+            false,
+            "encryption is switched off in the configuration".into(),
+        ));
+    }
+    if !nestegg::wake::is_reachable(&cfg, std::time::Duration::from_secs(5)) {
+        return Err((
+            false,
+            "the PBS does not answer; run this again when it is reachable".into(),
+        ));
+    }
+    // A snapshot that is still being written has no manifest to check.
+    // Only a real run is "a backup is running"; a lock blocked without one
+    // says so (with who holds it) instead.
+    let _no_run = match nestegg::run::RunLock::try_acquire(paths) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err((
+                false,
+                "a backup is running; run this again when it has finished".into(),
+            ));
+        }
+        Err(e) => return Err((false, format!("{e:#}"))),
+    };
+    let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
+    let snapshots = client
+        .list_snapshots(&cfg.effective_backup_id())
+        .map_err(|e| (true, format!("cannot list the snapshots: {e:#}")))?;
+    let Some(newest) = snapshots.first() else {
+        return Err((false, "there is no snapshot of this computer yet".into()));
+    };
+    match client.open_snapshot_with_key(&newest.snapshot, &Secret::new(json.into_bytes())) {
+        Ok(true) => Ok(format!("yes ({})", newest.snapshot)),
+        Ok(false) => Err((
+            false,
+            format!("the newest snapshot {} is not encrypted", newest.snapshot),
+        )),
+        Err(e) => Err((
+            true,
+            format!(
+                "{e:#}\n  (snapshot {}; if the key was replaced after that backup, run a \
+                 backup first)",
+                newest.snapshot
+            ),
+        )),
+    }
+}
+
 /// Remember which key was exported (paper key or file), under the run lock.
 fn record_export(store: &Store, key: &Secret) -> Result<()> {
     let mut state = store.load_state()?;
@@ -648,18 +1367,57 @@ fn write_user_file(path: &Path, data: &[u8]) -> Result<()> {
     }
 }
 
-fn check(paths: &Paths) -> Result<u8> {
-    let items = nestegg::check::run(
-        paths,
-        &nestegg::check::CheckOptions {
-            wake: false,
-            login: is_root(),
-        },
-    );
+/// The path under which `key paperkey --output <file>` remembers its file: the
+/// canonical absolute path. The file may not exist yet, then its directory is
+/// made canonical, so the name is the same before and after writing.
+fn paperkey_target(file: &Path) -> PathBuf {
+    let Ok(abs) = absolute_user_path(file) else {
+        return file.to_path_buf();
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&abs) {
+        return canonical;
+    }
+    match (abs.parent().map(std::fs::canonicalize), abs.file_name()) {
+        (Some(Ok(parent)), Some(name)) => parent.join(name),
+        _ => abs,
+    }
+}
+
+fn check(paths: &Paths, wake: bool) -> Result<u8> {
+    use nestegg::check::{CheckStatus, Outcome};
+    // A non-root group member cannot log in to PBS itself (the login item would
+    // always be "not checked: needs root", exit code 2). Let the daemon run the
+    // full check, so the login is really checked — the same way `status` and
+    // `backup` reach the daemon. Only if the daemon cannot be reached does the
+    // local check with its "needs root" skips remain.
+    let (items, wake_skipped) = if is_root() {
+        (
+            nestegg::check::run(paths, &nestegg::check::CheckOptions { wake, login: true }),
+            false,
+        )
+    } else {
+        match daemon_check(paths, wake)? {
+            Some(answer) => answer,
+            None => (
+                nestegg::check::run(paths, &nestegg::check::CheckOptions { wake, login: false }),
+                false,
+            ),
+        }
+    };
+    if wake_skipped {
+        println!(
+            "note: the server was not woken again: a wake attempt was made less than a \
+             minute ago. Run this again in a minute to wake it."
+        );
+    }
     for item in &items {
         println!(
             "[{}] {}{}",
-            if item.ok { " ok " } else { "FAIL" },
+            match item.status {
+                CheckStatus::Passed => " ok ",
+                CheckStatus::Failed => "FAIL",
+                CheckStatus::NotChecked => "skip",
+            },
             item.name,
             if item.detail.is_empty() {
                 String::new()
@@ -668,7 +1426,23 @@ fn check(paths: &Paths) -> Result<u8> {
             }
         );
     }
-    Ok(u8::from(!nestegg::check::passed(&items)?))
+    let outcome = nestegg::check::outcome(&items);
+    match outcome {
+        Outcome::Passed => {}
+        Outcome::Failed => println!("\nSomething failed (see FAIL above)."),
+        Outcome::Incomplete => println!(
+            "\nNot everything could be checked (see skip above). That is not a pass: \
+             the skipped checks say nothing about whether they would succeed."
+        ),
+    }
+    // The server did not answer and nobody asked to wake it.
+    let asleep = items
+        .iter()
+        .any(|i| i.name == nestegg::check::REACHABLE_ITEM && i.status == CheckStatus::NotChecked);
+    if asleep && !wake {
+        println!("To wake the server and check everything: sudo nestegg check --wake");
+    }
+    Ok(outcome.exit_code())
 }
 
 // ---------- commands that work through the daemon for non-root users ----------
@@ -698,6 +1472,40 @@ fn daemon_request(paths: &Paths, method: &str, path: &str) -> Result<(u16, serde
         .context("invalid daemon status line")?;
     let value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
     Ok((code, value))
+}
+
+/// Run the PBS check through the daemon (non-root path), so the PBS login is
+/// really checked. `Ok(None)` when the daemon socket cannot be reached, so the
+/// caller falls back to the local check that can only report "needs root".
+/// The second value is the daemon's `wake_skipped`: a wake was asked for but
+/// not made, because one was made less than a minute ago.
+fn daemon_check(
+    paths: &Paths,
+    wake: bool,
+) -> Result<Option<(Vec<nestegg::check::CheckItem>, bool)>> {
+    if UnixStream::connect(paths.socket()).is_err() {
+        return Ok(None);
+    }
+    let path = format!(
+        "/api/v1/pbs/check?wake={}",
+        if wake { "true" } else { "false" }
+    );
+    let (code, body) = daemon_request(paths, "POST", &path)?;
+    if code == 409 {
+        bail!("a PBS check is already running; try again in a moment");
+    }
+    if code != 200 {
+        bail!(
+            "daemon answered {code}: {}",
+            body["message"].as_str().unwrap_or("")
+        );
+    }
+    let items: Vec<nestegg::check::CheckItem> = serde_json::from_value(body["checks"].clone())
+        .context("unexpected check response from the daemon")?;
+    Ok(Some((
+        items,
+        body["wake_skipped"].as_bool().unwrap_or(false),
+    )))
 }
 
 fn backup_now(paths: &Paths) -> Result<u8> {
@@ -778,14 +1586,25 @@ fn snapshots(paths: &Paths, json: bool) -> Result<u8> {
 }
 
 fn status(paths: &Paths, json: bool) -> Result<u8> {
-    let cfg = Config::load(&paths.config_file).ok();
-    let status = nestegg::status::build(paths, cfg.as_ref(), nestegg::status::timer_enabled())?;
+    // A missing config means "not configured"; a config that exists but cannot
+    // be read is an error, not a reason to show defaults (e.g. a 0640 root:root
+    // file for a non-root caller).
+    let cfg = nestegg::status::config_for_status(&paths.config_file)?;
+    let status =
+        nestegg::status::build(paths, cfg.as_ref(), nestegg::status::timer_enabled(paths))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
         return Ok(0);
     }
     let health = serde_json::to_value(status.health)?;
     println!("Health:       {}", health.as_str().unwrap_or("?"));
+    if let Some(note) = nestegg::state::health_message(
+        &Store::new(paths).load_state()?,
+        status.current_run.as_ref(),
+        chrono::Utc::now(),
+    ) {
+        println!("              note: {note}");
+    }
     println!(
         "Machine:      {} (backup id {})",
         status.machine.hostname, status.machine.backup_id
@@ -807,6 +1626,12 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
         println!("Running:      {} ({:?})", run.id, run.state);
     }
     println!("Last success: {}", describe(status.last_success.as_ref()));
+    if let Some(success) = &status.last_success {
+        for (i, reason) in success.incomplete.iter().enumerate() {
+            let label = if i == 0 { "Incomplete:" } else { "" };
+            println!("{label:<14}{reason}");
+        }
+    }
     println!("Last run:     {}", describe(status.last_run.as_ref()));
     println!(
         "Schedule:     {}{}",
@@ -832,6 +1657,13 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
         );
     } else {
         println!("Encryption:   off");
+    }
+    if !status.server_verify_failed.is_empty() {
+        println!(
+            "Server check: FAILED for {} snapshot(s): {}",
+            status.server_verify_failed.len(),
+            status.server_verify_failed.join(", ")
+        );
     }
     Ok(0)
 }
@@ -862,11 +1694,17 @@ fn history(paths: &Paths, limit: usize, json: bool) -> Result<u8> {
     }
     for run in runs {
         let marker = match run.state {
+            RunState::Succeeded if !run.incomplete.is_empty() => "part",
             RunState::Succeeded => "ok  ",
             RunState::PbsUnreachable => "away",
             _ => "FAIL",
         };
-        println!("{marker} {}", describe(Some(&run)));
+        let incomplete = if run.incomplete.is_empty() {
+            String::new()
+        } else {
+            format!(" - incomplete: {}", run.incomplete.join("; "))
+        };
+        println!("{marker} {}{incomplete}", describe(Some(&run)));
     }
     Ok(0)
 }
@@ -939,11 +1777,45 @@ fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
     require_root("restore")?;
     let target = restore::absolute_target(args.target)?;
     let sudo = nestegg::identity::UserIdentity::from_sudo()?;
+    let cfg = Config::load(&paths.config_file)?;
     let key = if args.no_key {
         client::RestoreKey::Without
     } else if let Some(path) = args.keyfile {
         let path = absolute_user_path(path)?;
         client::RestoreKey::File(restore::read_user_key(&path, sudo.as_ref())?)
+    } else if cfg.backup.encryption {
+        // With encryption configured, hand the key over explicitly for a
+        // protected archive (so the client verifies the manifest signature),
+        // and refuse an unprotected one rather than restoring it silently: an
+        // old snapshot made before encryption was switched on, or one planted
+        // by someone without the key, is not verified against the key. The key
+        // is never decided by the restore's own second listing. (decision 0015)
+        let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
+        let files = client.snapshot_files(args.snapshot)?;
+        match client::archive_protection(&files, args.archive) {
+            client::Protection::Protected => client.configured_key()?,
+            client::Protection::NotListed => bail!(
+                "{} is not in {}; `nestegg snapshots` lists the snapshots, and the web UI \
+                 shows the archives of each",
+                args.archive,
+                args.snapshot
+            ),
+            client::Protection::ModeUnknown => bail!(
+                "the server does not say whether {} in {} is protected by the encryption key \
+                 (an older server). Pass the matching exported key with --keyfile <file> to \
+                 verify it, or restore it without verification with --no-key.",
+                args.archive,
+                args.snapshot
+            ),
+            client::Protection::Unprotected => bail!(
+                "{} in {} is not protected by the encryption key (it was made before \
+                 encryption was switched on, or by someone without the key), so it cannot be \
+                 verified against the key. Restore it anyway with --no-key, or pass the \
+                 matching exported key with --keyfile <file>.",
+                args.archive,
+                args.snapshot
+            ),
+        }
     } else {
         client::RestoreKey::Auto
     };
@@ -958,7 +1830,6 @@ fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
         }
         install_restore_signal_handlers();
     }
-    let cfg = Config::load(&paths.config_file)?;
     let mut stderr = std::io::stderr();
     let warnings = restore::execute(
         paths,

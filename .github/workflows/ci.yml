@@ -29,6 +29,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Supported systems are fixed in
+        # docs/decisions/0003-product-and-technical-baseline.md (Ubuntu
+        # 24.04 / 26.04, Linux Mint 22.x, Debian 13). Linux Mint 22 is based
+        # on Ubuntu 24.04, which ubuntu:24.04 covers; there is no official
+        # Linux Mint container image.
         base: ["ubuntu:24.04", "debian:trixie"]
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +48,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the upgrade test builds the merge base as well.
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -57,3 +65,28 @@ jobs:
       - run: cargo deb -p nestegg --no-build -o target/
       - name: Package and service test (systemd container)
         run: tests/e2e/systemd.sh
+      # The "old" package for the upgrade test is built from the merge base
+      # with the branch this change goes into: for a pull request that is the
+      # current tip of its base branch (the checkout is the merge commit), for
+      # a push to a feature branch the commit it forked from. When the merge
+      # base is HEAD itself (a push to the default branch or a tag on it) the
+      # first parent is used instead. The old package gets the suffix "~base"
+      # so that its version always sorts below the new one, even when both
+      # come from the same version in Cargo.toml. It builds into its own target
+      # directory so that target/release/nestegg stays the new binary.
+      - name: Build the previous package (merge base) for the upgrade test
+        env:
+          BASE_BRANCH: ${{ github.base_ref || github.event.repository.default_branch }}
+        run: |
+          base="$(git merge-base HEAD "origin/$BASE_BRANCH")"
+          if [ "$base" = "$(git rev-parse HEAD)" ]; then base="$(git rev-parse HEAD^1)"; fi
+          echo "old package from: $(git log -1 --format='%h %s' "$base")"
+          git worktree add --detach "$RUNNER_TEMP/base" "$base"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/base-target"
+          cd "$RUNNER_TEMP/base"
+          if [ -f ui/package-lock.json ]; then (cd ui && npm ci && npm run build); fi
+          cargo build --release
+          version="$("$CARGO_TARGET_DIR/release/nestegg" --version | awk '{print $2}')"
+          cargo deb -p nestegg --no-build -o "$RUNNER_TEMP/old/" --deb-version "$version~base"
+      - name: Package upgrade test (old package, then the new one over it)
+        run: tests/e2e/upgrade.sh "$RUNNER_TEMP"/old/nestegg_*.deb target/nestegg_*_amd64.deb

@@ -7,10 +7,102 @@ if [ "$1" = "configure" ]; then
     chmod 0755 /etc/nestegg
     chgrp nestegg /var/lib/nestegg 2>/dev/null || true
     chmod 0750 /var/lib/nestegg
+    # The configuration must be owned by root. It may carry a token in
+    # [notify] command and is readable by group members (for `nestegg status`),
+    # but not writable by them and not readable by anyone else. Correct a file
+    # that is too open (readable/writable/executable by others, OR writable by
+    # the group, which would let a member edit around the API checks) or wrongly
+    # owned; a stricter root:root 0600 an administrator chose is kept. Never
+    # follow a symlink, and set the mode only after the owner change worked, so a
+    # failed chown cannot leave a looser mode. If the nestegg group does not
+    # exist yet, fall back to root-only 0600 rather than leaving it readable by
+    # anyone (decision 0022, item 10).
+    cfg=/etc/nestegg/config.toml
+    if [ -f "$cfg" ] && [ ! -L "$cfg" ]; then
+        owner=$(stat -c '%U' "$cfg" 2>/dev/null || echo "?")
+        perms=$(stat -c '%a' "$cfg" 2>/dev/null || echo "")
+        case "$perms" in
+            ''|*[!0-7]*) perms="" ;;  # not a plain octal mode: skip
+        esac
+        too_open=no
+        if [ -n "$perms" ] && { [ $(( 0$perms & 0007 )) -ne 0 ] || [ $(( 0$perms & 0020 )) -ne 0 ]; }; then
+            too_open=yes
+        fi
+        if [ "$owner" != root ] || [ "$too_open" = yes ]; then
+            if chown root:nestegg "$cfg" 2>/dev/null; then
+                # The group exists: group-readable, never group-writable or
+                # other-accessible.
+                [ "$too_open" = yes ] && { chmod 0640 "$cfg" 2>/dev/null || true; }
+            elif chown root:root "$cfg" 2>/dev/null; then
+                # No nestegg group yet: root-only, never world-readable.
+                chmod 0600 "$cfg" 2>/dev/null || true
+            else
+                chmod 0600 "$cfg" 2>/dev/null || true
+            fi
+        fi
+    fi
+    running=no
     if [ -d /run/systemd/system ]; then
+        running=yes
         systemctl daemon-reload >/dev/null 2>&1 || true
         if systemctl is-active --quiet nestegg.service; then
             systemctl restart nestegg.service || true
+        fi
+    fi
+    # Lock files a development version left group/other-readable (0644) let a
+    # group member hold a shared lock on them and so block the daemon or a
+    # backup run (decision 0022). Tighten them to 0600 in place: a plain chmod,
+    # never through a symlink, never replacing or removing the file (replacing
+    # a lock file can give two processes each "the" lock). nestegg itself also
+    # tightens a lock file whenever it opens one. Must never abort the upgrade.
+    for _f in /run/nestegg/run.lock \
+              /var/lib/nestegg/.current.lock \
+              /var/lib/nestegg/.notify.lock \
+              /var/lib/nestegg/.notify-settings.lock; do
+        if [ -f "$_f" ] && [ ! -L "$_f" ]; then
+            chmod 0600 "$_f" 2>/dev/null || true
+        fi
+    done
+    # Units that were enabled before an `apt remove` (see prerm, preinst).
+    # They are enabled again only while the configuration still exists.
+    marker=/var/lib/nestegg/enabled-units
+    if [ -f "$marker" ]; then
+        configured=no
+        [ -e /etc/nestegg/config.toml ] && configured=yes
+        reenabled=""
+        while read -r unit; do
+            case "$unit" in
+                # The health check needs no configuration: without this, a
+                # remove and reinstall before `nestegg init` would leave it
+                # off for good (the one-time marker below is already set).
+                nestegg-notify.timer) ;;
+                nestegg.service|nestegg-backup.timer)
+                    [ "$configured" = yes ] || continue ;;
+                *) continue ;;
+            esac
+            # Without a running systemd (chroot, image build): enable only.
+            now=""
+            [ "$running" = yes ] && now=--now
+            if systemctl enable $now "$unit" >/dev/null 2>&1; then
+                reenabled="$reenabled $unit"
+            fi
+        done < "$marker"
+        if [ -n "$reenabled" ]; then
+            echo "nestegg: enabled again as before removal:$reenabled"
+        fi
+        rm -f "$marker"
+    fi
+    # The health check needs no setup (it does nothing while nestegg is not
+    # configured), so the package turns its timer on once: on a first
+    # installation and on the upgrade from a version that did not have it.
+    # The marker keeps a later decision of the user to switch it off (decision
+    # 0017); it stays on remove and purge, like the rest of the state.
+    notify_marker=/var/lib/nestegg/notify-timer-enabled
+    if [ ! -e "$notify_marker" ] && [ -e /usr/lib/systemd/system/nestegg-notify.timer ]; then
+        now=""
+        [ "$running" = yes ] && now=--now
+        if systemctl enable $now nestegg-notify.timer >/dev/null 2>&1; then
+            : > "$notify_marker" || true
         fi
     fi
     if [ ! -e /etc/nestegg/config.toml ]; then

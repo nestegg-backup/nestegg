@@ -3,7 +3,8 @@
 //! A data disk that failed to mount leaves an empty directory behind. Backing
 //! that up would look like a successful (but empty) backup, so sources are
 //! checked against `/etc/fstab` and the current mount table. Mount points
-//! below a source are not crossed by `proxmox-backup-client`; those that are
+//! below a source are not crossed by `proxmox-backup-client` when they are
+//! another file system (another device number); those that are
 //! not covered by another source or `include_dev` produce a warning.
 
 use std::path::{Path, PathBuf};
@@ -19,6 +20,10 @@ const DATA_FS: &[&str] = &[
 pub struct Mount {
     pub point: PathBuf,
     pub fstype: String,
+    /// Device number of the mounted file system as the mount table gives it
+    /// (`major:minor`). Two mounts of the same file system, such as a bind
+    /// mount, share it; the backup client tells file systems apart by it.
+    pub device: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,11 +69,15 @@ pub fn parse_mountinfo(text: &str) -> Vec<Mount> {
     text.lines()
         .filter_map(|line| {
             let (left, right) = line.split_once(" - ")?;
-            let point = left.split_whitespace().nth(4)?;
+            let mut fields = left.split_whitespace();
+            let device = fields.nth(2)?;
+            // Field 5 (two after the device and the root within it).
+            let point = fields.nth(1)?;
             let fstype = right.split_whitespace().next()?;
             Some(Mount {
                 point: PathBuf::from(unescape(point)),
                 fstype: fstype.to_string(),
+                device: device.to_string(),
             })
         })
         .collect()

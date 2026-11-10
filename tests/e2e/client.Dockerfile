@@ -1,9 +1,10 @@
-# Desktop stand-in: Ubuntu LTS with the official static proxmox-backup-client.
+# Desktop stand-in: Ubuntu LTS (or Debian) with the official static
+# proxmox-backup-client. procps provides pgrep for the process checks.
 ARG BASE=ubuntu:24.04
 FROM ${BASE}
 ARG KEYRING_SHA256=136673be77aba35dcce385b28737689ad64fd785a797e57897589aed08db6e45
 RUN apt-get update \
- && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl libcap2-bin \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl libcap2-bin procps \
  && curl -fsSL -o /usr/share/keyrings/proxmox-archive-keyring.gpg \
       https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg \
  && echo "${KEYRING_SHA256}  /usr/share/keyrings/proxmox-archive-keyring.gpg" | sha256sum -c - \

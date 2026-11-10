@@ -1,134 +1,158 @@
 # API requests from the UI
 
-Proposals for `api/openapi.yaml` and the daemon, written by the UI side.
-The core side decides and updates the contract. The UI already handles the
-current state gracefully (noted per item). The mock in `mock/world.ts`
-implements the proposed shapes, so they can be tried with `npm run dev`.
+What the UI still needs from `api/openapi.yaml` and the daemon, written by the
+UI side. The core side decides and updates the contract. Every item says what
+the UI does today without it. Checked against `api/openapi.yaml` (version
+0.3.0); items that were requested earlier and are in the contract by now are
+listed at the end.
 
-## 1. `GET /api/v1/machines` – other machines of the household (v0.3)
+## 1. Search inside a snapshot
 
-Read-only list of the backup groups in this PC's PBS namespace, as decided in
-0003 (Audit role, snapshots plus the uploaded status report).
+The restore flow has no search field: finding a file means opening folders one
+by one. Filtering only the folders that were opened so far would mislead (it
+would look like "not found" for files that exist), so the UI offers no search.
 
-```yaml
-MachinesResponse:
-  type: object
-  required: [machines]
-  properties:
-    read_at: { type: [string, "null"], format: date-time, description: When the PBS was last read. }
-    machines:
-      type: array
-      items:
-        type: object
-        required: [backup_id]
-        properties:
-          backup_id: { type: string, examples: ["media"] }
-          hostname: { type: [string, "null"], description: From the last status report. }
-          os: { type: [string, "null"] }
-          last_snapshot: { type: [string, "null"], format: date-time }
-          recent_snapshots:
-            type: array
-            description: Snapshot times of the last 14 days, newest first (for the 14-day strip).
-            items: { type: string, format: date-time }
-          size_bytes: { type: [integer, "null"], description: Size of the last snapshot. }
-          report:
-            description: Contents of the last uploaded status report, or null.
-            type: [object, "null"]
-            required: [reported_at, result]
-            properties:
-              reported_at: { type: string, format: date-time }
-              result: { type: string, enum: [succeeded, failed, pbs_unreachable] }
-              run_started_at: { type: [string, "null"], format: date-time }
-              error: { $ref: "#/components/schemas/RunError" }
-              key_exported: { type: [boolean, "null"] }
-              sources: { type: array, items: { type: string, examples: ["/home"] } }
-              overdue_after_hours: { type: [integer, "null"] }
-              nestegg_version: { type: [string, "null"] }
+Proposal:
+
+```
+GET /snapshots/{snapshotTime}/search?archive=home.pxar&q=report&limit=100
 ```
 
-- This PC may be part of the list; the UI filters out the entry whose
-  `backup_id` equals `status.machine.backup_id`.
-- Errors: `503 pbs_unreachable` like `/snapshots`.
-- Open question already noted in the prototype README: failed runs only show
-  up if a report is uploaded for them too (today a report is uploaded only
-  with a snapshot).
-- **Today:** the daemon answers 404; the list then shows only "This
-  computer", without an error.
+- `archive`: one archive of the snapshot (as in `browse`), required.
+- `q`: case-insensitive substring of the file or folder name (not a glob, not
+  a regular expression), at least 2 characters; 400 `bad_request` otherwise.
+- `limit`: 1 to 500, default 100.
+- Answer `200`: `{ entries: [{ path, name, type, size_bytes, modified }], truncated: bool }`.
+  `path` is the full path inside the archive, in the same form `browse` and
+  `RestoreRequest.paths` use (`/alice/Documents/report.odt`); the other fields
+  are those of `DirEntry`, so a hit can be ticked and restored like any entry.
+- Same permission rule as `browse` (non-root callers only see their home
+  directory; paths outside it never appear), `403` and `503 pbs_unreachable`
+  as for `browse`, and the same catalog cache (the first call for a snapshot
+  may be slow).
 
-## 2. `GET /api/v1/session` – who is using the UI
+## 2. Failed runs of the other computers
 
-```yaml
-SessionInfo:
-  type: object
-  required: [user, home]
-  properties:
-    user: { type: string, examples: ["alice"] }
-    home: { type: string, examples: ["/home/alice"] }
-```
+`GET /machines` takes the status report from the notes of the last successful
+snapshot. A computer whose backups fail for days therefore shows only its
+last success; the overview cannot say "failing" for it, only "overdue" once
+the threshold has passed.
 
-The daemon can take this from the peer credentials (`SO_PEERCRED`) of the
-socket connection opened by `nestegg ui`. The restore step "new folder" needs
-the home directory to offer `/home/alice/<name>` and to say who will own the
-restored files.
+Proposal: let a computer also upload a small report when a run fails (after
+it reached the server), and return the newest one as `report` with
+`result: failed` and `error: { kind, message }`. The UI already understands
+those fields (`MachineReport` in `src/lib/types.ts`) and shows a failing
+computer first in the list.
 
-- **Today:** 404; the UI then asks for a full absolute path instead.
+## 3. Reasons and check names that can be translated
 
-## 3. Restores
+`Run.incomplete` entries and the `name` and `detail` of `POST /pbs/check` are
+English sentences. The UI shows them as they are and says that they are
+English; a German reader sees English text in the middle of a German page.
 
-- **Several archives in one restore.** `RestoreRequest` has one `archive`, so
-  the UI lets the user pick from one area (`/home` or `/etc` …) per restore
-  and says so. Proposal: `archives: [{ archive, paths }]`, restored into
-  `<target_dir>/<archive name>/` when more than one is given.
-- **Stable error code when the target exists:** add `target_exists` to the
-  `Error.code` enum and answer `409`. The UI already shows a specific message
-  for `409` + `target_exists` (and for a `409` whose message contains
-  "exist").
-- **Progress:** `Restore` has no progress; add `restored_bytes` and, if
-  cheap, `total_bytes`. The UI shows the elapsed time until then.
-- **Search inside a snapshot** (the prototype has a search field): e.g.
-  `GET /snapshots/{time}/search?archive=&q=` returning paths. Left out of the
-  UI until it exists – filtering only the folders opened so far would
-  mislead.
-- **Today:** browse and `POST /restores` answer 501; the UI says that this
-  version cannot restore from the interface yet and shows the matching
-  `sudo nestegg restore <snapshot> <archive> <NEW-FOLDER>` command.
+Proposal: add a stable `code` next to each text, e.g.
+`incomplete: [{ code: "system_backup_skipped", detail: "<English text>" }]`
+(or a parallel `incomplete_codes` list, if the list of strings must stay) and
+`checks: [{ id: "pbs_reachable", name, ok, detail }]`. The UI would translate
+the codes it knows and fall back to the English text for the others.
 
-## 4. `POST /api/v1/pbs/check` – "Check connection" in settings
+## 4. Whether the backup client is installed
 
-The prototype has a "Verbindung prüfen" button. Proposal: runs the
-non-root parts of `nestegg check` (reachability, authentication, datastore
-access, key present) and returns
-`{ checks: [{ name, ok, detail }], checked_at }`. Must not wake the PBS
-unless asked (`?wake=true`).
+Before setup, the guide has to say "install `proxmox-backup-client`" without
+knowing whether that was done (`/status` answers `unconfigured`, and `nestegg
+check` only runs in the terminal). Proposal: `Status.client: { installed:
+bool, version: string | null }`, also while unconfigured. The guide could then
+mark that part as done.
 
-- **Today:** not in the API, so the button is left out. Settings show the
-  terminal command `sudo nestegg check` instead.
+## 5. Retention on the server view
 
-## 5. Run progress and cancelling
+The server view says "set on the server" for the retention rules. If the Audit
+role can read the prune and GC schedule of the datastore, add them to `GET
+/pbs` (`keep_last`, `keep_daily`, ... as numbers or null); otherwise nothing
+is needed.
 
-- `Run` during `uploading`: add an estimate (`expected_bytes` from the last
-  successful run is enough) so the UI can show a progress bar like the
-  prototype. Today the UI shows "x GB uploaded" without a bar.
-- `POST /runs/{id}/cancel` (the prototype has "Sicherung abbrechen").
-  Left out of the UI until it exists.
+## 6. Small points
 
-## 6. Structured schedule and server facts
-
-- `ConfigView.schedule` and `Status.schedule.calendar` are English free text
-  ("every 24 h"). Please add `interval_hours: integer` to both; the UI parses
-  `every N h` meanwhile and falls back to the raw text.
-- Server view: datastore usage (`used_bytes`, `total_bytes`) and the
-  retention settings, if readable with the Audit role. Left out until then.
+- **`Run.verified = false`:** the contract says "read back and matched" and
+  "absent in older records". Please say what `false` means (verification
+  skipped or failed?). The UI shows only `true` and treats `false` and absent
+  alike.
+- **Cancelling:** after `202` the run has no state that says "cancelling"; the
+  UI waits for `cancelled` (or `succeeded`) in `/status`. A `cancelling` flag on
+  `Run` would let a second tab show the same thing. Optional.
+- **Cancelling (settled):** the daemon follows the contract. `404 not_found`
+  for a run id that does not exist, `409 cannot_cancel` for a run that exists
+  but cannot be cancelled (still starting, or already over; the message says
+  which). The UI shows its own text for 409 and keeps the broad text for a 404,
+  because a daemon from before this change answered 404 for every case.
+- **`POST /pbs/check` and checks that were not made (settled):** every item
+  has `status` = `passed`, `failed` or `not_checked` (`ok` stays: `status ==
+  passed`, so `false` for a check that was not made). A server that does not
+  answer while Wake-on-LAN is on and no wake was requested is `not_checked`,
+  and so is everything that needs the server. The UI therefore checks
+  without `wake` first and offers "wake the server and check again". Items
+  without `status` (older daemons) are read by `ok`.
+- **The result of `POST /pbs/check` in `/status` (settled):** the daemon
+  remembers what its last connection check found out (reachable = the item
+  "PBS reachable" passed; failed and not checked both count as "did not
+  answer") and `/status` reports it in `pbs.reachable`/`checked_at` while it
+  is newer than what the last backup run recorded. It is kept in memory, so
+  after a restart of the daemon the run's value is the newest again. The UI
+  additionally keeps the result of its own check until `/status` reports a
+  later `checked_at`, which also covers older daemons.
+- **`unknown` run values (settled):** the contract has `unknown` for a run
+  `state`, `trigger` and `error.kind` written by a newer version. The UI
+  treats any word it does not know like `unknown` and says so ("not
+  understood by this version of nestegg, update nestegg") in the history, the
+  14-day strip and the headline. The daemon reports `health = failing` when
+  the last run's state is unknown; a daemon that still says `ok` gets the same
+  headline from the UI. `MachineReport.result` (other PCs) is read the same way.
+- **Who may cancel:** `POST /runs/{id}/cancel` does not mention permissions.
+  The UI offers the button to every user of the page and shows the daemon's
+  message for any other error.
 
 ## 7. Integration notes for the core side (not API)
 
-- **Build order:** the binary embeds `ui/dist` at compile time
-  (`rust-embed`, `allow_missing`). A `cargo build` before `npm run build`
-  ships the placeholder page; the `.deb` job in `ci.yml` should build the UI
-  first (Node 22: `npm ci && npm run build` in `ui/`). After the first UI
-  build an existing `target/` may need `cargo clean -p nestegg` once, because
-  the derive does not notice that the folder appeared.
 - **Websockets through `--dev-proxy`:** the forwarding in `nestegg ui` does
   not pass websocket upgrades on, so Vite's live reload would not work
   through it. The UI config points the HMR websocket straight at the Vite
   port; nothing is needed on the core side unless that should change.
+- **Embedded build:** after the first UI build an existing `target/` may need
+  `cargo clean -p nestegg` once, because the derive does not notice that
+  `ui/dist` appeared. CI builds the UI before the binary.
+
+## Implemented since the first version of this file
+
+All of these are in `api/openapi.yaml` and the UI uses them:
+
+- `GET /machines` (including `complete`) and `GET /session` (`user`, `home`,
+  `uid`, `root`).
+- Restores: `archives` for several archives in one restore (each into
+  `<target>/<archive name>/`), the stable `409 target_exists`, and progress
+  (`restored_bytes`, `total_bytes`, `warnings`).
+- `POST /pbs/check` ("Check connection" on the server view; the UI passes
+  `wake=true` only when the user asks to wake the server after a check found
+  it asleep) and `GET /pbs` (datastore usage on the server view).
+- `POST /runs/{id}/cancel` ("Cancel backup" with a confirmation; `404` for an
+  unknown run, `409 cannot_cancel` for one that is starting or over; a `404`
+  from an older daemon is handled like any not-cancellable case).
+- Run progress: `expected_bytes` and `processed_bytes` (a bar under "Upload
+  changed files").
+- `interval_hours` in `Status.schedule` and `ConfigView`; the UI no longer
+  parses the text `schedule` unless a daemon sends neither number.
+- New states: `health = incomplete` with `Run.incomplete`, `Run.verified`,
+  `RunError.kind = verification_failed` and `cancelled`,
+  `Status.server_verify_failed`, `Snapshot.verified = failed`.
+- Settings: `PATCH /config` with `editable` and `limits` (decision 0013). The
+  limits of decision 0022 are in: "overdue after" is capped at 168 hours or the
+  rhythm plus 72 hours (`limits.overdue_after_hours` has `base`,
+  `per_interval_extra`, `file_minimum`, so the weekly rhythm is possible and the
+  page computes the cap for the rhythm it is about to set), and the daemon alone
+  decides whether a new exclude pattern would leave out a whole folder; the page
+  shows its refusal.
+- `status.pbs.credentials_stored` and `status.encryption.key_present` (the
+  setup guide uses them to show the steps after `nestegg init`; null or absent
+  means unknown and never counts as missing).
+
+Not used by the UI: `MachinesResponse.complete` (the list simply shows who is
+visible), `PbsInfo.overview_configured` and `SessionInfo.uid` / `root`.

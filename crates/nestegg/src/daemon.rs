@@ -1,6 +1,6 @@
 //! `nestegg daemon`: local JSON API on a Unix socket (see `api/openapi.yaml`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,20 +34,121 @@ struct App {
     restores: Arc<Mutex<HashMap<String, RestoreJob>>>,
     /// Serialises catalog dumps (one dump per snapshot, no duplicates).
     catalog: Arc<Mutex<()>>,
-    /// Status reports of snapshots (`archive_sources`), by snapshot path.
-    reports: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    /// Backup metadata of snapshots, keyed by everything the answer depends
+    /// on (datastore, namespace, encryption, snapshot); `None` for snapshots
+    /// without trustworthy metadata (decision 0016). Snapshots do not change
+    /// once finished, but the configuration can change in the file while the
+    /// daemon runs, so it is part of the key. Bounded in size.
+    metadata: Arc<Mutex<MetadataCache>>,
+    /// Serialises settings changes (read, modify, write, switch the timer).
+    settings: Arc<Mutex<()>>,
+    /// Lets only one PBS check run at a time: a second request while one runs
+    /// is told "already checking" instead of starting another wake-up burst.
+    check_gate: Arc<tokio::sync::Mutex<()>>,
+    /// When the last wake attempt was sent, to keep a minimum interval between
+    /// wake-ups so group members cannot make the daemon spam Wake-on-LAN.
+    last_wake: Arc<Mutex<Option<std::time::Instant>>>,
+    /// What the last `POST /pbs/check` found out about reachability, and
+    /// when. `GET /status` reports it while it is newer than what the last
+    /// backup run recorded, so every page shows the newest thing known
+    /// instead of "reachable" from a run hours ago right after a check that
+    /// got no answer. Kept in memory only: after a restart of the daemon the
+    /// last run's value is the newest again.
+    last_check: Arc<Mutex<Option<LastCheck>>>,
+}
+
+/// Whether the server answered at the last connection check, and when.
+type LastCheck = (bool, chrono::DateTime<Utc>);
+
+/// Overlay the last connection check on the status when it is the newer
+/// information.
+fn newest_reachability(pbs: &mut crate::status::PbsStatus, last_check: Option<LastCheck>) {
+    let Some((reachable, at)) = last_check else {
+        return;
+    };
+    if pbs.checked_at.is_none_or(|run| at > run) {
+        pbs.reachable = Some(reachable);
+        pbs.checked_at = Some(at);
+    }
+}
+
+/// Shortest interval between two Wake-on-LAN attempts from `POST /pbs/check`.
+const MIN_WAKE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Key for the metadata cache. The blob a snapshot has, and whether it may
+/// be trusted, depends not only on the snapshot path but on the server
+/// (address and port), datastore and namespace it is read from and on whether
+/// encryption is configured.
+/// All of these can change in the configuration file while the daemon runs,
+/// so a stale answer must not survive a configuration change (decision 0016).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MetaKey {
+    server: String,
+    port: u16,
+    datastore: String,
+    namespace: String,
+    encryption: bool,
+    snapshot: String,
+}
+
+impl MetaKey {
+    fn new(config: &Config, snapshot: &str) -> MetaKey {
+        MetaKey {
+            server: config.pbs.server.clone(),
+            port: config.pbs.port,
+            datastore: config.pbs.datastore.clone(),
+            namespace: config.pbs.namespace.clone().unwrap_or_default(),
+            encryption: config.backup.encryption,
+            snapshot: snapshot.to_string(),
+        }
+    }
+}
+
+/// Bounded cache of backup metadata. Finished snapshots do not change, so a
+/// hit never goes stale for its key; the bound only caps memory for a daemon
+/// that browses very many snapshots over its lifetime. Oldest inserted
+/// entries are evicted first.
+#[derive(Default)]
+struct MetadataCache {
+    entries: HashMap<MetaKey, Option<crate::metadata::BackupMetadata>>,
+    order: VecDeque<MetaKey>,
+}
+
+impl MetadataCache {
+    const MAX: usize = 512;
+
+    fn get(&self, key: &MetaKey) -> Option<Option<crate::metadata::BackupMetadata>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: MetaKey, value: Option<crate::metadata::BackupMetadata>) {
+        if !self.entries.contains_key(&key) {
+            self.order.push_back(key.clone());
+            while self.order.len() > Self::MAX {
+                if let Some(old) = self.order.pop_front() {
+                    self.entries.remove(&old);
+                }
+            }
+        }
+        self.entries.insert(key, value);
+    }
 }
 
 /// Credentials of the process on the other end of the socket.
 #[derive(Clone, Debug)]
 pub struct Peer {
     pub uid: Option<u32>,
+    /// Primary gid, from the same peer credentials; the settings exclude guard
+    /// reads folders as this uid/gid (decision 0022).
+    pub gid: Option<u32>,
 }
 
 impl Connected<axum::serve::IncomingStream<'_, tokio::net::UnixListener>> for Peer {
     fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
+        let cred = stream.io().peer_cred().ok();
         Peer {
-            uid: stream.io().peer_cred().ok().map(|c| c.uid()),
+            uid: cred.as_ref().map(|c| c.uid()),
+            gid: cred.as_ref().map(|c| c.gid()),
         }
     }
 }
@@ -138,7 +239,7 @@ pub fn router(paths: Paths) -> Router {
         .route("/api/v1/snapshots/{time}/browse", get(browse))
         .route("/api/v1/restores", axum::routing::post(start_restore))
         .route("/api/v1/restores/{id}", get(get_restore))
-        .route("/api/v1/config", get(config))
+        .route("/api/v1/config", get(config).patch(update_config))
         .route("/api/v1/session", get(session))
         .route("/api/v1/pbs", get(pbs_info))
         .route("/api/v1/pbs/check", axum::routing::post(pbs_check))
@@ -151,7 +252,11 @@ pub fn router(paths: Paths) -> Router {
             start: Default::default(),
             restores: Default::default(),
             catalog: Default::default(),
-            reports: Default::default(),
+            metadata: Default::default(),
+            settings: Default::default(),
+            check_gate: Default::default(),
+            last_wake: Default::default(),
+            last_check: Default::default(),
         })
 }
 
@@ -159,15 +264,18 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION"), "api_version": API_VERSION }))
 }
 
-fn load_config(paths: &Paths) -> Option<Config> {
-    Config::load(&paths.config_file).ok()
-}
-
 async fn status(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Value>> {
     let status = blocking(move || {
-        let config = load_config(&app.paths);
-        let status =
-            crate::status::build(&app.paths, config.as_ref(), crate::status::timer_enabled())?;
+        // A config that exists but cannot be read or parsed is an error, not a
+        // reason to report the built-in defaults as the configuration.
+        let config = crate::status::config_for_status(&app.paths.config_file)?;
+        let mut status = crate::status::build(
+            &app.paths,
+            config.as_ref(),
+            crate::status::timer_enabled(&app.paths),
+        )?;
+        let last_check = *app.last_check.lock().unwrap_or_else(|e| e.into_inner());
+        newest_reachability(&mut status.pbs, last_check);
         Ok(serde_json::to_value(status)?)
     })
     .await?;
@@ -302,6 +410,40 @@ fn spawn_run(run_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Start the health check outside the daemon so a protection-reducing
+/// settings change is reported right away, not only at the next hourly timer
+/// (decision 0022). Best effort: under systemd it starts the oneshot unit
+/// (`--no-block`, so the daemon does not wait for the hook); otherwise it
+/// spawns a detached `nestegg notify`. A failure only delays the report to
+/// the next hourly check, so it is logged, not raised.
+fn spawn_notify(paths: &Paths) {
+    let under_systemd =
+        Path::new("/run/systemd/system").exists() && nix::unistd::geteuid().is_root();
+    let result = if under_systemd {
+        Command::new(&paths.systemctl)
+            .args(["start", "--no-block", crate::status::NOTIFY_UNIT])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|_| ())
+    } else {
+        match std::env::current_exe() {
+            Ok(exe) => Command::new(exe)
+                .arg("notify")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(|_| ()),
+            Err(e) => Err(e),
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("warning: could not start the health check after a settings change: {e}");
+    }
+}
+
 async fn list_snapshots(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Value>> {
     let result = tokio::task::spawn_blocking(
         move || -> Result<std::result::Result<serde_json::Value, String>> {
@@ -329,8 +471,137 @@ async fn list_snapshots(AxState(app): AxState<App>) -> ApiResult<Json<serde_json
 }
 
 async fn config(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Value>> {
-    let config = blocking(move || Config::load(&app.paths.config_file)).await?;
-    Ok(Json(crate::status::config_view(&config)))
+    let (config, timer) = blocking(move || {
+        let config = Config::load(&app.paths.config_file)?;
+        Ok((config, crate::status::timer_enabled(&app.paths)))
+    })
+    .await?;
+    Ok(Json(crate::status::config_view(&config, timer)))
+}
+
+/// `PATCH /api/v1/config`: change the settings group members may change
+/// (decision 0013). Every change and every refusal is logged with the
+/// caller to the daemon's journal.
+async fn update_config(
+    AxState(app): AxState<App>,
+    peer: PeerInfo,
+    body: std::result::Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let uid = peer
+        .as_ref()
+        .and_then(|Extension(ConnectInfo(p))| p.uid)
+        .ok_or_else(|| forbidden("unknown caller"))?;
+    // The exclude guard reads a folder's real entries with the requester's own
+    // identity (uid + primary gid of the socket), never as root, so its answer
+    // never reveals a name the requester could not list themselves. If the gid
+    // is not known no folder is read (decision 0022).
+    let identity = peer
+        .as_ref()
+        .and_then(|Extension(ConnectInfo(p))| p.gid)
+        .map(|gid| crate::settings::PeerIdentity { uid, gid });
+    let user_name = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+        Ok(Some(user)) => user.name,
+        _ => format!("uid {uid}"),
+    };
+    let caller = if user_name.starts_with("uid ") {
+        user_name.clone()
+    } else {
+        format!("{user_name} (uid {uid})")
+    };
+    let refuse = |msg: String| {
+        eprintln!("settings change by {caller} refused: {msg}");
+        bad_request(msg)
+    };
+    let Json(body) = body.map_err(|e| refuse(e.body_text()))?;
+    let patch =
+        crate::settings::SettingsPatch::from_json(body).map_err(|e| refuse(e.to_string()))?;
+    let paths = app.paths.clone();
+    let record_user = user_name.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _one_change_at_a_time = app.settings.lock().unwrap_or_else(|e| e.into_inner());
+        // A group member's change is reported to the users and the hook; root
+        // is trusted and not reported (decision 0022). The report is written
+        // ahead as an *intent*, before the configuration is changed, so a crash
+        // in between still leads to a message; if even the intent cannot be
+        // recorded the change is not applied (item 8).
+        let intent = if uid != 0 {
+            match crate::notify::record_settings_intent(&app.paths, &record_user) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    return Err(crate::settings::SettingsError::Failed(e.context(
+                        "the settings change was not applied because its report could not be \
+                         recorded; try again",
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        let timer = crate::settings::SystemdTimer {
+            systemctl: &app.paths.systemctl,
+        };
+        match crate::settings::update(&app.paths.config_file, &patch, &timer, identity) {
+            Ok(outcome) => {
+                // The change took effect: complete the intent with the real
+                // reductions (or drop it when nothing was lowered). Best effort
+                // — the intent already guarantees a message if this fails.
+                if let Some(id) = intent {
+                    if let Err(e) = crate::notify::finalize_settings_change(
+                        &app.paths,
+                        id,
+                        &record_user,
+                        outcome.reductions.clone(),
+                    ) {
+                        eprintln!("warning: could not complete the settings report: {e:#}");
+                    }
+                }
+                Ok(outcome)
+            }
+            Err(e) => {
+                // Nothing took effect: drop the intent so no message is sent.
+                if let Some(id) = intent {
+                    let _ = crate::notify::cancel_settings_intent(&app.paths, id);
+                }
+                Err(e)
+            }
+        }
+    })
+    .await
+    .map_err(ApiError::internal)?;
+    match result {
+        Ok(outcome) => {
+            if outcome.changes.is_empty() {
+                eprintln!("settings saved by {caller}: no changes");
+            } else {
+                eprintln!(
+                    "settings changed by {caller}: {}",
+                    outcome.changes.join("; ")
+                );
+            }
+            // When the change lowered the protection, trigger the check so the
+            // recorded report is delivered within seconds (a change that took
+            // effect but ended in an error, `outcome.error`, is reported too).
+            if uid != 0 && !outcome.reductions.is_empty() {
+                // Triggering the check runs `systemctl start`; keep it off the
+                // async reactor.
+                let notify_paths = paths.clone();
+                tokio::task::spawn_blocking(move || spawn_notify(&notify_paths));
+            }
+            if let Some(err) = outcome.error {
+                eprintln!("settings change by {caller} partly failed: {err:#}");
+                return Err(ApiError::internal(err));
+            }
+            Ok(Json(crate::status::config_view(
+                &outcome.config,
+                outcome.timer_enabled,
+            )))
+        }
+        Err(crate::settings::SettingsError::Invalid(msg)) => Err(refuse(msg)),
+        Err(e @ crate::settings::SettingsError::Failed(_)) => {
+            eprintln!("settings change by {caller} failed: {e}");
+            Err(ApiError::internal(e))
+        }
+    }
 }
 
 fn pbs_unreachable() -> ApiError {
@@ -373,47 +644,139 @@ fn snapshot_of(config: &Config, time: &str) -> ApiResult<String> {
     ))
 }
 
-/// Source path of `archive` as recorded in the snapshot's status report.
-/// Unprivileged access is refused for snapshots without this information.
+/// Source path of `archive` in `snapshot`, for deciding what an
+/// unprivileged user may see (decision 0016). It comes from the snapshot's
+/// metadata blob or, for snapshots of older versions, from the local run
+/// record of exactly that snapshot. Never from the snapshot notes: anyone
+/// with write access to the backup group can change those.
 fn snapshot_source(
     app: &App,
     config: &Config,
     snapshot: &str,
     archive: &str,
 ) -> ApiResult<PathBuf> {
+    let not_in_archive = || forbidden("this archive does not contain your home directory");
+    let key = MetaKey::new(config, snapshot);
     let cached = app
-        .reports
+        .metadata
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(snapshot)
-        .cloned();
-    let report = match cached {
-        Some(r) => r,
+        .get(&key);
+    let meta = match cached {
+        Some(m) => m,
         None => {
             if !crate::wake::is_reachable(config, std::time::Duration::from_secs(3)) {
                 return Err(pbs_unreachable());
             }
-            let client =
-                crate::client::Client::new(config, SecretStore::new(&app.paths.credentials_dir));
-            let notes = client
-                .notes(snapshot)
-                .map_err(|e| ApiError::internal(format!("{e:#}")))?;
-            let report = crate::run::parse_report(&notes).unwrap_or(serde_json::Value::Null);
-            app.reports
+            let m = load_metadata(&app.paths, config, snapshot)?;
+            app.metadata
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(snapshot.to_string(), report.clone());
-            report
+                .insert(key, m.clone());
+            m
         }
     };
-    report["archive_sources"][archive]
-        .as_str()
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            forbidden(
-                "this snapshot has no source information; restore it with `sudo nestegg restore`",
-            )
-        })
+    if let Some(meta) = meta {
+        return meta
+            .source_of(archive)
+            .map(PathBuf::from)
+            .ok_or_else(not_in_archive);
+    }
+    let record = Store::new(&app.paths)
+        .run_for_snapshot(snapshot)
+        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    match record {
+        Some(run) => run
+            .archives
+            .iter()
+            .find(|a| a.name == archive)
+            .map(|a| PathBuf::from(&a.source))
+            .ok_or_else(not_in_archive),
+        None => Err(forbidden(format!(
+            "this snapshot has no backup metadata (made by an older nestegg version) and \
+             no local run record, so its contents cannot be assigned to your home \
+             directory; ask an administrator to restore it with \
+             `sudo nestegg restore {snapshot} {archive} <target>`"
+        ))),
+    }
+}
+
+/// Read and check the metadata blob of `snapshot`. `None`: no blob, or a
+/// blob that cannot be trusted for permissions (not signed with the
+/// configured key although encryption is on, so it could have been made
+/// without the key).
+///
+/// With encryption on, [`crate::metadata::fetch`] hands the key to the
+/// client, which verifies the manifest signature: a blob that is not signed
+/// with our key (an unencrypted, possibly forged snapshot) makes the client
+/// refuse it, and that refusal is treated as "not trustworthy" here rather
+/// than a hard error, so the caller falls back to the local run record
+/// (decision 0016). The decision never depends on the server's file listing.
+fn load_metadata(
+    paths: &Paths,
+    config: &Config,
+    snapshot: &str,
+) -> ApiResult<Option<crate::metadata::BackupMetadata>> {
+    let client = crate::client::Client::new(config, SecretStore::new(&paths.credentials_dir));
+    let work = crate::secrets::create_private_dir(&paths.tmp_dir())
+        .and_then(|()| crate::staging::StagingDir::create(&paths.tmp_dir().join("metadata")))
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "cannot prepare to read the backup metadata of {snapshot}: {e:#}"
+            ))
+        })?;
+    let fetched = crate::metadata::fetch(&client, snapshot, work.path());
+    interpret_metadata(fetched, config.backup.encryption, snapshot)
+}
+
+/// Turn the outcome of reading the blob into the permission decision. Pure
+/// (no I/O) so the documented fallbacks can be unit-tested without a server.
+fn interpret_metadata(
+    fetched: Result<Option<crate::metadata::Fetched>>,
+    encryption: bool,
+    snapshot: &str,
+) -> ApiResult<Option<crate::metadata::BackupMetadata>> {
+    let untrusted = |why: String| {
+        eprintln!("backup metadata of {snapshot} refused: {why}");
+        forbidden(format!(
+            "the backup metadata of this snapshot cannot be used ({why}); ask an \
+             administrator to restore it with `sudo nestegg restore`"
+        ))
+    };
+    match fetched {
+        // No blob at all (older nestegg version): fall back to the local run
+        // record.
+        Ok(None) => Ok(None),
+        // The blob was restored (with the key when encryption is on, so the
+        // client verified the manifest signature). It must still parse and
+        // describe exactly this snapshot.
+        Ok(Some(fetched)) => {
+            let meta = crate::metadata::BackupMetadata::parse(&fetched.bytes)
+                .map_err(|e| untrusted(format!("{e:#}")))?;
+            if !meta.belongs_to(snapshot) {
+                return Err(untrusted(format!(
+                    "it describes {}, not this snapshot",
+                    meta.snapshot
+                )));
+            }
+            Ok(Some(meta))
+        }
+        // Encryption is on but the snapshot's manifest is not signed with our
+        // key: it could have been made without the key, so it is not trusted.
+        // Fall back to the local run record (decision 0016).
+        Err(e) if encryption && crate::client::manifest_unsigned_error(&format!("{e:#}")) => {
+            eprintln!(
+                "backup metadata of {snapshot} is not signed with the configured key although \
+                 encryption is on; not used for permissions"
+            );
+            Ok(None)
+        }
+        // Anything else (wrong key, transport or file-system error): a blob
+        // that cannot be read is an error (decision 0016).
+        Err(e) => Err(ApiError::internal(format!(
+            "cannot read the backup metadata of {snapshot}: {e:#}"
+        ))),
+    }
 }
 
 fn user_scope_for(
@@ -703,6 +1066,128 @@ async fn start_restore(
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
+/// Decide the restore key for `archive` in `snapshot` and, with encryption
+/// configured, warn when the archive is not protected by the key.
+///
+/// Permissions no longer depend on the key, but the content does: with
+/// encryption configured, a protected archive (encrypted or signed) is restored
+/// with the configured key handed over explicitly — never decided by the
+/// restore's own second listing — so the client verifies the manifest
+/// signature. An archive that is neither encrypted nor signed (an old snapshot
+/// made before encryption was switched on, or one planted by someone without
+/// the key) is restored without a key, but with a warning that it was not
+/// verified against the key. Without encryption configured the key is chosen as
+/// before (`Auto`). (decision 0015, 0016)
+fn restore_key_and_warning(
+    client: &crate::client::Client,
+    config: &Config,
+    snapshot: &str,
+    archive: &str,
+) -> Result<(crate::client::RestoreKey, Option<String>)> {
+    if !config.backup.encryption {
+        return Ok((crate::client::RestoreKey::Auto, None));
+    }
+    let files = client.snapshot_files(snapshot)?;
+    let protection = crate::client::archive_protection(&files, archive);
+    if protection == crate::client::Protection::NotListed {
+        anyhow::bail!("{archive} is not in {snapshot}");
+    }
+    if protection == crate::client::Protection::Protected {
+        Ok((client.configured_key()?, None))
+    } else {
+        Ok((
+            crate::client::RestoreKey::Without,
+            Some(format!(
+                "{archive} in this snapshot is not protected by the encryption key (it was \
+                 made before encryption was switched on, or by someone without the key); it \
+                 was restored without verifying it against the key"
+            )),
+        ))
+    }
+}
+
+/// Copies the progress of one archive restore into the job once a second.
+/// Dropping it stops the thread and waits for it, so the thread can never
+/// outlive the restore of its archive, whichever way that ends.
+struct ProgressMonitor {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressMonitor {
+    fn start(
+        done_before: u64,
+        src: Arc<std::sync::atomic::AtomicU64>,
+        dst: Arc<std::sync::atomic::AtomicU64>,
+        jobs: Arc<Mutex<HashMap<String, RestoreJob>>>,
+        id: &str,
+    ) -> ProgressMonitor {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let id = id.to_string();
+        let thread = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let now = done_before + src.load(Ordering::Relaxed);
+                    dst.store(now, Ordering::Relaxed);
+                    if let Some(j) = jobs.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+                        j.restored_bytes = now;
+                    }
+                    // Short steps, so a stop is noticed quickly.
+                    for _ in 0..10 {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            })
+        };
+        ProgressMonitor {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for ProgressMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// One line in the daemon's log (the journal) when an archive that is not
+/// protected by the configured encryption key is restored, besides the
+/// warning in the job: who restored what, without verification by the key.
+fn log_unprotected_restore(snapshot: &str, archive: &str, requester: &crate::restore::Requester) {
+    eprintln!("{}", unprotected_restore_line(snapshot, archive, requester));
+}
+
+fn unprotected_restore_line(
+    snapshot: &str,
+    archive: &str,
+    requester: &crate::restore::Requester,
+) -> String {
+    let name = |uid: u32| match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+        Ok(Some(user)) => format!("{} (uid {uid})", user.name),
+        _ => format!("uid {uid}"),
+    };
+    let who = match requester {
+        crate::restore::Requester::User(u) => name(u.uid),
+        crate::restore::Requester::Root { sudo: Some(u) } => {
+            format!("root (sudo by {})", name(u.uid))
+        }
+        crate::restore::Requester::Root { sudo: None } => "root".to_string(),
+    };
+    format!(
+        "warning: restore of {archive} from {snapshot} for {who}: the archive is not protected \
+         by the encryption key; it is restored without verifying it against the key"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_restore_job(
     paths: &Paths,
@@ -747,25 +1232,22 @@ fn run_restore_job(
         } else {
             target.to_path_buf()
         };
+        // The fallible lookups come before the progress monitor starts, and the
+        // monitor is a guard that stops and joins its thread when dropped, so
+        // no early return can leave a thread behind writing into the job.
+        let (key, key_warning) = restore_key_and_warning(&client, config, snapshot, &sel.archive)?;
+        if let Some(w) = key_warning {
+            log_unprotected_restore(snapshot, &sel.archive, requester);
+            warnings.push(w);
+        }
         let progress = crate::restore::Progress::default();
-        let monitor_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let monitor = {
-            let stop = monitor_stop.clone();
-            let src = progress.restored_bytes.clone();
-            let dst = restored.clone();
-            let jobs = jobs.clone();
-            let id = id.to_string();
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let now = done_before + src.load(Ordering::Relaxed);
-                    dst.store(now, Ordering::Relaxed);
-                    if let Some(j) = jobs.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
-                        j.restored_bytes = now;
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
-            })
-        };
+        let monitor = ProgressMonitor::start(
+            done_before,
+            progress.restored_bytes.clone(),
+            restored.clone(),
+            jobs.clone(),
+            id,
+        );
         let mut log = Vec::new();
         let result = crate::restore::execute(
             paths,
@@ -775,15 +1257,14 @@ fn run_restore_job(
                 archive: &sel.archive,
                 target: &sub,
                 patterns: &patterns,
-                key: crate::client::RestoreKey::Auto,
+                key,
                 staging_dir: None,
             },
             requester,
             &progress,
             &mut log,
         );
-        monitor_stop.store(true, Ordering::Relaxed);
-        let _ = monitor.join();
+        drop(monitor);
         done_before += progress.restored_bytes.load(Ordering::Relaxed);
         restored.store(done_before, Ordering::Relaxed);
         warnings.extend(
@@ -818,8 +1299,36 @@ async fn get_restore(
     Ok(Json(job))
 }
 
+/// `alice (uid 1000)` for the daemon log and run records.
+fn caller_name(peer: &PeerInfo) -> String {
+    match peer.as_ref().and_then(|Extension(ConnectInfo(p))| p.uid) {
+        Some(uid) => match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+            Ok(Some(user)) => format!("{} (uid {uid})", user.name),
+            _ => format!("uid {uid}"),
+        },
+        None => "unknown caller".into(),
+    }
+}
+
+/// What a cancel request found.
+enum CancelOutcome {
+    Signalled,
+    /// No run with this id has ever been recorded.
+    Unknown,
+    /// The run exists but has not published its process yet.
+    Starting,
+    /// The run exists and is over.
+    Finished,
+}
+
+/// `POST /api/v1/runs/{id}/cancel`: any group member may cancel (they
+/// operate the backups of this computer); who did it is logged and ends up
+/// in the run record. 404 for an id that does not exist, 409
+/// `cannot_cancel` for a run that exists but cannot be cancelled (still
+/// starting, or already over).
 async fn cancel_run(
     AxState(app): AxState<App>,
+    peer: PeerInfo,
     UrlPath(id): UrlPath<String>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     if !is_valid_run_id(&id) {
@@ -829,33 +1338,75 @@ async fn cancel_run(
             "unknown run",
         ));
     }
+    let caller = caller_name(&peer);
     let paths = app.paths.clone();
-    let found = blocking(move || {
+    let who = caller.clone();
+    let run_id = id.clone();
+    let outcome = blocking(move || {
+        let id = run_id;
+        if Store::new(&paths).get_run(&id)?.is_none() {
+            return Ok(CancelOutcome::Unknown);
+        }
+        if crate::run::active_run(&paths)?.is_none_or(|r| r.id != id) {
+            return Ok(CancelOutcome::Finished);
+        }
         let text = std::fs::read_to_string(paths.runtime_dir.join("run.pid")).unwrap_or_default();
         let mut parts = text.split_whitespace();
-        let (Some(pid), Some(run_id)) = (parts.next(), parts.next()) else {
-            return Ok(false);
+        let (Some(pid), Some(pid_run_id)) = (parts.next(), parts.next()) else {
+            return Ok(CancelOutcome::Starting);
         };
-        if run_id != id || crate::run::active_run(&paths)?.is_none_or(|r| r.id != id) {
-            return Ok(false);
+        if pid_run_id != id {
+            return Ok(CancelOutcome::Starting);
         }
         let pid: i32 = pid.parse()?;
-        nix::sys::signal::kill(
+        // Read by the run when it records the cancellation.
+        let note = crate::run::cancel_note_path(&paths, &id);
+        if let Err(e) = crate::secrets::create_private_dir(&paths.tmp_dir())
+            .and_then(|()| crate::secrets::write_private_file(&note, format!("{who}\n").as_bytes()))
+        {
+            eprintln!("cannot record who cancelled run {id}: {e:#}");
+        }
+        match nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGTERM,
-        )?;
-        Ok(true)
+        ) {
+            Ok(()) => Ok(CancelOutcome::Signalled),
+            // The run ended between the active-run check and the signal: there
+            // is no such process any more. That is "already over", not a server
+            // error (409 cannot_cancel, not 500).
+            Err(nix::errno::Errno::ESRCH) => Ok(CancelOutcome::Finished),
+            Err(e) => Err(e.into()),
+        }
     })
     .await?;
-    if found {
-        Ok((StatusCode::ACCEPTED, Json(json!({ "cancelling": true }))))
-    } else {
-        Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "no running backup with this id",
-        ))
-    }
+    let (log, message) = match outcome {
+        CancelOutcome::Signalled => {
+            eprintln!("backup run {id} cancelled by {caller}");
+            return Ok((StatusCode::ACCEPTED, Json(json!({ "cancelling": true }))));
+        }
+        CancelOutcome::Unknown => {
+            eprintln!("cancel of backup run {id} by {caller}: unknown run");
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "unknown run",
+            ));
+        }
+        CancelOutcome::Starting => (
+            "the run is still starting",
+            "the backup is still starting and cannot be cancelled yet; try again in a moment",
+        ),
+        CancelOutcome::Finished => (
+            "the run is already over",
+            "this backup has already finished and cannot be cancelled",
+        ),
+    };
+    eprintln!("cancel of backup run {id} by {caller}: {log}");
+    Err(ApiError::new(
+        StatusCode::CONFLICT,
+        "cannot_cancel",
+        message,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -867,18 +1418,84 @@ async fn pbs_check(
     AxState(app): AxState<App>,
     Query(q): Query<WakeQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    pbs_check_with(app, q.wake.unwrap_or(false), |paths, options| {
+        crate::check::run_reporting(paths, options)
+    })
+    .await
+}
+
+/// Whether a wake attempt may be made now: none was sent within
+/// [`MIN_WAKE_INTERVAL`] (counted from the end of the check that sent it), so
+/// group members cannot make the daemon spam Wake-on-LAN.
+fn wake_allowed(last_sent: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_sent.is_none_or(|t| now.saturating_duration_since(t) >= MIN_WAKE_INTERVAL)
+}
+
+/// `POST /pbs/check` with the check itself passed in (tests use a double).
+async fn pbs_check_with(
+    app: App,
+    wake: bool,
+    check: impl FnOnce(&Paths, &crate::check::CheckOptions) -> crate::check::Checked + Send + 'static,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Only one check at a time: a login, a reachability probe and possibly a
+    // Wake-on-LAN burst can take minutes, and any group member can ask for one.
+    // A second request while one runs is refused with a clear message rather
+    // than piling on more work and more wake-ups. The gate is an owned guard
+    // that moves into the blocking task below: if the caller goes away and this
+    // future is dropped, the check goes on, and so does the gate until the
+    // check has finished.
+    let Ok(gate) = app.check_gate.clone().try_lock_owned() else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "already_checking",
+            "a PBS check is already running; try again in a moment",
+        ));
+    };
+    // Keep a minimum interval between wake attempts: if one was sent very
+    // recently, check without sending another wake-up burst. Only a check that
+    // really sent a packet starts the interval (not one where the server
+    // answered at once, or Wake-on-LAN is off or not configured).
+    let effective_wake = wake
+        && wake_allowed(
+            *app.last_wake.lock().unwrap_or_else(|e| e.into_inner()),
+            std::time::Instant::now(),
+        );
     let paths = app.paths.clone();
-    let wake = q.wake.unwrap_or(false);
-    let checks = blocking(move || {
-        Ok(crate::check::run(
+    let last_wake = app.last_wake.clone();
+    let last_check = app.last_check.clone();
+    let (checks, checked_at) = blocking(move || {
+        let _gate = gate;
+        let checked = check(
             &paths,
-            &crate::check::CheckOptions { wake, login: true },
-        ))
+            &crate::check::CheckOptions {
+                wake: effective_wake,
+                login: true,
+            },
+        );
+        if checked.wake_sent {
+            *last_wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+        }
+        let checked_at = Utc::now();
+        // The server answered, or it did not (failed, or asleep and not woken):
+        // either way that is now the newest thing known about it. No such item
+        // (the configuration could not be read): nothing was learned.
+        if let Some(item) = checked
+            .items
+            .iter()
+            .find(|i| i.name == crate::check::REACHABLE_ITEM)
+        {
+            let reachable = item.status == crate::check::CheckStatus::Passed;
+            *last_check.lock().unwrap_or_else(|e| e.into_inner()) = Some((reachable, checked_at));
+        }
+        Ok((checked.items, checked_at))
     })
     .await?;
     Ok(Json(json!({
         "checks": checks,
-        "checked_at": crate::state::format_time(Utc::now()),
+        "checked_at": crate::state::format_time(checked_at),
+        // True when a wake was asked for but skipped because one was sent very
+        // recently (the minimum interval between wake attempts).
+        "wake_skipped": wake && !effective_wake,
     })))
 }
 
@@ -997,5 +1614,545 @@ pub async fn shutdown_signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn paths(dir: &Path) -> Paths {
+        Paths {
+            config_file: dir.join("config.toml"),
+            credentials_dir: dir.join("cred"),
+            state_dir: dir.join("state"),
+            runtime_dir: dir.join("run"),
+            systemctl: dir.join("no-systemctl"),
+        }
+    }
+
+    const CONFIG: &str = "[pbs]\nserver = \"pbs.example.com\"\ndatastore = \"backups\"\nauth_id = \"backup@pbs!desktop\"\n";
+
+    fn patch(body: &str, uid: Option<u32>) -> Request<Body> {
+        let mut req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/config")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        if let Some(uid) = uid {
+            req.extensions_mut().insert(ConnectInfo(Peer {
+                uid: Some(uid),
+                gid: Some(nix::unistd::getgid().as_raw()),
+            }));
+        }
+        req
+    }
+
+    async fn json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn app(dir: &Path) -> App {
+        App {
+            paths: paths(dir),
+            start: Default::default(),
+            restores: Default::default(),
+            catalog: Default::default(),
+            metadata: Default::default(),
+            settings: Default::default(),
+            check_gate: Default::default(),
+            last_wake: Default::default(),
+            last_check: Default::default(),
+        }
+    }
+
+    const SNAPSHOT: &str = "host/desktop/2026-11-06T21:20:00Z";
+
+    fn meta_for(backup_time: i64) -> crate::metadata::BackupMetadata {
+        crate::metadata::BackupMetadata {
+            format: crate::metadata::FORMAT,
+            nestegg_version: "0.1.0".into(),
+            backup_id: "desktop".into(),
+            hostname: "desktop".into(),
+            backup_time,
+            snapshot: crate::client::snapshot_path("desktop", backup_time),
+            archive_sources: [("home.pxar".to_string(), "/home".to_string())].into(),
+            sources: vec!["/home".into()],
+            system_mode: false,
+            incomplete: vec![],
+        }
+    }
+
+    #[test]
+    fn interpret_metadata_trusts_authentic_falls_back_and_refuses() {
+        // A blob that was restored with the key, parses and describes exactly
+        // this snapshot: trusted.
+        let good = meta_for(1_794_000_000);
+        assert_eq!(good.snapshot, SNAPSHOT);
+        let fetched = Ok(Some(crate::metadata::Fetched {
+            bytes: good.to_bytes(),
+        }));
+        assert_eq!(
+            interpret_metadata(fetched, true, SNAPSHOT).ok(),
+            Some(Some(good))
+        );
+
+        // No blob (older version): fall back to the local run record.
+        assert_eq!(
+            interpret_metadata(Ok(None), true, SNAPSHOT).ok(),
+            Some(None)
+        );
+
+        // Encryption on, but the snapshot's manifest is not signed with our
+        // key (an unencrypted, possibly forged snapshot): the client refuses
+        // it; that is not a hard error, it falls back to the local record.
+        let unsigned = Err(anyhow::anyhow!(
+            "Error: manifest has no signature, but an encryption key is set - refusing to trust \
+             a potentially tampered, unsigned backup"
+        ));
+        assert_eq!(
+            interpret_metadata(unsigned, true, SNAPSHOT).ok(),
+            Some(None)
+        );
+
+        // A blob that belongs to another snapshot: refused (403), never used.
+        let other = crate::metadata::Fetched {
+            bytes: meta_for(1_794_000_001).to_bytes(),
+        };
+        let err = interpret_metadata(Ok(Some(other)), true, SNAPSHOT).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // A blob that does not parse: refused (403).
+        let bad = crate::metadata::Fetched {
+            bytes: b"not json".to_vec(),
+        };
+        let err = interpret_metadata(Ok(Some(bad)), true, SNAPSHOT).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // Any other read failure (wrong key, transport, file system): a blob
+        // that cannot be read is an error, not a silent fall-back.
+        let io = Err(anyhow::anyhow!(
+            "Error: wrong key - unable to verify signature since manifest's key aa does not \
+             match provided key bb"
+        ));
+        let err = interpret_metadata(io, true, SNAPSHOT).unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn metadata_cache_is_keyed_by_config_and_bounded() {
+        let config = Config::parse(CONFIG).unwrap();
+        let mut other = config.clone();
+        // Same snapshot, different datastore -> different key -> no stale hit.
+        other.pbs.datastore = "other".into();
+        let mut cache = MetadataCache::default();
+        cache.insert(
+            MetaKey::new(&config, SNAPSHOT),
+            Some(meta_for(1_794_000_000)),
+        );
+        assert!(cache.get(&MetaKey::new(&config, SNAPSHOT)).is_some());
+        assert!(cache.get(&MetaKey::new(&other, SNAPSHOT)).is_none());
+        // Another server with the same datastore and namespace names.
+        let mut moved = config.clone();
+        moved.pbs.server = "other.example.com".into();
+        assert!(cache.get(&MetaKey::new(&moved, SNAPSHOT)).is_none());
+        let mut port = config.clone();
+        port.pbs.port += 1;
+        assert!(cache.get(&MetaKey::new(&port, SNAPSHOT)).is_none());
+
+        // The cache is bounded: inserting far more than MAX evicts the oldest.
+        for i in 0..(MetadataCache::MAX as i64 + 100) {
+            let snap = crate::client::snapshot_path("desktop", 1_000_000 + i);
+            cache.insert(MetaKey::new(&config, &snap), None);
+        }
+        assert!(cache.entries.len() <= MetadataCache::MAX);
+    }
+
+    #[test]
+    fn scope_comes_from_metadata_then_local_record_never_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let config = Config::parse(CONFIG).unwrap();
+        let meta = crate::metadata::BackupMetadata {
+            format: crate::metadata::FORMAT,
+            nestegg_version: "0.1.0".into(),
+            backup_id: "desktop".into(),
+            hostname: "desktop".into(),
+            backup_time: 1_794_000_000,
+            snapshot: SNAPSHOT.into(),
+            archive_sources: [("home.pxar".to_string(), "/home".to_string())].into(),
+            sources: vec!["/home".into()],
+            system_mode: false,
+            incomplete: vec![],
+        };
+        app.metadata
+            .lock()
+            .unwrap()
+            .insert(MetaKey::new(&config, SNAPSHOT), Some(meta));
+        // A local record that claims something else does not matter while
+        // the snapshot has metadata.
+        let store = Store::new(&app.paths);
+        let mut run = Run::new(Trigger::Timer, Utc::now());
+        run.snapshot = Some(SNAPSHOT.into());
+        run.archives = vec![crate::state::ArchiveInfo {
+            name: "etc.pxar".into(),
+            source: "/etc".into(),
+            size_bytes: None,
+        }];
+        run.finish(crate::state::RunState::Succeeded, Utc::now());
+        store.record_run_only(&run).unwrap();
+        assert_eq!(
+            snapshot_source(&app, &config, SNAPSHOT, "home.pxar").ok(),
+            Some(PathBuf::from("/home"))
+        );
+        let err = snapshot_source(&app, &config, SNAPSHOT, "etc.pxar").unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // Without metadata: the local record of exactly this snapshot.
+        app.metadata
+            .lock()
+            .unwrap()
+            .insert(MetaKey::new(&config, SNAPSHOT), None);
+        assert_eq!(
+            snapshot_source(&app, &config, SNAPSHOT, "etc.pxar").ok(),
+            Some(PathBuf::from("/etc"))
+        );
+        assert_eq!(
+            snapshot_source(&app, &config, SNAPSHOT, "home.pxar")
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        // Neither: refused with a pointer to the administrator.
+        let other = "host/desktop/2026-11-07T00:00:00Z";
+        app.metadata
+            .lock()
+            .unwrap()
+            .insert(MetaKey::new(&config, other), None);
+        let err = snapshot_source(&app, &config, other, "home.pxar").unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert!(
+            err.message.contains("ask an administrator"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("sudo nestegg restore"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_change_needs_a_known_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), CONFIG).unwrap();
+        let resp = router(paths(dir.path()))
+            .oneshot(patch(r#"{"interval_hours":12}"#, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+            CONFIG
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_change_through_the_router() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), CONFIG).unwrap();
+        let me = nix::unistd::getuid().as_raw();
+        let resp = router(paths(dir.path()))
+            .oneshot(patch(
+                r#"{"interval_hours":12,"overdue_after_hours":30}"#,
+                Some(me),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let view = json(resp).await;
+        assert_eq!(view["interval_hours"], 12);
+        assert_eq!(view["automatic_backups"], false);
+        let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(text.contains("interval_hours = 12"), "{text}");
+
+        // Without systemctl, automatic backups cannot be switched on.
+        let resp = router(paths(dir.path()))
+            .oneshot(patch(r#"{"automatic_backups":true}"#, Some(me)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let err = json(resp).await;
+        assert_eq!(err["code"], "internal");
+        assert!(
+            err["message"].as_str().unwrap().contains("need systemd"),
+            "{err}"
+        );
+        // Switching off what is already off needs no systemctl.
+        let resp = router(paths(dir.path()))
+            .oneshot(patch(r#"{"automatic_backups":false}"#, Some(me)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = router(paths(dir.path()))
+            .oneshot(patch(r#"{"datastore":"other"}"#, Some(me)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(resp).await["code"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn only_one_pbs_check_runs_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        let app = app(dir.path());
+        // Simulate a check already in progress by holding the gate.
+        let held = app.check_gate.clone().lock_owned().await;
+        let err = pbs_check(AxState(app.clone()), Query(WakeQuery { wake: Some(false) }))
+            .await
+            .expect_err("a second check must be refused while one runs");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, "already_checking");
+        drop(held);
+    }
+
+    #[test]
+    fn a_restore_whose_key_lookup_fails_leaves_no_monitor_thread_behind() {
+        // Encryption on and no credentials stored: the crypt-mode lookup of
+        // the archive fails before any client runs (no password). The job must
+        // end with that error, and no progress thread may stay behind writing
+        // into the job (it would hold a clone of `jobs` for ever).
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir_all(&p.credentials_dir).unwrap();
+        let config = crate::config::example("pbs.example.com", "backups", "backup@pbs!desktop");
+        assert!(config.backup.encryption);
+        let jobs: Arc<Mutex<HashMap<String, RestoreJob>>> = Default::default();
+        let restored = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let selections = vec![ArchivePaths {
+            archive: "home.pxar".into(),
+            paths: Vec::new(),
+        }];
+        let result = run_restore_job(
+            &p,
+            &config,
+            SNAPSHOT,
+            &selections,
+            &dir.path().join("target"),
+            &crate::restore::Requester::Root { sudo: None },
+            &restored,
+            &jobs,
+            "job",
+        );
+        assert!(result.is_err(), "the key lookup must fail");
+        assert_eq!(
+            Arc::strong_count(&jobs),
+            1,
+            "a monitor thread still holds the job table"
+        );
+        assert_eq!(Arc::strong_count(&restored), 1);
+    }
+
+    #[test]
+    fn the_progress_monitor_stops_when_dropped() {
+        let jobs: Arc<Mutex<HashMap<String, RestoreJob>>> = Default::default();
+        let src = Arc::new(std::sync::atomic::AtomicU64::new(7));
+        let dst = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let monitor = ProgressMonitor::start(5, src.clone(), dst.clone(), jobs.clone(), "x");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while dst.load(Ordering::Relaxed) != 12 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(dst.load(Ordering::Relaxed), 12);
+        let started = std::time::Instant::now();
+        drop(monitor);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(Arc::strong_count(&jobs), 1);
+        assert_eq!(Arc::strong_count(&src), 1);
+    }
+
+    #[test]
+    fn an_unprotected_restore_is_logged_with_snapshot_archive_and_requester() {
+        let line = unprotected_restore_line(
+            SNAPSHOT,
+            "home.pxar",
+            &crate::restore::Requester::Root { sudo: None },
+        );
+        assert!(line.contains(SNAPSHOT), "{line}");
+        assert!(line.contains("home.pxar"), "{line}");
+        assert!(line.contains("for root"), "{line}");
+        assert!(line.contains("not protected"), "{line}");
+    }
+
+    #[test]
+    fn a_wake_is_allowed_once_a_minute() {
+        let now = std::time::Instant::now();
+        assert!(wake_allowed(None, now));
+        let later = |secs| now + std::time::Duration::from_secs(secs);
+        assert!(!wake_allowed(Some(now), now));
+        assert!(!wake_allowed(Some(now), later(59)));
+        assert!(wake_allowed(Some(now), later(60)));
+        // A stamp "after" now (cannot happen with a monotonic clock) is not
+        // an underflow.
+        assert!(!wake_allowed(Some(later(5)), now));
+    }
+
+    fn checked(wake_sent: bool) -> crate::check::Checked {
+        crate::check::Checked {
+            items: Vec::new(),
+            wake_sent,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_wake_that_was_really_sent_starts_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        // Asked to wake, but nothing was sent (the server answered at once):
+        // the next request may still wake.
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let record = |sent: bool| {
+            let asked = asked.clone();
+            move |_: &Paths, o: &crate::check::CheckOptions| {
+                asked.lock().unwrap().push(o.wake);
+                checked(sent)
+            }
+        };
+        let r = pbs_check_with(app.clone(), true, record(false))
+            .await
+            .ok()
+            .expect("the check answers");
+        assert_eq!(r.0["wake_skipped"], false);
+        assert!(app.last_wake.lock().unwrap().is_none());
+        // This one sends a packet.
+        let r = pbs_check_with(app.clone(), true, record(true))
+            .await
+            .ok()
+            .expect("the check answers");
+        assert_eq!(r.0["wake_skipped"], false);
+        assert!(app.last_wake.lock().unwrap().is_some());
+        // Within the minute: checked without waking, and the caller is told.
+        let r = pbs_check_with(app.clone(), true, record(false))
+            .await
+            .ok()
+            .expect("the check answers");
+        assert_eq!(r.0["wake_skipped"], true);
+        // Not asked to wake: never "skipped".
+        let r = pbs_check_with(app.clone(), false, record(false))
+            .await
+            .ok()
+            .expect("the check answers");
+        assert_eq!(r.0["wake_skipped"], false);
+        assert_eq!(*asked.lock().unwrap(), vec![true, true, false, false]);
+    }
+
+    #[tokio::test]
+    async fn the_check_gate_is_held_until_the_check_ends_even_if_the_caller_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let request = tokio::spawn(pbs_check_with(app.clone(), false, move |_, _| {
+            started_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            checked(false)
+        }));
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        // The caller goes away: the request future is dropped.
+        request.abort();
+        assert!(request.await.err().expect("aborted").is_cancelled());
+        // The check is still running, so the gate is still closed.
+        let err = pbs_check_with(app.clone(), false, |_, _| checked(false))
+            .await
+            .expect_err("the gate must stay closed while the check runs");
+        assert_eq!(err.code, "already_checking");
+        // The check ends: the gate opens.
+        go_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.check_gate.try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the gate never opened"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_of_a_just_ended_run_is_409_not_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir_all(&p.state_dir).unwrap();
+        std::fs::create_dir_all(&p.runtime_dir).unwrap();
+        let id = "20261108T120000Z-manual-abcd";
+        let store = Store::new(&p);
+        let mut run = Run::new(Trigger::Manual, Utc::now());
+        run.id = id.into();
+        store.record_run_only(&run).unwrap();
+        store.save_current(&run).unwrap();
+        // The run looks active: a held run lock and a fresh current.json.
+        let _lock = crate::run::RunLock::try_acquire(&p).unwrap().unwrap();
+        // The pid file points at a process that no longer exists, so the signal
+        // gets ESRCH. That is "already finished" (409 cannot_cancel), not a
+        // server error (500).
+        std::fs::write(p.runtime_dir.join("run.pid"), format!("2147483646 {id}\n")).unwrap();
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/runs/{id}/cancel"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(Peer {
+            uid: Some(0),
+            gid: Some(0),
+        }));
+        let resp = router(p).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(json(resp).await["code"], "cannot_cancel");
+    }
+    #[test]
+    fn the_status_reports_the_newer_of_run_and_connection_check() {
+        let t = |h: u32| chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 5, h, 0, 0).unwrap();
+        let pbs = |reachable, checked_at| crate::status::PbsStatus {
+            server: "pbs.example.com".into(),
+            datastore: "datastore".into(),
+            namespace: None,
+            reachable,
+            checked_at,
+            wake_on_lan: false,
+            credentials_stored: None,
+        };
+        // A check after the last run that got no answer wins.
+        let mut s = pbs(Some(true), Some(t(8)));
+        newest_reachability(&mut s, Some((false, t(9))));
+        assert_eq!((s.reachable, s.checked_at), (Some(false), Some(t(9))));
+        // A run after the check wins again.
+        let mut s = pbs(Some(true), Some(t(10)));
+        newest_reachability(&mut s, Some((false, t(9))));
+        assert_eq!((s.reachable, s.checked_at), (Some(true), Some(t(10))));
+        // Nothing known from a run yet: the check is all there is.
+        let mut s = pbs(None, None);
+        newest_reachability(&mut s, Some((true, t(9))));
+        assert_eq!((s.reachable, s.checked_at), (Some(true), Some(t(9))));
+        // No check made: unchanged.
+        let mut s = pbs(Some(true), Some(t(8)));
+        newest_reachability(&mut s, None);
+        assert_eq!((s.reachable, s.checked_at), (Some(true), Some(t(8))));
     }
 }

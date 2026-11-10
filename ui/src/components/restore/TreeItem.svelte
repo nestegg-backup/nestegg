@@ -17,13 +17,12 @@
   const folder = $derived(node.type === "archive" || node.type === "directory");
   const inherited = $derived(restore.inherited(node));
   const checked = $derived(inherited || restore.isSelected(node));
-  const locked = $derived(restore.lockedArchive());
-  const disabled = $derived(inherited || (locked !== null && locked !== node.archive));
+  const disabled = $derived(inherited);
   const id = $derived(`n-${node.archive}-${node.path}`.replace(/[^A-Za-z0-9_-]/g, (c) => `_${c.charCodeAt(0).toString(16)}`));
 </script>
 
 <li>
-  <div class="node" class:dir={folder} style:padding-left="{depth * 22}px">
+  <div class="node" class:dir={folder} style:--depth={depth}>
     {#if folder}
       <button
         class="twist"
@@ -43,7 +42,7 @@
   </div>
   {#if node.open}
     {#if node.loading}
-      <p class="state" style:padding-left="{(depth + 1) * 22 + 56}px">{t.restore.dirLoading}</p>
+      <p class="state" style:--depth={depth + 1}>{t.restore.dirLoading}</p>
     {:else if node.children}
       {#if node.children.length}
         <ul>
@@ -52,17 +51,22 @@
           {/each}
         </ul>
       {:else}
-        <p class="state" style:padding-left="{(depth + 1) * 22 + 56}px">{t.restore.dirEmpty}</p>
+        <p class="state" style:--depth={depth + 1}>{t.restore.dirEmpty}</p>
       {/if}
     {/if}
   {:else if node.failed}
-    <p class="state bad" style:padding-left="{(depth + 1) * 22 + 56}px">{t.restore.dirFailed}</p>
+    <p class="state bad" style:--depth={depth + 1}>{t.restore.dirFailed}</p>
   {/if}
 </li>
 
 <style>
-  .node { display: grid; grid-template-columns: 28px 22px minmax(0, 1fr) auto; align-items: center; gap: 6px; padding: 5px 8px 5px 0; border-radius: 6px; }
-  .node:hover { background: var(--bg1); }
+  /* --depth is the nesting level; --indent the step per level (smaller on a phone, see below). */
+  li { --indent: 22px; }
+  .node {
+    display: grid; grid-template-columns: 28px 22px minmax(0, 1fr) auto; align-items: center; gap: 6px;
+    padding: 5px 8px 5px calc(var(--depth) * var(--indent)); border-radius: 6px;
+  }
+  .node:hover { background: var(--box-hover); }
   .twist {
     appearance: none; border: 0; background: none; width: 28px; height: 28px; cursor: pointer; border-radius: 6px;
     display: grid; place-items: center; color: var(--muted);
@@ -71,9 +75,18 @@
   .twist[aria-expanded="true"] svg { transform: rotate(90deg); }
   input { margin: 0; width: 17px; height: 17px; accent-color: var(--accent); }
   input:disabled + label { color: var(--muted); }
-  label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  /* Names wrap (a long file name or the translated "list of programs ..." label is never cut off). */
+  label { min-width: 0; overflow-wrap: break-word; cursor: pointer; }
   .dir label { font-weight: 500; }
   .size { font-size: var(--fs-s); color: var(--faint); }
-  .state { font-size: var(--fs-s); color: var(--muted); padding: 4px 0; }
+  .state { font-size: var(--fs-s); color: var(--muted); padding: 4px 0 4px calc(var(--depth) * var(--indent) + 56px); }
   .state.bad { color: var(--bad); }
+  /* Phone: a deep folder must leave room for the name. The steps get smaller and the size moves below
+     the name, so an ordinary file name is not broken in the middle. */
+  @media (max-width: 480px) {
+    li { --indent: 12px; }
+    .node { grid-template-columns: 28px 22px minmax(0, 1fr); row-gap: 0; }
+    .size { grid-column: 3; }
+    .size:empty { display: none; }
+  }
 </style>

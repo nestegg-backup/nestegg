@@ -161,9 +161,13 @@ printf '%s\n' "$TOKEN_SECRET" | in_chroot nestegg credentials set-password --all
 in_chroot nestegg key create --allow-plain >/dev/null
 in_chroot nestegg key export /root/exported-key.json >/dev/null
 cp "$mnt/root/exported-key.json" /work/nestegg-key.json
-in_chroot nestegg key confirm-exported >/dev/null
+in_chroot nestegg key confirm-exported --file /root/exported-key.json --accept-local-copy >/dev/null
 in_chroot nestegg rescue export-settings /root/nestegg-rescue.toml >/dev/null
 cp "$mnt/root/nestegg-rescue.toml" /work/nestegg-rescue.toml
+# The same key as a printed paper key, saved as a text file (the rescue
+# test gives it to the wizard as a file or types it in).
+in_chroot nestegg key paperkey --output /root/paperkey.txt >/dev/null
+cp "$mnt/root/paperkey.txt" /work/nestegg-paperkey.txt
 grep -q '^system = true' "$mnt/etc/nestegg/config.toml"
 
 # First start: back up and power off. A restored system (rescue report

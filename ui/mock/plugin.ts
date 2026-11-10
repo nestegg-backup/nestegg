@@ -89,10 +89,10 @@ export function mockApi(): Plugin {
         }
         if (!url.pathname.startsWith("/api/")) return next();
         if (!authorized(req.headers.authorization, MOCK_TOKEN)) return send(res, 401, UNAUTHORIZED);
-        const body = req.method === "POST" ? await readBody(req) : null;
+        const body = req.method === "POST" || req.method === "PATCH" ? await readBody(req) : null;
         const reply = current.handle(req.method ?? "GET", url.pathname.slice("/api/v1".length), url.searchParams, body);
         // A little latency, so loading states are visible during development.
-        setTimeout(() => send(res, reply.status, reply.body), 120);
+        setTimeout(() => send(res, reply.status, reply.body), reply.delayMs ?? 120);
       });
     },
   };

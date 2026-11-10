@@ -9,6 +9,8 @@
 pub mod cli;
 pub mod exec;
 pub mod fixup;
+pub mod guard;
+pub mod paperkey;
 pub mod plan;
 
 use std::fs;
@@ -59,6 +61,22 @@ fn default_port() -> u16 {
 pub const SETTINGS_FILE: &str = "nestegg-rescue.toml";
 
 impl Settings {
+    /// The same settings with control characters removed from every text
+    /// (they come from a file on an attached drive and are shown as
+    /// defaults and in warnings).
+    pub fn printable(self) -> Settings {
+        Settings {
+            server: printable(&self.server),
+            port: self.port,
+            datastore: printable(&self.datastore),
+            namespace: self.namespace.as_deref().map(printable),
+            auth_id: printable(&self.auth_id),
+            fingerprint: self.fingerprint.as_deref().map(printable),
+            backup_id: self.backup_id.as_deref().map(printable),
+            wake_mac: self.wake_mac.as_deref().map(printable),
+        }
+    }
+
     pub fn from_config(c: &Config) -> Settings {
         Settings {
             server: c.pbs.server.clone(),
@@ -84,6 +102,7 @@ impl Settings {
                 broadcast: std::net::Ipv4Addr::BROADCAST,
                 port: 9,
                 timeout_seconds: 300,
+                enabled: true,
             });
         }
         c.validate()?;
@@ -115,6 +134,18 @@ impl Session {
         Ok(Session { config, store_dir })
     }
 
+    /// Replace the key used for this session (after a key was rejected).
+    pub fn set_key(&self, key: Option<&Secret>) -> Result<()> {
+        let key_path = self.store_dir.join(secrets::ENCRYPTION_KEY);
+        match key {
+            Some(k) => secrets::write_private_file(&key_path, k.as_bytes()),
+            None => {
+                let _ = fs::remove_file(&key_path);
+                Ok(())
+            }
+        }
+    }
+
     pub fn client(&self) -> Client<'_> {
         Client::new(&self.config, SecretStore::new(&self.store_dir))
     }
@@ -126,6 +157,9 @@ impl Session {
             .into_iter()
             .filter(|g| g.backup_type == "host")
             .map(|g| g.backup_id)
+            // A PBS only accepts plain names; one with control characters
+            // comes from something else and could rewrite console lines.
+            .filter(|id| !has_control_chars(id))
             .collect();
         ids.sort();
         Ok(ids)
@@ -137,11 +171,62 @@ impl Session {
         let snaps = self
             .client()
             .list_group_snapshots(&format!("host/{backup_id}"))?;
-        Ok(snaps.into_iter().filter(has_system_archive).collect())
+        Ok(usable_snapshots(snaps))
     }
 
-    /// Read `layout.json` and the package list of a snapshot.
-    pub fn inventory(&self, snapshot: &str) -> Result<(Layout, Option<String>)> {
+    /// The key of this session, if one was given.
+    pub fn key(&self) -> Option<Secret> {
+        SecretStore::new(&self.store_dir)
+            .load(secrets::ENCRYPTION_KEY)
+            .ok()
+    }
+
+    /// Check the key of this session against `snapshot` before anything is
+    /// read from it. With a key, the manifest is read with that key (the
+    /// client verifies its signature, so a wrong key fails here) and the
+    /// crypt mode of every archive the restore reads is taken from that
+    /// verified manifest. See [`Protection`].
+    pub fn check_key(&self, snapshot: &str) -> Result<Protection> {
+        let client = self.client();
+        let signed = crate::client::listed_as_signed(&client.snapshot_files(snapshot)?);
+        let Some(key) = self.key() else {
+            return Ok(if signed {
+                Protection::KeyMissing
+            } else {
+                Protection::Plain
+            });
+        };
+        if !signed {
+            return Ok(Protection::Unsigned);
+        }
+        match client.read_manifest_with_key(snapshot, &key) {
+            Ok(manifest) => protection_from_manifest(&manifest, RESTORED_ARCHIVES),
+            // The server listed signed files, but the manifest has no
+            // signature: the same as not signed at all.
+            Err(e) if format!("{e:#}").contains("manifest has no signature") => {
+                Ok(Protection::Unsigned)
+            }
+            // Only a failure that is about the key is called one; a network
+            // or server error must not send the user looking for another key.
+            Err(e) if classify_failure(&e) == FailureKind::Key => {
+                Err(e.context(format!("the key does not open {snapshot}")))
+            }
+            // Right key, wrong signature: the table of contents is not the
+            // one the backup was made with.
+            Err(e) if format!("{e:#}").to_lowercase().contains("wrong signature") => Err(e
+                .context(format!(
+                    "the table of contents of {snapshot} was changed after the backup was made \
+                     (its signature does not match your key); do not restore this backup"
+                ))),
+            Err(e) => Err(e.context(format!(
+                "cannot read the table of contents of {snapshot} from the backup server"
+            ))),
+        }
+    }
+
+    /// Read `layout.json`, the package list and the storage records of a
+    /// snapshot. `key` comes from [`Protection::restore_key`].
+    pub fn inventory(&self, snapshot: &str, key: RestoreKey) -> Result<Inventory> {
         let base = work_dir().join("inventory");
         let _ = fs::remove_dir_all(&base);
         let mut sink = std::io::sink();
@@ -152,18 +237,327 @@ impl Session {
                     archive: "inventory.pxar",
                     target: &base,
                     patterns: &[],
-                    key: RestoreKey::Auto,
+                    key,
                 },
                 &mut sink,
             )
             .context("cannot read the inventory of this snapshot")?;
-        let layout: Layout = serde_json::from_slice(
-            &fs::read(base.join(LAYOUT_FILE))
-                .context("this snapshot has no disk layout (made by an older nestegg)")?,
+        // Only a layout that is not in the backup makes the backup unusable;
+        // a local read error (disk, permissions) is reported as what it is.
+        let layout_bytes = match fs::read(base.join(LAYOUT_FILE)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Unusable(
+                    "this snapshot has no disk layout (made by an older nestegg)".into(),
+                )
+                .into());
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context("cannot read the disk layout restored from this snapshot"));
+            }
+        };
+        let layout: Layout = serde_json::from_slice(&layout_bytes)
+            .map_err(|e| Unusable(format!("invalid layout.json: {e}")))?;
+        let read = |name: &str| fs::read_to_string(base.join(name)).ok();
+        Ok(Inventory {
+            layout,
+            selections: read("dpkg-selections.txt"),
+            fstab: read("fstab"),
+            crypttab: read("crypttab"),
+            lsblk: read("lsblk.json"),
+        })
+    }
+}
+
+/// The snapshots that hold a system backup and have plain names (a PBS never
+/// makes one with control characters in it; a server that does is not
+/// believed, since the names are printed).
+pub fn usable_snapshots(snaps: Vec<SnapshotInfo>) -> Vec<SnapshotInfo> {
+    snaps
+        .into_iter()
+        .filter(has_system_archive)
+        .filter(|s| !has_control_chars(&s.snapshot) && !has_control_chars(&s.time))
+        .collect()
+}
+
+/// What the rescue system reads from a snapshot's `inventory.pxar`.
+pub struct Inventory {
+    pub layout: Layout,
+    /// `dpkg --get-selections` of the backed-up system.
+    pub selections: Option<String>,
+    /// `/etc/fstab`, `/etc/crypttab` and `lsblk --json` of the backed-up
+    /// system: used to recognise its surviving disks.
+    pub fstab: Option<String>,
+    pub crypttab: Option<String>,
+    pub lsblk: Option<String>,
+}
+
+impl Inventory {
+    pub fn recorded_ids(&self) -> Vec<guard::Recorded> {
+        guard::recorded_ids(
+            &self.layout,
+            self.fstab.as_deref(),
+            self.crypttab.as_deref(),
+            self.lsblk.as_deref(),
         )
-        .context("invalid layout.json")?;
-        let selections = fs::read_to_string(base.join("dpkg-selections.txt")).ok();
-        Ok((layout, selections))
+    }
+}
+
+/// Whether a message of the client is about the key (wrong key, damaged key
+/// file) rather than about the network, the server or a name that happens to
+/// contain the word "key". Only phrases the client or nestegg use for key
+/// trouble count, never a bare word.
+pub fn client_blames_the_key(message: &str) -> bool {
+    let m = message.to_lowercase();
+    [
+        "wrong key",
+        "missing key",
+        "provided key",
+        "unable to verify signature",
+        "has no signature",
+        // Phrases, not the bare word: a snapshot path in the client's own
+        // message may contain a host called `decrypt-box`.
+        "unable to decrypt",
+        "failed to decrypt",
+        "could not decrypt",
+        "decryption failed",
+        "error decoding base64",
+        "wrong fingerprint",
+        "fingerprint too short",
+        "key file is protected",
+        "pass the exported key",
+        // A key file the client cannot parse.
+        "parse data as keyconfig",
+        "error reading encryption key",
+    ]
+    .iter()
+    .any(|w| m.contains(w))
+}
+
+/// Whether a message of the client says that the backup itself is damaged
+/// or gone, so that neither another key nor trying again can help:
+/// - `wrong signature in manifest`: the key is the right one (its
+///   fingerprint matches), but the table of contents was changed after the
+///   backup was made;
+/// - the snapshot was removed in the meantime.
+pub fn client_reports_unusable(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("wrong signature")
+        || m.contains("enoent")
+        || (m.contains("snapshot") && m.contains("does not exist"))
+}
+
+/// A backup that can never be restored, whatever key is given and however
+/// often it is tried (a mix of protected and unprotected archives, an
+/// archive missing, no usable disk layout).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unusable(pub String);
+
+impl std::fmt::Display for Unusable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unusable {}
+
+/// What kind of failure reading a backup was, i.e. what could help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The key does not open the backup (another key may help).
+    Key,
+    /// The backup cannot be used at all (another backup is the only way).
+    Unusable,
+    /// Network, server or anything else (trying again may help).
+    Other,
+}
+
+/// The one classification of errors from reading a backup. The cause at the
+/// bottom of the error decides, not the wording of the context around it
+/// (that contains snapshot and host names).
+pub fn classify_failure(e: &anyhow::Error) -> FailureKind {
+    let cause = e.root_cause().to_string();
+    if e.downcast_ref::<Unusable>().is_some() || client_reports_unusable(&cause) {
+        FailureKind::Unusable
+    } else if client_blames_the_key(&cause) {
+        FailureKind::Key
+    } else {
+        FailureKind::Other
+    }
+}
+
+/// Control characters, and the invisible Unicode format characters that
+/// reorder or hide text in a terminal (bidirectional overrides, zero-width
+/// characters).
+fn unprintable(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}' | '\u{feff}')
+}
+
+fn has_control_chars(text: &str) -> bool {
+    text.chars().any(unprintable)
+}
+
+/// Text from an attached drive, a settings file or the server, safe to print
+/// on the console: control characters (escape sequences could rewrite the
+/// lines with the certificate fingerprint or a warning) become `?`.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if unprintable(c) { '?' } else { c })
+        .collect()
+}
+
+/// Like [`printable`] for a text of several lines that nestegg composed
+/// itself: line breaks and tabs stay.
+pub fn printable_block(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if unprintable(c) && c != '\n' && c != '\t' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// The archives a restore reads: all of them must be protected by the key.
+pub const RESTORED_ARCHIVES: &[&str] = &["inventory.pxar", "system.pxar"];
+
+/// How the key relates to a snapshot (see [`Session::check_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Protection {
+    /// No key was given and the backup is neither signed nor encrypted:
+    /// restored as it is (as before keys were checked).
+    Plain,
+    /// No key was given, but the backup is signed or encrypted.
+    KeyMissing,
+    /// The manifest's signature was verified with the key and every archive
+    /// the restore reads is encrypted: the key fits.
+    Encrypted,
+    /// A key was given, but the backup is neither signed nor encrypted. It
+    /// is not protected by the key: anyone with write access to the backup
+    /// server could have made or changed it.
+    Unsigned,
+    /// The signature was verified with the key, but these archives
+    /// (name, crypt mode) are not encrypted.
+    NotEncrypted(Vec<(String, String)>),
+}
+
+impl Protection {
+    /// What is wrong with restoring this backup with a key at hand, or
+    /// `None` if nothing is. Restoring despite it needs an explicit yes.
+    pub fn concern(&self) -> Option<String> {
+        match self {
+            Protection::Plain | Protection::Encrypted => None,
+            Protection::KeyMissing => {
+                Some("this backup is encrypted, but no encryption key was given.".into())
+            }
+            Protection::Unsigned => Some(
+                "this backup is NOT encrypted and NOT signed, so it is not protected by your \
+                 key: anyone with access to the backup server could have changed it."
+                    .into(),
+            ),
+            Protection::NotEncrypted(list) => Some(format!(
+                "this backup is signed with your key (checked), but {} {} not encrypted. \
+                 nestegg encrypts every archive when a key is set, so this backup was made \
+                 in another way.",
+                list.iter()
+                    .map(|(a, m)| format!("{a} ({m})"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if list.len() == 1 { "is" } else { "are" }
+            )),
+        }
+    }
+
+    /// How to read the archives once this protection was accepted.
+    pub fn restore_key(&self, key: Option<Secret>) -> RestoreKey {
+        match (self, key) {
+            // Always pass the key: the client then refuses any manifest
+            // that is not signed with it.
+            (Protection::Encrypted, Some(k)) => RestoreKey::File(k),
+            // Signed with the key, archives signed but not encrypted: the
+            // key is passed as well, so the client checks the signature.
+            (Protection::NotEncrypted(_), Some(k)) => RestoreKey::File(k),
+            _ => RestoreKey::Without,
+        }
+    }
+}
+
+/// Strength of a crypt mode as the client reports it; an unknown mode counts
+/// like `sign-only` (not trusted as encrypted, not known to be unreadable).
+fn mode_rank(mode: &str) -> u8 {
+    match mode {
+        "none" => 0,
+        "encrypt" => 2,
+        _ => 1,
+    }
+}
+
+/// Decide from a manifest that the client verified with the key.
+pub fn protection_from_manifest(
+    manifest: &serde_json::Value,
+    archives: &[&str],
+) -> Result<Protection> {
+    let files = manifest["files"].to_string();
+    let mut weak = Vec::new();
+    for archive in archives {
+        let modes = crate::client::crypt_modes_for_archive(&files, archive);
+        // The weakest file of the archive counts (split archives have two,
+        // in any order).
+        let Some(weakest) = modes.iter().min_by_key(|m| mode_rank(m)) else {
+            return Err(Unusable(format!("{archive} is missing from this backup")).into());
+        };
+        if weakest != "encrypt" {
+            weak.push((archive.to_string(), weakest.clone()));
+        }
+    }
+    // A signed manifest with an archive that is neither encrypted nor signed
+    // is something neither nestegg nor the client produces. The client
+    // refuses to read such an archive without the key, which would only show
+    // after the disk was erased: stop here, whatever the user allows.
+    if let Some((archive, _)) = weak.iter().find(|(_, mode)| mode == "none") {
+        return Err(Unusable(format!(
+            "this backup mixes protected and unprotected archives ({archive} is neither \
+             encrypted nor signed although the backup is signed); nestegg rescue does not \
+             restore such a backup"
+        ))
+        .into());
+    }
+    Ok(if weak.is_empty() {
+        Protection::Encrypted
+    } else {
+        Protection::NotEncrypted(weak)
+    })
+}
+
+/// Short label for the list of backups, from the crypt modes the server
+/// lists for the archives a restore reads (not verified yet).
+pub fn protection_label(s: &SnapshotInfo) -> &'static str {
+    let modes: Vec<&str> = s
+        .crypt_modes
+        .iter()
+        .filter(|(f, _)| {
+            RESTORED_ARCHIVES
+                .iter()
+                .any(|a| f.starts_with(&format!("{}.", a.trim_end_matches(".pxar"))))
+        })
+        .map(|(_, m)| m.as_str())
+        .collect();
+    if modes.is_empty() {
+        ""
+    } else if modes.iter().all(|m| *m == "encrypt") {
+        "encrypted"
+    } else if modes.iter().all(|m| *m == "none") {
+        "NOT ENCRYPTED"
+    } else if modes.iter().all(|m| *m == "sign-only") {
+        "signed, not encrypted"
+    } else {
+        "partly encrypted"
     }
 }
 
@@ -181,10 +575,18 @@ pub struct Disk {
     pub path: String,
     pub size_bytes: u64,
     pub model: String,
+    pub serial: String,
     pub transport: String,
     /// Holds the running rescue system or something mounted.
     pub in_use: bool,
+    /// The disk itself and every device on it (partitions, assembled RAID,
+    /// open LUKS mappings, ...), each once.
+    pub items: Vec<guard::BlockItem>,
 }
+
+/// Smallest disk offered as restore target (smaller ones cannot hold a
+/// system anyway; the plan checks the real space requirement later).
+const MIN_TARGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub fn parse_disks(lsblk_json: &str, busy: &[String]) -> Result<Vec<Disk>> {
     let v: serde_json::Value =
@@ -198,19 +600,40 @@ pub fn parse_disks(lsblk_json: &str, busy: &[String]) -> Result<Vec<Disk>> {
             continue;
         }
         let path = d["path"].as_str().unwrap_or_default().to_string();
-        if path.starts_with("/dev/zram") || path.starts_with("/dev/loop") || path.is_empty() {
+        // Floppy drives (QEMU and some firmware show one) and other tiny
+        // devices are never a sensible restore target.
+        if path.starts_with("/dev/zram")
+            || path.starts_with("/dev/loop")
+            || path.starts_with("/dev/fd")
+            || path.is_empty()
+        {
             continue;
         }
         let size = d["size"]
             .as_u64()
             .or_else(|| d["size"].as_str().and_then(|s| s.parse().ok()))
             .unwrap_or(0);
-        if size == 0 || d["ro"].as_bool() == Some(true) {
+        if size < MIN_TARGET_BYTES || d["ro"].as_bool() == Some(true) {
             continue;
         }
         let mut in_use = busy.iter().any(|b| b == &path);
+        let mut items: Vec<guard::BlockItem> = Vec::new();
         let mut stack: Vec<&serde_json::Value> = vec![d];
         while let Some(n) = stack.pop() {
+            let s = |k: &str| n[k].as_str().unwrap_or_default().trim().to_string();
+            // Free text written on the drive (a label can hold anything).
+            let text = |k: &str| printable(&s(k));
+            let item_path = s("path");
+            if !items.iter().any(|i| i.path == item_path) {
+                items.push(guard::BlockItem {
+                    path: item_path,
+                    kind: s("type"),
+                    fstype: s("fstype"),
+                    uuid: s("uuid"),
+                    partuuid: s("partuuid"),
+                    label: text("label"),
+                });
+            }
             if let Some(points) = n["mountpoints"].as_array()
                 && points
                     .iter()
@@ -219,23 +642,33 @@ pub fn parse_disks(lsblk_json: &str, busy: &[String]) -> Result<Vec<Disk>> {
                 in_use = true;
             }
             if let Some(children) = n["children"].as_array() {
-                stack.extend(children.iter());
+                // Reversed so that partitions come out in disk order.
+                stack.extend(children.iter().rev());
             }
         }
         out.push(Disk {
             path,
             size_bytes: size,
-            model: d["model"].as_str().unwrap_or("").trim().to_string(),
+            model: printable(d["model"].as_str().unwrap_or("").trim()),
+            serial: printable(d["serial"].as_str().unwrap_or("").trim()),
             transport: d["tran"].as_str().unwrap_or("").to_string(),
             in_use,
+            items,
         });
     }
     Ok(out)
 }
 
 pub fn list_disks() -> Result<Vec<Disk>> {
+    // NAME must be among the columns: without it lsblk prints a flat list
+    // instead of a tree, and partitions would not appear below their disk.
     let out = std::process::Command::new("lsblk")
-        .args(["-J", "-b", "-o", "PATH,TYPE,SIZE,MODEL,TRAN,RO,MOUNTPOINTS"])
+        .args([
+            "-J",
+            "-b",
+            "-o",
+            "NAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,RO,MOUNTPOINTS,FSTYPE,UUID,PARTUUID,LABEL",
+        ])
         .output()
         .context("cannot run lsblk")?;
     if !out.status.success() {
@@ -286,19 +719,41 @@ pub fn fetch_fingerprint(server: &str, port: u16) -> Result<String> {
     Ok(fp)
 }
 
+/// A settings file found on attached media.
+#[derive(Debug, Clone)]
+pub struct FoundSettings {
+    /// Where it was found, for the user: a path, or the path on a device
+    /// that is not mounted (`/nestegg-rescue.toml on /dev/sdb1`).
+    pub origin: String,
+    pub settings: Settings,
+}
+
+/// Key files and settings found on attached media.
+#[derive(Default)]
+pub struct MediaScan {
+    pub keys: Vec<PathBuf>,
+    /// Every settings file found, sorted by origin.
+    pub settings: Vec<FoundSettings>,
+    /// Devices (e.g. `/dev/sdb1`) on which a key or settings file was found;
+    /// such a disk is never pre-selected as restore target.
+    pub devices: Vec<String>,
+    /// Partitions on which the search stopped at a limit.
+    pub notes: Vec<String>,
+}
+
 /// Look for exported key files and settings on attached partitions. A
 /// partition that is not mounted is mounted read-only WITHOUT journal
 /// replay (so nothing is written to it), searched, the files found are
 /// copied into the work directory, and it is unmounted again (so the disk
-/// stays selectable as restore target).
-pub fn scan_media() -> (Vec<PathBuf>, Option<(PathBuf, Settings)>) {
-    let mut keys = Vec::new();
-    let mut settings = None;
+/// stays selectable as restore target). The search per partition is
+/// limited (see [`Budget`]).
+pub fn scan_media() -> MediaScan {
+    let mut scan = MediaScan::default();
     let Ok(out) = std::process::Command::new("lsblk")
         .args(["-J", "-l", "-o", "PATH,KNAME,TYPE,FSTYPE,MOUNTPOINTS"])
         .output()
     else {
-        return (keys, settings);
+        return scan;
     };
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
     for d in v["blockdevices"].as_array().cloned().unwrap_or_default() {
@@ -314,30 +769,44 @@ pub fn scan_media() -> (Vec<PathBuf>, Option<(PathBuf, Settings)>) {
                     .collect()
             })
             .unwrap_or_default();
+        let dev = d["path"].as_str().unwrap_or("").to_string();
+        let before = (scan.keys.len(), scan.settings.len());
+        let mut budget = Budget::default();
         if let Some(m) = mounted.first() {
-            search_media(Path::new(m), None, &mut keys, &mut settings);
-            continue;
+            search_media(Path::new(m), None, &dev, &mut budget, &mut scan);
+        } else {
+            let kname = d["kname"].as_str().unwrap_or("x");
+            let point = work_dir().join("media").join(kname);
+            if fs::create_dir_all(&point).is_err() {
+                continue;
+            }
+            // A drive that hangs while mounting must not hold up the wizard.
+            let ok = std::process::Command::new("timeout")
+                .args(["20", "mount", "-o", options])
+                .arg(&dev)
+                .arg(&point)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if ok {
+                let copies = work_dir().join("found").join(kname);
+                search_media(&point, Some(&copies), &dev, &mut budget, &mut scan);
+                let _ = std::process::Command::new("umount").arg(&point).status();
+            }
+            let _ = fs::remove_dir(&point);
         }
-        let kname = d["kname"].as_str().unwrap_or("x");
-        let point = work_dir().join("media").join(kname);
-        if fs::create_dir_all(&point).is_err() {
-            continue;
+        if (scan.keys.len(), scan.settings.len()) != before {
+            scan.devices.push(dev.clone());
         }
-        let ok = std::process::Command::new("mount")
-            .args(["-o", options])
-            .arg(d["path"].as_str().unwrap_or(""))
-            .arg(&point)
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if ok {
-            let copies = work_dir().join("found").join(kname);
-            search_media(&point, Some(&copies), &mut keys, &mut settings);
-            let _ = std::process::Command::new("umount").arg(&point).status();
+        if let Some(limit) = budget.exhausted {
+            scan.notes.push(format!(
+                "Stopped looking on {dev} after {limit}. A key file there can still be \
+                 given by its path; settings can be typed in."
+            ));
         }
-        let _ = fs::remove_dir(&point);
     }
-    (keys, settings)
+    scan.settings.sort_by(|a, b| a.origin.cmp(&b.origin));
+    scan
 }
 
 /// Read-only mount options that also skip journal/log replay, or `None` for
@@ -352,75 +821,241 @@ fn no_write_mount_options(fstype: &str) -> Option<&'static str> {
     })
 }
 
-/// Collect settings and key files below `root`; with `copy_to`, copy them
-/// there first (the medium is unmounted afterwards).
+/// Limits of the search on one partition: it runs before the first
+/// question, on every attached disk, so a big data disk must not hold it up.
+#[derive(Debug, Default)]
+pub struct Budget {
+    entries: usize,
+    files: usize,
+    bytes: u64,
+    /// Which limit was reached, if one was.
+    pub exhausted: Option<&'static str>,
+}
+
+/// Directory entries looked at per partition.
+const MAX_ENTRIES: usize = 5000;
+/// Files opened per partition.
+const MAX_FILES: usize = 64;
+/// Bytes read per partition (a paper key as html is about 100-180 KB).
+const MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Largest settings file read.
+const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
+
+impl Budget {
+    /// Count one directory entry; `false` once the limit is reached.
+    fn entry(&mut self) -> bool {
+        self.entries += 1;
+        if self.entries > MAX_ENTRIES {
+            self.exhausted.get_or_insert("5000 directory entries");
+            return false;
+        }
+        true
+    }
+
+    /// Reserve reading a file of `len` bytes; `false` if that exceeds a limit.
+    fn read(&mut self, len: u64) -> bool {
+        if self.files >= MAX_FILES {
+            self.exhausted.get_or_insert("64 files");
+            return false;
+        }
+        if self.bytes + len > MAX_BYTES {
+            self.exhausted.get_or_insert("8 MiB read");
+            return false;
+        }
+        self.files += 1;
+        self.bytes += len;
+        true
+    }
+}
+
+/// Collect settings and key files below `root` (on `dev`); with `copy_to`,
+/// copy the keys there (the medium is unmounted afterwards).
 fn search_media(
     root: &Path,
     copy_to: Option<&Path>,
-    keys: &mut Vec<PathBuf>,
-    settings: &mut Option<(PathBuf, Settings)>,
+    dev: &str,
+    budget: &mut Budget,
+    scan: &mut MediaScan,
 ) {
-    let keep = |path: &Path| -> Option<PathBuf> {
-        let Some(dir) = copy_to else {
-            return Some(path.to_path_buf());
-        };
-        let rel = path.strip_prefix(root).ok()?;
-        let flat = rel.to_string_lossy().replace('/', "_");
-        fs::create_dir_all(dir).ok()?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).ok()?;
-        let dest = dir.join(flat);
-        fs::copy(path, &dest).ok()?;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).ok()?;
-        Some(dest)
+    let origin = |path: &Path| -> String {
+        match (copy_to, path.strip_prefix(root)) {
+            (Some(_), Ok(rel)) => format!("/{} on {dev}", rel.display()),
+            _ => path.display().to_string(),
+        }
     };
-    for path in walk(root, 2) {
+    for (path, len) in walk(root, 2, budget) {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         if name == SETTINGS_FILE {
-            if let Ok(Ok(s)) = fs::read_to_string(&path).map(|t| toml::from_str::<Settings>(&t))
-                && let Some(kept) = keep(&path)
-            {
-                *settings = Some((kept, s));
+            if len > MAX_SETTINGS_BYTES || !budget.read(len) {
+                continue;
             }
-        } else if name.ends_with(".json")
-            && looks_like_key(&path)
-            && let Some(kept) = keep(&path)
-        {
-            keys.push(kept);
+            if let Ok(Ok(s)) = fs::read_to_string(&path).map(|t| toml::from_str::<Settings>(&t)) {
+                scan.settings.push(FoundSettings {
+                    origin: printable(&origin(&path)),
+                    settings: s.printable(),
+                });
+            }
+            continue;
+        }
+        if !key_candidate_name(&name) || len > MAX_KEY_FILE_BYTES || !budget.read(len) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if !might_be_key(&bytes) || !key_or_protected(key_from_bytes(&path, &bytes)) {
+            continue;
+        }
+        let kept = match copy_to {
+            None => Some(path.clone()),
+            Some(dir) => keep_copy(root, &path, dir, &bytes),
+        };
+        if let Some(k) = kept {
+            scan.keys.push(k);
         }
     }
 }
 
-fn walk(dir: &Path, depth: u32) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        match e.file_type() {
-            Ok(t) if t.is_file() => out.push(p),
-            Ok(t) if t.is_dir() && depth > 0 => out.extend(walk(&p, depth - 1)),
-            _ => {}
+/// Copy a key file found on a medium that is unmounted afterwards.
+fn keep_copy(root: &Path, path: &Path, dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
+    let rel = path.strip_prefix(root).ok()?;
+    // The copy's name is shown to the user and typed back by them: no
+    // control characters from the name on the drive.
+    let flat = printable(&rel.to_string_lossy()).replace('/', "_");
+    fs::create_dir_all(dir).ok()?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).ok()?;
+    // Two names that differ only in control characters look the same now.
+    let mut dest = dir.join(&flat);
+    for n in 2..100 {
+        if !dest.exists() {
+            break;
         }
+        dest = dir.join(format!("{n}-{flat}"));
     }
+    secrets::write_private_file(&dest, bytes).ok()?;
+    Some(dest)
+}
+
+/// Regular files below `dir`, at most `depth` directory levels down,
+/// breadth first (keys usually lie at the top), with their sizes.
+fn walk(dir: &Path, depth: u32, budget: &mut Budget) -> Vec<(PathBuf, u64)> {
+    let mut out = Vec::new();
+    let mut level = vec![dir.to_path_buf()];
+    for d in 0..=depth {
+        let mut next = Vec::new();
+        for dir in level {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            // Entry by entry, so that the limit also holds inside one huge
+            // directory (nothing is collected or sorted beyond it).
+            for e in entries.flatten() {
+                if !budget.entry() {
+                    prioritise(&mut out);
+                    return out;
+                }
+                match e.file_type() {
+                    Ok(t) if t.is_file() => {
+                        out.push((e.path(), e.metadata().map(|m| m.len()).unwrap_or(u64::MAX)))
+                    }
+                    Ok(t) if t.is_dir() && d < depth => next.push(e.path()),
+                    _ => {}
+                }
+            }
+        }
+        level = next;
+    }
+    prioritise(&mut out);
     out
 }
 
-/// A `proxmox-backup-client` key file (JSON with `kdf` and `data`).
-pub fn looks_like_key(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
-    if meta.len() > 64 * 1024 {
-        return false;
+/// Files whose name starts with `nestegg` first (the settings file and the
+/// names the documentation suggests for keys), then the ones nearest the top
+/// (keys usually lie there), then by path: the limit on opened files is
+/// spent on the likely candidates, and the order does not depend on the
+/// file system.
+fn prioritise(files: &mut [(PathBuf, u64)]) {
+    files.sort_by_cached_key(|(path, _)| {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        (
+            !name.starts_with("nestegg"),
+            path.components().count(),
+            path.clone(),
+        )
+    });
+}
+
+/// Largest file looked at as a key: a paper key as html carries a QR code
+/// image and is about 100-180 KB.
+const MAX_KEY_FILE_BYTES: u64 = 1024 * 1024;
+
+/// File names worth opening: exported keys (`.json`) and paper keys saved
+/// as text or html (`nestegg key paperkey --output`). Files without an
+/// extension are not opened (there are too many of them on a system disk);
+/// such a key can still be given by its path.
+fn key_candidate_name(lowercase_name: &str) -> bool {
+    match lowercase_name.rsplit_once('.') {
+        None => false,
+        Some((_, ext)) => matches!(
+            ext,
+            "json" | "txt" | "text" | "html" | "htm" | "md" | "key" | "asc"
+        ),
     }
-    fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v| v.get("kdf").is_some() && v.get("data").is_some())
+}
+
+/// Cheap test before parsing: a paper key has the BEGIN line, an exported
+/// key file a `"kdf"` field.
+fn might_be_key(bytes: &[u8]) -> bool {
+    let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    contains(paperkey::BEGIN.as_bytes()) || contains(b"\"kdf\"")
+}
+
+/// Read a key from an exported key file (JSON) or a saved paper key (text
+/// or html). Only keys without password are supported.
+pub fn read_key(path: &Path) -> Result<paperkey::Key> {
+    let shown = shown_path(path);
+    let meta = fs::metadata(path).with_context(|| format!("cannot read {shown}"))?;
+    if !meta.is_file() || meta.len() > MAX_KEY_FILE_BYTES {
+        bail!("{shown} is not a key file");
+    }
+    let bytes = fs::read(path).with_context(|| format!("cannot read {shown}"))?;
+    key_from_bytes(path, &bytes)
+}
+
+fn key_from_bytes(path: &Path, bytes: &[u8]) -> Result<paperkey::Key> {
+    let text = String::from_utf8_lossy(bytes);
+    let shown = shown_path(path);
+    paperkey::from_file_text(&text).map_err(|e| match e {
+        paperkey::KeyTextError::NotAKey(m) => {
+            anyhow::anyhow!("{shown} is not a key file or paper key: {}", printable(&m))
+        }
+        other => anyhow::anyhow!("{shown}: {}", printable(&other.to_string())),
+    })
+}
+
+/// A path for messages: its name may come from an attached drive.
+pub fn shown_path(path: &Path) -> String {
+    printable(&path.display().to_string())
+}
+
+/// A key, or a password-protected key (it is offered and then explained).
+fn key_or_protected(r: Result<paperkey::Key>) -> bool {
+    match r {
+        Ok(_) => true,
+        Err(e) => e.to_string().contains("protected with a password"),
+    }
+}
+
+/// A key file or a saved paper key (a password-protected key counts: it is
+/// offered and then explained).
+pub fn looks_like_key(path: &Path) -> bool {
+    key_or_protected(read_key(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -428,9 +1063,10 @@ pub fn looks_like_key(path: &Path) -> bool {
 
 pub fn ask(prompt: &str, default: Option<&str>) -> Result<String> {
     loop {
+        // The prompt and the default may contain names from a drive.
         match default {
-            Some(d) if !d.is_empty() => eprint!("{prompt} [{d}]: "),
-            _ => eprint!("{prompt}: "),
+            Some(d) if !d.is_empty() => eprint!("{} [{}]: ", printable_block(prompt), printable(d)),
+            _ => eprint!("{}: ", printable_block(prompt)),
         }
         std::io::stderr().flush()?;
         let mut line = String::new();
@@ -450,19 +1086,25 @@ pub fn ask(prompt: &str, default: Option<&str>) -> Result<String> {
 pub fn ask_yes(prompt: &str, default_yes: bool) -> Result<bool> {
     let d = if default_yes { "Y/n" } else { "y/N" };
     let v = ask(&format!("{prompt} ({d})"), Some(""))?;
-    Ok(match v.to_lowercase().as_str() {
+    Ok(interpret_yes(&v, default_yes))
+}
+
+/// An empty answer means the default; everything that is not a clear yes is
+/// a no.
+pub fn interpret_yes(answer: &str, default_yes: bool) -> bool {
+    match answer.trim().to_lowercase().as_str() {
         "" => default_yes,
         "y" | "yes" | "j" | "ja" => true,
         _ => false,
-    })
+    }
 }
 
 pub fn ask_secret(prompt: &str) -> Result<Secret> {
     use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
     let stdin = std::io::stdin();
     let tty = nix::unistd::isatty(&stdin).unwrap_or(false);
-    eprint!("{prompt}: ");
-    std::io::stderr().flush()?;
+    // Switch echo off BEFORE showing the prompt: input typed (or pasted)
+    // as soon as the prompt appears must never be echoed.
     let saved = if tty {
         let original = tcgetattr(&stdin)?;
         let mut silent = original.clone();
@@ -472,27 +1114,36 @@ pub fn ask_secret(prompt: &str) -> Result<Secret> {
     } else {
         None
     };
+    eprint!("{prompt}: ");
+    std::io::stderr().flush()?;
     let mut line = String::new();
     let r = stdin.lock().read_line(&mut line);
     if let Some(original) = saved {
         let _ = tcsetattr(&stdin, SetArg::TCSANOW, &original);
         eprintln!();
     }
-    r?;
+    let read = r?;
     let v = line.trim_end_matches(['\n', '\r']).to_string();
     if v.is_empty() {
-        bail!("empty input");
+        if read == 0 {
+            bail!("input closed");
+        }
+        // Just Enter: ask again instead of ending the wizard.
+        eprintln!("Please enter a value.");
+        return ask_secret(prompt);
     }
     Ok(Secret::new(v.into_bytes()))
 }
 
-/// Let the user pick one entry (1-based numbers). `default` is 0-based.
-pub fn choose(prompt: &str, items: &[String], default: usize) -> Result<usize> {
+/// Let the user pick one entry (1-based numbers). `default` is 0-based;
+/// without one the user has to type a number.
+pub fn choose(prompt: &str, items: &[String], default: Option<usize>) -> Result<usize> {
     for (i, item) in items.iter().enumerate() {
-        eprintln!("  {:>2}) {item}", i + 1);
+        eprintln!("  {:>2}) {}", i + 1, printable_block(item));
     }
+    let default = default.map(|d| (d + 1).to_string());
     loop {
-        let v = ask(prompt, Some(&(default + 1).to_string()))?;
+        let v = ask(prompt, default.as_deref())?;
         match v.parse::<usize>() {
             Ok(n) if n >= 1 && n <= items.len() => return Ok(n - 1),
             _ => eprintln!("Please enter a number between 1 and {}.", items.len()),
@@ -533,13 +1184,48 @@ mod tests {
   "children":[{"path":"/dev/sda1","type":"part","size":1,"mountpoints":["/run/live/medium"]}]},
  {"path":"/dev/nvme0n1","type":"disk","size":512110190592,"model":"Samsung SSD 980 ","tran":"nvme","ro":false,"mountpoints":[null]},
  {"path":"/dev/sr0","type":"rom","size":1073741312,"model":"DVD","tran":"sata","ro":false,"mountpoints":[null]},
- {"path":"/dev/zram0","type":"disk","size":8000000,"model":null,"tran":null,"ro":false,"mountpoints":["[SWAP]"]}
+ {"path":"/dev/zram0","type":"disk","size":8000000,"model":null,"tran":null,"ro":false,"mountpoints":["[SWAP]"]},
+ {"path":"/dev/fd0","type":"disk","size":4096,"model":null,"tran":null,"ro":false,"mountpoints":[null]},
+ {"path":"/dev/sdb","type":"disk","size":16777216,"model":"Tiny","tran":"usb","ro":false,"mountpoints":[null]}
 ]}"#;
         let d = parse_disks(json, &[]).unwrap();
         assert_eq!(d.len(), 2);
         assert!(d[0].in_use);
         assert!(!d[1].in_use);
         assert_eq!(d[1].model, "Samsung SSD 980");
+        assert_eq!(d[0].items.len(), 2);
+        assert_eq!(d[1].items.len(), 1);
+    }
+
+    #[test]
+    fn disk_items_with_signatures() {
+        let json = r#"{"blockdevices":[
+ {"path":"/dev/sdb","type":"disk","size":4000787030016,"model":"WDC WD40EFRX","serial":"WD-0001","tran":"sata","ro":false,"mountpoints":[null],"fstype":null,"uuid":null,"partuuid":null,"label":null,
+  "children":[
+   {"path":"/dev/sdb1","type":"part","size":1,"mountpoints":[null],"fstype":"linux_raid_member","uuid":"r1","partuuid":"p1","label":"desktop:0",
+    "children":[{"path":"/dev/md127","type":"raid1","size":1,"mountpoints":[null],"fstype":"ext4","uuid":"e1","label":null}]},
+   {"path":"/dev/sdb2","type":"part","size":1,"mountpoints":[null],"fstype":"crypto_LUKS","uuid":"l1","partuuid":"p2","label":null}]}
+]}"#;
+        let d = parse_disks(json, &[]).unwrap();
+        assert_eq!(d[0].serial, "WD-0001");
+        let paths: Vec<&str> = d[0].items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["/dev/sdb", "/dev/sdb1", "/dev/md127", "/dev/sdb2"]);
+        assert_eq!(d[0].items[1].fstype, "linux_raid_member");
+        assert_eq!(d[0].items[1].partuuid, "p1");
+        assert_eq!(d[0].items[3].uuid, "l1");
+        assert!(!d[0].in_use);
+    }
+
+    #[test]
+    fn yes_no_answers() {
+        assert!(!interpret_yes("", false));
+        assert!(interpret_yes("", true));
+        for yes in ["y", "Y", "yes", "YES", " ja ", "j"] {
+            assert!(interpret_yes(yes, false), "{yes}");
+        }
+        for no in ["n", "no", "nein", "maybe", "yy", "ok", "1"] {
+            assert!(!interpret_yes(no, true), "{no}");
+        }
     }
 
     #[test]
@@ -553,7 +1239,553 @@ mod tests {
         .unwrap();
         let other = dir.path().join("other.json");
         fs::write(&other, r#"{"a":1}"#).unwrap();
-        assert!(looks_like_key(&k));
+        assert!(!looks_like_key(&k), "data is not a valid key value");
         assert!(!looks_like_key(&other));
+        let data = "RVhBTVBMRS1LRVktTk9ULUEtUkVBTC1LRVktMDEyMzQ=";
+        fs::write(
+            &k,
+            format!(r#"{{"kdf":null,"created":"x","modified":"x","data":"{data}"}}"#),
+        )
+        .unwrap();
+        assert!(looks_like_key(&k));
+        let paper = dir.path().join("paper.txt");
+        fs::write(
+            &paper,
+            format!(
+                "header\n{}\n{{\"kdf\":null,\"created\":\"x\",\"modified\":\"x\",\"data\":\"{data}\"}}\n{}\nQR\n",
+                paperkey::BEGIN,
+                paperkey::END
+            ),
+        )
+        .unwrap();
+        assert!(looks_like_key(&paper));
+        let protected = dir.path().join("protected.json");
+        fs::write(
+            &protected,
+            format!(
+                r#"{{"kdf":{{"Scrypt":{{"n":1}}}},"created":"x","modified":"x","data":"{data}"}}"#
+            ),
+        )
+        .unwrap();
+        assert!(looks_like_key(&protected));
+        assert!(
+            read_key(&protected)
+                .unwrap_err()
+                .to_string()
+                .contains("password")
+        );
+    }
+
+    #[test]
+    fn key_file_names() {
+        for n in [
+            "key.json",
+            "paperkey.txt",
+            "paper.html",
+            "paper.htm",
+            "notes.md",
+        ] {
+            assert!(key_candidate_name(n), "{n}");
+        }
+        // Files without extension are not opened any more.
+        for n in [
+            "photo.jpg",
+            "backup.tar.gz",
+            "movie.mkv",
+            "paperkey",
+            "vmlinuz",
+        ] {
+            assert!(!key_candidate_name(n), "{n}");
+        }
+    }
+
+    const DATA: &str = "RVhBTVBMRS1LRVktTk9ULUEtUkVBTC1LRVktMDEyMzQ=";
+
+    fn key_json() -> String {
+        format!(r#"{{"kdf":null,"created":"x","modified":"x","data":"{DATA}"}}"#)
+    }
+
+    #[test]
+    fn media_search_finds_keys_and_every_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let settings = "server = \"pbs.example.com\"\ndatastore = \"store\"\nauth_id = \"backup@pbs!desktop\"\n";
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::write(root.join(SETTINGS_FILE), settings).unwrap();
+        fs::write(root.join("a").join(SETTINGS_FILE), settings).unwrap();
+        fs::write(root.join("key.json"), key_json()).unwrap();
+        fs::write(
+            root.join("a/b/paper.txt"),
+            format!("{}\n{}\n{}\n", paperkey::BEGIN, key_json(), paperkey::END),
+        )
+        .unwrap();
+        // Too deep, no extension, not a key:
+        fs::write(root.join("a/b/c/deep.json"), key_json()).unwrap();
+        fs::write(root.join("keyfile"), key_json()).unwrap();
+        fs::write(root.join("notes.txt"), "shopping list").unwrap();
+        let mut scan = MediaScan::default();
+        let mut budget = Budget::default();
+        search_media(root, None, "/dev/sdz1", &mut budget, &mut scan);
+        let names: Vec<String> = scan
+            .keys
+            .iter()
+            .map(|k| k.strip_prefix(root).unwrap().display().to_string())
+            .collect();
+        assert_eq!(names, ["key.json", "a/b/paper.txt"], "breadth first");
+        assert_eq!(scan.settings.len(), 2);
+        assert!(
+            scan.settings
+                .iter()
+                .any(|f| f.origin == root.join(SETTINGS_FILE).display().to_string())
+        );
+        assert_eq!(budget.exhausted, None);
+        // On a medium that is unmounted afterwards: copies, and origins
+        // that name the device.
+        let copies = dir.path().join("copies");
+        let mut scan = MediaScan::default();
+        search_media(
+            root,
+            Some(&copies),
+            "/dev/sdz1",
+            &mut Budget::default(),
+            &mut scan,
+        );
+        assert!(scan.keys.iter().all(|k| k.starts_with(&copies)));
+        assert!(
+            scan.settings
+                .iter()
+                .any(|f| f.origin == "/a/nestegg-rescue.toml on /dev/sdz1"),
+            "{:?}",
+            scan.settings
+        );
+    }
+
+    #[test]
+    fn media_search_is_limited() {
+        let dir = tempfile::tempdir().unwrap();
+        // Many candidate files that are not keys: only MAX_FILES are opened.
+        for i in 0..(MAX_FILES + 20) {
+            fs::write(dir.path().join(format!("{i:03}.txt")), "x").unwrap();
+        }
+        fs::write(dir.path().join("zzz-key.json"), key_json()).unwrap();
+        let mut scan = MediaScan::default();
+        let mut budget = Budget::default();
+        search_media(dir.path(), None, "/dev/sdz1", &mut budget, &mut scan);
+        assert_eq!(budget.exhausted, Some("64 files"));
+        assert!(scan.keys.is_empty());
+        // Bytes: big files exhaust the byte budget.
+        let mut b = Budget::default();
+        assert!(b.read(MAX_BYTES - 10));
+        assert!(!b.read(11));
+        assert_eq!(b.exhausted, Some("8 MiB read"));
+        // Directory entries.
+        let mut b = Budget::default();
+        assert!((0..MAX_ENTRIES).all(|_| b.entry()));
+        assert!(!b.entry());
+    }
+
+    #[test]
+    fn cheap_precheck_before_parsing() {
+        assert!(might_be_key(key_json().as_bytes()));
+        assert!(might_be_key(format!("x {} y", paperkey::BEGIN).as_bytes()));
+        assert!(!might_be_key(b"{\"data\": \"abc\"}"));
+        assert!(!might_be_key(b""));
+    }
+
+    fn manifest(modes: &[(&str, &str)]) -> serde_json::Value {
+        serde_json::json!({
+            "files": modes
+                .iter()
+                .map(|(f, m)| serde_json::json!({"filename": f, "crypt-mode": m, "size": 1}))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn every_restored_archive_must_be_encrypted() {
+        let all = manifest(&[
+            ("inventory.pxar.didx", "encrypt"),
+            ("system.pxar.didx", "encrypt"),
+            ("catalog.pcat1.didx", "encrypt"),
+        ]);
+        assert_eq!(
+            protection_from_manifest(&all, RESTORED_ARCHIVES).unwrap(),
+            Protection::Encrypted
+        );
+        // Inventory encrypted, system neither encrypted nor signed: refused
+        // before the disk step, whatever the user would allow (the client
+        // could not read that archive after the disk was erased).
+        let mixed = manifest(&[
+            ("inventory.pxar.didx", "encrypt"),
+            ("system.pxar.didx", "none"),
+        ]);
+        let e = protection_from_manifest(&mixed, RESTORED_ARCHIVES).unwrap_err();
+        assert!(
+            e.to_string().contains("mixes protected and unprotected")
+                && e.to_string().contains("system.pxar"),
+            "{e}"
+        );
+        // That message must not be taken for a wrong key.
+        assert!(!client_blames_the_key(&e.to_string()), "{e}");
+        let signed = manifest(&[
+            ("inventory.pxar.didx", "sign-only"),
+            ("system.pxar.didx", "sign-only"),
+        ]);
+        let p = protection_from_manifest(&signed, RESTORED_ARCHIVES).unwrap();
+        let concern = p.concern().unwrap();
+        assert!(
+            concern.contains("signed with your key") && concern.contains("system.pxar (sign-only)"),
+            "{concern}"
+        );
+        // A split archive counts with its weakest part.
+        let split = manifest(&[
+            ("inventory.pxar.didx", "encrypt"),
+            ("system.mpxar.didx", "encrypt"),
+            ("system.ppxar.didx", "sign-only"),
+        ]);
+        assert!(matches!(
+            protection_from_manifest(&split, RESTORED_ARCHIVES).unwrap(),
+            Protection::NotEncrypted(_)
+        ));
+        let missing = manifest(&[("inventory.pxar.didx", "encrypt")]);
+        let e = protection_from_manifest(&missing, RESTORED_ARCHIVES).unwrap_err();
+        assert!(e.to_string().contains("system.pxar is missing"), "{e}");
+    }
+
+    #[test]
+    fn how_archives_are_read_after_the_check() {
+        let key = || Some(Secret::new(b"k".to_vec()));
+        assert!(matches!(
+            Protection::Encrypted.restore_key(key()),
+            RestoreKey::File(_)
+        ));
+        assert!(matches!(
+            Protection::Unsigned.restore_key(key()),
+            RestoreKey::Without
+        ));
+        assert!(matches!(
+            Protection::Plain.restore_key(None),
+            RestoreKey::Without
+        ));
+        // Signed but not encrypted: the key goes along, so the client
+        // checks the signature for every archive.
+        assert!(matches!(
+            Protection::NotEncrypted(vec![]).restore_key(key()),
+            RestoreKey::File(_)
+        ));
+        let c = Protection::Unsigned.concern().unwrap();
+        assert!(c.contains("not protected by your key") && c.contains("could have changed it"));
+        assert_eq!(Protection::Plain.concern(), None);
+        assert_eq!(Protection::Encrypted.concern(), None);
+    }
+
+    #[test]
+    fn only_key_messages_are_blamed_on_the_key() {
+        for m in [
+            "wrong key - unable to verify signature since manifest's key aa does not match provided key bb",
+            "missing key - manifest was created with key aa",
+            "Error: error decoding base64 data at line 1 column 143",
+            "unable to decrypt chunk",
+            "KeyConfig contains wrong fingerprint 00:11:22:33, contained key has fingerprint d7:99",
+            "KeyConfig fingerprint too short",
+            "manifest has no signature, but an encryption key is set - refusing to trust a \
+             potentially tampered, unsigned backup",
+            "this archive is encrypted or signed; pass the exported key with --keyfile",
+        ] {
+            assert!(client_blames_the_key(m), "{m}");
+        }
+        for m in [
+            "error trying to connect: tcp connect error: Connection refused (os error 111)",
+            "no such snapshot host/desktop/2026-11-08T21:30:12Z",
+            "permission check failed",
+            // The bare word "key" in a name or an unrelated sentence:
+            "no such snapshot host/keyserver/2026-11-08T21:30:12Z",
+            "backup group host/monkey does not exist",
+            "datastore 'keys' does not exist",
+            "authentication failed for backup@pbs!key",
+            "cannot read the table of contents of host/key-box/2026-11-08T21:30:12Z from the backup server",
+            "the snapshot comment says: key rotated",
+            "this snapshot has no disk layout (made by an older nestegg)",
+            "this backup mixes protected and unprotected archives (system.pxar is neither \
+             encrypted nor signed although the backup is signed)",
+        ] {
+            assert!(!client_blames_the_key(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn failures_are_sorted_by_their_cause() {
+        let kind = |e: anyhow::Error| classify_failure(&e);
+        // The words around the cause (snapshot and host names) do not count.
+        let wrong = anyhow::anyhow!("wrong key - unable to verify signature")
+            .context("cannot read the inventory of this snapshot");
+        assert_eq!(kind(wrong), FailureKind::Key);
+        let network = anyhow::anyhow!("Connection refused (os error 111)")
+            .context("cannot read the table of contents of host/decrypt-key/2026 from the server");
+        assert_eq!(kind(network), FailureKind::Other);
+        // The client's own message can carry a host name too.
+        let named = anyhow::anyhow!(
+            "snapshot \"ns/desktops/host/decrypt-box/2020-01-01T00:00:00Z\" does not exist."
+        );
+        assert_eq!(kind(named), FailureKind::Unusable);
+        assert_eq!(
+            kind(anyhow::anyhow!("Error: ENOENT: No such file or directory")),
+            FailureKind::Unusable
+        );
+        // Right key, changed manifest: no other key and no retry helps.
+        let tampered = anyhow::anyhow!("Error: wrong signature in manifest")
+            .context("the table of contents of host/desktop/2026 was changed");
+        assert_eq!(kind(tampered), FailureKind::Unusable);
+        // A key file the client cannot parse is a key problem.
+        for m in [
+            "Couldn't parse data as KeyConfig",
+            "error reading encryption key from fd",
+            "unable to decrypt chunk",
+        ] {
+            assert_eq!(kind(anyhow::anyhow!(m)), FailureKind::Key, "{m}");
+        }
+        // Other things that do not exist are not this backup's fault.
+        assert_eq!(
+            kind(anyhow::anyhow!("datastore 'keys' does not exist")),
+            FailureKind::Other
+        );
+        let unusable: anyhow::Error = Unusable("this backup mixes protected".into()).into();
+        assert_eq!(
+            kind(unusable.context("cannot read host/desktop/x")),
+            FailureKind::Unusable
+        );
+        // As produced by the manifest check:
+        let mixed = manifest(&[
+            ("inventory.pxar.didx", "encrypt"),
+            ("system.pxar.didx", "none"),
+        ]);
+        let e = protection_from_manifest(&mixed, RESTORED_ARCHIVES).unwrap_err();
+        assert_eq!(classify_failure(&e), FailureKind::Unusable);
+        let e = protection_from_manifest(&manifest(&[]), RESTORED_ARCHIVES).unwrap_err();
+        assert_eq!(classify_failure(&e), FailureKind::Unusable, "{e}");
+    }
+
+    #[test]
+    fn the_weakest_file_of_an_archive_counts() {
+        let split = |a: &str, b: &str| {
+            manifest(&[
+                ("inventory.pxar.didx", "encrypt"),
+                ("system.mpxar.didx", a),
+                ("system.ppxar.didx", b),
+            ])
+        };
+        // sign-only and none, in both orders: the weakest is none, and a
+        // signed backup with an unsigned archive is refused.
+        for (a, b) in [("sign-only", "none"), ("none", "sign-only")] {
+            let e = protection_from_manifest(&split(a, b), RESTORED_ARCHIVES).unwrap_err();
+            assert!(e.to_string().contains("mixes protected"), "{a}/{b}: {e}");
+            assert_eq!(classify_failure(&e), FailureKind::Unusable);
+        }
+        for (a, b) in [("encrypt", "none"), ("none", "encrypt")] {
+            assert!(
+                protection_from_manifest(&split(a, b), RESTORED_ARCHIVES).is_err(),
+                "{a}/{b}"
+            );
+        }
+        // encrypt and sign-only: signed, not encrypted, whatever the order.
+        for (a, b) in [("encrypt", "sign-only"), ("sign-only", "encrypt")] {
+            assert_eq!(
+                protection_from_manifest(&split(a, b), RESTORED_ARCHIVES).unwrap(),
+                Protection::NotEncrypted(vec![("system.pxar".into(), "sign-only".into())]),
+                "{a}/{b}"
+            );
+        }
+        // A mode the client may add later is not trusted as encrypted.
+        assert!(matches!(
+            protection_from_manifest(&split("encrypt", "future-mode"), RESTORED_ARCHIVES).unwrap(),
+            Protection::NotEncrypted(_)
+        ));
+        assert_eq!(
+            protection_from_manifest(&split("encrypt", "encrypt"), RESTORED_ARCHIVES).unwrap(),
+            Protection::Encrypted
+        );
+    }
+
+    #[test]
+    fn names_from_the_server_with_control_characters_are_not_offered() {
+        let snap = |name: &str| SnapshotInfo {
+            time: String::new(),
+            snapshot: name.into(),
+            size_bytes: None,
+            archives: vec!["system.pxar.didx".into()],
+            encrypted: None,
+            verified: None,
+            protected: false,
+            comment: None,
+            archive_bytes: vec![],
+            crypt_modes: vec![],
+        };
+        let kept = usable_snapshots(vec![
+            snap("host/desktop/2026-11-08T21:30:12Z"),
+            snap("host/desktop/2026-11-08\u{1b}[2K"),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].snapshot, "host/desktop/2026-11-08T21:30:12Z");
+    }
+
+    #[test]
+    fn invisible_format_characters_are_replaced_too() {
+        // Right-to-left override and zero-width space.
+        assert_eq!(printable("a\u{202e}b\u{200b}c"), "a?b?c");
+        assert_eq!(printable_block("x\u{2066}y\nz\tw"), "x?y\nz\tw");
+        assert!(has_control_chars("host\u{202e}"));
+        assert!(!has_control_chars("host-01.example.com"));
+    }
+
+    #[test]
+    fn text_from_a_drive_cannot_rewrite_the_console() {
+        assert_eq!(printable("pbs.example.com"), "pbs.example.com");
+        assert_eq!(
+            printable("aa:bb\u{1b}[2K\r!!! all fine\nnext"),
+            "aa:bb?[2K?!!! all fine?next"
+        );
+        let s = Settings {
+            server: "pbs\u{7}.example.com".into(),
+            fingerprint: Some("aa\u{1b}[1A".into()),
+            ..Default::default()
+        }
+        .printable();
+        assert_eq!(s.server, "pbs?.example.com");
+        assert_eq!(s.fingerprint.as_deref(), Some("aa?[1A"));
+        // Blocks that nestegg composed keep their line breaks.
+        assert_eq!(printable_block("a\n  b\t\u{1b}[1A\r"), "a\n  b\t?[1A?");
+    }
+
+    /// A file name that tries to rewrite the console.
+    const EVIL: &str = "k\u{1b}[2K\r!!! all fine\u{7}.json";
+
+    #[test]
+    fn key_file_names_from_a_drive_are_printed_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        // The scan: on a medium that is unmounted afterwards the copy gets a
+        // plain name (it is shown and typed back by the user); two names
+        // that differ only in control characters do not overwrite each other.
+        let drive = dir.path().join("drive");
+        fs::create_dir_all(&drive).unwrap();
+        fs::write(drive.join(EVIL), key_json()).unwrap();
+        fs::write(drive.join("k\u{1b}[2K\r!!! all fine\u{8}.json"), key_json()).unwrap();
+        let copies = dir.path().join("copies");
+        let mut scan = MediaScan::default();
+        search_media(
+            &drive,
+            Some(&copies),
+            "/dev/sdz1",
+            &mut Budget::default(),
+            &mut scan,
+        );
+        assert_eq!(scan.keys.len(), 2, "{:?}", scan.keys);
+        // Two different copies, not one written twice.
+        assert_ne!(scan.keys[0], scan.keys[1], "{:?}", scan.keys);
+        for k in &scan.keys {
+            assert!(k.starts_with(&copies));
+            let name = k.file_name().unwrap().to_string_lossy();
+            assert!(!name.chars().any(char::is_control), "{name:?}");
+            assert!(k.exists());
+        }
+        // Mounted: the real path is kept, but what is printed is safe.
+        let mut scan = MediaScan::default();
+        search_media(&drive, None, "/dev/sdz1", &mut Budget::default(), &mut scan);
+        assert_eq!(scan.keys.len(), 2);
+        for k in &scan.keys {
+            assert!(!shown_path(k).chars().any(char::is_control));
+        }
+        // Errors that name the file.
+        let broken = dir.path().join(format!("b{EVIL}"));
+        fs::create_dir_all(dir.path().join(format!("d{EVIL}"))).unwrap();
+        fs::write(&broken, "{\"kdf\":null}").unwrap();
+        for e in [
+            read_key(&broken).unwrap_err(),
+            read_key(&dir.path().join(format!("missing{EVIL}"))).unwrap_err(),
+            read_key(&dir.path().join(format!("d{EVIL}"))).unwrap_err(),
+            key_from_bytes(&broken, b"nothing").unwrap_err(),
+        ] {
+            let text = format!("{e:#}");
+            assert!(!text.chars().any(char::is_control), "{text:?}");
+            assert!(text.contains("k?[2K?!!! all fine?"), "{text}");
+        }
+    }
+
+    #[test]
+    fn drive_text_in_the_disk_list_is_printable() {
+        let json = r#"{"blockdevices":[
+ {"path":"/dev/sdb","type":"disk","size":4000787030016,"model":"Evil\u001b[2K Disk","serial":"S\u001b[1A","ro":false,"mountpoints":[null],
+  "children":[{"path":"/dev/sdb1","type":"part","size":1,"mountpoints":[null],"fstype":"ext4","label":"data\u001b[2K\r!!!"}]}
+]}"#;
+        let d = parse_disks(json, &[]).unwrap();
+        assert_eq!(d[0].model, "Evil?[2K Disk");
+        assert_eq!(d[0].serial, "S?[1A");
+        assert_eq!(d[0].items[1].label, "data?[2K?!!!");
+    }
+
+    #[test]
+    fn likely_key_files_are_looked_at_first() {
+        let mut files: Vec<(PathBuf, u64)> = [
+            "/m/a/b/paper.txt",
+            "/m/zeta.json",
+            "/m/a/Nestegg-Paperkey.txt",
+            "/m/alpha.txt",
+            "/m/nestegg-rescue.toml",
+        ]
+        .iter()
+        .map(|p| (PathBuf::from(p), 1))
+        .collect();
+        prioritise(&mut files);
+        let order: Vec<&str> = files.iter().map(|(p, _)| p.to_str().unwrap()).collect();
+        assert_eq!(
+            order,
+            [
+                "/m/nestegg-rescue.toml",
+                "/m/a/Nestegg-Paperkey.txt",
+                "/m/alpha.txt",
+                "/m/zeta.json",
+                "/m/a/b/paper.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn backup_list_says_whether_a_backup_is_encrypted() {
+        let snap = |modes: &[(&str, &str)]| SnapshotInfo {
+            time: String::new(),
+            snapshot: String::new(),
+            size_bytes: None,
+            archives: vec![],
+            encrypted: None,
+            verified: None,
+            protected: false,
+            comment: None,
+            archive_bytes: vec![],
+            crypt_modes: modes
+                .iter()
+                .map(|(f, m)| (f.to_string(), m.to_string()))
+                .collect(),
+        };
+        let encrypted = [
+            ("inventory.pxar.didx", "encrypt"),
+            ("system.pxar.didx", "encrypt"),
+            ("index.json.blob", "sign-only"),
+        ];
+        assert_eq!(protection_label(&snap(&encrypted)), "encrypted");
+        let none = [
+            ("inventory.pxar.didx", "none"),
+            ("system.pxar.didx", "none"),
+        ];
+        assert_eq!(protection_label(&snap(&none)), "NOT ENCRYPTED");
+        let signed = [
+            ("inventory.pxar.didx", "sign-only"),
+            ("system.pxar.didx", "sign-only"),
+        ];
+        assert_eq!(protection_label(&snap(&signed)), "signed, not encrypted");
+        let mixed = [
+            ("inventory.pxar.didx", "encrypt"),
+            ("system.pxar.didx", "none"),
+        ];
+        assert_eq!(protection_label(&snap(&mixed)), "partly encrypted");
+        assert_eq!(protection_label(&snap(&[])), "");
     }
 }

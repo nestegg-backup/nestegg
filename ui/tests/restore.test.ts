@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { childPath, displayPath, folderNameFor, folderProblem, isWithin } from "../src/lib/restore.svelte";
+import {
+  archiveFolder,
+  childPath,
+  displayPath,
+  folderNameFor,
+  folderProblem,
+  isWithin,
+  restoreRequest,
+  selectedArchives,
+} from "../src/lib/restore.svelte";
 
 const config = { sources: [{ archive: "home.pxar", path: "/home" }, { archive: "etc.pxar", path: "/etc" }] };
 
@@ -28,5 +37,41 @@ describe("restore helpers", () => {
     expect(folderProblem("relative/path", true)).toBe("not_absolute");
     expect(folderProblem("/home/alice/../bob", true)).toBe("invalid");
     expect(folderProblem("/home/alice/restore", true)).toBeNull();
+  });
+});
+
+describe("restore request", () => {
+  const sel = (archive: string, path: string) => ({ archive, path, size: null });
+
+  it("one archive keeps the plain form every daemon understands", () => {
+    expect(restoreRequest([sel("home.pxar", "/alice/a"), sel("home.pxar", "/alice/b")], "t", "/home/alice/new")).toEqual({
+      snapshot_time: "t",
+      archive: "home.pxar",
+      paths: ["/alice/a", "/alice/b"],
+      target_dir: "/home/alice/new",
+    });
+  });
+
+  it("an archive whose root is selected restores the whole archive (empty path list)", () => {
+    expect(restoreRequest([sel("home.pxar", "/")], "t", "/x").paths).toEqual([]);
+  });
+
+  it("several archives go into `archives`, each archive once, grouped in selection order", () => {
+    const req = restoreRequest([sel("home.pxar", "/alice/a"), sel("etc.pxar", "/"), sel("home.pxar", "/alice/b")], "t", "/x");
+    expect(req).toEqual({
+      snapshot_time: "t",
+      archives: [
+        { archive: "home.pxar", paths: ["/alice/a", "/alice/b"] },
+        { archive: "etc.pxar", paths: [] },
+      ],
+      target_dir: "/x",
+    });
+    expect("archive" in req).toBe(false);
+    expect(selectedArchives([sel("home.pxar", "/a"), sel("etc.pxar", "/"), sel("home.pxar", "/b")])).toEqual(["home.pxar", "etc.pxar"]);
+  });
+
+  it("names the subfolder of an archive like the daemon", () => {
+    expect(archiveFolder("home.pxar")).toBe("home");
+    expect(archiveFolder("usr-local.pxar")).toBe("usr-local");
   });
 });

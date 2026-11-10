@@ -1,0 +1,266 @@
+# 0019 – Rescue wizard: paper keys, key check before erasing, no default "trust"
+
+- Status: accepted
+- Date: 2026-11-09
+- Changes: decision 0006 (rescue stick), key handling of the wizard
+
+## Context
+
+Three problems of the rescue wizard:
+
+1. At "Does it match the fingerprint on the PBS dashboard?" the default
+   answer was yes. Pressing Enter pinned whatever certificate the network
+   presented, which defeats the question.
+2. The wizard only read an exported key *file* (JSON). Users are told to
+   print a paper key (`nestegg key paperkey`), which the stick could not
+   use. The paper key is exactly the thing someone has in their hands when
+   the computer is dead and the key file was never copied anywhere.
+3. A wrong key was noticed when the disk layout of the chosen backup was
+   read. That was before any disk was touched, but the error ended the
+   wizard instead of letting the user try another key.
+
+Findings with the real `proxmox-backup-client` 4.2.8 (Debian trixie and
+Ubuntu 24.04 images):
+
+- A key file with only `created`, `modified` (both RFC 3339 strings) and
+  `data` restores backups; `kdf` and `fingerprint` may be missing. `data`
+  is 44 base64 characters (32 bytes), not longer. So one line of the paper
+  key is enough.
+- A wrong key fails at the start of a restore, before any data is read:
+  `wrong key - unable to verify signature since manifest's key e4:84:… does
+  not match provided key 87:2f:…`; no key: `missing key - manifest was
+  created with key …`.
+- `proxmox-backup-client key paperkey` prints `-----BEGIN PROXMOX BACKUP
+  KEY-----`, the pretty-printed key JSON, `-----END PROXMOX BACKUP KEY-----`
+  and a QR code (text blocks, or an `<img>` in html output of about 180 KB).
+
+## Decision
+
+1. **No default for trust.** "Trust this certificate?" defaults to no; only
+   `y`/`yes`/`j`/`ja` pins the fingerprint. A fingerprint equal to the one in
+   the saved settings is still accepted without a question. The other yes/no
+   questions were checked: "Use this disk anyway?" and "Encrypt the restored
+   disk?" default to no; "Remove the rescue stick and restart now?" defaults
+   to yes, since it neither trusts, erases nor overwrites anything. The
+   decision lives in a function with the question injected, so a unit test
+   presses Enter.
+2. **Three ways to give the key**, all in the one "Encryption key" step:
+   a path to an exported key file *or* a saved paper key (text or html), the
+   word `type` to type the paper key by hand, `-` for an unencrypted backup.
+   Media are searched for both kinds of files (`.json`, `.txt`, `.html`, … up
+   to 1 MiB, two directory levels down). The parser (`rescue/paperkey.rs`)
+   reads only what is between the markers (the first complete JSON object
+   after the last BEGIN marker before an END marker, so header lines that
+   mention the markers do not matter), tolerates CRLF, blanks and html
+   entities, and accepts a missing END marker only when the key text itself
+   is complete.
+3. **Typing asks for the `data` line only** (44 characters). Quotes, commas,
+   blanks and a leading `"data":` are ignored; a forgotten final `=` is
+   added. Errors name the position of the first impossible character and the
+   expected length. The input stays visible (unlike a passphrase): 44
+   characters are easy to mistype, and the check against the backup only
+   says "wrong", not where. The prompt warns about the US keyboard layout of
+   the console and about look-alikes (`l I 1`, `O 0`). A pasted full JSON
+   block is accepted when it arrives in one line.
+4. **Only keys without password.** A key with a `kdf` (scrypt, pbkdf2) is
+   refused with a message that says how to remove the password from a copy.
+5. **The key is checked against the chosen backup before the disk step**,
+   for every source of the key. The wizard reads `inventory.pxar` of the
+   chosen snapshot with the key (the same read that provides the disk layout
+   anyway), and prints "The key fits this backup". If that fails, it shows
+   the client's message and a menu: enter or select another key (default for
+   key problems), choose another backup, try again, quit. Nothing was
+   changed at that point; no disk was listed yet. `rescue restore` already
+   stopped at the same read.
+6. **The test drives all of it** (`tests/rescue/run.sh`, wizard mode now the
+   default): the debian variant gets the key as a saved paper-key file on the
+   media, the ubuntu variant types the data line with quotes and a comma;
+   each variant first gives a wrong key the other way round, and a wrong key
+   with `--wipe` to the non-interactive restore must leave the target disk
+   all zeros.
+
+## Consequences
+
+- A person with only the printed paper key can restore. They type 44
+  characters instead of copying a file.
+- A wrong key costs a menu choice, not a restart of the wizard.
+- A key of a different generation is found out before the disk step, not
+  during the restore. A backup that is not encrypted is no longer accepted
+  silently when a key was given (see the amendment below).
+- The default of the wizard test changed to the interactive wizard; the
+  non-interactive command is still available as `WIZARD=0`.
+
+## Alternatives rejected
+
+- Asking for the whole JSON block: a console takes one line per prompt, and
+  most of the block (`created`, `modified`, `fingerprint`) is not needed.
+- Showing a fingerprint of a typed key for comparison: it is derived with
+  the key derivation of the client; reimplementing it would copy part of the
+  client. The check against the backup is authoritative anyway.
+- Hiding the typed key: makes typos invisible; shoulder-surfing a rescue
+  console is a smaller risk than a key that cannot be corrected.
+- Verifying with a separate request before choosing the backup: the key can
+  only be checked against a snapshot, so it happens when one is chosen.
+
+## Amendment: review findings (2026-11-09)
+
+An independent review found gaps; checked with the real client 4.2.8
+against a throwaway PBS 4.2.9:
+
+- With a key, `restore … index.json -` prints the manifest only after the
+  client verified its signature with the key; it lists the crypt mode of
+  every file (`encrypt`, `sign-only`, `none`). Wrong key: `wrong key -
+  unable to verify signature …`. Any read of an unsigned backup with a key:
+  `manifest has no signature, but an encryption key is set - refusing to
+  trust a potentially tampered, unsigned backup`. nestegg used to read
+  unsigned backups with `--crypt-mode none` even when a key was given, so
+  "the key fits" was never proven and a pushed unencrypted backup passed.
+- A key file whose last `data` character has non-zero padding bits fails
+  with `error decoding base64 data`; a wrong or malformed `fingerprint`
+  with `KeyConfig contains wrong fingerprint …` / `fingerprint too short`;
+  without `fingerprint` the key works.
+
+Changes:
+
+1. **The key check proves the key for everything that is restored.** With a
+   key, the wizard and `rescue restore` read the manifest with the key and
+   take the crypt modes from that verified manifest: `inventory.pxar` and
+   `system.pxar` (every part of a split archive) must be `encrypt`. Only
+   then "The key fits this backup" is printed. Afterwards both archives are
+   read with the key passed explicitly, so the client refuses any manifest
+   not signed with it.
+2. **A backup the key does not protect is not taken silently.** Not signed
+   at all, or signed but with an archive that is not encrypted (`sign-only`
+   is named as "signed with your key, but not encrypted", not as "not
+   encrypted"): the wizard warns and asks "Restore this backup anyway?"
+   (default no, then the menu offers another backup); `rescue restore`
+   refuses unless `--allow-unprotected-backup`. The list of backups shows
+   `encrypted` / `NOT ENCRYPTED` (from the server's list; the verified
+   manifest decides). Without a key nothing changes for unencrypted
+   backups. Without a key for an encrypted backup, the wizard says so and
+   offers the key menu (the `--keyfile` hint of the normal restore does not
+   appear in the wizard).
+3. **A fingerprint from a settings file needs a `y` too.** Any attached
+   partition can carry `nestegg-rescue.toml`. The wizard names the file it
+   uses, lists all when there are several and lets the user choose; a
+   matching fingerprint is shown with its source but still needs an
+   explicit `y` once (Enter is no); a differing one is pointed out in a
+   warning. Only a fingerprint the user confirmed is pinned (also when the
+   certificate could not be fetched), and it is not asked again in the same
+   run.
+4. **Typed keys: strict base64**, so a wrong last character is found at
+   once (it must be one of `A E I M Q U Y c g k o s w 0 4 8`); the client's
+   `error decoding base64 data` counts as a key problem in the menu.
+5. **The media scan is bounded** (it runs before the first question on
+   every partition): top three directory levels, files with key-like
+   extensions only (no files without extension), at most 5000 directory
+   entries, 64 opened files and 8 MiB per partition, a cheap check for the
+   BEGIN line or `"kdf"` before parsing, a progress line. Parsing paper keys
+   is linear in the file size (it was quadratic with many END lines).
+6. **Key files built by nestegg carry no `fingerprint`**: it is not needed,
+   and a damaged copy made the key unusable. A file with several key blocks
+   is used with its first valid one, and the wizard says how many it found
+   and which one it uses. Html entities are decoded in general (`&#x2B;`,
+   `&#X2F;`, `&#61;`, `&#x3D;`, …, any case).
+7. **Tests**: the VM test pushes an unencrypted decoy backup that is newer
+   than the real one; the non-interactive restore must refuse it and the
+   wizard must decline it by default. The checks on the output of single
+   commands now cut out exactly that output (start/exit markers that only
+   the command prints), the wizard is left right after the wrong key and
+   the disk is checked to be all zeros there, the missing key file must be
+   reported by the wizard (not just echoed), and the settings file on the
+   stick keeps its fingerprint. CI also runs a complete non-interactive
+   restore (`WIZARD=0`, Ubuntu/BIOS/LUKS), as does the release workflow.
+   Both readers of saved paper keys (`rescue/paperkey.rs` and `keyproof.rs`)
+   are tested against the same real client output (text and html, with
+   nestegg's header); they are not merged yet.
+
+Rejected: allowing `sign-only` without a question. A signed backup is
+authentic, but nestegg never makes one, so it is unusual enough to ask.
+
+## Amendment: second review (2026-11-10)
+
+A re-check of the changes above found more:
+
+1. Decoding html entities was still quadratic for a text full of `&`
+   without `;` (a crafted 1 MB file stalled the wizard for many seconds).
+   The end of an entity is now looked for only in the next few bytes.
+2. A backup whose signed manifest lists an archive that is neither encrypted
+   nor signed is refused outright, also with `--allow-unprotected-backup`:
+   the client cannot read such an archive without the key, which would only
+   show after the disk was erased. A backup that is signed but not encrypted
+   is restored with the key passed for every archive, so the client checks
+   the signature each time.
+3. Only client messages about the key ("wrong key", "missing key",
+   "signature", ...) are reported as "the key does not open this backup"; a
+   network or server error while reading the manifest is reported as such,
+   so the wizard offers "try again" instead of "another key".
+4. Text read from attached drives (settings values, file names) is printed
+   with control characters replaced, so an escape sequence cannot rewrite
+   the lines that show the certificate fingerprint or a warning.
+5. The search on attached drives counts directory entries one by one (the
+   limit also holds inside one huge directory), looks at files whose name
+   starts with `nestegg` first, then at the ones nearest the top, and gives
+   a drive 20 seconds to mount.
+6. The warning for a backup that is signed but not encrypted no longer says
+   that the key cannot vouch for it (it did verify the signature).
+
+## Amendment: third review (2026-11-10)
+
+1. **Every text from a drive or the server is printed safely.** Besides
+   settings values, the following also pass through the replacement of
+   control characters by `?`: the names of key files found on drives (the
+   list, the copy made for a medium that is unmounted afterwards - a number
+   in the list now selects a file whose name cannot be typed - and error
+   messages that name the file), disk model, serial number and file system
+   labels, the names of computers and backups offered by the server (a
+   name with control characters is not offered at all, a PBS never makes
+   one), and the messages of the client and of file operations (also those
+   that leave `nestegg rescue restore` as its error). Texts nestegg composes
+   itself from such values (plan, warnings, report) are printed with line
+   breaks kept and all other control characters replaced.
+2. **One classification of failures.** `is_key_problem` looked for the bare
+   word "key" and took host names and hints for key trouble. It is gone.
+   `classify_failure` decides from the cause at the bottom of the error
+   (never from the context around it, which contains snapshot and host
+   names) and only by phrases that mean key trouble (`client_blames_the_key`:
+   wrong or missing key, "provided key", signature that cannot be verified or
+   missing, decrypt, base64, wrong or short fingerprint).
+3. **A third class: this backup cannot be used.** `Unusable` is the error of
+   a backup that no key and no second try can cure: the mix of protected and
+   unprotected archives, an archive missing from the manifest, no or invalid
+   disk layout. The wizard says so and pre-selects "Choose another backup"
+   (also after a declined backup); "Try again" stays the default only for
+   network and server errors.
+4. **The weakest crypt mode of an archive counts.** A split archive
+   (`.mpxar`/`.ppxar`) was taken with its first mode that was not `encrypt`,
+   so `sign-only` plus `none` was recorded as `sign-only` and the mixed
+   backup was not refused. Modes are ranked (`none` < `sign-only` and
+   unknown modes < `encrypt`); the order of the files no longer matters.
+5. **Tests.** Unit tests for the four points (file names with escape
+   sequences, table of client messages including names with "key", menu
+   default for an unusable backup, split archives in both orders). The VM
+   test pushes a backup that is only signed with the right key next to the
+   decoy; both are refused by default in the wizard and by `rescue
+   restore`, the signed one is read with `--allow-unprotected-backup`
+   (dry run), and the wizard's menu after a backup without disk layout
+   defaults to another backup. The real client makes one crypt mode per run,
+   so a backup that mixes modes cannot be produced for the VM test.
+
+## Amendment: check of the third review's fixes (2026-11-10)
+
+1. `wrong signature in manifest` is what the client says when the key is
+   the right one but the table of contents was changed on the server. It is
+   classified as "this backup cannot be used" (default: choose another
+   backup) with a message that says so; the patterns for key trouble had
+   lost it, so it looked like a network error with "try again".
+2. A snapshot that no longer exists is "cannot be used" as well. Key
+   trouble is recognised by phrases only ("unable to decrypt", not the bare
+   "decrypt"): the client's own message contains the snapshot path, and a
+   host may be called `decrypt-box`. A key file the client cannot parse is
+   key trouble.
+3. Only a `layout.json` that is missing from the backup makes the backup
+   unusable; a local read error is reported as that.
+4. Invisible Unicode format characters (bidirectional overrides, zero-width
+   characters) are replaced like control characters; the warning about an
+   unprotected backup goes through the same filter.

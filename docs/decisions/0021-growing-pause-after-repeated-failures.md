@@ -1,0 +1,109 @@
+# 0021 – Growing pause between automatic retries after repeated failures
+
+- Status: accepted
+- Date: 2026-11-09
+
+## Context
+
+The timer checks every hour whether a backup is due. A backup is due until
+one succeeds, so a problem that does not go away by itself (a revoked API
+token, a full datastore, a snapshot that fails the read-back check of
+decision 0015) was retried every hour, forever. Each retry that gets as far
+as the server wakes it with Wake-on-LAN: a server that is meant to sleep was
+woken 24 times a day for nothing.
+
+Since decision 0017 the user is told about a failing backup, so retrying
+often no longer serves to "get noticed".
+
+## Decision
+
+1. The state counts failed runs in a row (`consecutive_failures`). A success
+   resets the count. Runs that ended as `pbs_unreachable` or `cancelled` are
+   neither failures nor successes: they do not count and do not reset.
+2. The first failure is retried at the next hourly check as before (many
+   failures are transient). From the second failure in a row the timer waits
+   2, 4, 8, 16 hours after the last failure before it tries again, never
+   longer than `schedule.interval_hours`. A check that falls into the pause
+   ends like "not due": exit code 0, no run record, the server is not
+   contacted.
+3. The pause ends at once when something changes that can cure the failure:
+   the configuration file has other content than the failed run read (by
+   hand or through the web UI; compared by a fingerprint of the content, not
+   by file time),
+   credentials are stored (`credentials set-password`), a key is created,
+   imported or confirmed. A manually started run (`nestegg backup`, "Back
+   up now") is never held back.
+4. `schedule.next_run` of the status shows the real next attempt.
+
+An unreachable server keeps being checked every hour: that is the normal
+case for a laptop away from home or a server that is switched on in the
+evening, and the check itself costs one TCP connection attempt (plus the
+Wake-on-LAN packets, repeated with growing pauses within one check, see
+decision 0009).
+
+## Consequences
+
+- A permanently failing backup contacts the server once per backup interval
+  instead of every hour.
+- After a fix that nestegg cannot see (the token was repaired on the
+  server), the next automatic attempt can be up to one interval away; the
+  message of the paused check and the documentation name `nestegg backup`.
+- State files of older versions have no counter; it starts at 0.
+
+## Update 2026-11-10: the pause is bounded against a wrong clock
+
+The pause is measured from the failed run's recorded time. If that time lies
+in the future — the clock was ahead when the run failed and was corrected
+afterwards — the pause would last until the (still future) failure time plus
+the doubling, which can be arbitrarily long and freeze the automatic retries.
+`retry_not_before` takes the current time: the next attempt can never lie later
+than one backup interval from now (the code states that bound explicitly; it
+cannot bind on its own). Both the timer check and the status view pass the same
+"now".
+
+### Revision 2026-11-10: a future stamp means no pause at all
+
+Capping the future failure time at "now" (an earlier attempt at this fix) was
+not enough: the pause was then measured from "now" at *every* hourly check, so
+`not_before` stayed `now + pause` and still never arrived — the retries stayed
+frozen. A failure time in the future cannot be trusted at all, so
+`retry_not_before` now returns "no pause" for it: the next hourly check retries
+at once. A normal (past) failure still pauses as before, bounded by one backup
+interval.
+
+### A transient read-back failure does not count
+
+A run that failed only because the server was unavailable during the read-back
+(decision 0015) is marked `transient`. Like `pbs_unreachable` and `cancelled`
+it is neither a failure nor a success for `consecutive_failures`: it does not
+count and does not reset, and `retry_not_before` never pauses on it. The next
+hourly check tries again. A read-back *mismatch* (content differs, an archive
+is missing) is a real failure and counts as before.
+
+### Revision 2026-11-10: a repeated transient read-back failure counts
+
+Only the first transient read-back failure in a row is free; the next one
+directly after it is an ordinary failure that counts and pauses (decision 0015,
+update (c)). A run lock that is blocked although no backup runs is an ordinary
+failure too (decision 0022, section 5).
+
+### A success stamp in the future is not a recent backup
+
+The same wrong-clock problem exists for the last **success**: with its time in
+the future, "now minus finished" is negative, so nothing was due, nothing was
+overdue and nobody was told until real time passed the wrong stamp. A success
+stamp that lies more than five minutes in the future (clock steps of seconds
+change nothing) now says nothing about the age of the backup: a timer backup is
+due at once (the successful run then records a correct stamp), the next backup
+shown by the status is "now", and until then the health is `overdue` with a note
+that the time of the last backup lies in the future because the clock was
+wrong. The same tolerance applies to a leftover `current.json` whose start lies
+in the future: it no longer counts as a run that is still starting.
+
+## Alternatives rejected
+
+- **Pausing only for failures after the server was contacted.** Local
+  failures (key not exported, source missing) are cheap to retry, but the
+  rule "which error kinds pause" is hard to explain, and the commands that
+  cure them end the pause anyway.
+- **A configurable schedule.** Nobody should have to tune this.

@@ -2,8 +2,20 @@
 
 import { api, ApiFailure, optional } from "./api";
 import { initBrowserSession } from "./session";
+import { newestReach, reachOfCheck, type Reach } from "./check";
 import { isActive } from "./derive";
-import type { ConfigView, HealthInfo, MachinesResponse, Run, SessionInfo, Snapshot, Status } from "./types";
+import type {
+  ConfigView,
+  HealthInfo,
+  MachinesResponse,
+  PbsCheckResult,
+  PbsInfo,
+  Run,
+  SessionInfo,
+  SettingsChange,
+  Snapshot,
+  Status,
+} from "./types";
 
 const POLL_RUNNING_MS = 2_000;
 const POLL_IDLE_MS = 30_000;
@@ -40,6 +52,25 @@ class AppState {
     list: [],
     error: null,
   });
+  /** Facts about the server (`GET /pbs`); undefined: not offered by this daemon, null: not loaded yet or failed. */
+  pbs = $state<PbsInfo | null | undefined>(null);
+  /** The "check connection" action of the server view; kept here so it survives leaving the page. */
+  pbsCheck = $state<
+    | { state: "idle" }
+    | { state: "running"; wake: boolean }
+    | { state: "done"; result: PbsCheckResult; wake: boolean }
+    | { state: "error"; message: string }
+  >({ state: "idle" });
+  /** What the newest connection check of this page session found out about the server; kept across new checks. */
+  checkReach = $state<Reach | null>(null);
+  /** The cancel action of the running backup. */
+  cancel = $state<
+    | { state: "idle" }
+    | { state: "asking" }
+    | { state: "sending" }
+    | { state: "requested"; runId: string }
+    | { state: "error"; kind: "gone" | "cannot" | "other"; message: string }
+  >({ state: "idle" });
   now = $state(new Date());
   starting = $state(false);
   startError = $state<{ kind: "conflict" | "other"; message: string } | null>(null);
@@ -49,6 +80,11 @@ class AppState {
 
   get running(): boolean {
     return isActive(this.status?.current_run);
+  }
+
+  /** The newest thing known about the server: the last backup run (`/status`) or this page's own check. */
+  get reach(): Reach | null {
+    return this.status ? newestReach(this.status.pbs, this.checkReach) : null;
   }
 
   /** Cached data is shown, but the daemon does not answer right now. */
@@ -63,6 +99,8 @@ class AppState {
     void this.loadRuns();
     void this.loadConfig();
     void this.loadMachines();
+    // The sidebar strip of this PC needs the server's snapshots on every page.
+    void this.loadSnapshots();
     api.health().then((h) => (this.healthInfo = h), () => {});
     optional(api.session()).then((s) => (this.session = s), () => (this.session = undefined));
     setInterval(() => (this.now = new Date()), 15_000);
@@ -102,7 +140,11 @@ class AppState {
         before?.last_success?.id !== after.last_success?.id ||
         before?.current_run?.id !== after.current_run?.id;
       if (changed || this.running || wasRunning || wasOffline) void this.loadRuns();
-      if (wasOffline && this.config.state === "error") void this.loadConfig();
+      // A cancel request is over as soon as the run it was meant for is no longer active.
+      if (this.cancel.state === "requested" && after.current_run?.id !== this.cancel.runId) this.cancel = { state: "idle" };
+      if (!this.running && (this.cancel.state === "asking" || this.cancel.state === "error")) this.cancel = { state: "idle" };
+      // Settings can change elsewhere (another tab, the terminal): keep them fresh.
+      if (!this.running || (wasOffline && this.config.state === "error")) void this.loadConfig();
       if (before && before.last_success?.id !== after.last_success?.id && this.snapshots.state !== "idle") {
         void this.loadSnapshots(true);
       }
@@ -141,6 +183,28 @@ class AppState {
     }
   }
 
+  /**
+   * Save a settings change (`PATCH /config`). On success the new
+   * configuration replaces the loaded one and /status is asked again, so the
+   * next run and the overdue state follow at once. Rejects with ApiFailure.
+   */
+  async saveSettings(change: SettingsChange): Promise<ConfigView> {
+    try {
+      const config = await api.updateConfig(change);
+      this.config = { state: "ok", value: config, error: null };
+      void this.poll();
+      return config;
+    } catch (e) {
+      const f = asFailure(e);
+      // The daemon stopped or the session ended: let the page show it.
+      if (f.kind === "daemon" || f.kind === "unauthorized") void this.poll();
+      // A failed save can still have changed something (e.g. the timer was
+      // switched but not started): show what the daemon has now.
+      else void this.loadConfig();
+      throw f;
+    }
+  }
+
   async loadMachines() {
     try {
       this.machines = await optional(api.machines());
@@ -162,6 +226,55 @@ class AppState {
     } catch (e) {
       this.snapshots = { state: "error", list: [], error: asFailure(e) };
     }
+  }
+
+  /** Ask the daemon to cancel the running backup (after the user confirmed). */
+  async cancelRun() {
+    const run = this.status?.current_run;
+    if (!run) return;
+    this.cancel = { state: "sending" };
+    try {
+      await api.cancelRun(run.id);
+      this.cancel = { state: "requested", runId: run.id };
+    } catch (e) {
+      const f = asFailure(e);
+      // 409 `cannot_cancel`: the run exists but is only just starting or already over. 404: no such
+      // run; an older daemon also answered 404 for those two cases, so its text covers all of them.
+      if (f.kind === "conflict") this.cancel = { state: "error", kind: "cannot", message: f.message };
+      else if (f.kind === "not_found") this.cancel = { state: "error", kind: "gone", message: f.message };
+      else this.cancel = { state: "error", kind: "other", message: f.message };
+    }
+    await this.poll();
+  }
+
+  /** Server facts for the server view. Quiet on failure: the view works without them. */
+  async loadPbs() {
+    try {
+      this.pbs = await optional(api.pbs());
+    } catch {
+      this.pbs = null;
+    }
+  }
+
+  /**
+   * "Check connection": runs the checks of `nestegg check`. Without `wake` a
+   * server that sleeps is reported as "not checked" and nothing is woken; the
+   * page then offers to wake it, which runs the check again with `wake` (the
+   * daemon wakes the server first, which can take minutes).
+   */
+  async checkPbs(wake = false) {
+    if (this.pbsCheck.state === "running") return;
+    this.pbsCheck = { state: "running", wake };
+    try {
+      // An unreachable server is a normal answer (200 with a failed "PBS reachable" item), not an error.
+      const result = await api.checkPbs(wake);
+      this.pbsCheck = { state: "done", result, wake };
+      this.checkReach = reachOfCheck(result) ?? this.checkReach;
+    } catch (e) {
+      this.pbsCheck = { state: "error", message: asFailure(e).message };
+    }
+    void this.poll();
+    void this.loadPbs();
   }
 
   async startRun() {

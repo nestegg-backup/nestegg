@@ -1,0 +1,106 @@
+name: rescue
+
+# Bare-metal restore end to end (tests/rescue/run.sh): back up a freshly
+# installed desktop VM, restore it with the rescue stick onto an empty disk
+# and boot the result. Builds the rescue ISO once and runs every variant
+# against it. Weekly, on demand, and for pull requests that touch the rescue
+# code, the disk layout or the test itself.
+
+on:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/nestegg/src/rescue/**"
+      - "crates/nestegg/src/layout.rs"
+      # The rescue path reads snapshots and checks keys through these.
+      - "crates/nestegg/src/client.rs"
+      - "crates/nestegg/src/keyproof.rs"
+      - "packaging/rescue/**"
+      - "tests/rescue/**"
+      # tests/rescue/run.sh starts the PBS with these.
+      - "tests/e2e/lib.sh"
+      - "tests/e2e/pbs.Dockerfile"
+      - "tests/e2e/pbs-entrypoint.sh"
+      - ".github/workflows/rescue.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  iso:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the web UI (embedded into the binary)
+        if: hashFiles('ui/package-lock.json') != ''
+        working-directory: ui
+        run: npm ci && npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Build the rescue ISO
+        run: packaging/rescue/build.sh target/release/nestegg target/nestegg-rescue-amd64.iso
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rescue-iso
+          retention-days: 3
+          path: |
+            target/release/nestegg
+            target/nestegg-rescue-amd64.iso
+
+  test:
+    needs: iso
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # wizard 1: the interactive wizard (default of run.sh); wizard 0: a
+        # complete non-interactive `nestegg rescue restore`, on the variant
+        # that also passes --encrypt-passphrase-file.
+        include:
+          - variant: debian-btrfs-uefi
+            wizard: "1"
+          - variant: ubuntu-ext4-bios-luks
+            wizard: "1"
+          - variant: ubuntu-ext4-bios-luks
+            wizard: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rescue-iso
+          path: rescue-iso
+      - name: Enable KVM for the test VMs
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf
+      - name: Rescue end-to-end test (backup, restore onto an empty disk, boot)
+        env:
+          # Keep the work directory so the console logs can be collected.
+          KEEP: "1"
+          WIZARD: ${{ matrix.wizard }}
+        run: |
+          # Artifacts do not keep the executable bit.
+          chmod +x rescue-iso/release/nestegg
+          sudo --preserve-env=KEEP,WIZARD tests/rescue/run.sh rescue-iso/release/nestegg \
+            rescue-iso/nestegg-rescue-amd64.iso "${{ matrix.variant }}"
+      - name: Collect the VM console logs
+        if: failure()
+        run: |
+          mkdir -p rescue-logs
+          sudo find /var/tmp -maxdepth 2 -path '/var/tmp/nestegg-rescue-e2e.*' -name '*.log' \
+            -exec cp {} rescue-logs/ \;
+          sudo chown -R "$(id -u):$(id -g)" rescue-logs
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: rescue-logs-${{ matrix.variant }}-wizard${{ matrix.wizard }}
+          path: rescue-logs/

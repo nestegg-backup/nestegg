@@ -10,6 +10,9 @@ use crate::config::{Config, Paths};
 use crate::state::{Health, Run, State, Store, health, next_due};
 
 pub const TIMER_UNIT: &str = "nestegg-backup.timer";
+/// The health-check oneshot, started right after a settings change so the
+/// change is reported without waiting for the hourly timer (decision 0022).
+pub const NOTIFY_UNIT: &str = "nestegg-notify.service";
 
 #[derive(Debug, Serialize)]
 pub struct Status {
@@ -22,6 +25,7 @@ pub struct Status {
     pub health: Health,
     pub overdue_after_hours: u32,
     pub encryption: Encryption,
+    pub server_verify_failed: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,6 +44,9 @@ pub struct PbsStatus {
     #[serde(with = "crate::state::rfc3339_opt")]
     pub checked_at: Option<DateTime<Utc>>,
     pub wake_on_lan: bool,
+    /// The token secret (or password) is stored. `None`: this process may
+    /// not look into the credentials directory (not root).
+    pub credentials_stored: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,10 +63,30 @@ pub struct Encryption {
     pub enabled: bool,
     pub key_fingerprint: Option<String>,
     pub key_exported: bool,
+    /// An encryption key is stored (it may still be unconfirmed). `None`:
+    /// this process may not look into the credentials directory (not root).
+    pub key_present: Option<bool>,
 }
 
-pub fn timer_enabled() -> bool {
-    Command::new("systemctl")
+/// Load the configuration for a status view. A missing file means "not
+/// configured" (`Ok(None)`); a file that exists but cannot be read or parsed is
+/// an error, so a caller who may not read it (for example a group member facing
+/// a `0640 root:root` file) is not silently shown the built-in defaults as if
+/// they were the configuration.
+pub fn config_for_status(path: &std::path::Path) -> Result<Option<Config>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Config::load(path).map(Some)
+}
+
+pub fn timer_enabled(paths: &Paths) -> bool {
+    systemctl_is_enabled(&paths.systemctl)
+}
+
+/// `systemctl is-enabled` of the backup timer; false if systemctl is missing.
+pub fn systemctl_is_enabled(systemctl: &std::path::Path) -> bool {
+    Command::new(systemctl)
         .args(["is-enabled", "--quiet", TIMER_UNIT])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -82,6 +109,19 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
     let current = crate::run::active_run(paths)?;
     let now = Utc::now();
     let overdue_after_hours = config.map(|c| c.overdue_after_hours).unwrap_or(36);
+    // Only root can list the credentials directory; anyone else gets "unknown"
+    // instead of a wrong "no".
+    let stored = |name: &str| -> Option<bool> {
+        let secrets = crate::secrets::SecretStore::new(&paths.credentials_dir);
+        if secrets.exists(name) {
+            return Some(true);
+        }
+        match std::fs::read_dir(&paths.credentials_dir) {
+            Ok(_) => Some(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        }
+    };
     let interval = config.map(|c| c.schedule.interval_hours).unwrap_or(24);
     Ok(Status {
         machine: Machine {
@@ -99,13 +139,22 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
             namespace: config.and_then(|c| c.pbs.namespace.clone()),
             reachable: state.pbs_reachable,
             checked_at: state.pbs_checked_at,
-            wake_on_lan: config.is_some_and(|c| c.wake.is_some()),
+            wake_on_lan: config.is_some_and(|c| c.active_wake().is_some()),
+            credentials_stored: stored(crate::secrets::PASSWORD),
         },
         schedule: Schedule {
             enabled: timer,
             calendar: format!("every {interval} h (checked hourly)"),
             interval_hours: interval,
-            next_run: (timer && current.is_none()).then(|| next_due(&state, interval, now)),
+            next_run: (timer && current.is_none()).then(|| {
+                let due = next_due(&state, interval, now);
+                // After failures in a row the timer pauses before it retries.
+                let config_now = crate::state::config_stamp(&paths.config_file);
+                match crate::state::retry_not_before(&state, interval, config_now.as_deref(), now) {
+                    Some(not_before) => due.max(not_before),
+                    None => due,
+                }
+            }),
         },
         health: health(
             config.is_some(),
@@ -122,12 +171,20 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
             enabled: config.is_none_or(|c| c.backup.encryption),
             key_fingerprint: state.key_fingerprint.clone(),
             key_exported: state.key_exported(),
+            key_present: stored(crate::secrets::ENCRYPTION_KEY),
         },
+        server_verify_failed: state.server_verify_failed.clone(),
     })
 }
 
-/// Configuration without secrets (the config file never contains any).
-pub fn config_view(config: &Config) -> serde_json::Value {
+/// Configuration without secrets (the config file never contains any),
+/// plus what the settings form of the web UI needs (decision 0013).
+pub fn config_view(config: &Config, timer_enabled: bool) -> serde_json::Value {
+    let wake_configured = config.wake.is_some();
+    let editable: Vec<&str> = crate::settings::EDITABLE
+        .into_iter()
+        .filter(|key| *key != "wake_on_lan" || wake_configured)
+        .collect();
     serde_json::json!({
         "backup_id": config.effective_backup_id(),
         "sources": config.backup.sources.iter().map(|s| serde_json::json!({
@@ -139,5 +196,10 @@ pub fn config_view(config: &Config) -> serde_json::Value {
         "interval_hours": config.schedule.interval_hours,
         "encryption": config.backup.encryption,
         "overdue_after_hours": config.overdue_after_hours,
+        "automatic_backups": timer_enabled,
+        "wake_on_lan": config.active_wake().is_some(),
+        "wake_on_lan_configured": wake_configured,
+        "editable": editable,
+        "limits": crate::settings::limits_json(config),
     })
 }

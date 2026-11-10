@@ -17,6 +17,8 @@ pub struct Paths {
     pub credentials_dir: PathBuf,
     pub state_dir: PathBuf,
     pub runtime_dir: PathBuf,
+    /// `systemctl` binary used to read and switch the backup timer.
+    pub systemctl: PathBuf,
 }
 
 impl Paths {
@@ -31,6 +33,7 @@ impl Paths {
             credentials_dir: env_path("NESTEGG_CREDENTIALS_DIR", "/etc/nestegg/credentials"),
             state_dir: env_path("NESTEGG_STATE_DIR", "/var/lib/nestegg"),
             runtime_dir: env_path("NESTEGG_RUNTIME_DIR", "/run/nestegg"),
+            systemctl: env_path("NESTEGG_SYSTEMCTL", "systemctl"),
         }
     }
 
@@ -61,6 +64,11 @@ impl Paths {
     pub fn tmp_dir(&self) -> PathBuf {
         self.runtime_dir.join("tmp")
     }
+
+    /// What `nestegg notify` has already told whom (decision 0017).
+    pub fn notify_state_file(&self) -> PathBuf {
+        self.state_dir.join("notify.json")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,6 +92,38 @@ pub struct Config {
     /// the overview only shows the machine's own backups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overview: Option<OverviewConfig>,
+    /// How problems are reported (decision 0017). Root-only: the web UI
+    /// cannot change it, because `command` runs as root.
+    #[serde(default, skip_serializing_if = "NotifyConfig::is_default")]
+    pub notify: NotifyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyConfig {
+    /// Desktop notification for every logged-in user.
+    #[serde(default = "default_true")]
+    pub desktop: bool,
+    /// Program and arguments (no shell) to run as root for every event.
+    /// The event is in `NESTEGG_*` environment variables, the message on
+    /// stdin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        NotifyConfig {
+            desktop: true,
+            command: None,
+        }
+    }
+}
+
+impl NotifyConfig {
+    pub fn is_default(&self) -> bool {
+        *self == NotifyConfig::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -123,6 +163,10 @@ pub struct WakeConfig {
     /// How long to wait for the PBS after sending the magic packet.
     #[serde(default = "default_wake_timeout")]
     pub timeout_seconds: u64,
+    /// Switch Wake-on-LAN off without forgetting the MAC address (the web
+    /// UI toggles this key).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -374,7 +418,19 @@ impl Config {
         if self.schedule.interval_hours == 0 {
             bail!("schedule.interval_hours must be at least 1");
         }
+        if let Some(command) = &self.notify.command
+            && command
+                .first()
+                .is_none_or(|program| program.trim().is_empty())
+        {
+            bail!("notify.command must start with the program to run");
+        }
         Ok(())
+    }
+
+    /// The Wake-on-LAN settings if Wake-on-LAN is configured and switched on.
+    pub fn active_wake(&self) -> Option<&WakeConfig> {
+        self.wake.as_ref().filter(|w| w.enabled)
     }
 
     /// Backup ID, falling back to the host name.
@@ -446,6 +502,7 @@ pub fn example(server: &str, datastore: &str, auth_id: &str) -> Config {
         backup: BackupConfig::default(),
         schedule: ScheduleConfig::default(),
         overview: None,
+        notify: NotifyConfig::default(),
     }
 }
 
@@ -528,6 +585,31 @@ auth_id = "backup@pbs!desktop"
             [0, 0, 0x5e, 0, 0x53, 1]
         );
         assert!(parse_mac("zz:00:5e:00:53:01").is_err());
+    }
+
+    #[test]
+    fn notify_section_defaults_and_validation() {
+        let c = Config::parse(MINIMAL).unwrap();
+        assert!(c.notify.desktop);
+        assert_eq!(c.notify.command, None);
+        // The default section is not written out again.
+        assert!(!c.to_toml().unwrap().contains("[notify]"));
+
+        let hook = format!(
+            "{MINIMAL}\n[notify]\ndesktop = false\ncommand = [\"/usr/local/bin/my-hook\", \"arg\"]\n"
+        );
+        let c = Config::parse(&hook).unwrap();
+        assert!(!c.notify.desktop);
+        assert_eq!(c.notify.command.as_ref().unwrap().len(), 2);
+        assert_eq!(Config::parse(&c.to_toml().unwrap()).unwrap(), c);
+
+        let empty = format!("{MINIMAL}\n[notify]\ncommand = []\n");
+        assert!(Config::parse(&empty).is_err());
+        let unknown = format!("{MINIMAL}\n[notify]\nmail = \"x\"\n");
+        assert!(Config::parse(&unknown).is_err());
+        // A shell string instead of an array is refused.
+        let shell = format!("{MINIMAL}\n[notify]\ncommand = \"my-hook --x\"\n");
+        assert!(Config::parse(&shell).is_err());
     }
 
     #[test]

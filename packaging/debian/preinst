@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+# The marker written by prerm on removal is only meant for the next
+# installation. On an upgrade of an installed package it is stale (left by a
+# reinstall that could not act on it), so drop it before postinst reads it.
+if [ "$1" = "upgrade" ]; then
+    rm -f /var/lib/nestegg/enabled-units
+fi
+exit 0

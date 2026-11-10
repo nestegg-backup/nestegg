@@ -76,7 +76,51 @@ describe("status sentence of this PC", () => {
 
   it("mentions a switched-off schedule", () => {
     const s = selfSummary(status({ schedule: { enabled: false } }), de, fde, now);
-    expect(s.text).toContain("Die automatische Sicherung ist ausgeschaltet.");
+    // Not "Alles in Ordnung": the lead says what is off, the text when the last backup was.
+    expect(s.lead).toBe("Die automatische Sicherung ist aus.");
+    expect(s.text).toContain("Zuletzt gesichert heute um 01:42.");
+    expect(s.text).toContain("Gesichert wird nur, wenn du die Sicherung startest.");
+    // Other states keep the plain sentence.
+    const overdue = selfSummary(status({ schedule: { enabled: false }, health: "overdue" }), de, fde, now);
+    expect(overdue.text).toContain("Die automatische Sicherung ist ausgeschaltet.");
+  });
+});
+
+describe("local history empty, backups on the server (e.g. after a reinstall)", () => {
+  const server = { count: 12, latest: "2026-11-05T00:40:00Z" };
+  const fresh = { health: "never" as const, last_run: null, last_success: null };
+
+  it("does not claim that there is no backup at all", () => {
+    const s = selfSummary(status(fresh), de, fde, now, server);
+    expect(s.kind).toBe("never");
+    expect(s.lead).toBe("Von dieser Installation gibt es noch keine Sicherung.");
+    expect(s.text).toContain("Auf dem Server liegen 12 frühere Stände dieses PCs.");
+    expect(s.text).toContain("Der neueste entstand am ");
+    expect(s.text).toContain("Daraus kannst du Dateien wiederherstellen.");
+    const e = selfSummary(status(fresh), en, fen, now, { count: 1, latest: server.latest });
+    expect(e.lead).toBe("No backup from this installation yet.");
+    expect(e.text).toContain("The server holds 1 earlier backup of this computer.");
+    expect(e.text).toContain("You can restore files from it.");
+    expect(selfRowText(status(fresh), de, fde, now, server)).toBe("Frühere Stände auf dem Server");
+    expect(selfRowText(status(fresh), en, fen, now, server)).toBe("Earlier backups on the server");
+  });
+
+  it("keeps the plain 'no backup yet' when the server is empty or not asked yet", () => {
+    for (const srv of [null, { count: 0, latest: null }]) {
+      expect(selfSummary(status(fresh), de, fde, now, srv).lead).toBe("Noch keine Sicherung.");
+      expect(selfRowText(status(fresh), de, fde, now, srv)).toBe("Noch nie gesichert");
+    }
+  });
+
+  it("uses the newest snapshot when /status leaves out last_success", () => {
+    const st = status({ last_run: undefined, last_success: undefined });
+    expect(selfSummary(st, de, fde, now, server).lead).toMatch(/^Am .*5\. November.*01:40 gesichert\.$/);
+    expect(selfSummary(st, en, fen, now, { count: 1, latest: "2026-11-08T00:42:00Z" }).lead).toBe("Backed up today at 01:42.");
+    expect(selfSummary(st, en, fen, now).lead).toBe("Backed up.");
+    expect(selfSummary(status({ health: "failing", last_run: undefined, last_success: undefined }), en, fen, now, server).text).toContain("Last backed up on ");
+    expect(selfRowText(st, en, fen, now)).toBe("Backed up");
+    expect(selfRowText(status({ health: "overdue", last_run: undefined, last_success: undefined }), en, fen, now)).toBe("Overdue");
+    expect(selfRowText(status({ health: "overdue", last_run: undefined, last_success: undefined }), de, fde, now, server)).toBe("Überfällig, zuletzt 5. Nov.");
   });
 });
 
@@ -98,14 +142,14 @@ describe("other PCs and server", () => {
 
   it("server line in the list states the last check, with time", () => {
     const st = status({});
-    expect(serverRow({ ...st, pbs: { ...st.pbs, reachable: true, checked_at: "2026-11-08T00:42:00Z" } }, de, fde, now).text).toBe("Erreichbar, geprüft um 01:42");
+    expect(serverRow({ ...st.pbs, reachable: true, checked_at: "2026-11-08T00:42:00Z" }, de, fde, now).text).toBe("Erreichbar, geprüft um 01:42");
     // Wake-on-LAN does not turn "not reachable" into "asleep".
-    expect(serverRow({ ...st, pbs: { ...st.pbs, reachable: false, checked_at: "2026-11-08T13:30:00Z", wake_on_lan: true } }, de, fde, now)).toEqual({
+    expect(serverRow({ ...st.pbs, reachable: false, checked_at: "2026-11-08T13:30:00Z" }, de, fde, now)).toEqual({
       tone: "pbs",
       text: "Nicht erreichbar, geprüft um 14:30",
     });
-    expect(serverRow({ ...st, pbs: { ...st.pbs, reachable: false, checked_at: "2026-11-05T13:30:00Z" } }, en, fen, now).text).toBe("Not reachable, checked on 5 Nov");
-    expect(serverRow({ ...st, pbs: { ...st.pbs, reachable: null } }, de, fde, now).text).toBe("Noch nicht geprüft");
+    expect(serverRow({ ...st.pbs, reachable: false, checked_at: "2026-11-05T13:30:00Z" }, en, fen, now).text).toBe("Not reachable, checked on 5 Nov");
+    expect(serverRow({ ...st.pbs, reachable: null }, de, fde, now).text).toBe("Noch nicht geprüft");
   });
 });
 
@@ -146,7 +190,7 @@ describe("contract-valid minimal status objects", () => {
     encryption: { enabled: true },
     health,
   });
-  const healths: Status["health"][] = ["ok", "running", "overdue", "failing", "never", "unconfigured"];
+  const healths: Status["health"][] = ["ok", "running", "overdue", "failing", "incomplete", "never", "unconfigured"];
 
   it.each(healths)("health=%s renders without run details", (h) => {
     for (const [msgs, fmt] of [[de, fde], [en, fen]] as const) {
@@ -155,7 +199,7 @@ describe("contract-valid minimal status objects", () => {
         expect(s.lead.length).toBeGreaterThan(0);
         expect(s.lead + s.text).not.toMatch(/undefined|null|NaN|Invalid/);
         expect(selfRowText(st, msgs, fmt, now)).not.toMatch(/undefined|null|NaN|Invalid/);
-        expect(serverRow(st, msgs, fmt, now).text.length).toBeGreaterThan(0);
+        expect(serverRow(st.pbs, msgs, fmt, now).text.length).toBeGreaterThan(0);
       }
     }
   });
@@ -169,7 +213,7 @@ describe("contract-valid minimal status objects", () => {
 describe("key copy wording", () => {
   it("does not claim that the key exists only on the computer", () => {
     for (const msgs of [de, en]) {
-      const all = [msgs.key.title, msgs.key.text, msgs.key.otherTitle, msgs.key.otherText("media"), msgs.self.keyLead, msgs.row.keyMissing].join(" ");
+      const all = [msgs.key.otherTitle, msgs.key.otherText("media"), msgs.self.keyLead, msgs.row.keyMissing].join(" ");
       expect(all).not.toMatch(/liegt nur|nur auf dem PC|only exists|fehlt\b|missing/i);
       expect(all).toMatch(/bestätigt|confirmed/);
     }

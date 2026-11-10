@@ -8,44 +8,40 @@
 <script lang="ts">
   import Dot from "./Dot.svelte";
   import { api } from "../lib/api";
-  import { errorKind, type RunRow } from "../lib/derive";
+  import { errorKind, isIncomplete, otherWarnings, runTone, type RunRow } from "../lib/derive";
+  import { runResultText } from "../lib/text";
   import { f, t } from "../lib/locale";
-  import type { Run } from "../lib/types";
 
-  /** `remote`: rows of another PC, built from what the PBS reports; there is no log to load. */
-  let { rows, loaded, remote = false }: { rows: RunRow[]; loaded: boolean; remote?: boolean } = $props();
+  /**
+   * `remote`: rows of another PC, built from what the PBS reports; there is no
+   * log to load and no duration or upload size.
+   * `emptyText`: replaces the default text of an empty list.
+   * `damaged`: snapshot paths the server marked as damaged; their rows say so, like the 14-day strip.
+   */
+  let {
+    rows,
+    loaded,
+    remote = false,
+    emptyText,
+    damaged = new Set<string>(),
+  }: { rows: RunRow[]; loaded: boolean; remote?: boolean; emptyText?: string; damaged?: ReadonlySet<string> } = $props();
+
+  const LIMIT = 8;
   let showAll = $state(false);
-  const shown = $derived(showAll ? rows : rows.slice(0, 7));
+  /** Rows opened or closed by the user; the newest row starts open when it failed. */
+  let toggled = $state<Record<string, boolean>>({});
+  const shown = $derived(showAll ? rows : rows.slice(0, LIMIT));
+  const cols = $derived(remote ? 4 : 5);
 
-  function what(row: RunRow): string {
-    const r = row.run;
-    switch (r.state) {
-      case "succeeded":
-        if (r.warnings?.length) return t.runs.succeededWarnings(r.warnings.length);
-        return r.trigger === "timer" ? t.runs.succeeded : t.runs.succeededManual;
-      case "failed":
-        return t.runs.failed(t.reason[errorKind(r) ?? "internal"]);
-      case "pbs_unreachable":
-        return row.count > 1 ? t.runs.pbsTimes(row.count) : t.runs.pbs;
-      default:
-        return t.runs.cancelled;
-    }
+  function isOpen(row: RunRow, i: number): boolean {
+    if (!row.expandable) return false;
+    return toggled[row.run.id] ?? (i === 0 && row.run.state === "failed");
   }
 
-  function tone(r: Run) {
-    return r.state === "failed" ? "bad" : r.state === "pbs_unreachable" ? "pbs" : "neutral";
-  }
-
-  function extra(r: Run): string {
-    if (r.state !== "succeeded") return "";
-    const parts: string[] = [];
-    if (r.duration_seconds != null) parts.push(f.duration(r.duration_seconds));
-    if (r.uploaded_bytes != null) parts.push(t.runs.uploaded(f.size(r.uploaded_bytes)));
-    return parts.join(", ");
-  }
+  const slug = (id: string) => `log-${id.replace(/[^A-Za-z0-9_-]/g, "_")}`;
 
   async function load(id: string) {
-    if (logs[id]?.state === "ok" || logs[id]?.state === "loading") return;
+    if (remote || logs[id]?.state === "ok" || logs[id]?.state === "loading") return;
     logs[id] = { state: "loading" };
     try {
       logs[id] = { state: "ok", detail: await api.run(id) };
@@ -53,91 +49,134 @@
       logs[id] = { state: "error" };
     }
   }
+
+  function toggle(row: RunRow, i: number) {
+    const open = !isOpen(row, i);
+    toggled[row.run.id] = open;
+    if (open) void load(row.run.id);
+  }
+
+  // A row that starts open needs its log as well.
+  $effect(() => {
+    const first = rows[0];
+    if (first && isOpen(first, 0)) void load(first.run.id);
+  });
 </script>
 
 {#if !rows.length}
-  {#if loaded}<p class="empty">{t.runs.empty}</p>{/if}
+  {#if loaded}
+    <h2 class="sec-title empty-title">{t.runs.title}</h2>
+    <p class="empty">{emptyText ?? t.runs.empty}</p>
+  {/if}
 {:else}
-  <ul class="runs">
-    {#each shown as row (row.run.id)}
-      {@const r = row.run}
-      {@const log = logs[r.id]}
-      {#if row.expandable}
-        <li>
-          <details class="run" ontoggle={(e) => !remote && (e.currentTarget as HTMLDetailsElement).open && load(r.id)}>
-            <summary>
-              <span class="when">{f.dayShort(r.started_at)}</span>
-              <span class="time">{f.time(r.started_at)}</span>
-              <span class="what"><Dot tone={tone(r)} /><span>{what(row)}</span></span>
-              <span class="extra"><span class="more more-closed">{t.runs.showLog}</span><span class="more more-open">{t.runs.hideLog}</span></span>
-            </summary>
-            {#if r.warnings?.length}
-              <p class="log-explain"><strong>{t.runs.warnings}:</strong> {r.warnings.join(" · ")}</p>
+  <table class="tbl runs" class:remote>
+    <caption>{t.runs.title}</caption>
+    <thead>
+      <tr>
+        <th scope="col">{t.runs.colDay}</th>
+        <th scope="col">{t.runs.colStart}</th>
+        <th scope="col">{t.runs.colResult}</th>
+        {#if !remote}<th scope="col" class="c-dur">{t.runs.colDuration}</th>{/if}
+        <th scope="col" class="r">{#if remote}<span class="sr">{t.runs.showLog}</span>{:else}{t.runs.colUploaded}{/if}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {#each shown as row, i (row.run.id)}
+        {@const r = row.run}
+        {@const open = isOpen(row, i)}
+        {@const log = logs[r.id]}
+        <tr class="run" class:bad={r.state === "failed"}>
+          <td class="m">{f.dayShort(r.started_at)}</td>
+          <td class="start">{f.time(r.started_at)}</td>
+          <td class="c-res"><span class="res"><Dot tone={runTone(r, damaged)} /><span class:muted={r.state === "cancelled"}>{runResultText(r, row.count, damaged, t)}</span></span></td>
+          {#if !remote}<td class="m c-dur">{r.duration_seconds != null ? f.duration(r.duration_seconds) : ""}</td>{/if}
+          <td class="r c-end" class:c-empty={!row.expandable && (remote || r.uploaded_bytes == null || r.state !== "succeeded")}>
+            {#if row.expandable}
+              <button class="linkbtn" type="button" aria-expanded={open} aria-controls={slug(r.id)} onclick={() => toggle(row, i)}>
+                {open ? t.runs.hideLog : t.runs.showLog}
+              </button>
+            {:else if !remote && r.state === "succeeded" && r.uploaded_bytes != null}
+              {f.size(r.uploaded_bytes)}
             {/if}
-            {#if remote}
-              <!-- svelte-ignore a11y_no_noninteractive_tabindex (scrollable log must be reachable by keyboard) -->
-              {#if r.error?.message}<div class="log" tabindex="0" role="region" aria-label={t.other.reportedError}>{r.error.message}</div>{/if}
-            {:else if !log || log.state === "loading"}
-              <p class="log-explain">{t.runs.logLoading}</p>
-            {:else if log.state === "error"}
-              <p class="log-explain">{t.runs.logFailed}</p>
-            {:else if log.detail?.log_tail?.length}
-              <!-- svelte-ignore a11y_no_noninteractive_tabindex (scrollable log must be reachable by keyboard) -->
-              <div class="log" tabindex="0" role="region" aria-label={t.runs.showLog}>{log.detail.log_tail.join("\n")}</div>
-            {:else}
-              <p class="log-explain">{r.error?.message ?? t.runs.logEmpty}</p>
-            {/if}
-            {#if errorKind(r)}
-              <p class="log-explain">{t.explain[errorKind(r)!]}</p>
-            {/if}
-          </details>
-        </li>
-      {:else}
-        <li class="run">
-          <span class="when">{f.dayShort(r.started_at)}</span>
-          <span class="time">{f.time(r.started_at)}</span>
-          <span class="what"><Dot tone={tone(r)} /><span class:muted={r.state === "cancelled"}>{what(row)}</span></span>
-          <span class="extra">{extra(r)}</span>
-        </li>
-      {/if}
-    {/each}
-    {#if rows.length > 7}
-      <li class="more-row">
-        <button class="linkbtn" type="button" aria-expanded={showAll} onclick={() => (showAll = !showAll)}>
-          {showAll ? t.runs.showFewer : t.runs.showAll(rows.length)}
-        </button>
-      </li>
-    {/if}
-  </ul>
+          </td>
+        </tr>
+        {#if open}
+          <tr class="logrow" id={slug(r.id)}>
+            <td colspan={cols}><div class="logwrap">
+              {#if isIncomplete(r)}
+                <div class="explain">
+                  <strong>{t.runs.incompleteReasons}:</strong>
+                  <ul class="reasons">{#each r.incomplete ?? [] as reason}<li>{reason}</li>{/each}</ul>
+                  <span class="faint">{t.self.incompleteNote}</span>
+                </div>
+              {/if}
+              {#if otherWarnings(r).length}
+                <p class="explain"><strong>{t.runs.warnings}:</strong> {otherWarnings(r).join(" · ")}</p>
+              {/if}
+              {#if remote}
+                <!-- svelte-ignore a11y_no_noninteractive_tabindex (scrollable log must be reachable by keyboard) -->
+                {#if r.error?.message}<pre class="log" tabindex="0" aria-label={t.other.reportedError}>{r.error.message}</pre>{/if}
+              {:else if !log || log.state === "loading"}
+                <p class="explain">{t.runs.logLoading}</p>
+              {:else if log.state === "error"}
+                <p class="explain">{t.runs.logFailed}</p>
+              {:else if log.detail?.log_tail?.length}
+                <!-- svelte-ignore a11y_no_noninteractive_tabindex (scrollable log must be reachable by keyboard) -->
+                <pre class="log" tabindex="0" aria-label={t.runs.showLog}>{log.detail.log_tail.join("\n")}</pre>
+              {:else}
+                <p class="explain">{r.error?.message ?? t.runs.logEmpty}</p>
+              {/if}
+              {#if errorKind(r)}
+                <p class="explain">{t.explain[errorKind(r)!]}</p>
+              {/if}
+            </div></td>
+          </tr>
+        {/if}
+      {/each}
+    </tbody>
+  </table>
+  {#if rows.length > LIMIT}
+    <div class="more">
+      <button class="btn small" type="button" aria-expanded={showAll} onclick={() => (showAll = !showAll)}>
+        {showAll ? t.runs.showFewer : t.runs.showAll(rows.length)}
+      </button>
+    </div>
+  {/if}
 {/if}
 
 <style>
-  .run, .run > summary {
-    display: grid; grid-template-columns: 108px var(--time-col) minmax(0, 1fr) auto; gap: 4px 16px;
-    align-items: baseline;
-  }
-  .run { padding: 11px 0; }
-  details.run { display: block; }
-  details.run > summary { cursor: pointer; list-style: none; }
-  details.run > summary::-webkit-details-marker { display: none; }
-  .when, .time { color: var(--muted); }
-  .what { display: flex; align-items: center; gap: 8px; min-width: 0; }
-  .extra { color: var(--faint); font-size: var(--fs-s); text-align: right; }
-  .more { color: var(--accent); font-size: var(--fs-s); text-decoration: underline; text-underline-offset: 3px; }
-  details.run[open] .more-closed, details.run:not([open]) .more-open { display: none; }
-  .more-row { padding: 14px 0 0; }
+  .runs, .empty-title { margin-top: 28px; }
+  .start { font-weight: 500; white-space: nowrap; }
+  .c-end { white-space: nowrap; }
+  tr.bad .c-res { color: var(--bad); }
+  .logrow td { padding: 0 0 12px; }
+  /* Long log lines scroll inside the log; they must not widen the table. */
+  .logwrap { width: 0; min-width: 100%; }
   .log {
-    margin: 12px 0 4px; background: var(--bg1); border-radius: 8px; padding: 14px 16px;
-    font-family: var(--mono); font-size: var(--fs-s); line-height: 1.7; color: var(--muted);
-    overflow-x: auto; white-space: pre;
+    margin: 0; background: var(--side); border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px;
+    font: 12.5px/1.6 var(--mono); color: var(--muted); overflow-x: auto; white-space: pre;
   }
-  .log-explain { margin-top: 10px; color: var(--muted); max-width: 60ch; }
-  .log-explain strong { font-weight: 500; color: var(--text); }
+  .explain { margin: 8px 0 0; color: var(--muted); font-size: 13px; max-width: 72ch; }
+  .explain:first-child { margin-top: 0; }
+  .explain strong { font-weight: 500; color: var(--text); }
+  .reasons { margin: 4px 0 4px; padding-left: 18px; list-style: disc; }
+  .reasons li { margin-top: 2px; }
+  .more { margin-top: 10px; }
+
   @media (max-width: 760px) {
-    .run, .run > summary { grid-template-columns: minmax(0, 1fr) auto; }
-    .when { grid-column: 1; }
-    .time { grid-column: 2; text-align: right; }
-    .what { grid-column: 1 / -1; }
-    .extra { grid-column: 1 / -1; text-align: left; }
+    thead { display: none; }
+    table, tbody, tr, td { display: block; }
+    caption { display: block; }
+    /* Two lines per run: day, start and size (or the log link); then the result. */
+    tr.run {
+      display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 2px 10px;
+      padding: 9px 0; border-bottom: 1px solid var(--rule);
+    }
+    tr.run td { border: 0; padding: 0; }
+    tr.run .m { color: var(--text); }
+    tr.run .c-dur { display: none; }
+    tr.run .c-end { grid-column: 3; grid-row: 1; text-align: right; color: var(--muted); font-size: 13px; }
+    tr.run .c-res { grid-column: 1 / -1; grid-row: 2; }
+    .logrow td { border-bottom: 1px solid var(--rule); padding-top: 4px; }
   }
 </style>

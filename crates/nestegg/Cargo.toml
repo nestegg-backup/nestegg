@@ -16,6 +16,7 @@ hyper = { version = "1.12.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "client-legacy", "http1"] }
 mime_guess = "2.0.5"
 nix = { version = "0.31.3", features = ["fs", "user", "process", "signal", "term", "hostname"] }
+pathpatterns = "0.1.2"
 rand = "0.10.3"
 rust-embed = { version = "8.13.0", features = ["interpolate-folder-path"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -24,6 +25,7 @@ sha2 = "0.11.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "process", "fs", "io-util", "time"] }
 toml = "1.2.1"
+toml_edit = "0.25.19"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -42,13 +44,15 @@ rebuilds and offers a terminal interface and a local web interface."""
 section = "admin"
 priority = "optional"
 depends = "$auto, systemd"
-recommends = "proxmox-backup-client | proxmox-backup-client-static"
+recommends = "proxmox-backup-client | proxmox-backup-client-static, libnotify-bin"
 maintainer-scripts = "../../packaging/debian/"
 assets = [
     ["target/release/nestegg", "usr/bin/", "755"],
     ["../../packaging/systemd/nestegg.service", "usr/lib/systemd/system/", "644"],
     ["../../packaging/systemd/nestegg-backup.service", "usr/lib/systemd/system/", "644"],
     ["../../packaging/systemd/nestegg-backup.timer", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/systemd/nestegg-notify.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/systemd/nestegg-notify.timer", "usr/lib/systemd/system/", "644"],
     ["../../packaging/systemd/nestegg.tmpfiles", "usr/lib/tmpfiles.d/nestegg.conf", "644"],
     ["../../packaging/systemd/nestegg.sysusers", "usr/lib/sysusers.d/nestegg.conf", "644"],
     ["../../README.md", "usr/share/doc/nestegg/README.md", "644"],

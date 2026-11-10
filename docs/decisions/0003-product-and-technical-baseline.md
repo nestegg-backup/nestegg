@@ -1,6 +1,6 @@
 # 0003 – Product and technical baseline
 
-- Status: accepted (bare-metal restore changed by 0006)
+- Status: accepted (bare-metal restore changed by 0006, credential sealing by 0008)
 - Date: 2026-11-08
 
 ## Decisions

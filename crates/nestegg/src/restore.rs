@@ -355,9 +355,11 @@ pub struct UserScope {
 }
 
 /// Map a user's home directory onto an archive: `home = /home/alice` and
-/// the archive's source path `/home` give `/alice`. `source_path` must come
-/// from the snapshot itself (its status report), not from the current
-/// configuration, which may have changed since.
+/// the archive's source path `/home` give `/alice`. `source_path` must
+/// describe the snapshot itself, not the current configuration (which may
+/// have changed since), and must come from a source the user cannot
+/// change: the snapshot's metadata blob or the local run record, never the
+/// snapshot notes (decision 0016).
 pub fn user_scope(source_path: &Path, home: &Path, uid: u32) -> Option<UserScope> {
     use std::os::unix::fs::MetadataExt;
     // The home directory must be a real directory owned by the caller and
@@ -468,11 +470,51 @@ pub fn patterns_for(paths: &[String]) -> Vec<String> {
     out
 }
 
+/// Largest file accepted as a key file or saved paper key. A key file has
+/// a few hundred bytes; an html paper key with its QR code some 10 KiB.
+pub const MAX_KEY_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read a small regular file named by a user. Refuses anything else: a
+/// FIFO or terminal would block forever, a device such as `/dev/zero` or a
+/// whole disk would be read into memory without end.
+pub fn read_small_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK: opening a FIFO without a writer returns at once.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+        .open(path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    if meta.len() > max_bytes {
+        bail!(
+            "{} is too large ({} bytes; a key file has less than {max_bytes})",
+            path.display(),
+            meta.len()
+        );
+    }
+    let mut data = Vec::new();
+    // The limit again while reading: the file may grow after the check.
+    file.take(max_bytes + 1)
+        .read_to_end(&mut data)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    if data.len() as u64 > max_bytes {
+        bail!("{} is too large for a key file", path.display());
+    }
+    Ok(data)
+}
+
 /// Read the key file named by the user (for `--keyfile`).
 pub fn read_user_key(path: &Path, sudo: Option<&UserIdentity>) -> Result<crate::secrets::Secret> {
     let bytes = match sudo {
         Some(user) => crate::identity::read_file_as(user, path)?,
-        None => std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?,
+        None => read_small_regular_file(path, MAX_KEY_FILE_BYTES)?,
     };
     Ok(crate::secrets::Secret::new(bytes))
 }
@@ -480,6 +522,34 @@ pub fn read_user_key(path: &Path, sudo: Option<&UserIdentity>) -> Result<crate::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_files_must_be_small_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("key.json");
+        std::fs::write(&ok, b"{}").unwrap();
+        assert_eq!(read_small_regular_file(&ok, 16).unwrap(), b"{}");
+
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![0u8; 17]).unwrap();
+        let err = read_small_regular_file(&big, 16).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
+
+        // A FIFO without a writer must not block.
+        let fifo = dir.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let err = read_small_regular_file(&fifo, 16).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let err = read_small_regular_file(Path::new("/dev/zero"), 16)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        let err = read_small_regular_file(dir.path(), 16)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
 
     #[test]
     fn staged_restore_needs_space_for_both_copies() {

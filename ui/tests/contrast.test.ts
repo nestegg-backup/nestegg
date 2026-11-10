@@ -10,10 +10,16 @@ function tokens(block: string): Record<string, string> {
   return out;
 }
 
-const darkBlock = css.slice(0, css.indexOf("@media (prefers-color-scheme: light)"));
-const lightBlock = css.slice(css.indexOf("@media (prefers-color-scheme: light)"));
-const dark = tokens(darkBlock);
-const light = { ...dark, ...tokens(lightBlock) };
+/** The body of the first rule that starts with `selector {`. */
+function block(selector: string): string {
+  const start = css.indexOf(`${selector} {`);
+  if (start < 0) throw new Error(`no rule ${selector}`);
+  return css.slice(start, css.indexOf("}", start));
+}
+
+const dark = tokens(block(":root"));
+const lightSystem = tokens(block(':root:not([data-theme="dark"])'));
+const lightChosen = tokens(block(':root[data-theme="light"]'));
 
 function lum(hex: string): number {
   const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
@@ -24,35 +30,70 @@ function ratio(a: string, b: string): number {
   return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
 }
 
+describe("token sets", () => {
+  it("the light theme is the same whether chosen or taken from the system", () => {
+    expect(lightSystem).toEqual(lightChosen);
+  });
+
+  it("both themes define the same colour tokens", () => {
+    expect(Object.keys(lightChosen).sort()).toEqual(Object.keys(dark).sort());
+  });
+});
+
 describe.each([
   ["dark", dark],
-  ["light", light],
+  ["light", lightChosen],
 ])("%s theme", (_name, t) => {
-  const surfaces = ["bg0", "bg1", "bg2"];
+  const need = (fg: string, bgs: string[], min: number) => {
+    for (const bg of bgs) {
+      expect(t[fg], fg).toBeDefined();
+      expect(t[bg], bg).toBeDefined();
+      expect(ratio(t[fg]!, t[bg]!), `${fg} on ${bg}`).toBeGreaterThanOrEqual(min);
+    }
+  };
 
-  it.each(["text", "muted", "accent"])("text colour %s reaches 4.5:1 on every surface", (fg) => {
-    for (const bg of surfaces) expect(ratio(t[fg]!, t[bg]!), `${fg} on ${bg}`).toBeGreaterThanOrEqual(4.5);
+  it("body text reaches 4.5:1 on every surface it is used on", () => {
+    need("text", ["win", "side", "box", "box-hover", "field", "sel", "err-bg"], 4.5);
+    need("muted", ["win", "side", "box", "field", "sel", "err-bg"], 4.5);
   });
 
-  // `faint` text sits on bg0/bg1 only; on bg2 it is used for disabled buttons,
-  // which WCAG 1.4.3 exempts.
-  it("faint text reaches 4.5:1 on the page and the list pane", () => {
-    for (const bg of ["bg0", "bg1"]) expect(ratio(t.faint!, t[bg]!), `faint on ${bg}`).toBeGreaterThanOrEqual(4.5);
+  // `faint` labels (table heads, group titles, fact labels) never sit on a
+  // selected row; on `box` it is the disabled-button text (exempt, but met).
+  it("faint text reaches 4.5:1 on the surfaces it is used on", () => {
+    need("faint", ["win", "side", "box"], 4.5);
   });
 
-  it("status colours used as text reach 4.5:1 on the page", () => {
-    for (const fg of ["bad", "warn", "ok", "pbs"]) expect(ratio(t[fg]!, t.bg0!), fg).toBeGreaterThanOrEqual(4.5);
+  it("links and the back control reach 4.5:1", () => {
+    need("accent-text", ["win", "side", "box"], 4.5);
   });
 
-  it("primary button text reaches 4.5:1", () => {
-    expect(ratio(t["on-accent"]!, t.accent!)).toBeGreaterThanOrEqual(4.5);
-    expect(ratio(t["on-accent"]!, t["accent-hover"]!)).toBeGreaterThanOrEqual(4.5);
+  it("status colours used as text reach 4.5:1", () => {
+    need("bad", ["win", "side", "box", "sel", "err-bg"], 4.5);
+    need("warn", ["win", "side", "sel"], 4.5);
+    need("ok", ["win", "box"], 4.5);
+    need("pbs", ["win", "side"], 4.5);
   });
 
-  it("non-text marks and field borders reach 3:1", () => {
-    expect(ratio(t.mark!, t.bg0!)).toBeGreaterThanOrEqual(3);
-    // Input fields sit on the page; their border marks the boundary (WCAG 1.4.11).
-    expect(ratio(t["field-border"]!, t.bg0!)).toBeGreaterThanOrEqual(3);
-    for (const s of ["ok", "warn", "bad", "pbs"]) expect(ratio(t[s]!, t.bg1!), s).toBeGreaterThanOrEqual(3);
+  it("text on filled marks and buttons reaches 4.5:1", () => {
+    need("on-accent", ["accent", "accent-hover"], 4.5);
+    need("on-tick", ["tick"], 4.5); // day number in a backed-up day
+    need("on-bad-fill", ["bad-fill"], 4.5); // day number in a failed day
+    need("on-pbs", ["pbs"], 4.5); // day number in a "server not reachable" day
+    need("on-warn", ["warn"], 4.5); // day number in a "backed up, incomplete" day
+  });
+
+  it("non-text marks, field borders and switches reach 3:1", () => {
+    need("tick", ["win", "side"], 3);
+    need("field-border", ["win", "box", "field"], 3);
+    need("bad-fill", ["win"], 3);
+    need("pbs", ["win", "side"], 3);
+    need("warn", ["win"], 3); // filled day mark: incomplete
+    need("bad", ["win"], 3); // ring around a day with a damaged backup
+    need("bad", ["side", "sel"], 3);
+    need("warn", ["side", "sel"], 3);
+    // A switch shows its state by the knob: white knob on the accent fill
+    // (on, checked above with 4.5:1) or the muted knob in a bordered field (off).
+    need("muted", ["field"], 3);
+    need("on-accent", ["accent"], 3);
   });
 });

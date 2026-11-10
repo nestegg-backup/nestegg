@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: nestegg local API
-  version: 0.2.0
+  version: 0.3.0
   summary: Local control API of the nestegg daemon.
   description: |
     Served by `nestegg daemon` on the Unix socket `/run/nestegg/api.sock`
@@ -25,6 +25,9 @@ info:
       browse and restore everything; other users (members of group
       `nestegg`) only paths inside their own home directory, and their
       restores are written with their own identity (files owned by them).
+      Every caller may change the settings offered by `PATCH /config`
+      (decision 0013); server, credentials, encryption and sources stay
+      terminal-only.
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
@@ -112,8 +115,12 @@ paths:
         "202":
           description: |
             Cancellation requested. The run normally ends with state
-            `cancelled`; if the client had already finished, the run
-            completes as `succeeded`.
+            `cancelled`, and its error message names the caller ("cancel
+            requested by alice (uid 1000)"); the daemon also logs it. If
+            the upload had already finished but the read-back check had
+            not, the run also ends as `cancelled` (the snapshot stays on
+            the server, unverified); after the check it completes as
+            `succeeded`.
           content:
             application/json:
               schema:
@@ -121,12 +128,16 @@ paths:
                 properties:
                   cancelling: { type: boolean }
         "404":
-          description: No running backup with this ID.
+          description: "`not_found`: no run with this ID exists (or it is not a valid run ID)."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
-          description: "`cannot_cancel`: still starting (retry) or already finishing."
+          description: |
+            `cannot_cancel`: the run exists but cannot be cancelled. Either it
+            is still starting and has not published its process yet (try
+            again in a moment), or it is already over (succeeded, failed,
+            cancelled). The message says which of the two.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -154,6 +165,26 @@ paths:
     post:
       operationId: checkPbs
       summary: Run the checks of `nestegg check` (configuration, client, secrets, sources, reachability, login).
+      description: |
+        Always answers 200 (or 409 while another check runs); problems are
+        items. An item is `passed`, `failed`, or `not_checked`. A check that
+        could not be made is never reported as passed: a server that does not
+        answer while Wake-on-LAN is configured and no wake was requested is
+        `not_checked` ("PBS reachable"), and so are the checks that need
+        the server ("PBS login and datastore access", "overview access").
+        With `wake=true` the server is woken first (this may take minutes);
+        if it still does not answer, "PBS reachable" is `failed`. Without
+        Wake-on-LAN, a server that does not answer is `failed`.
+
+        Only one check runs at a time: a request made while one is running is
+        refused with 409 `already_checking`; a check whose caller went away
+        still finishes, and counts as running until it has. There is also a
+        minimum interval between wake attempts: a wake asked for less than a
+        minute after a check that really sent a wake-up packet is skipped
+        (`wake_skipped: true`) and the check runs without sending another
+        wake-up burst. A check in which no packet was sent (the server
+        answered at once, Wake-on-LAN off or not configured, every send
+        failed) does not start that minute.
       parameters:
         - name: wake
           in: query
@@ -169,6 +200,9 @@ paths:
                 required: [checks, checked_at]
                 properties:
                   checked_at: { type: string, format: date-time }
+                  wake_skipped:
+                    type: boolean
+                    description: A wake was asked for but skipped because a wake-up packet was sent less than a minute ago (minimum interval between wake attempts).
                   checks:
                     type: array
                     items:
@@ -176,8 +210,25 @@ paths:
                       required: [name, ok, detail]
                       properties:
                         name: { type: string, examples: ["PBS reachable"] }
-                        ok: { type: boolean }
+                        status:
+                          type: string
+                          enum: [passed, failed, not_checked]
+                          description: |
+                            Absent in answers of older daemons, which knew
+                            only `ok`; treat `ok: true` as `passed` and
+                            `ok: false` as `failed` then.
+                        ok:
+                          type: boolean
+                          description: |
+                            `status == passed`. A check that was not made
+                            has `ok: false`, so a client that only knows
+                            `ok` shows it as a problem, never as fine.
                         detail: { type: string }
+        "409":
+          description: Another PBS check is already running (`already_checking`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
   /machines:
     get:
       operationId: listMachines
@@ -255,7 +306,10 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/DirEntry" }
         "403":
-          description: Outside the caller's home directory.
+          description: |
+            Outside the caller's home directory, or (for non-root callers) a
+            snapshot without backup metadata and without a local run record
+            (decision 0016).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -277,8 +331,10 @@ paths:
         `<target_dir>/<archive name without .pxar>/`; an archive may be
         listed only once. One restore at a time. For non-root callers the
         home directory is mapped onto the archive using the source paths
-        recorded in the snapshot's status report; snapshots without that
-        information can only be restored by root. Paths are matched
+        in the snapshot's metadata blob (`nestegg-meta.conf`) or, for
+        snapshots of older versions, in the local run record of that
+        snapshot; never the snapshot notes (decision 0016). Snapshots
+        with neither can only be restored by root (403 `forbidden`). Paths are matched
         literally (no globbing). Some problems (e.g. no matching files)
         only show up in the job's `error`.
       requestBody:
@@ -339,6 +395,70 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ConfigView" }
+    patch:
+      operationId: updateConfig
+      summary: Change the settings that may be changed from the web UI.
+      description: |
+        Partial update: only the fields present (and not `null`) change.
+        Allowed for every caller (members of group `nestegg` and root);
+        the daemon logs the caller and the change to its journal. Only the
+        touched keys of `/etc/nestegg/config.toml` are rewritten (comments
+        and layout stay); the result is validated before it atomically
+        replaces the file. Changes are serialised; a run in progress is not
+        affected (it read the configuration when it started), so they are
+        also accepted during a run. `automatic_backups` runs
+        `systemctl enable|disable --now nestegg-backup.timer` only when the
+        state differs; if that fails, the file change is undone and the
+        response is 500 `internal`. Server, datastore, namespace, auth id,
+        fingerprint, credentials, encryption and sources are rejected with
+        400: they can only be changed by root in the terminal
+        (decision 0013).
+        A change by a group member that lowers the protection (automatic
+        backups off, an exclude added, "overdue after" or the interval
+        raised, Wake-on-LAN off) is reported to the logged-in users and the
+        notification hook, naming who changed what (decision 0022); a change
+        by root is not.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SettingsChange" }
+            examples:
+              rhythm:
+                value: { interval_hours: 12, overdue_after_hours: 30 }
+              excludes:
+                value: { excludes: ["**/.cache", "**/node_modules", "*.iso"] }
+              switches:
+                value: { automatic_backups: false, wake_on_lan: true }
+      responses:
+        "200":
+          description: Saved; the new configuration (same as `GET /config`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigView" }
+        "400":
+          description: |
+            `bad_request`: a value is out of range or invalid, a field is
+            unknown or terminal-only, or Wake-on-LAN should be switched on
+            without a `[wake]` section; also for a body that is not valid
+            JSON or is sent without `Content-Type: application/json`.
+            Nothing was changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: The caller could not be identified.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: |
+            `internal`: the configuration file is missing or invalid, could
+            not be written, or the timer could not be switched (nothing was
+            changed).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 components:
   parameters:
     RunId:
@@ -354,7 +474,7 @@ components:
         code:
           type: string
           description: Stable identifier.
-          enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
+          enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, already_checking, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
         message: { type: string, description: Human-readable English text. }
     Health:
       type: object
@@ -380,9 +500,10 @@ components:
             server: { type: string, examples: ["pbs.example.com:8007"] }
             datastore: { type: string, examples: ["backups"] }
             namespace: { type: [string, "null"], examples: ["desktops"] }
-            reachable: { type: [boolean, "null"], description: Result of the last check; null if never checked. }
+            reachable: { type: [boolean, "null"], description: "Whether the server answered at the newest of the last backup run and the last `POST /pbs/check` (the check is remembered until the daemon restarts); null if never checked." }
             checked_at: { type: [string, "null"], format: date-time }
-            wake_on_lan: { type: boolean, description: Wake-on-LAN is configured. }
+            wake_on_lan: { type: boolean, description: "Wake-on-LAN is configured and switched on (`wake.enabled`)." }
+            credentials_stored: { type: [boolean, "null"], description: "The token secret (or password) is stored on this computer (`nestegg credentials set-password`). Null or absent: unknown." }
         schedule:
           type: object
           required: [enabled]
@@ -409,11 +530,17 @@ components:
             Summary for the dashboard.
             `ok` – last success within the overdue threshold;
             `running` – a run is in progress;
-            `overdue` – no success within the threshold;
+            `overdue` – no success within the threshold, or the time of the
+            last success lies more than five minutes in the future (the
+            clock was wrong when it was recorded; a backup is then due at
+            once and `schedule.next_run` is now);
             `failing` – the last run failed;
+            `incomplete` – the last backup succeeded, but it does not contain
+            everything the configuration asks for (see `last_success.incomplete`);
             `never` – no successful backup yet;
             `unconfigured` – setup not finished.
-          enum: [ok, running, overdue, failing, never, unconfigured]
+            `failing` and `overdue` take precedence over `incomplete`.
+          enum: [ok, running, overdue, failing, incomplete, never, unconfigured]
         overdue_after_hours: { type: integer, examples: [36] }
         encryption:
           type: object
@@ -421,16 +548,22 @@ components:
           properties:
             enabled: { type: boolean }
             key_fingerprint: { type: [string, "null"], description: Fingerprint of the encryption key (not secret). }
-            key_exported: { type: boolean, description: The user confirmed that the key was exported (paper key or file). }
+            key_exported: { type: boolean, description: The user proved with a copy of the key or the check code of the paper key that a copy exists outside this computer. }
+            key_present: { type: [boolean, "null"], description: "An encryption key is stored on this computer (`nestegg key create` or `key import`); it may still be unconfirmed. Null or absent: unknown." }
+        server_verify_failed:
+          type: array
+          description: Snapshots of this machine that the server's own verification marked as failed, as seen at the end of the last run. Empty or absent if none.
+          items: { type: string, examples: ["host/desktop/2026-11-08T21:30:12Z"] }
     Run:
       type: object
       required: [id, trigger, state, started_at]
       properties:
         id: { type: string }
-        trigger: { type: string, enum: [timer, manual, cli] }
+        trigger: { type: string, enum: [timer, manual, cli, unknown] }
         state:
           type: string
-          enum: [starting, waking_pbs, inventory, uploading, finishing, succeeded, failed, pbs_unreachable, cancelled]
+          description: "`unknown`: a value written by a newer version this one does not recognise (forward compatibility)."
+          enum: [starting, waking_pbs, inventory, uploading, finishing, succeeded, failed, pbs_unreachable, cancelled, unknown]
         started_at: { type: string, format: date-time }
         finished_at: { type: [string, "null"], format: date-time }
         duration_seconds: { type: [integer, "null"] }
@@ -450,6 +583,28 @@ components:
         warnings:
           type: array
           items: { type: string }
+        incomplete:
+          type: array
+          description: |
+            Why this backup does not contain everything the configuration
+            asks for (full system backup skipped, an optional source missing,
+            ...). Empty or absent for a complete backup. English text; every
+            entry is also in `warnings`.
+          items: { type: string }
+        verified:
+          type: boolean
+          description: The snapshot was read back from the server after the upload and matched. Absent in records of older versions.
+        transient:
+          type: boolean
+          description: |
+            Only on a failed run: the failure is a server-availability problem,
+            not a persistent fault (the server was unreachable or stopped
+            answering during the read-back, so the snapshot may exist but
+            nothing was proven). Reported as `verification_failed`, but, like
+            `pbs_unreachable`, it does not pause the automatic retries. Only
+            the first such failure in a row is transient; the next one
+            directly after it is an ordinary failure (decision 0015). Absent
+            (false) otherwise and in records of older versions.
         error:
           oneOf:
             - $ref: "#/components/schemas/RunError"
@@ -460,7 +615,8 @@ components:
       properties:
         kind:
           type: string
-          enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, cancelled, internal]
+          description: "`verification_failed`: the upload finished, but reading the snapshot back from the server failed or did not match. `already_running`: the run did not start because another backup run held the run lock (state `cancelled`). `internal` also covers a run lock that could not be taken although no backup was running (the message names the holders). `unknown`: a kind written by a newer version this one does not recognise (forward compatibility)."
+          enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, credentials_unreadable, verification_failed, cancelled, internal, unknown]
         message: { type: string }
     RunDetail:
       allOf:
@@ -546,6 +702,95 @@ components:
         interval_hours: { type: integer }
         encryption: { type: boolean }
         overdue_after_hours: { type: integer }
+        automatic_backups: { type: boolean, description: "`nestegg-backup.timer` is enabled." }
+        wake_on_lan: { type: boolean, description: Wake-on-LAN is configured and switched on. }
+        wake_on_lan_configured: { type: boolean, description: "A `[wake]` section with a MAC address exists; only then can `wake_on_lan` be switched on." }
+        editable:
+          type: array
+          description: Fields `PATCH /config` accepts for this configuration (`wake_on_lan` only when configured).
+          items: { type: string, enum: [interval_hours, overdue_after_hours, excludes, wake_on_lan, automatic_backups] }
+        limits: { $ref: "#/components/schemas/SettingsLimits" }
+    SettingsChange:
+      type: object
+      additionalProperties: false
+      description: Absent or `null` fields stay unchanged.
+      properties:
+        interval_hours:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 168
+          description: |
+            A backup runs when the last success is older than this (the timer
+            checks hourly; there is no time of day).
+        overdue_after_hours:
+          type: [integer, "null"]
+          minimum: 2
+          description: |
+            Must be greater than `interval_hours` (checked when either
+            changes). Through this API at most 168 h (7 days) or
+            `interval_hours` + 72 h, whichever is larger, evaluated against
+            the interval in effect after the same request (a weekly rhythm
+            may be overdue after up to 240 h); a longer time can only be set
+            as root in the file. A value above that cap is kept and can only
+            be lowered here (decision 0022). `limits.overdue_after_hours`
+            reports the numbers of this rule.
+        excludes:
+          type: [array, "null"]
+          description: |
+            The complete new list (replaces the old one; send the current
+            list with items added or removed). `proxmox-backup-client
+            --exclude` syntax. At most 200 patterns, each 1-256 bytes, no
+            control characters or invisible Unicode format characters, no
+            leading or trailing spaces, no duplicates, no leading `-`, no
+            pattern the backup client cannot parse (an unclosed `[`…`]` class, a
+            trailing `\`, `[a-]`), and no pattern that matches everything (`*`,
+            `**`, `/`, `/*`, `**/*`, ...). A change is refused when its whole new
+            list, evaluated with the backup client's own matcher inside each
+            archive it really produces (later patterns win), would leave out a
+            whole configured source, a whole home directory of a regular user
+            inside a source (or a parent directory of one), or (full system
+            backup) a whole top-level system directory that the old list did not
+            — whatever the spelling (`/alice`, `alice`, `**/alice`, `/[a-z]*`,
+            `/alice/[.a-zA-Z]*`, …); the message names the folder. To judge this
+            the daemon may read a folder's top-level entry names with the
+            requester's own permissions, never as root, so the answer never
+            reveals a name the requester could not list themselves. A folder the
+            old list already left out is kept (decision 0022).
+          maxItems: 200
+          items: { type: string, minLength: 1, maxLength: 256 }
+        wake_on_lan:
+          type: [boolean, "null"]
+          description: Sets `wake.enabled`; the MAC address is kept when switching off. `true` needs a `[wake]` section.
+        automatic_backups:
+          type: [boolean, "null"]
+          description: Enable or disable `nestegg-backup.timer` (`systemctl enable|disable --now`).
+    SettingsLimits:
+      type: object
+      properties:
+        interval_hours:
+          type: object
+          properties: { min: { type: integer }, max: { type: integer } }
+        overdue_after_hours:
+          type: object
+          description: |
+            `max` is the effective cap for the interval currently in the file:
+            `max(base, interval + per_interval_extra)`, and never below a larger
+            value root already set (which can then only be lowered through the
+            API; decision 0022). Both keys can change in one request, so the web
+            interface recomputes the cap from `base` and `per_interval_extra`
+            for the interval it is about to set (so a weekly rhythm can be
+            overdue after up to 10 days).
+          properties:
+            min: { type: integer }
+            max: { type: integer }
+            greater_than_interval: { type: boolean }
+            base: { type: integer, description: "Base cap in hours (168)." }
+            per_interval_extra: { type: integer, description: "Hours added on top of the interval (72)." }
+            file_minimum: { type: integer, description: "A larger value already in the file; the cap is never below it." }
+        excludes:
+          type: object
+          description: "`max_length` is a byte count (decision 0022)."
+          properties: { max_items: { type: integer }, max_length: { type: integer } }
     SessionInfo:
       type: object
       required: [user, home, uid, root]
@@ -587,7 +832,11 @@ components:
                 items: { type: string, format: date-time }
               size_bytes: { type: [integer, "null"] }
               report:
-                description: Status report from the notes of the last snapshot.
+                description: |
+                  Status report from the notes of the last snapshot. For
+                  display only: notes can be changed by anyone with write
+                  access to the backup group and are never used for
+                  permissions (decision 0016).
                 type: [object, "null"]
                 properties:
                   reported_at: { type: string, format: date-time }
@@ -601,3 +850,8 @@ components:
                   nestegg_version: { type: string }
                   uploaded_bytes: { type: [integer, "null"] }
                   duration_seconds: { type: integer }
+                  incomplete:
+                    type: array
+                    description: Why the backup is incomplete (decision 0015); empty or absent if complete.
+                    items: { type: string }
+                  verified: { type: boolean, description: The snapshot was read back after the upload. Absent in reports of older versions. }

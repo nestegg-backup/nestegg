@@ -1,0 +1,40 @@
+[Unit]
+Description=nestegg backup health check (tells users when backups fail or stop)
+Documentation=file:/usr/share/doc/nestegg/README.md
+After=network-online.target
+# This oneshot is started on demand - the hourly timer, after every backup
+# (OnSuccess=/OnFailure=) and right after a protection-reducing settings
+# change (decision 0022). Several of these can land within seconds, which is
+# normal, not a crash loop, so the default start rate limit must not trip.
+# The unit has no OnFailure= of its own, so it cannot loop. A flood of settings
+# changes cannot turn into a flood of expensive runs either: the daemon writes
+# each change to a small inbox, and a run that was started for a settings change
+# sleeps out a short quiet period before it takes the work lock, so systemd
+# coalesces the repeated `start --no-block` jobs into that one activating
+# instance (decision 0022, item 3) and one run then combines all pending
+# changes into a single message. So keeping the rate limit off is correct:
+# without it a burst of changes could trip the default 5-starts-in-10-s limit
+# and systemd would refuse to run the check, dropping the reports.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nestegg notify
+Nice=10
+# The command hook gets 60 s, every desktop user 15 s.
+TimeoutStartSec=5min
+
+# Sandboxing. This unit has to change to other users (to run their
+# notify-send on their session bus below /run/user) and starts the
+# administrator's hook command, which may need the network, a mail
+# submission program or any file on the system. So, as for the other units
+# (docs/decisions/0007-systemd-unit-sandboxing.md), no option may hide,
+# replace or lock paths or identities, and in addition none may restrict
+# networking or privilege gain: NoNewPrivileges=yes would switch off the
+# set-group-ID bit of mail programs such as Postfix's sendmail, and
+# PrivateNetwork or RestrictAddressFamilies would break a push-message hook.
+# crates/nestegg/tests/units.rs enforces this.
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=~CAP_SYS_MODULE
+SystemCallFilter=~@module

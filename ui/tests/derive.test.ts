@@ -5,11 +5,16 @@ import {
   intervalHours,
   isActive,
   machineKind,
+  machineSnapshotEvents,
   restorableArchives,
+  restoreOffer,
   runEvents,
   runStep,
   selfKind,
+  selfStrip,
+  serverBackups,
   serverContact,
+  snapshotEvents,
   sortMachines,
 } from "../src/lib/derive";
 import { createFormatter } from "../src/lib/format";
@@ -195,6 +200,7 @@ describe("serverContact", () => {
     // Checked before the PBS is contacted, or anywhere: no evidence.
     expect(serverContact(failed("source_missing"))).toBe("unknown");
     expect(serverContact(failed("config"))).toBe("unknown");
+    expect(serverContact(failed("credentials_unreadable"))).toBe("unknown");
     expect(serverContact(failed("already_running"))).toBe("unknown");
     expect(serverContact(failed("internal"))).toBe("unknown");
     expect(serverContact(run("x", "failed"))).toBe("unknown");
@@ -213,5 +219,69 @@ describe("misc", () => {
   it("lists restorable archives", () => {
     expect(restorableArchives(["home.pxar.didx", "etc.pxar.didx", "index.json.blob", "client.log.blob"])).toEqual(["home.pxar", "etc.pxar"]);
     expect(restorableArchives(undefined)).toEqual([]);
+  });
+});
+
+describe("restore entry and backups on the server", () => {
+  const snaps = (state: "idle" | "loading" | "ok" | "error", times: string[] = []) => ({ state, list: times.map((time) => ({ time })) });
+
+  it("offers restore whenever the PC is set up, independent of the local history", () => {
+    for (const kind of ["never", "ok", "failing", "overdue", "key_missing"] as const) {
+      expect(restoreOffer(kind, snaps("idle"))).toBe("show");
+      expect(restoreOffer(kind, snaps("loading"))).toBe("show");
+      // A failed list is no proof that nothing is there; the restore flow shows the error.
+      expect(restoreOffer(kind, snaps("error"))).toBe("show");
+      expect(restoreOffer(kind, snaps("ok", ["2026-11-01T00:40:00Z"]))).toBe("show");
+      expect(restoreOffer(kind, snaps("ok"))).toBe("empty");
+    }
+    expect(restoreOffer("unconfigured", snaps("ok", ["2026-11-01T00:40:00Z"]))).toBe("none");
+  });
+
+  it("marks days with a snapshot on the server as backed up, also without local runs", () => {
+    const cells = dayStrip(snapshotEvents([{ time: "2026-11-07T00:40:00Z" }, { time: "2026-10-01T00:40:00Z" }]), now, f);
+    expect(cells.filter((c) => c.kind === "ok").map((c) => c.key)).toEqual(["2026-11-07"]);
+  });
+
+  it("summarises only a loaded list", () => {
+    expect(serverBackups(snaps("loading", ["2026-11-01T00:40:00Z"]))).toBeNull();
+    expect(serverBackups(snaps("error"))).toBeNull();
+    expect(serverBackups(snaps("ok"))).toEqual({ count: 0, latest: null, damaged: 0 });
+    expect(serverBackups(snaps("ok", ["2026-10-01T00:40:00Z", "2026-11-01T00:40:00Z"]))).toEqual({ count: 2, latest: "2026-11-01T00:40:00Z", damaged: 0 });
+  });
+});
+
+describe("mini strips", () => {
+  it("other PCs show snapshot days only, never a failure from a report", () => {
+    const m: Machine = {
+      backup_id: "media",
+      last_snapshot: "2026-11-07T00:50:00Z",
+      recent_snapshots: ["2026-11-06T00:50:00Z"],
+      report: { reported_at: "2026-11-08T00:36:00Z", result: "failed", run_started_at: "2026-11-08T00:31:00Z" },
+    };
+    const events = machineSnapshotEvents(m);
+    expect(events.map((e) => e.kind)).toEqual(["ok", "ok"]);
+    const cells = dayStrip(events, now, f);
+    expect(cells).toHaveLength(14);
+    expect(cells.filter((c) => c.kind === "ok").map((c) => c.key)).toEqual(["2026-11-06", "2026-11-07"]);
+    expect(cells.at(-1)).toMatchObject({ key: "2026-11-08", kind: "none", today: true });
+  });
+
+  it("an empty answer draws no backed-up day", () => {
+    expect(dayStrip(machineSnapshotEvents({ backup_id: "x" }), now, f).every((c) => c.kind === "none")).toBe(true);
+  });
+
+  it("this PC uses its run history plus the snapshots on the server", () => {
+    const cells = selfStrip(
+      [run("2026-11-08T00:31:00Z", "failed"), run("2026-11-07T00:31:00Z", "pbs_unreachable")],
+      null,
+      [{ time: "2026-11-01T00:40:00Z" }],
+      now,
+      f,
+    );
+    const kind = (key: string) => cells.find((c) => c.key === key)?.kind;
+    expect(kind("2026-11-08")).toBe("fail");
+    expect(kind("2026-11-07")).toBe("pbs");
+    expect(kind("2026-11-01")).toBe("ok");
+    expect(kind("2026-11-02")).toBe("none");
   });
 });
