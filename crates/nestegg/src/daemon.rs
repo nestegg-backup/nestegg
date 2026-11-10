@@ -138,12 +138,17 @@ impl MetadataCache {
 #[derive(Clone, Debug)]
 pub struct Peer {
     pub uid: Option<u32>,
+    /// Primary gid, from the same peer credentials; the settings exclude guard
+    /// reads folders as this uid/gid (decision 0022).
+    pub gid: Option<u32>,
 }
 
 impl Connected<axum::serve::IncomingStream<'_, tokio::net::UnixListener>> for Peer {
     fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
+        let cred = stream.io().peer_cred().ok();
         Peer {
-            uid: stream.io().peer_cred().ok().map(|c| c.uid()),
+            uid: cred.as_ref().map(|c| c.uid()),
+            gid: cred.as_ref().map(|c| c.gid()),
         }
     }
 }
@@ -486,6 +491,14 @@ async fn update_config(
         .as_ref()
         .and_then(|Extension(ConnectInfo(p))| p.uid)
         .ok_or_else(|| forbidden("unknown caller"))?;
+    // The exclude guard reads a folder's real entries with the requester's own
+    // identity (uid + primary gid of the socket), never as root, so its answer
+    // never reveals a name the requester could not list themselves. If the gid
+    // is not known no folder is read (decision 0022).
+    let identity = peer
+        .as_ref()
+        .and_then(|Extension(ConnectInfo(p))| p.gid)
+        .map(|gid| crate::settings::PeerIdentity { uid, gid });
     let user_name = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
         Ok(Some(user)) => user.name,
         _ => format!("uid {uid}"),
@@ -527,7 +540,7 @@ async fn update_config(
         let timer = crate::settings::SystemdTimer {
             systemctl: &app.paths.systemctl,
         };
-        match crate::settings::update(&app.paths.config_file, &patch, &timer) {
+        match crate::settings::update(&app.paths.config_file, &patch, &timer, identity) {
             Ok(outcome) => {
                 // The change took effect: complete the intent with the real
                 // reductions (or drop it when nothing was lowered). Best effort
@@ -1531,8 +1544,10 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         if let Some(uid) = uid {
-            req.extensions_mut()
-                .insert(ConnectInfo(Peer { uid: Some(uid) }));
+            req.extensions_mut().insert(ConnectInfo(Peer {
+                uid: Some(uid),
+                gid: Some(nix::unistd::getgid().as_raw()),
+            }));
         }
         req
     }

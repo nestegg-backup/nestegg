@@ -739,11 +739,14 @@ components:
             list, evaluated with the backup client's own matcher inside each
             archive it really produces (later patterns win), would leave out a
             whole configured source, a whole home directory of a regular user
-            inside a source, or (full system backup) a whole top-level system
-            directory that the old list did not — whatever the spelling
-            (`/alice`, `alice`, `**/alice`, `/[a-z]*`, `/alice/[.a-zA-Z]*`, …);
-            the message names the folder. A folder the old list already left out
-            is kept (decision 0022).
+            inside a source (or a parent directory of one), or (full system
+            backup) a whole top-level system directory that the old list did not
+            — whatever the spelling (`/alice`, `alice`, `**/alice`, `/[a-z]*`,
+            `/alice/[.a-zA-Z]*`, …); the message names the folder. To judge this
+            the daemon may read a folder's top-level entry names with the
+            requester's own permissions, never as root, so the answer never
+            reveals a name the requester could not list themselves. A folder the
+            old list already left out is kept (decision 0022).
           maxItems: 200
           items: { type: string, minLength: 1, maxLength: 256 }
         wake_on_lan:

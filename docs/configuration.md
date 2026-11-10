@@ -253,7 +253,7 @@ The daemon identifies the caller by the socket credentials:
   |---|---|---|
   | Backup rhythm | `schedule.interval_hours` | 1 to 168 hours |
   | "Overdue" after | `overdue_after_hours` | 2 hours up to `max(168, interval + 72)` hours, and more than the rhythm (so a weekly rhythm can be overdue after up to 10 days) |
-  | Excludes | `backup.excludes` | up to 200 patterns of at most 256 bytes each, each one the backup client can parse; none that excludes everything (`*`, `**`, `/`, ...) and no change whose list, as the client applies it (matched inside each archive, later patterns win), would leave out a whole source, a whole user home directory, or (in system mode) a whole top-level system directory |
+  | Excludes | `backup.excludes` | up to 200 patterns of at most 256 bytes each, each one the backup client can parse; none that excludes everything (`*`, `**`, `/`, ...) and no change whose list, as the client applies it (matched inside each archive, later patterns win), would leave out a whole source, a whole user home directory (or a parent directory of one), or (in system mode) a whole top-level system directory |
   | Wake-on-LAN on/off | `wake.enabled` | only with a `[wake]` section; switching off keeps the MAC |
   | Automatic backups on/off | `nestegg-backup.timer` | `systemctl enable/disable --now` |
 
@@ -269,7 +269,11 @@ The daemon identifies the caller by the socket credentials:
   ([decision 0022](decisions/0022-settings-changes-that-reduce-protection.md)).
   The exclude guard is a guard against accidents and casual misuse, not a
   security boundary: a group member can still narrow the backup folder by
-  folder, which is reported, named, to the owner. nestegg matches patterns with
+  folder, which is reported, named, to the owner. To judge whether a list
+  empties a folder the daemon may read that folder's top-level entry names, and
+  it does so with the requesting user's own permissions, never as root, so the
+  guard's answer never reveals a name the requester could not list themselves.
+  nestegg matches patterns with
   the same `pathpatterns` library the backup client uses (an older release of
   the same code), so a pattern that the client cannot parse — an unclosed
   `[`…`]` class, a trailing `\` — is refused here with a plain message instead

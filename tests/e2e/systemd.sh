@@ -334,6 +334,44 @@ check "config.toml still 0640 root:nestegg after the change" bash -c "[[ \$(dock
 patch_config as_alice '{"automatic_backups":true}' >/dev/null
 check "automatic backups on again" on_client systemctl is-enabled --quiet nestegg-backup.timer
 
+echo "-- the exclude guard reads folders as the requester, not as root (decision 0022)"
+# The daemon runs as root and could read every home directory, but the guard
+# must read a folder's entries only with the identity of the user who asked, so
+# its answer cannot reveal a name a group member could not list themselves.
+# bob is a regular user but not in group nestegg; make his home private (0700)
+# with one known entry. /root is root's private home and behaves the same way.
+on_client bash -c 'chmod 700 /home/bob && echo secret > /home/bob/private-file && chown -R bob: /home/bob'
+check "bob's home is private (0700)" bash -c "[[ \$(docker exec $client stat -c '%a %U' /home/bob) == '700 bob' ]]"
+check "alice cannot list bob's home" bash -c "! docker exec -u alice $client ls /home/bob >/dev/null 2>&1"
+# alice (a group member) re-includes an existing name and a missing name in
+# bob's home. She cannot list it, so the guard falls back to computation and
+# gives the SAME answer (status and text) for both: nothing leaks.
+hit="$(patch_config as_alice '{"excludes":["/bob/*","!/bob/private-file"]}')"
+miss="$(patch_config as_alice '{"excludes":["/bob/*","!/bob/does-not-exist"]}')"
+check "probing another user's private home is refused" test "$(tail -1 <<<"$hit")" = 400
+check "the refusal names bob's home, not its contents" contains "$hit" '/home/bob'
+check "an existing and a missing name in it get the identical answer" test "$hit" = "$miss"
+# For alice's OWN home the precise judgement still works: she can list it, so a
+# re-included real entry is kept (accepted) while a re-included missing one is
+# refused. The two answers differ, which proves her home was really read.
+keep="$(patch_config as_alice '{"excludes":["/alice/*","!/alice/notes.txt"]}')"
+check "a real entry re-included in the own home is accepted" test "$(tail -1 <<<"$keep")" = 200
+on_client bash -c "cat /root/config.good > $cfg"
+drop="$(patch_config as_alice '{"excludes":["/alice/*","!/alice/not-there"]}')"
+check "a missing entry re-included in the own home is refused" test "$(tail -1 <<<"$drop")" = 400
+check "so the two own-home answers differ" bash -c "[[ \"\$(tail -1 <<<'$keep')\" != \"\$(tail -1 <<<'$drop')\" ]]"
+# Undo the accepted change so the rest of the run starts from the good config.
+on_client bash -c "cat /root/config.good > $cfg"
+# The accepted change above is a reported reduction: it starts a health check
+# with a short quiet period. Wait for that check to finish and clear the
+# settings inbox, so it cannot overlap the failing-hook test further below.
+sleep 2
+for _ in $(seq 1 40); do
+  [[ "$(on_client systemctl is-active nestegg-notify.service 2>/dev/null || true)" == inactive ]] && break
+  sleep 1
+done
+on_client rm -f /var/lib/nestegg/notify-settings.json
+
 echo "-- a group member cannot take the daemon's lock files (decision 0022, item 2)"
 # The lock files only root processes need are 0600 root, so a group member
 # cannot open them (and so cannot hold a shared flock that would block the

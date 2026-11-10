@@ -85,22 +85,46 @@ thus reported calmly (weekly), but from the start, not only after weeks.
     there; a source that keeps its own archive (a data disk that must be its own
     mount) is tested separately.
 
-  "Would empty the folder" means the list excludes the folder entry itself, or
-  excludes every child. The children are the folder's **real top-level entry
-  names** (read as root, names only, at most 4096 of them in the order the file
-  system lists them, with a time limit of two seconds so a dead network file
-  system cannot hang the request): when every one of them is left out, the
-  folder is emptied. For a folder with more entries the first 4096 decide, so
-  such a list can be refused although a later entry would stay; that errs on
-  the side of the guard. Only when the real
-  names are not known (the folder is empty, cannot be read or does not answer
-  in time) are made-up names used instead, one per kind of first character
-  (digit, upper and lower case letter, underscore, dot, non-ASCII), and the
-  folder counts as emptied when the list leaves out all of them. A change is
-  refused
-  only when the **new** list would empty a folder that the **old** list did not,
-  so a dangerous pattern root already put in the file is grandfathered and a
-  plain reorder is refused only when it changes the outcome.
+  "Would empty the folder" means the list excludes the folder entry itself,
+  excludes any **ancestor directory** of it inside the archive (a pattern that
+  takes out a parent — `/var/home` above the home `/var/home/alice` — takes out
+  everything below it), or excludes **every child**. The folder-entry and the
+  ancestor tests are pure computation. The children are the folder's **real
+  top-level entry names**, and here is the one place the guard looks at the file
+  system. It reads them **with the identity of the user who sent the request**,
+  never as root: the peer credentials of the socket connection (uid and primary
+  gid, no supplementary groups), in a child process dropped to that identity
+  with a time limit, so what the requester could not list themselves counts as
+  "entries unknown". The guard's answer therefore never depends on a name the
+  requester cannot see anyway — a group member cannot learn from it which files
+  exist in another user's `0700` home directory or in `/root`. The read is
+  bounded: names only, at most 4096 of them, a two-second limit after which the
+  child is killed and reaped without blocking the request (which holds the
+  settings lock), and no more than a fixed number of such reads at once — a
+  further read while that bound is reached counts the folder as unknown rather
+  than waiting, so a reader hung on a dead file system cannot make requests pile
+  up readers without end. The child runs a standard tool (`find`, part of the
+  required `findutils` package on Debian/Ubuntu), not nestegg code; a missing
+  tool is handled as "unknown". For a folder with more than 4096 entries the
+  first 4096 decide, so such a list can be refused although a later entry would
+  stay; that errs on the side of the guard. When the real names are not known
+  (the folder is empty, the requester cannot read it, it does not answer in
+  time, or the requester is not known on the code path) made-up names are used
+  instead, one per kind of first character (digit, upper and lower case letter,
+  underscore, dot, non-ASCII), and the folder counts as emptied when the list
+  leaves out all of them. A change is refused only when the **new** list would
+  empty a folder that the **old** list did not, so a dangerous pattern root
+  already put in the file is grandfathered and a plain reorder is refused only
+  when it changes the outcome.
+
+  The folder guard is the **last** validation step. Everything that can refuse a
+  request for another reason — a value out of range, an invalid pattern,
+  Wake-on-LAN without a `[wake]` section — is checked before any folder is read.
+  A refusal for another reason therefore never depends on folder contents, so it
+  cannot be combined with the folder read to probe for names while leaving no
+  trace (the earlier order read the folder first, then refused for the other
+  reason, which told the requester whether a name existed without writing or
+  reporting anything).
 
   A pattern the matcher cannot parse is refused up front with a plain message:
   an unclosed `[`…`]` character class, a trailing `\`, a malformed range
@@ -198,7 +222,12 @@ the value as root in `/etc/nestegg/config.toml`.
   checks that the hook gets the `settings` event with the user's name without
   waiting for the hourly timer, that the `automatic_off` condition follows, that
   an exclude of a whole source is refused with the plain message, and that a
-  group member cannot open the daemon's lock files.
+  group member cannot open the daemon's lock files. It also proves the folder
+  guard reads as the requester: a member's exclude that re-includes a name in
+  another user's `0700` home directory gets the **same** answer (status and
+  text) whether that name exists or not, while for the member's own home the
+  precise judgement still works (a re-included real entry is accepted, a
+  re-included missing one refused).
 
 ### What this does and does not guarantee (the limits, plainly)
 
@@ -253,3 +282,17 @@ the value as root in `/etc/nestegg/config.toml`.
   files are `0600`; `postinst` also tightens a group-writable or wrongly owned
   file and falls back to `0600` without the group; and `nestegg init` writes the
   file atomically with its final mode and refuses a symlink.
+- **Third review (2026-11-10).** The folder guard no longer reads entry names as
+  root: it reads them with the requester's own identity (uid and primary gid of
+  the socket, no supplementary groups) in a child process with a time limit and
+  a bound on how many such reads run at once, so its answer can no longer reveal
+  a name in another user's `0700` home directory or in `/root` (a group member
+  could otherwise tell an existing name from a missing one by whether a
+  `!`-re-include change was accepted). The guard became the **last** validation
+  step, so a refusal for another reason (for example Wake-on-LAN without a
+  `[wake]` section) never reads a folder and so cannot be used to probe without
+  a trace. An **excluded ancestor directory** of a protected folder now counts
+  as emptying it (a parent such as `/var/home` above `/var/home/alice`), which
+  the earlier version missed. The old in-thread read with a timeout, which left
+  a thread hanging on a dead file system and added one per further request, is
+  replaced by the bounded child-process reader.

@@ -11,12 +11,14 @@
 //! [`Config::parse`] before it atomically replaces the file.
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::ops::RangeInclusive;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use pathpatterns::{MatchEntry, MatchType, PatternFlag};
@@ -300,11 +302,33 @@ pub fn limits_json(current: &Config) -> serde_json::Value {
 
 /// Check a change against the current configuration. `home_dirs` are the home
 /// directories of regular users, from the account database, used to refuse an
-/// exclude that would drop a whole home directory (decision 0022).
+/// exclude that would drop a whole home directory (decision 0022). `identity`
+/// is the requester (peer credentials of the socket): the folder guard reads a
+/// folder's real entries only with that identity, in a child process dropped
+/// to it, never as root, so its answer never depends on a name the requester
+/// could not list themselves. `None` (the requester is unknown on this path)
+/// reads nothing and judges by computation alone.
 pub fn validate(
     patch: &SettingsPatch,
     current: &Config,
     home_dirs: &[PathBuf],
+    identity: Option<PeerIdentity>,
+) -> Result<(), SettingsError> {
+    let reader: Box<FolderReader> = match identity {
+        Some(id) => Box::new(move |folder: &Path| real_children(folder, id)),
+        None => Box::new(|_: &Path| Vec::new()),
+    };
+    validate_with_reader(patch, current, home_dirs, reader.as_ref())
+}
+
+/// The body of [`validate`] with the folder reader injected, so tests can
+/// supply the real top-level entries of a folder (or a reader that panics, to
+/// prove it is never called when the request is refused for another reason).
+fn validate_with_reader(
+    patch: &SettingsPatch,
+    current: &Config,
+    home_dirs: &[PathBuf],
+    read_children: &FolderReader,
 ) -> Result<(), SettingsError> {
     if let Some(h) = patch.interval_hours
         && !INTERVAL_HOURS.contains(&h)
@@ -358,25 +382,10 @@ pub fn validate(
             )));
         }
     }
+    // Pattern validity is content-independent, so it is checked here with the
+    // other refusals. The content-dependent folder guard runs last (below).
     if let Some(list) = &patch.excludes {
         validate_excludes(list).map_err(invalid)?;
-        // The whole new list is judged as the client applies it: a change that
-        // would leave out a whole configured source, a whole home directory of
-        // a regular user, or (in system mode) a whole top-level system
-        // directory is refused, unless the old list already left it out (root
-        // may have put the pattern there). Judging the list as a whole catches
-        // character-class and several-patterns bypasses and reordering too
-        // (decision 0022, items 5, 9).
-        if let Some(why) = excludes_reduce_protection(
-            &current.backup.excludes,
-            list,
-            &current.backup.sources,
-            home_dirs,
-            current.backup.system,
-            &real_children,
-        ) {
-            return Err(invalid(why));
-        }
     }
     if patch.wake_on_lan == Some(true) && current.wake.is_none() {
         return Err(invalid(
@@ -384,6 +393,31 @@ pub fn validate(
              MAC address of the backup server. Add it in the terminal (see \
              docs/configuration.md), then switch it on here.",
         ));
+    }
+    // The folder guard is the LAST validation step: it is the only check whose
+    // answer can depend on a folder's real contents, so everything that can
+    // refuse a request for another reason is checked before any folder is read.
+    // A refusal for another reason therefore never reveals anything about the
+    // folders, and the only read that happens is for a request that is
+    // otherwise acceptable (decision 0022).
+    //
+    // The whole new list is judged as the client applies it: a change that
+    // would leave out a whole configured source, a whole home directory of a
+    // regular user, or (in system mode) a whole top-level system directory is
+    // refused, unless the old list already left it out (root may have put the
+    // pattern there). Judging the list as a whole catches character-class and
+    // several-patterns bypasses and reordering too (decision 0022, items 5, 9).
+    if let Some(list) = &patch.excludes
+        && let Some(why) = excludes_reduce_protection(
+            &current.backup.excludes,
+            list,
+            &current.backup.sources,
+            home_dirs,
+            current.backup.system,
+            read_children,
+        )
+    {
+        return Err(invalid(why));
     }
     Ok(())
 }
@@ -600,6 +634,29 @@ const PROBES_MORE: [&str; 4] = [
 const MAX_PROBE_ENTRIES: usize = 4096;
 /// Reading the names must not hang the request on a dead network file system.
 const PROBE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// At most this many folder reads (child processes) may run at once. A read
+/// requested while the cap is reached is not started: the folder counts as
+/// unknown and the guard falls back to computation, so a reader hung on a dead
+/// file system cannot make further requests pile up readers without bound
+/// (decision 0022).
+const MAX_READS_IN_FLIGHT: usize = 16;
+static READS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// The identity the daemon reads a protected folder's entries with: the peer
+/// credentials of the socket connection — the requester's uid and primary gid.
+/// The read runs in a child process dropped to this identity with no
+/// supplementary groups, so the guard only ever sees what the requester could
+/// list themselves and its answer never reveals a name in another user's home
+/// directory or in `/root` (decision 0022).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerIdentity {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Returns a folder's real top-level entries (name, whether a directory).
+/// Injected so tests can supply entries or a reader that must not be called.
+type FolderReader = dyn Fn(&Path) -> Vec<(String, bool)>;
 
 /// The final match decision of the whole exclude list for one archive-relative
 /// path, exactly as the client applies it: the *last* entry whose pattern
@@ -630,9 +687,16 @@ fn list_empties_folder(
         return false;
     };
     let dir = nix::libc::S_IFDIR;
-    // The folder entry itself (not meaningful for the archive root "/").
-    if rel != "/" && list_excludes_path(entries, &rel, dir) {
-        return true;
+    // The folder is left out when any ancestor directory of it inside the
+    // archive — from the first path component down to the folder itself — is
+    // excluded: a pattern that takes out a parent (`/var/home` above the home
+    // `/var/home/alice`) takes out everything below it. Pure computation; the
+    // archive root "/" itself cannot be named here (a pattern that empties it
+    // is refused earlier as "excludes everything"). (decision 0022, item 3.)
+    for ancestor in ancestor_dirs(&rel) {
+        if list_excludes_path(entries, &ancestor, dir) {
+            return true;
+        }
     }
     let base = if rel == "/" { "" } else { rel.as_str() };
     let probe = |name: &str| list_excludes_path(entries, &format!("{base}/{name}"), dir);
@@ -655,6 +719,20 @@ fn list_empties_folder(
         };
         list_excludes_path(entries, &format!("{base}/{name}"), mode)
     })
+}
+
+/// Every ancestor directory path of `rel` inside the archive, from the first
+/// path component down to `rel` itself (archive-relative, each with a leading
+/// slash). Empty for the archive root "/".
+fn ancestor_dirs(rel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for part in rel.split('/').filter(|p| !p.is_empty()) {
+        cur.push('/');
+        cur.push_str(part);
+        out.push(cur.clone());
+    }
+    out
 }
 
 /// The path of `folder` inside an archive rooted at `root`, with a leading
@@ -731,42 +809,179 @@ fn protected_folders(
     out
 }
 
-/// Real top-level entry names (and whether each is a directory) of `folder`:
-/// at most [`MAX_PROBE_ENTRIES`], in the order the file system lists them, and
-/// only the names, never the contents. A folder that cannot be read, is empty
-/// or does not answer in time yields an empty list; the guard then falls back
-/// to the made-up names (decision 0022).
-fn real_children(folder: &Path) -> Vec<(String, bool)> {
-    // In a helper thread with a time limit: a home directory on a network
-    // file system that does not answer must not hang the request (which
-    // holds the settings lock). On a timeout the entries count as unknown;
-    // the thread ends by itself when the file system answers.
-    let folder = folder.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(read_children(&folder, MAX_PROBE_ENTRIES));
-    });
-    rx.recv_timeout(PROBE_READ_TIMEOUT).unwrap_or_default()
+/// Caps the number of concurrent folder reads (see [`MAX_READS_IN_FLIGHT`]).
+/// The slot is released only when the owning child is fully reaped (`Drop`),
+/// so a reader hung on a dead file system keeps its slot until the kernel
+/// finally lets it die — exactly the pile-up the bound protects against.
+struct InFlightGuard;
+
+impl InFlightGuard {
+    /// A slot, or `None` when [`MAX_READS_IN_FLIGHT`] is already reached.
+    fn acquire() -> Option<InFlightGuard> {
+        let mut cur = READS_IN_FLIGHT.load(Ordering::Relaxed);
+        loop {
+            if cur >= MAX_READS_IN_FLIGHT {
+                return None;
+            }
+            match READS_IN_FLIGHT.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(InFlightGuard),
+                Err(now) => cur = now,
+            }
+        }
+    }
 }
 
-/// The first `max` top-level entries of `folder` (name, is a directory).
-/// Unreadable folder: empty. Names that are not valid UTF-8 are skipped.
-fn read_children(folder: &Path, max: usize) -> Vec<(String, bool)> {
-    let Ok(rd) = fs::read_dir(folder) else {
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        READS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Real top-level entry names (and whether each is a directory) of `folder`,
+/// read with the requester's own identity and never as root, so the guard only
+/// ever sees names the requester could list themselves (decision 0022). The
+/// read runs in a child process (`find`) dropped to `identity`. A folder the
+/// requester cannot list, an empty one, a read that does not finish within
+/// [`PROBE_READ_TIMEOUT`], a missing `find`, or more than
+/// [`MAX_READS_IN_FLIGHT`] reads already in flight all yield an empty list;
+/// the guard then falls back to the made-up names. At most
+/// [`MAX_PROBE_ENTRIES`] names are read, only the names, never the contents.
+fn real_children(folder: &Path, identity: PeerIdentity) -> Vec<(String, bool)> {
+    let Some(guard) = InFlightGuard::acquire() else {
         return Vec::new();
     };
-    let mut out: Vec<(String, bool)> = Vec::new();
-    for entry in rd.flatten() {
-        if out.len() >= max {
-            // Judged by what was read: a list that leaves out all of these
-            // is refused, which errs on the side of the guard.
-            break;
+    match spawn_find(folder, identity) {
+        Ok(child) => collect_with_timeout(child, guard),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Start `find` listing the top-level entries of `folder` as `identity`. When
+/// the daemon runs as root it drops the child to `identity`'s uid and primary
+/// gid and clears the supplementary groups (as `std::process::Command` does
+/// when a uid/gid is set as root), so the child sees exactly what the requester
+/// would. When the process is not root it can only read as itself: the read is
+/// started only when `identity` is the current user, otherwise it is refused
+/// (the caller then treats the folder as unknown). The child runs no nestegg
+/// code; `find` is part of the required `findutils` package on Debian/Ubuntu,
+/// and a missing one is handled as "unknown".
+fn spawn_find(folder: &Path, identity: PeerIdentity) -> std::io::Result<std::process::Child> {
+    let mut cmd = Command::new("find");
+    // Only the direct children, printed as `<type><name>\0`: the type is one
+    // byte (`d` for a directory) and the NUL separates records, so a name with
+    // spaces or newlines cannot confuse the parse.
+    cmd.arg(folder)
+        .args(["-maxdepth", "1", "-mindepth", "1", "-printf", "%y%f\\0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if nix::unistd::geteuid().is_root() {
+        let (uid, gid) = (identity.uid, identity.gid);
+        // Drop to the requester before `exec`, in the forked child: clear the
+        // supplementary groups, then the gid, then the uid (order matters — once
+        // the uid is dropped the group changes are no longer permitted). Only
+        // async-signal-safe syscalls run here. `std::os::unix`'s own `groups`
+        // helper is still unstable, so the drop is done by hand.
+        unsafe {
+            cmd.pre_exec(move || {
+                if nix::libc::setgroups(0, std::ptr::null()) != 0
+                    || nix::libc::setgid(gid as nix::libc::gid_t) != 0
+                    || nix::libc::setuid(uid as nix::libc::uid_t) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        out.push((name, is_dir));
+    } else if identity.uid != nix::unistd::geteuid().as_raw()
+        || identity.gid != nix::unistd::getegid().as_raw()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot read a folder as another user without root",
+        ));
+    }
+    cmd.spawn()
+}
+
+/// Read a spawned `find`'s output with a time limit. On time-out the child is
+/// killed and reaped on a detached thread, so a reader hung on a dead file
+/// system neither blocks the request (which holds the settings lock) nor leaks
+/// a thread; the in-flight slot (`guard`) is released only once the child is
+/// finally reaped, so the bound keeps such stuck reads from piling up.
+fn collect_with_timeout(
+    mut child: std::process::Child,
+    guard: InFlightGuard,
+) -> Vec<(String, bool)> {
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let _ = tx.send(parse_find_output(BufReader::new(stdout)));
+    });
+    match rx.recv_timeout(PROBE_READ_TIMEOUT) {
+        Ok(entries) => {
+            // The reader hit EOF or the entry bound: the child is done or will
+            // get EPIPE on its next write; reap it so no zombie is left.
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            drop(guard);
+            entries
+        }
+        Err(_) => {
+            // Timed out: kill now, reap in the background so the request is not
+            // slowed down by a child stuck on a dead file system.
+            let _ = child.kill();
+            std::thread::spawn(move || {
+                let _ = reader.join();
+                let _ = child.wait();
+                drop(guard);
+            });
+            Vec::new()
+        }
+    }
+}
+
+/// Parse `find … -printf '%y%f\0'`: one NUL-terminated record per entry, the
+/// first byte the type (`d` for a directory) and the rest the name. At most
+/// [`MAX_PROBE_ENTRIES`] entries and a bounded number of bytes are read, so a
+/// folder with very many or very long names cannot grow the daemon's memory;
+/// names that are not valid UTF-8 are skipped.
+fn parse_find_output(mut reader: impl BufRead) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut rec: Vec<u8> = Vec::new();
+    let mut total: usize = 0;
+    let max_bytes = MAX_PROBE_ENTRIES.saturating_mul(MAX_EXCLUDE_LEN.max(512));
+    while out.len() < MAX_PROBE_ENTRIES {
+        rec.clear();
+        match reader.read_until(0, &mut rec) {
+            Ok(0) => break,
+            Ok(n) => {
+                total = total.saturating_add(n);
+                if total > max_bytes {
+                    break;
+                }
+                if rec.last() == Some(&0) {
+                    rec.pop();
+                }
+                let Some((&kind, name)) = rec.split_first() else {
+                    continue;
+                };
+                if let Ok(name) = std::str::from_utf8(name) {
+                    out.push((name.to_string(), kind == b'd'));
+                }
+            }
+            Err(_) => break,
+        }
     }
     out
 }
@@ -787,7 +1002,7 @@ fn excludes_reduce_protection(
     sources: &[crate::config::Source],
     home_dirs: &[PathBuf],
     system: bool,
-    read_children: &dyn Fn(&Path) -> Vec<(String, bool)>,
+    read_children: &FolderReader,
 ) -> Option<String> {
     let old = match_entries(old_list);
     let new = match_entries(new_list);
@@ -1082,6 +1297,7 @@ pub fn update(
     config_file: &Path,
     patch: &SettingsPatch,
     timer: &dyn Timer,
+    identity: Option<PeerIdentity>,
 ) -> Result<Outcome, SettingsError> {
     let old_text = fs::read_to_string(config_file)
         .with_context(|| format!("cannot read configuration {}", config_file.display()))?;
@@ -1091,7 +1307,12 @@ pub fn update(
             config_file.display()
         )
     })?;
-    validate(patch, &current, &excludes_guard_home_dirs(patch, &current))?;
+    validate(
+        patch,
+        &current,
+        &excludes_guard_home_dirs(patch, &current),
+        identity,
+    )?;
     let new_text = rewrite(&old_text, patch)?;
     let new = Config::parse(&new_text).map_err(|e| {
         invalid(format!(
@@ -1380,6 +1601,51 @@ interval_hours = 24
 
     fn strings(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Test shim for [`super::validate`]: these checks exercise everything but
+    /// the folder reader (the reader is covered through `guard_with` and
+    /// `validate_with_reader`), so they run with no requester identity — every
+    /// folder counts as unknown, judged by computation alone.
+    fn validate(
+        patch: &SettingsPatch,
+        current: &Config,
+        home_dirs: &[PathBuf],
+    ) -> Result<(), SettingsError> {
+        super::validate(patch, current, home_dirs, None)
+    }
+
+    /// Test shim for [`super::update`]: no requester identity (see `validate`).
+    fn update(
+        config_file: &Path,
+        patch: &SettingsPatch,
+        timer: &dyn Timer,
+    ) -> Result<Outcome, SettingsError> {
+        super::update(config_file, patch, timer, None)
+    }
+
+    /// The current process's own identity, for the real-process reader tests.
+    fn current_ids() -> PeerIdentity {
+        PeerIdentity {
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+        }
+    }
+
+    /// Serialises the tests that take in-flight reader slots, so the global
+    /// in-flight counter is not disturbed by a concurrent reader test.
+    static READER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Whether `find` (findutils) is on this host; the reader tests skip
+    /// without it, since a missing tool is handled as "unknown".
+    fn find_available() -> bool {
+        Command::new("find")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     #[test]
@@ -1845,19 +2111,7 @@ interval_hours = 24
     #[test]
     fn a_big_home_directory_is_judged_by_its_real_entries_too() {
         // A normal desktop home has far more than a few dozen entries; the
-        // guard must not fall back to made-up names there (it did above 64).
-        let dir = tempfile::tempdir().unwrap();
-        for n in 0..200 {
-            fs::create_dir(dir.path().join(format!("Dir{n}"))).unwrap();
-        }
-        let read = read_children(dir.path(), MAX_PROBE_ENTRIES);
-        assert_eq!(read.len(), 200);
-        assert!(read.iter().all(|(_, is_dir)| *is_dir));
-        // More entries than the bound: judged by the ones that were read.
-        assert_eq!(read_children(dir.path(), 50).len(), 50);
-        assert!(real_children(dir.path()).len() == 200);
-        assert!(read_children(&dir.path().join("missing"), 10).is_empty());
-
+        // guard must not fall back to made-up names there.
         let names: Vec<String> = (0..200).map(|n| format!("Dir{n}")).collect();
         let entries: Vec<(&str, bool)> = names.iter().map(|n| (n.as_str(), true)).collect();
         for list in [
@@ -1877,6 +2131,132 @@ interval_hours = 24
         assert!(
             guard_with(&[], &["/alice/Dir1*"], false, &[("/home/alice", &entries)]).is_none(),
             "most folders stay"
+        );
+    }
+
+    #[test]
+    fn the_child_reader_reads_a_folder_as_the_requester() {
+        let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !find_available() {
+            eprintln!("skipping: `find` (findutils) is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..200 {
+            fs::create_dir(dir.path().join(format!("Dir{n}"))).unwrap();
+        }
+        fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // Read as the current user (the daemon reads as root; a unit test runs
+        // unprivileged, so the identity is the current user, which `spawn_find`
+        // runs as without a privilege change).
+        let read = real_children(dir.path(), current_ids());
+        assert_eq!(read.len(), 201, "200 folders and one file");
+        assert_eq!(read.iter().filter(|(_, is_dir)| *is_dir).count(), 200);
+        assert!(
+            read.iter().any(|(n, is_dir)| n == "notes.txt" && !is_dir),
+            "the file is seen as a non-directory"
+        );
+        // A folder that does not exist yields "unknown" (empty).
+        assert!(real_children(&dir.path().join("missing"), current_ids()).is_empty());
+
+        // A folder the requester cannot list counts as "unknown". Only
+        // meaningful unprivileged: root bypasses the mode bits.
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipping the mode-000 case: running as root bypasses permissions");
+        } else {
+            let locked = dir.path().join("locked");
+            fs::create_dir(&locked).unwrap();
+            fs::create_dir(locked.join("inside")).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let got = real_children(&locked, current_ids());
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(got.is_empty(), "an unreadable folder is unknown, not read");
+        }
+    }
+
+    #[test]
+    fn parse_find_output_bounds_entries_and_skips_bad_names() {
+        // One record per entry: first byte the type, then the name, NUL-ended.
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(b"dDocuments\0");
+        input.extend_from_slice(b"fnotes.txt\0");
+        input.extend_from_slice(b"dwith space and\nnewline\0");
+        // A name that is not valid UTF-8 is skipped, not guessed.
+        input.push(b'f');
+        input.extend_from_slice(&[0xff, 0xfe]);
+        input.push(0);
+        let got = parse_find_output(std::io::Cursor::new(input));
+        assert_eq!(
+            got,
+            vec![
+                ("Documents".to_string(), true),
+                ("notes.txt".to_string(), false),
+                ("with space and\nnewline".to_string(), true),
+            ]
+        );
+        // The entry bound holds even for a flood of records.
+        let mut many: Vec<u8> = Vec::new();
+        for i in 0..(MAX_PROBE_ENTRIES + 500) {
+            many.extend_from_slice(format!("df{i}\0").as_bytes());
+        }
+        assert_eq!(
+            parse_find_output(std::io::Cursor::new(many)).len(),
+            MAX_PROBE_ENTRIES
+        );
+    }
+
+    #[test]
+    fn a_hung_reader_is_cut_off_and_does_not_slow_the_next_read() {
+        let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A child that never produces output (stand-in for a dead file system):
+        // it is killed at the timeout and the call returns empty, promptly.
+        let Ok(child) = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            eprintln!("skipping: `sleep` is not available");
+            return;
+        };
+        let guard = InFlightGuard::acquire().expect("a slot is free");
+        let start = std::time::Instant::now();
+        let out = collect_with_timeout(child, guard);
+        let elapsed = start.elapsed();
+        assert!(out.is_empty());
+        assert!(
+            elapsed < PROBE_READ_TIMEOUT + std::time::Duration::from_secs(2),
+            "cut off near the timeout, not after sleep ends: {elapsed:?}"
+        );
+        // The killed child is reaped on a detached thread; wait for it to
+        // release its in-flight slot before the next serialised test runs.
+        for _ in 0..1000 {
+            if READS_IN_FLIGHT.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(READS_IN_FLIGHT.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reads_in_flight_are_bounded() {
+        let _serial = READER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Hold the cap; a further acquire is refused (so that read is judged by
+        // computation and does not wait), and freeing one slot lets it in again.
+        let mut held: Vec<InFlightGuard> = Vec::new();
+        for _ in 0..MAX_READS_IN_FLIGHT {
+            held.push(InFlightGuard::acquire().expect("under the cap"));
+        }
+        assert!(
+            InFlightGuard::acquire().is_none(),
+            "no more than the cap at once"
+        );
+        held.pop();
+        assert!(
+            InFlightGuard::acquire().is_some(),
+            "a freed slot can be taken"
         );
     }
 
@@ -1906,6 +2286,132 @@ interval_hours = 24
             guard_with(&[], &["/alice/[a-zA-Z.]*"], false, &[]).is_none(),
             "names starting with a digit or an underscore would stay"
         );
+    }
+
+    #[test]
+    fn the_folder_guard_is_the_last_check_and_an_earlier_refusal_reads_nothing() {
+        // A reader that panics if it is ever called: for a request refused for a
+        // reason that does not depend on folder contents, no folder is read
+        // (decision 0022, item 2). So a refusal never leaks whether a name
+        // exists, and the probing-with-a-second-failing-change trick leaves no
+        // content-dependent trace.
+        let panicking =
+            |_: &Path| -> Vec<(String, bool)> { panic!("the folder guard must not run here") };
+        let c = current();
+        let homes = [PathBuf::from("/home/alice")];
+        // Wake-on-LAN without a [wake] section: refused before any read, even
+        // though the exclude list alone would empty a home.
+        let mut no_wake = c.clone();
+        no_wake.wake = None;
+        let e = validate_with_reader(
+            &SettingsPatch {
+                excludes: Some(strings(&["/alice"])),
+                wake_on_lan: Some(true),
+                ..patch()
+            },
+            &no_wake,
+            &homes,
+            &panicking,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("[wake]"), "{e}");
+        // A malformed pattern is refused before any read.
+        let e = validate_with_reader(
+            &SettingsPatch {
+                excludes: Some(strings(&["[abc"])),
+                ..patch()
+            },
+            &c,
+            &homes,
+            &panicking,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("malformed"), "{e}");
+        // A bad interval, with an emptying exclude in the same request: refused
+        // for the interval, nothing read.
+        let e = validate_with_reader(
+            &SettingsPatch {
+                interval_hours: Some(0),
+                excludes: Some(strings(&["/alice"])),
+                ..patch()
+            },
+            &c,
+            &homes,
+            &panicking,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("interval_hours"), "{e}");
+        // When nothing else refuses, the guard does run, as the last step.
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let watching = {
+            let reached = reached.clone();
+            move |_: &Path| -> Vec<(String, bool)> {
+                reached.set(true);
+                Vec::new()
+            }
+        };
+        let e = validate_with_reader(
+            &SettingsPatch {
+                excludes: Some(strings(&["/alice"])),
+                ..patch()
+            },
+            &c,
+            &homes,
+            &watching,
+        )
+        .unwrap_err();
+        assert!(reached.get(), "the guard ran when nothing else refused");
+        assert!(e.to_string().contains("whole folder"), "{e}");
+    }
+
+    #[test]
+    fn an_excluded_parent_empties_a_folder_below_it() {
+        // In system mode the whole system is one archive rooted at "/". A home
+        // below an intermediate directory (`/var/home/alice`) is emptied by a
+        // pattern that excludes the parent (`/var/home`), although the pattern
+        // never names the home itself — the parent takes everything below it
+        // with it (decision 0022, item 3). Pure computation, so the reader is
+        // never consulted (identity `None`).
+        let mut c = current();
+        c.backup.system = true;
+        let homes = [PathBuf::from("/var/home/alice")];
+        assert!(
+            super::validate(
+                &SettingsPatch {
+                    excludes: Some(strings(&["/var/home"])),
+                    ..patch()
+                },
+                &c,
+                &homes,
+                None,
+            )
+            .is_err(),
+            "excluding the parent /var/home empties /var/home/alice"
+        );
+        // A directory that is not an ancestor of the home does not.
+        assert!(
+            super::validate(
+                &SettingsPatch {
+                    excludes: Some(strings(&["/var/cache"])),
+                    ..patch()
+                },
+                &c,
+                &homes,
+                None,
+            )
+            .is_ok(),
+            "an unrelated directory leaves the home alone"
+        );
+        // The computation also sees it through `ancestor_dirs` directly.
+        assert_eq!(
+            ancestor_dirs("/var/home/alice"),
+            vec![
+                "/var".to_string(),
+                "/var/home".to_string(),
+                "/var/home/alice".to_string()
+            ]
+        );
+        assert!(ancestor_dirs("/").is_empty());
     }
 
     #[test]
