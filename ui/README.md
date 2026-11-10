@@ -31,7 +31,12 @@ local API described in [`../api/openapi.yaml`](../api/openapi.yaml).
   switched the timer off on purpose is nagged), (6) first backup. Unknown
   values (null or absent) never count as missing. Everything happens in a
   terminal as root; the page never asks for a password, token secret or
-  key. It composes the commands from non-secret entries (server, datastore,
+  key. The paper key is led through in order: write the file, print it,
+  delete it (`rm` of the same path), confirm with the check code; nestegg then
+  asks for the statement `yes` (the guide never adds `--printed`, which is for
+  scripts), and refuses while the file still lies on this computer. After a
+  copy on a USB stick the guide says to unplug the stick. A copy inside a
+  folder that is backed up does not count, even on an external disk. It composes the commands from non-secret entries (server, datastore,
   namespace, token ID, path of the USB stick, check code of the paper key)
   and moves on by itself while `/status` is polled. **A command that still
   has a placeholder (`<NAME>`) cannot be copied** (the copy button is
@@ -169,6 +174,7 @@ Add faults to any scenario with `&fault=a,b`:
 | `no_encryption` | encryption is switched off (no key steps in the guide) |
 | `unknown_stored` | `credentials_stored` and `key_present` are `null` (the daemon cannot tell) |
 | `no_usage` | `GET /pbs` does not know the datastore usage |
+| `long_overdue` | "overdue after" is 744 hours in the file, above the API's limit of 168: `limits` reports 744 as the maximum and the settings page can only lower it |
 
 `down` can also be switched while the page is open:
 `curl -X POST 'http://127.0.0.1:5173/__mock/fault?down=1'` (and `down=0`); it
@@ -186,13 +192,18 @@ starting"), for a run that is over `409` ("already finished"), and `404` for an
 id that does not exist, like the daemon (see `API-REQUESTS.md`).
 `POST /pbs/check` answers like `check::run` of the daemon (never fails, real
 item names, `status` per item) and does not change `/status`. Without a
-configuration (`unconfigured`) `/machines` answers `500` like the daemon, so
-the list of other computers is empty and the sidebar shows no note.
+configuration (`unconfigured`) `/machines` answers `500` like the daemon (the
+list of other computers is empty and the sidebar shows no note), and
+`503 pbs_unreachable` while the server does not answer (the scenarios
+`pbs_unreachable` and `overdue`, the fault `check_down`): the sidebar then says
+that other computers cannot be read.
 Restoring into `/home/alice/Dokumente` (or another existing folder of the
 mock) answers `409 target_exists`. A restore takes about 4 s and reports
 `restored_bytes` and `total_bytes` while it runs.
 `PATCH /config` changes the settings of the current scenario like the daemon
-(same validation, `src/lib/settings.ts`); later `/config` and `/status` calls
+(same validation, `src/lib/settings.ts`, including decision 0022: "overdue after"
+at most 168 hours, no new exclude that drops a whole backed-up folder or a whole
+top-level directory, both with the plain refusal text of the daemon); later `/config` and `/status` calls
 show the new values. Reloading with `?scenario=` resets them.
 
 To use another port, set `NESTEGG_UI_PORT` (not `--port`), so the HMR

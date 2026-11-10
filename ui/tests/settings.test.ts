@@ -1,7 +1,7 @@
 // Settings validation must match the daemon (crates/nestegg/src/settings.rs).
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api, ApiFailure } from "../src/lib/api";
-import { excludeProblem, excludesEverything, settingsProblem } from "../src/lib/settings";
+import { DEFAULT_LIMITS, excludeProblem, excludesEverything, settingsProblem, wholeSourceProblem } from "../src/lib/settings";
 
 const current = { interval_hours: 24, overdue_after_hours: 36, wake_on_lan_configured: true };
 
@@ -20,11 +20,53 @@ describe("settings validation", () => {
   it("checks ranges and the overdue rule", () => {
     expect(settingsProblem({ interval_hours: 12 }, current)).toBeNull();
     expect(settingsProblem({ interval_hours: 169, overdue_after_hours: 744 }, current)).toContain("between 1 and 168");
-    expect(settingsProblem({ overdue_after_hours: 745 }, current)).toContain("between 2 and 744");
+    expect(DEFAULT_LIMITS.overdue_after_hours.max).toBe(168);
+    expect(settingsProblem({ overdue_after_hours: 168 }, current)).toBeNull();
+    expect(settingsProblem({ overdue_after_hours: 169 }, current)).toBe(
+      "overdue_after_hours must be between 2 and 168 hours (7 days) through the web interface. A longer time can only be set as root in /etc/nestegg/config.toml.",
+    );
     expect(settingsProblem({ interval_hours: 36 }, current)).toContain("greater than interval_hours");
     expect(settingsProblem({ interval_hours: 48, overdue_after_hours: 60 }, current)).toBeNull();
     expect(settingsProblem({ interval_hours: null }, current)).toBeNull();
     expect(settingsProblem({}, current)).toBeNull();
+  });
+
+  it("lets a value from the file, above the limit, only be lowered", () => {
+    const fromFile = { ...current, overdue_after_hours: 744 };
+    const limits = { ...DEFAULT_LIMITS, overdue_after_hours: { ...DEFAULT_LIMITS.overdue_after_hours, max: 744 } };
+    expect(settingsProblem({ overdue_after_hours: 744 }, fromFile, limits)).toBeNull();
+    expect(settingsProblem({ overdue_after_hours: 200 }, fromFile, limits)).toBeNull();
+    expect(settingsProblem({ overdue_after_hours: 745 }, fromFile, limits)).toBe(
+      "overdue_after_hours must be between 2 and 168 hours (7 days) through the web interface; the current value of 744 can only be lowered here. A longer time can only be set as root in /etc/nestegg/config.toml.",
+    );
+    // Other changes are not held up by the long value.
+    expect(settingsProblem({ interval_hours: 12 }, fromFile, limits)).toBeNull();
+  });
+
+  it("refuses an exclude that would drop a whole folder, like the daemon", () => {
+    const sources = ["/home", "/etc", "/root", "/usr/local"];
+    for (const bad of ["/home", "/home/", "/home/*", "/home/**", "/etc", "/root", "/usr", "/var", "/alice", "/usr/local", "/usr/local/*", "/usr/local/**", "home", "etc", "local"])
+      expect(wholeSourceProblem(bad, sources), bad).not.toBeNull();
+    for (const ok of ["**/.cache", "**/node_modules", "**/lost+found", "/alice/Downloads", "/home/*/Videos", "*.iso", "node_modules", "/usr/lib", "!/home"])
+      expect(wholeSourceProblem(ok, sources), ok).toBeNull();
+    expect(wholeSourceProblem("/home/", sources)).toBe(
+      "exclude pattern `/home/` would drop the whole top-level directory `/home` from every archive that contains it; an administrator can still set it as root in /etc/nestegg/config.toml.",
+    );
+    expect(wholeSourceProblem("/usr/local/*", sources)).toBe(
+      "exclude pattern `/usr/local/*` would drop the whole backup source `/usr/local`; an administrator can still set it as root in /etc/nestegg/config.toml.",
+    );
+    expect(wholeSourceProblem("local", sources)).toBe(
+      "exclude pattern `local` matches the whole backup source `local` in every archive, which would leave it out of the backup; an administrator can still set it as root in /etc/nestegg/config.toml.",
+    );
+  });
+
+  it("checks a new exclude against the sources, but keeps one that is already in the list", () => {
+    const withSources = { ...current, sources: ["/home", "/etc"], excludes: ["/etc/*"] };
+    expect(settingsProblem({ excludes: ["/etc/*", "**/.cache"] }, withSources)).toBeNull();
+    expect(settingsProblem({ excludes: ["/etc/*", "/home"] }, withSources)).toContain("top-level directory");
+    expect(settingsProblem({ excludes: ["/home/*"] }, { ...current, sources: ["/home"], excludes: [] })).toContain("whole");
+    // Without knowing the sources only the top-level rule applies.
+    expect(settingsProblem({ excludes: ["/var"] }, current)).toContain("top-level directory `/var`");
   });
 
   it("refuses terminal-only and unknown fields, and Wake-on-LAN without a MAC", () => {

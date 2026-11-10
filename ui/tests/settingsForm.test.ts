@@ -3,20 +3,37 @@ import { describe, expect, it } from "vitest";
 import de from "../src/i18n/de";
 import en from "../src/i18n/en";
 import { ApiFailure } from "../src/lib/api";
-import { settingsProblem } from "../src/lib/settings";
-import { INTERVAL_CHOICES, intervalOptions, overdueFor, parseHours, problemText, saveFailure } from "../src/lib/settingsForm";
+import { DEFAULT_LIMITS, settingsProblem } from "../src/lib/settings";
+import { INTERVAL_CHOICES, intervalOptions, intervalReachable, overdueFor, parseHours, problemText, saveFailure } from "../src/lib/settingsForm";
+import type { SettingsLimits } from "../src/lib/types";
 
 const current = { interval_hours: 24, overdue_after_hours: 36, wake_on_lan_configured: false };
+/** `limits` of a daemon whose file has a longer "overdue after" than the API allows. */
+const fromFile: SettingsLimits = {
+  ...DEFAULT_LIMITS,
+  overdue_after_hours: { ...DEFAULT_LIMITS.overdue_after_hours, max: 744 },
+};
 
 describe("rhythm choices", () => {
-  it("offers 6 h, 12 h, daily, every 2 days and weekly", () => {
+  it("knows 6 h, 12 h, daily, every 2 days and weekly", () => {
     expect(INTERVAL_CHOICES).toEqual([6, 12, 24, 48, 168]);
-    expect(intervalOptions(24)).toEqual([6, 12, 24, 48, 168]);
+  });
+
+  it("offers only the rhythms the longest allowed 'overdue' time can follow", () => {
+    // "Overdue after" is capped at 168 hours and must stay above the rhythm: weekly cannot be reached.
+    expect(intervalOptions(24)).toEqual([6, 12, 24, 48]);
+    expect(intervalReachable(48)).toBe(true);
+    expect(intervalReachable(168)).toBe(false);
+    // With a longer value from the file (limits report it as the maximum) weekly works again.
+    expect(intervalOptions(24, fromFile)).toEqual([6, 12, 24, 48, 168]);
+    expect(intervalReachable(168, fromFile)).toBe(true);
   });
 
   it("adds the current value when it was set to something else in the terminal", () => {
-    expect(intervalOptions(36)).toEqual([6, 12, 24, 36, 48, 168]);
-    expect(intervalOptions(null)).toEqual([6, 12, 24, 48, 168]);
+    expect(intervalOptions(36)).toEqual([6, 12, 24, 36, 48]);
+    expect(intervalOptions(null)).toEqual([6, 12, 24, 48]);
+    // A rhythm that is already set stays in the list, even if it could not be chosen today.
+    expect(intervalOptions(168)).toEqual([6, 12, 24, 48, 168]);
   });
 
   it("names the choices", () => {
@@ -51,12 +68,20 @@ describe("overdue threshold with a longer rhythm", () => {
     expect(overdueFor(48, 36)).toBe(72);
     expect(overdueFor(36, 36)).toBe(54);
     expect(overdueFor(24, 20)).toBe(36);
-    expect(overdueFor(168, 36)).toBe(252);
-    // The raised value is accepted by the same rules as the daemon's.
-    for (const h of INTERVAL_CHOICES) {
+    expect(overdueFor(168, 36, fromFile)).toBe(252);
+    // The raised value is accepted by the same rules as the daemon's, for every rhythm on offer.
+    for (const h of intervalOptions(24)) {
       const raised = overdueFor(h, 6);
       expect(settingsProblem({ interval_hours: h, overdue_after_hours: raised ?? 6 }, current)).toBeNull();
     }
+    for (const h of intervalOptions(24, fromFile)) {
+      const raised = overdueFor(h, 6, fromFile);
+      expect(settingsProblem({ interval_hours: h, overdue_after_hours: raised ?? 6 }, current, fromFile)).toBeNull();
+    }
+  });
+
+  it("never goes above the limit", () => {
+    expect(overdueFor(144, 36)).toBe(168);
   });
 });
 
@@ -77,6 +102,11 @@ describe("problem texts", () => {
     { excludes: Array.from({ length: 201 }, (_, i) => `p${i}`) },
     { wake_on_lan: true },
     { datastore: "x" },
+    { overdue_after_hours: 169 },
+    { excludes: ["/home"] },
+    { excludes: ["/var"] },
+    { excludes: ["/usr/local/*"] },
+    { excludes: ["etc"] },
   ];
 
   it.each([
@@ -84,10 +114,38 @@ describe("problem texts", () => {
     ["en", en],
   ])("has a %s text for every validation message", (_lang, t) => {
     for (const body of bodies) {
-      const message = settingsProblem(body, current);
+      const message = settingsProblem(body, { ...current, sources: ["/home", "/etc", "/usr/local"] });
       expect(message, JSON.stringify(body)).not.toBeNull();
       expect(problemText(message!, t), message!).not.toBeNull();
     }
+  });
+
+  it("explains the limit on 'overdue after' and says an administrator can lift it", () => {
+    const capped = settingsProblem({ overdue_after_hours: 169 }, current)!;
+    expect(problemText(capped, en)).toBe(
+      "Allowed are 2 to 168 hours (7 days) here. A longer time can only be set by an administrator in /etc/nestegg/config.toml.",
+    );
+    expect(problemText(capped, de)).toContain("2 bis 168 Stunden (7 Tage)");
+    expect(problemText(capped, de)).toContain("/etc/nestegg/config.toml");
+    // A value from the file above the limit: the page says it can only be shortened.
+    const lowered = settingsProblem({ overdue_after_hours: 745 }, { ...current, overdue_after_hours: 744 }, fromFile)!;
+    expect(problemText(lowered, en)).toContain("The current value of 744 hours");
+    expect(problemText(lowered, en)).toContain("only be shortened");
+    expect(problemText(lowered, de)).toContain("nur verkürzen");
+    // A daemon from before the limit still gets its range sentence.
+    expect(problemText("overdue_after_hours must be between 2 and 744 (31 days)", en)).toBe("Allowed are 2 to 744 hours.");
+  });
+
+  it("explains an exclude that would drop a whole folder, in both languages", () => {
+    const sources = ["/home", "/etc", "/usr/local"];
+    const ask = (pattern: string, t: typeof en) => problemText(settingsProblem({ excludes: [pattern] }, { ...current, sources })!, t);
+    expect(ask("/usr/local/*", en)).toContain("whole backed-up folder “/usr/local”");
+    expect(ask("/home/*", en)).toContain("everything in “/home”");
+    expect(ask("etc", en)).toContain("whole backed-up folder “etc”");
+    expect(ask("/usr/local/**", de)).toContain("ganze gesicherte Ordner „/usr/local“");
+    expect(ask("/var", en)).toContain("everything in “/var”");
+    expect(ask("/var", de)).toContain("alles in „/var“");
+    for (const t of [en, de]) expect(ask("/home", t)).toContain("/etc/nestegg/config.toml");
   });
 
   it("keeps the numbers of the message", () => {

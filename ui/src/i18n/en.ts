@@ -198,6 +198,7 @@ const en = {
       credentials: "None yet, the token secret is missing",
       key_create: "None yet, there is no key",
       key_confirm: "None yet, the key copy is not confirmed",
+      credentials_unreadable: "None yet, the stored secrets cannot be read",
     },
     nextOff: "None, automatic backups are off",
     onServer: (size: string, count: number) =>
@@ -282,6 +283,8 @@ const en = {
       "The setup exists, but the secret of the token is not stored on this computer yet. The command asks for it; what you type stays invisible. Then nestegg checks that server, access and backup program are fine.",
     cmdPassword: "Asks for the secret of the token.",
     cmdCheck: "Checks that server, access and backup program are fine.",
+    cmdCheckNote:
+      "One line stays red for now: “backup timer enabled” shows FAIL until you switch on automatic backups in a later step. That is expected. If the backup server is asleep, its lines show skip (not checked) instead; sudo nestegg check --wake wakes it first.",
     automaticWhy:
       "With automatic backups on, nestegg checks every hour whether a backup is due and catches up on missed ones. You can switch them on here or in a terminal.",
     automaticButton: "Switch on automatic backups",
@@ -294,7 +297,7 @@ const en = {
     keyCreateImport:
       "If you already have a key from before, for example after a reinstall, do not create a new one but bring the old one back: sudo nestegg key import <key file>. Otherwise the older backups cannot be opened.",
     keyStoreWhy:
-      "Without this key nobody can open the backups, not even you if the computer breaks. That is why a copy must be kept outside this computer. A copy that only lies on this computer does not count. There are two ways; one is enough. Backups only start once you have confirmed the copy.",
+      "Without this key nobody can open the backups, not even you if the computer breaks. That is why a copy must be kept outside this computer. A copy that only lies on this computer does not count, nor does one inside a folder that is backed up, even on an external disk. There are two ways; one is enough. Backups only start once you have confirmed the copy.",
     usbTitle: "On a USB stick",
     usbText:
       "Write the key to a USB stick and keep the stick somewhere other than the computer. Enter where the stick is mounted, usually below /media.",
@@ -304,17 +307,24 @@ const en = {
     stickInvalid: "This must be a full path starting with /.",
     fillStick: "Enter the path of the stick first.",
     usbConfirm: "Then confirm that the file is on the stick:",
+    usbUnplug: "When nestegg has confirmed it, unplug the stick and keep it away from the computer.",
     usbLocal:
       "If the file lies on a disk of this computer instead, nestegg refuses, because a copy that is lost with the computer is no protection. Only if another copy exists elsewhere, add --accept-local-copy to the second command.",
     paperTitle: "On paper",
     paperText:
-      "Creates a page to print, the file nestegg-paper-key.html in your home folder. It shows the key as a QR code and a short check code. Open the file in the browser, print it and keep the printout safe, not next to the computer.",
+      "Creates a page to print, with the key as a QR code and a short check code. Do these four steps in this order.",
+    paperWrite: "Write the paper key file. It is named nestegg-paper-key.html and lies in your home folder:",
+    paperPrint: "Open the file in the browser and print it. Keep the printout safe, not next to the computer.",
+    paperDelete:
+      "Delete the file. As long as it still lies on this computer, nestegg refuses to confirm:",
+    paperConfirm: "Confirm with the check code at the top of the printed page:",
+    paperAsk:
+      "nestegg then asks whether the sheet is printed and stored away from the computer. Type yes if it is.",
     codeLabel: "Check code of the paper key",
     codePlaceholder: "ABCD-0123",
     codeHint: "Not secret. Eight characters from 0–9 and A–F, with or without hyphen.",
     codeInvalid: "That does not look like a check code (eight characters from 0–9 and A–F).",
     fillCode: "Enter the check code first.",
-    paperConfirm: "Then confirm with the check code at the top of the printed page:",
     firstBackupText:
       "Everything is ready. Click “Back up now” above. The first time, everything is uploaded, which can take a long time. You can close the page meanwhile.",
   },
@@ -473,6 +483,8 @@ const en = {
   settings: {
     title: "Settings",
     intro: "Changes are saved immediately and apply from the next backup.",
+    reported:
+      "Changes that reduce the protection are reported to everyone who uses this computer: automatic backups switched off, a new exclude, a longer rhythm or a longer time before “overdue”, Wake-on-LAN switched off.",
     introReadOnly:
       "This nestegg version only shows the settings. Change them in a terminal in the file /etc/nestegg/config.toml (sudoedit /etc/nestegg/config.toml).",
     offline: "Nothing can be changed without a connection to the nestegg service.",
@@ -484,6 +496,8 @@ const en = {
     automaticOff: "Backups only run when you start them yourself.",
     interval: "Rhythm",
     intervalHint: "How often a backup is due.",
+    intervalLimit: (max: number) =>
+      `Longer rhythms are not possible here: “overdue” may be at most ${max} hours here, and it must be longer than the rhythm. An administrator can set more in /etc/nestegg/config.toml.`,
     everyHours: (h: number) =>
       h === 1
         ? "Every hour"
@@ -541,6 +555,10 @@ const en = {
       wholeNumber: "Please enter a whole number of hours.",
       intervalRange: (min: number, max: number) => `The rhythm must be between ${min} and ${max} hours.`,
       overdueRange: (min: number, max: number) => `Allowed are ${min} to ${max} hours.`,
+      overdueCapped: (min: number, max: number, current: number | null) =>
+        `Allowed are ${min} to ${max} hours${max % 24 === 0 ? ` (${max / 24} days)` : ""} here.${
+          current === null ? "" : ` The current value of ${current} hours stands in the file like that and can only be shortened here, not made longer.`
+        } A longer time can only be set by an administrator in /etc/nestegg/config.toml.`,
       overdueNotGreater: (interval: number) =>
         `Must be longer than the rhythm (${interval} hours). Otherwise every backup counts as overdue before the next one is due.`,
       excludeEmpty: "Please enter a pattern, for example **/.cache.",
@@ -549,6 +567,10 @@ const en = {
       excludeSpaces: "The pattern must not start or end with a space.",
       excludeDash: "The pattern must not start with a minus sign.",
       excludeEverything: "Nothing would be backed up any more. Please choose a narrower pattern.",
+      excludeSource: (what: string) =>
+        `That would leave the whole backed-up folder “${what}” out of the backup. nestegg does not allow that here. An administrator can still set it in /etc/nestegg/config.toml.`,
+      excludeTopLevel: (dir: string) =>
+        `That would leave everything in “${dir}” out of every backup. nestegg does not allow that here. An administrator can still set it in /etc/nestegg/config.toml.`,
       excludeDuplicate: "This pattern is already in the list.",
       excludeTooMany: (n: number) => `More than ${n} patterns are not possible.`,
       wakeNotConfigured:

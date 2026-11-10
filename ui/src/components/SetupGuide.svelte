@@ -7,6 +7,7 @@
     ENABLE_TIMERS_COMMAND,
     KEY_CREATE_COMMAND,
     PAPER_KEY_COMMAND,
+    PAPER_KEY_DELETE_COMMAND,
     SET_PASSWORD_COMMAND,
     initCommand,
     keyConfirmCodeCommand,
@@ -126,7 +127,7 @@
               <p class="text">{g.credentialsWhy}</p>
               <ol class="cmds">
                 <li><Cmd command={SET_PASSWORD_COMMAND} /><p class="hint">{g.cmdPassword}</p></li>
-                <li><Cmd command={CHECK_COMMAND} /><p class="hint">{g.cmdCheck}</p></li>
+                <li><Cmd command={CHECK_COMMAND} /><p class="hint">{g.cmdCheck}</p><p class="hint">{g.cmdCheckNote}</p></li>
               </ol>
             {:else if step === "key_create"}
               <p class="text">{g.keyCreateWhy}</p>
@@ -151,24 +152,38 @@
                   <Cmd command={keyExportCommand(stick)} missing={g.fillStick} />
                   <p class="hint">{g.usbConfirm}</p>
                   <Cmd command={keyConfirmFileCommand(stick)} missing={g.fillStick} />
+                  <p class="hint">{g.usbUnplug}</p>
                   <p class="hint">{g.usbLocal}</p>
                 </section>
                 <section aria-labelledby="h-paper">
                   <h3 id="h-paper">{g.paperTitle}</h3>
                   <p class="text">{g.paperText}</p>
-                  <Cmd command={PAPER_KEY_COMMAND} />
-                  <p class="hint">{g.paperConfirm}</p>
-                  <div class="field one">
-                    <label for="g-code">{g.codeLabel}</label>
-                    <input
-                      id="g-code" class="input code" autocomplete="off" spellcheck="false" placeholder={g.codePlaceholder}
-                      bind:value={code} aria-invalid={codeBad ? "true" : undefined}
-                      aria-describedby={codeBad ? "g-code-hint g-code-bad" : "g-code-hint"}
-                    />
-                    <p class="hint" id="g-code-hint">{g.codeHint}</p>
-                    {#if codeBad}<p class="hint bad" id="g-code-bad" use:reveal>{g.codeInvalid}</p>{/if}
-                  </div>
-                  <Cmd command={keyConfirmCodeCommand(code)} missing={g.fillCode} />
+                  <ol class="paper">
+                    <li>
+                      <p class="text">{g.paperWrite}</p>
+                      <Cmd command={PAPER_KEY_COMMAND} />
+                    </li>
+                    <li><p class="text">{g.paperPrint}</p></li>
+                    <li>
+                      <p class="text">{g.paperDelete}</p>
+                      <Cmd command={PAPER_KEY_DELETE_COMMAND} />
+                    </li>
+                    <li>
+                      <p class="text">{g.paperConfirm}</p>
+                      <div class="field one">
+                        <label for="g-code">{g.codeLabel}</label>
+                        <input
+                          id="g-code" class="input code" autocomplete="off" spellcheck="false" placeholder={g.codePlaceholder}
+                          bind:value={code} aria-invalid={codeBad ? "true" : undefined}
+                          aria-describedby={codeBad ? "g-code-hint g-code-bad" : "g-code-hint"}
+                        />
+                        <p class="hint" id="g-code-hint">{g.codeHint}</p>
+                        {#if codeBad}<p class="hint bad" id="g-code-bad" use:reveal>{g.codeInvalid}</p>{/if}
+                      </div>
+                      <Cmd command={keyConfirmCodeCommand(code)} missing={g.fillCode} />
+                      <p class="hint">{g.paperAsk}</p>
+                    </li>
+                  </ol>
                 </section>
               </div>
             {:else if step === "automatic"}
@@ -230,6 +245,9 @@
   .field.one { margin-top: 12px; max-width: 420px; }
   .input[aria-invalid="true"] { border-color: var(--bad); }
   .cmds li { margin-top: 12px; }
+  .paper { list-style: decimal; padding-left: 20px; margin-top: 4px; }
+  .paper li { margin-top: 12px; padding-left: 4px; }
+  .paper li::marker { color: var(--muted); }
   .cmds .hint { margin-top: 4px; }
   .ways { display: grid; gap: 22px; margin-top: 14px; }
   .ways section { border-left: 2px solid var(--rule); padding-left: 14px; }

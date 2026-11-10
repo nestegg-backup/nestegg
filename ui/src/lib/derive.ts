@@ -457,11 +457,15 @@ export function keyMissing(s: Status): boolean {
  * Same order as the setup guide: the token secret, then the key, then the key copy. Unknown
  * values (null or absent) never count as missing.
  */
-export type Blocked = "unconfigured" | "credentials" | "key_create" | "key_confirm";
+export type Blocked = "unconfigured" | "credentials" | "credentials_unreadable" | "key_create" | "key_confirm";
 
 export function backupBlocked(s: Status): Blocked | null {
   if (s.health === "unconfigured") return "unconfigured";
   if (s.pbs.credentials_stored === false) return "credentials";
+  // The stored secrets exist, but cannot be decrypted (new mainboard): every run fails the same way
+  // until they are stored again. A backup that is running now shows that it got further.
+  if (s.last_run?.state === "failed" && s.last_run.error?.kind === "credentials_unreadable" && !isActive(s.current_run))
+    return "credentials_unreadable";
   if (s.encryption.enabled && keyMissing(s)) return "key_create";
   if (s.encryption.enabled && s.encryption.key_exported === false) return "key_confirm";
   return null;
@@ -608,8 +612,17 @@ export function keyConfirmCodeCommand(code: string): string {
   return `sudo nestegg key confirm-exported \\\n  ${option("paper-code", normalizeCheckCode(code), "CODE")}`;
 }
 
+/** Where the guide writes the paper key file; the delete command below names the same path. */
+const PAPER_KEY_FILE = '"$HOME/nestegg-paper-key.html"';
+
 /** The paper key as an HTML page to print. `--format=html` is needed, the default is plain text. */
-export const PAPER_KEY_COMMAND = 'sudo nestegg key paperkey \\\n  --format=html \\\n  --output="$HOME/nestegg-paper-key.html"';
+export const PAPER_KEY_COMMAND = `sudo nestegg key paperkey \\\n  --format=html \\\n  --output=${PAPER_KEY_FILE}`;
+
+/**
+ * Deletes the paper key file after printing. nestegg remembers where it wrote the file and refuses
+ * to confirm the paper key while it still lies on this computer (decision 0018).
+ */
+export const PAPER_KEY_DELETE_COMMAND = `rm ${PAPER_KEY_FILE}`;
 
 export const SET_PASSWORD_COMMAND = "sudo nestegg credentials set-password";
 export const CHECK_COMMAND = "sudo nestegg check";

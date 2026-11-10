@@ -10,9 +10,20 @@ import type { SettingsLimits } from "./types";
 /** Rhythm choices of the select: 6 h, 12 h, daily, every 2 days, weekly. */
 export const INTERVAL_CHOICES: readonly number[] = [6, 12, 24, 48, 168];
 
-/** The choices, plus the current value when it is something else (set in the terminal). */
-export function intervalOptions(current: number | null | undefined): number[] {
-  const list = [...INTERVAL_CHOICES];
+/**
+ * Can this rhythm be chosen? "Overdue after" must stay above it, and the API caps that at its
+ * `limits` maximum (decision 0022): a rhythm at or above the cap cannot be reached.
+ */
+export function intervalReachable(hours: number, limits: SettingsLimits = DEFAULT_LIMITS): boolean {
+  return limits.overdue_after_hours.greater_than_interval === false || hours < limits.overdue_after_hours.max;
+}
+
+/**
+ * The choices that can be reached, plus the current value when it is something else (set in the
+ * terminal, or a rhythm the cap would not allow today).
+ */
+export function intervalOptions(current: number | null | undefined, limits: SettingsLimits = DEFAULT_LIMITS): number[] {
+  const list = INTERVAL_CHOICES.filter((h) => h === current || intervalReachable(h, limits));
   if (current != null && !list.includes(current)) list.push(current);
   return list.sort((a, b) => a - b);
 }
@@ -44,6 +55,8 @@ export function problemText(message: string, t: Messages): string | null {
   const p = t.settings.problem;
   let m: RegExpExecArray | null;
   if ((m = /^interval_hours must be between (\d+) and (\d+)/.exec(message))) return p.intervalRange(num(m[1]), num(m[2]));
+  if ((m = /^overdue_after_hours must be between (\d+) and (\d+) hours \(7 days\) through the web interface(?:; the current value of (\d+) can only be lowered here)?/.exec(message)))
+    return p.overdueCapped(num(m[1]), num(m[2]), m[3] === undefined ? null : num(m[3]));
   if ((m = /^overdue_after_hours must be between (\d+) and (\d+)/.exec(message))) return p.overdueRange(num(m[1]), num(m[2]));
   if ((m = /must be greater than interval_hours \((\d+)\)/.exec(message))) return p.overdueNotGreater(num(m[1]));
   if (/must be a non-negative integer/.test(message)) return p.wholeNumber;
@@ -53,6 +66,9 @@ export function problemText(message: string, t: Messages): string | null {
   if (/must not start or end with spaces/.test(message)) return p.excludeSpaces;
   if (/must not start with `-`/.test(message)) return p.excludeDash;
   if (/would exclude everything/.test(message)) return p.excludeEverything;
+  if ((m = /matches the whole backup source `([^`]+)` in every archive/.exec(message))) return p.excludeSource(m[1]!);
+  if ((m = /would drop the whole top-level directory `([^`]+)`/.exec(message))) return p.excludeTopLevel(m[1]!);
+  if ((m = /would drop the whole backup source `([^`]+)`/.exec(message))) return p.excludeSource(m[1]!);
   if (/is listed twice/.test(message)) return p.excludeDuplicate;
   if ((m = /^at most (\d+) exclude patterns/.exec(message))) return p.excludeTooMany(num(m[1]));
   if (/^Wake-on-LAN is not set up/.test(message)) return p.wakeNotConfigured;

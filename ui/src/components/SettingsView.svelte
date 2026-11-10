@@ -10,7 +10,7 @@
   import { ApiFailure } from "../lib/api";
   import { scheduleHours } from "../lib/derive";
   import { DEFAULT_LIMITS, settingsProblem } from "../lib/settings";
-  import { intervalOptions, overdueFor, parseHours, problemText, saveFailure } from "../lib/settingsForm";
+  import { INTERVAL_CHOICES, intervalOptions, intervalReachable, overdueFor, parseHours, problemText, saveFailure } from "../lib/settingsForm";
   import { f, t } from "../lib/locale";
   import type { SettingKey, SettingsChange, Status } from "../lib/types";
 
@@ -40,7 +40,11 @@
     interval_hours: interval ?? 24,
     overdue_after_hours: overdue ?? 36,
     wake_on_lan_configured: wolConfigured ?? false,
+    sources,
+    excludes,
   });
+  // A longer rhythm needs a longer "overdue" time than the API allows: say why it is not offered.
+  const intervalCapped = $derived(INTERVAL_CHOICES.some((h) => h !== interval && !intervalReachable(h, limits)));
 
   // ---- per-row state: saving, just saved, not saved
   let pending = $state<Partial<Record<Row, boolean>>>({});
@@ -198,7 +202,7 @@
 
 {#snippet problemLine(row: Row, id: string)}
   {#if problems[row]}
-    <p class="e" id={id} use:reveal>
+    <p class="e" id={id} use:reveal={problems[row]}>
       {s.notSaved(problems[row]!.text)}
       {#if problems[row]!.detail}<span class="detail">{t.errors.detail(problems[row]!.detail!)}</span>{/if}
     </p>
@@ -215,6 +219,7 @@
       <LoadError text={t.load.configFailed} onretry={() => app.loadConfig()} />
     {:else}
       <p class="lead-text">{c && !canEdit ? s.introReadOnly : s.intro}</p>
+      {#if canEdit}<p class="hint">{s.reported}</p>{/if}
       {#if app.offline && canEdit}<p class="hint bad">{s.offline}</p>{/if}
     {/if}
   {/if}
@@ -255,7 +260,7 @@
             {:else}
               <span class="l">{s.interval}</span>
             {/if}
-            <p class="h" id="h-interval">{s.intervalHint}</p>
+            <p class="h" id="h-interval">{s.intervalHint}{intervalCapped ? ` ${s.intervalLimit(limits.overdue_after_hours.max)}` : ""}</p>
           </div>
           <div class="c">
             {@render savedMark("interval")}
@@ -267,7 +272,7 @@
                 aria-describedby={describe("h-interval", problems.interval && "e-interval")}
                 onchange={changeInterval}
               >
-                {#each intervalOptions(interval) as h (h)}
+                {#each intervalOptions(interval, limits) as h (h)}
                   <option value={String(h)}>{s.everyHours(h)}</option>
                 {/each}
               </select>

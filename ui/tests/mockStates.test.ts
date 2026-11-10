@@ -340,3 +340,75 @@ describe("GET /machines without a configuration", () => {
     expect(ok.status).toBe(200);
   });
 });
+
+describe("GET /machines while the backup server does not answer", () => {
+  const machines = (w: World) => w.handle("GET", "/machines", params, null);
+
+  it("answers 503 pbs_unreachable like the daemon where the server is off", () => {
+    for (const sc of ["pbs_unreachable", "overdue"] as const) {
+      const r = machines(new World(sc, "full"));
+      expect(r.status, sc).toBe(503);
+      expect(r.body).toMatchObject({ code: "pbs_unreachable" });
+    }
+    const down = new World("ok", "full");
+    down.faults.add("check_down");
+    expect(machines(down).status).toBe(503);
+  });
+
+  it("answers 200 wherever the server answers or is not known to be off", () => {
+    for (const sc of ["ok", "failing", "never", "key_not_exported", "damaged", "credentials_unreadable"] as const)
+      expect(machines(new World(sc, "full")).status, sc).toBe(200);
+    // Older daemons do not have the endpoint at all.
+    expect(machines(new World("pbs_unreachable", "today")).status).toBe(404);
+  });
+});
+
+describe("PATCH /config limits (decision 0022)", () => {
+  const patch = (w: World, body: unknown) => w.handle("PATCH", "/config", params, body);
+  const limits = (w: World) => (w.handle("GET", "/config", params, null).body as { limits: { overdue_after_hours: { max: number } } }).limits;
+
+  it("refuses 'overdue after' above 168 hours and says an administrator can set it in the file", () => {
+    const w = new World("ok", "full");
+    expect(limits(w).overdue_after_hours.max).toBe(168);
+    expect(patch(w, { overdue_after_hours: 168 }).status).toBe(200);
+    const r = patch(w, { overdue_after_hours: 169 });
+    expect(r.status).toBe(400);
+    expect((r.body as { message: string }).message).toContain("(7 days) through the web interface");
+    expect((r.body as { message: string }).message).toContain("/etc/nestegg/config.toml");
+  });
+
+  it("a value from the file above the limit is reported as the maximum and can only be lowered", () => {
+    const w = new World("ok", "full");
+    w.faults.add("long_overdue");
+    const cfg = w.handle("GET", "/config", params, null).body as { overdue_after_hours: number };
+    expect(cfg.overdue_after_hours).toBe(744);
+    expect(limits(w).overdue_after_hours.max).toBe(744);
+    expect(patch(w, { overdue_after_hours: 745 }).status).toBe(400);
+    expect(patch(w, { interval_hours: 12 }).status).toBe(200);
+    expect(patch(w, { overdue_after_hours: 100 }).status).toBe(200);
+    // Lowered once, the limit is the API's again.
+    expect(limits(w).overdue_after_hours.max).toBe(168);
+    expect(patch(w, { overdue_after_hours: 200 }).status).toBe(400);
+  });
+
+  it("refuses a new exclude that would drop a whole folder, but accepts ordinary ones", () => {
+    const w = new World("ok", "full");
+    for (const bad of ["/home", "/home/*", "/etc", "/var", "/alice", "/usr/local/**", "home"]) {
+      const r = patch(w, { excludes: [...(w.config()!.excludes ?? []), bad] });
+      expect(r.status, bad).toBe(400);
+      expect((r.body as { message: string }).message).toContain("an administrator can still set it as root");
+    }
+    expect(patch(w, { excludes: ["**/.cache", "/home/*/Videos", "**/node_modules"] }).status).toBe(200);
+    expect(w.config()!.excludes).toEqual(["**/.cache", "/home/*/Videos", "**/node_modules"]);
+  });
+});
+
+describe("the sleeping server's detail text", () => {
+  it("is the daemon's: it names no command (the page offers the wake button)", () => {
+    const r = new World("overdue", "full").handle("POST", "/pbs/check", params, null).body as PbsCheckResult;
+    const reachable = r.checks.find((c) => c.name === "PBS reachable")!;
+    expect(reachable.status).toBe("not_checked");
+    expect(reachable.detail).toBe("no answer; the server may be asleep (Wake-on-LAN is configured, a backup run wakes it by itself)");
+    expect(reachable.detail).not.toContain("nestegg check");
+  });
+});

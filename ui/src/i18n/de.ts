@@ -199,6 +199,7 @@ const de = {
       credentials: "Noch keine, das Secret des Tokens fehlt",
       key_create: "Noch keine, es gibt keinen Schlüssel",
       key_confirm: "Noch keine, die Schlüsselkopie ist nicht bestätigt",
+      credentials_unreadable: "Noch keine, die gespeicherten Zugangsdaten sind nicht lesbar",
     },
     nextOff: "Keine, automatisch sichern ist aus",
     onServer: (size: string, count: number) =>
@@ -283,6 +284,8 @@ const de = {
       "Die Einrichtung ist angelegt, aber das Secret des Tokens ist noch nicht auf diesem PC gespeichert. Der Befehl fragt danach; die Eingabe bleibt unsichtbar. Danach prüft nestegg, ob Server, Zugang und Backup-Programm in Ordnung sind.",
     cmdPassword: "Fragt nach dem Secret des Tokens.",
     cmdCheck: "Prüft, ob Server, Zugang und Backup-Programm in Ordnung sind.",
+    cmdCheckNote:
+      "Eine Zeile bleibt vorerst rot: „backup timer enabled“ zeigt FAIL, bis du im späteren Schritt die automatische Sicherung einschaltest. Das ist so gewollt. Schläft der Backup-Server, zeigen seine Zeilen stattdessen skip (nicht geprüft); sudo nestegg check --wake weckt ihn vorher auf.",
     automaticWhy:
       "Mit der automatischen Sicherung prüft nestegg jede Stunde, ob eine Sicherung fällig ist, und holt versäumte nach. Du kannst sie hier einschalten oder im Terminal.",
     automaticButton: "Automatische Sicherung einschalten",
@@ -295,7 +298,7 @@ const de = {
     keyCreateImport:
       "Hast du schon einen Schlüssel von früher, zum Beispiel nach einer Neuinstallation, legst du keinen neuen an, sondern holst den alten zurück: sudo nestegg key import <Schlüsseldatei>. Sonst lassen sich die älteren Sicherungen nicht öffnen.",
     keyStoreWhy:
-      "Ohne diesen Schlüssel kann niemand die Sicherungen öffnen, auch du nicht, wenn der PC kaputtgeht. Darum muss eine Kopie außerhalb dieses PCs liegen. Eine Kopie, die nur auf diesem PC liegt, zählt nicht. Es gibt zwei Wege, einer genügt. Gesichert wird erst, wenn du die Kopie bestätigt hast.",
+      "Ohne diesen Schlüssel kann niemand die Sicherungen öffnen, auch du nicht, wenn der PC kaputtgeht. Darum muss eine Kopie außerhalb dieses PCs liegen. Eine Kopie, die nur auf diesem PC liegt, zählt nicht, und eine in einem gesicherten Ordner auch nicht, selbst auf einer externen Platte. Es gibt zwei Wege, einer genügt. Gesichert wird erst, wenn du die Kopie bestätigt hast.",
     usbTitle: "Auf einen USB-Stick",
     usbText:
       "Schreibe den Schlüssel auf einen USB-Stick und bewahre den Stick an einem anderen Ort auf als den PC. Trag ein, wo der Stick eingebunden ist, meist unter /media.",
@@ -305,17 +308,24 @@ const de = {
     stickInvalid: "Das muss ein ganzer Pfad sein, der mit / beginnt.",
     fillStick: "Erst den Pfad des Sticks eintragen.",
     usbConfirm: "Danach bestätigst du, dass die Datei auf dem Stick liegt:",
+    usbUnplug: "Wenn nestegg die Kopie bestätigt hat, ziehst du den Stick ab und bewahrst ihn getrennt vom PC auf.",
     usbLocal:
       "Liegt die Datei stattdessen auf einer Platte dieses PCs, lehnt nestegg ab, denn eine Kopie, die mit dem PC verloren geht, schützt nicht. Nur wenn es woanders noch eine Kopie gibt, hängst du an den zweiten Befehl --accept-local-copy an.",
     paperTitle: "Auf Papier",
     paperText:
-      "Erzeugt eine Seite zum Ausdrucken, die Datei nestegg-paper-key.html in deinem Home-Ordner. Darauf stehen der Schlüssel als QR-Code und ein kurzer Prüfcode. Öffne die Datei im Browser, drucke sie aus und lege den Ausdruck sicher ab, nicht neben dem PC.",
+      "Erzeugt eine Seite zum Ausdrucken, mit dem Schlüssel als QR-Code und einem kurzen Prüfcode. Mach diese vier Schritte in dieser Reihenfolge.",
+    paperWrite: "Schreibe die Papierschlüssel-Datei. Sie heißt nestegg-paper-key.html und liegt in deinem Home-Ordner:",
+    paperPrint: "Öffne die Datei im Browser und drucke sie aus. Lege den Ausdruck sicher ab, nicht neben dem PC.",
+    paperDelete:
+      "Lösche die Datei. Solange sie noch auf diesem PC liegt, bestätigt nestegg nicht:",
+    paperConfirm: "Bestätige mit dem Prüfcode, der oben auf der gedruckten Seite steht:",
+    paperAsk:
+      "nestegg fragt dann, ob das Blatt gedruckt und getrennt vom PC aufbewahrt ist. Tippe yes, wenn das stimmt.",
     codeLabel: "Prüfcode des Papierschlüssels",
     codePlaceholder: "ABCD-0123",
     codeHint: "Nicht geheim. Acht Zeichen aus 0–9 und A–F, mit oder ohne Bindestrich.",
     codeInvalid: "Das sieht nicht wie ein Prüfcode aus (acht Zeichen aus 0–9 und A–F).",
     fillCode: "Erst den Prüfcode eintragen.",
-    paperConfirm: "Danach bestätigst du mit dem Prüfcode, der oben auf der gedruckten Seite steht:",
     firstBackupText:
       "Alles ist vorbereitet. Klicke oben auf „Jetzt sichern“. Beim ersten Mal wird alles hochgeladen, das kann lange dauern. Du kannst die Seite währenddessen schließen.",
   },
@@ -478,6 +488,8 @@ const de = {
   settings: {
     title: "Einstellungen",
     intro: "Änderungen werden sofort gespeichert und gelten ab der nächsten Sicherung.",
+    reported:
+      "Änderungen, die den Schutz verringern, werden allen gemeldet, die diesen PC benutzen: automatische Sicherung aus, ein neuer Ausschluss, ein längerer Rhythmus oder eine längere Zeit bis „überfällig“, Wake-on-LAN aus.",
     introReadOnly:
       "Diese nestegg-Version zeigt die Einstellungen nur an. Ändern lässt sich das im Terminal in der Datei /etc/nestegg/config.toml (sudoedit /etc/nestegg/config.toml).",
     offline: "Ohne Verbindung zum nestegg-Dienst lässt sich gerade nichts ändern.",
@@ -488,6 +500,8 @@ const de = {
     automaticOn: "nestegg prüft stündlich, ob eine Sicherung fällig ist, und holt verpasste nach.",
     automaticOff: "Gesichert wird nur, wenn du es selbst startest.",
     interval: "Rhythmus",
+    intervalLimit: (max: number) =>
+      `Längere Rhythmen gehen hier nicht: „Überfällig“ darf hier höchstens ${max} Stunden betragen und muss länger sein als der Rhythmus. Ein Administrator kann mehr in /etc/nestegg/config.toml einstellen.`,
     intervalHint: "Wie oft eine Sicherung fällig ist.",
     everyHours: (h: number) =>
       h === 1
@@ -548,6 +562,10 @@ const de = {
       wholeNumber: "Bitte eine ganze Zahl von Stunden eingeben.",
       intervalRange: (min: number, max: number) => `Der Rhythmus muss zwischen ${min} und ${max} Stunden liegen.`,
       overdueRange: (min: number, max: number) => `Erlaubt sind ${min} bis ${max} Stunden.`,
+      overdueCapped: (min: number, max: number, current: number | null) =>
+        `Erlaubt sind hier ${min} bis ${max} Stunden${max % 24 === 0 ? ` (${max / 24} Tage)` : ""}.${
+          current === null ? "" : ` Der aktuelle Wert von ${current} Stunden steht so in der Datei und lässt sich hier nur verkürzen, nicht verlängern.`
+        } Eine längere Zeit kann nur ein Administrator in /etc/nestegg/config.toml einstellen.`,
       overdueNotGreater: (interval: number) =>
         `Muss länger sein als der Rhythmus (${interval} Stunden). Sonst gilt jede Sicherung schon als überfällig, bevor die nächste fällig ist.`,
       excludeEmpty: "Bitte ein Muster eingeben, zum Beispiel **/.cache.",
@@ -556,6 +574,10 @@ const de = {
       excludeSpaces: "Das Muster darf nicht mit einem Leerzeichen beginnen oder enden.",
       excludeDash: "Das Muster darf nicht mit einem Minuszeichen beginnen.",
       excludeEverything: "Damit würde nichts mehr gesichert. Bitte ein engeres Muster wählen.",
+      excludeSource: (what: string) =>
+        `Damit würde der ganze gesicherte Ordner „${what}“ aus der Sicherung fallen. Das lässt nestegg hier nicht zu. Ein Administrator kann es in /etc/nestegg/config.toml trotzdem festlegen.`,
+      excludeTopLevel: (dir: string) =>
+        `Damit würde alles in „${dir}“ aus jeder Sicherung fallen. Das lässt nestegg hier nicht zu. Ein Administrator kann es in /etc/nestegg/config.toml trotzdem festlegen.`,
       excludeDuplicate: "Dieses Muster ist schon in der Liste.",
       excludeTooMany: (n: number) => `Mehr als ${n} Muster sind nicht möglich.`,
       wakeNotConfigured:

@@ -6,6 +6,7 @@ import {
   ENABLE_TIMERS_COMMAND,
   backupBlocked,
   PAPER_KEY_COMMAND,
+  PAPER_KEY_DELETE_COMMAND,
   hasPlaceholder,
   initCommand,
   keyConfirmCodeCommand,
@@ -332,6 +333,15 @@ describe("placeholders can never run", () => {
     expect(PAPER_KEY_COMMAND).toBe('sudo nestegg key paperkey \\\n  --format=html \\\n  --output="$HOME/nestegg-paper-key.html"');
   });
 
+  it("the paper key file is deleted at the path it was written to, and the confirm command has no --printed", () => {
+    const written = /--output=("\$HOME\/[^"]+")/.exec(PAPER_KEY_COMMAND)![1];
+    expect(PAPER_KEY_DELETE_COMMAND).toBe(`rm ${written}`);
+    expect(hasPlaceholder(PAPER_KEY_DELETE_COMMAND)).toBe(false);
+    // `--printed` is for scripts without a terminal; the guide leads through the question instead.
+    expect(keyConfirmCodeCommand("abcd0123")).not.toContain("printed");
+    expect(JSON.stringify([de.guide, en.guide])).not.toContain("--printed");
+  });
+
   it("the timers command enables both timers", () => {
     expect(ENABLE_TIMERS_COMMAND).toBe("sudo systemctl enable --now nestegg-backup.timer nestegg-notify.timer");
   });
@@ -343,6 +353,31 @@ describe("guide wording", () => {
     expect(en.guide.setupIntro).toContain("never type the secret");
     expect(de.guide.keyStoreWhy).toContain("nur auf diesem PC liegt, zählt nicht");
     expect(en.guide.keyStoreWhy).toContain("only lies on this computer does not count");
+  });
+
+  it("leads through the paper key in order and says nestegg asks whether it is printed", () => {
+    for (const g of [de.guide, en.guide]) {
+      expect(g.paperAsk).toContain("yes");
+      expect(g.paperDelete).toMatch(/nestegg/);
+    }
+    expect(en.guide.paperAsk).toContain("printed and stored away from the computer");
+    expect(de.guide.paperAsk).toContain("gedruckt");
+    expect(en.guide.usbUnplug).toContain("unplug the stick");
+    expect(de.guide.usbUnplug).toContain("ziehst du den Stick ab");
+  });
+
+  it("says that a copy inside a folder that is backed up does not count, even on an external disk", () => {
+    expect(en.guide.keyStoreWhy).toContain("inside a folder that is backed up, even on an external disk");
+    expect(de.guide.keyStoreWhy).toContain("gesicherten Ordner");
+    expect(de.guide.keyStoreWhy).toContain("externen Platte");
+  });
+
+  it("explains the red 'backup timer enabled' line of nestegg check and the sleeping server", () => {
+    for (const g of [de.guide, en.guide]) {
+      expect(g.cmdCheckNote).toContain("backup timer enabled");
+      expect(g.cmdCheckNote).toContain("sudo nestegg check --wake");
+      expect(g.cmdCheckNote).toContain("skip");
+    }
   });
 
   it("calls the token's secret 'Secret' in German, never 'Geheimnis'", () => {
@@ -360,6 +395,20 @@ describe("backupBlocked: no promised time while no backup can run", () => {
     expect(backupBlocked(status({}, { key_present: true, key_exported: false }))).toBe("key_confirm");
     // The secret is named first when both are missing.
     expect(backupBlocked(status({}, { key_present: false, key_exported: false }, { credentials_stored: false }))).toBe("credentials");
+  });
+  it("stored secrets that cannot be read block, until a backup is running or the last run is fine again", () => {
+    const run = (kind: string, state: Run["state"] = "failed"): Run => ({ ...ok, id: "b", state, error: { kind: kind as never, message: "x" } });
+    expect(backupBlocked(status({ health: "failing", last_run: run("credentials_unreadable") }))).toBe("credentials_unreadable");
+    // Another failure does not block by itself, and neither does a later success.
+    expect(backupBlocked(status({ health: "failing", last_run: run("source_missing") }))).toBeNull();
+    expect(backupBlocked(status({ last_run: ok }))).toBeNull();
+    // A backup that is running now got further.
+    const running: Run = { ...ok, id: "c", state: "uploading" };
+    expect(backupBlocked(status({ health: "running", last_run: run("credentials_unreadable"), current_run: running }))).toBeNull();
+    // The missing secret is named first; a missing key after the unreadable secrets.
+    expect(backupBlocked(status({ last_run: run("credentials_unreadable") }, {}, { credentials_stored: false }))).toBe("credentials");
+    expect(backupBlocked(status({ last_run: run("credentials_unreadable") }, { key_present: false, key_exported: false }))).toBe("credentials_unreadable");
+    for (const t of [de, en]) expect(t.self.nextBlocked.credentials_unreadable).toBeTruthy();
   });
   it("unknown values, a working set-up and switched-off encryption block nothing", () => {
     expect(backupBlocked(status())).toBeNull();

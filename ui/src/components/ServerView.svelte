@@ -27,6 +27,11 @@
   async function run(wake = false) {
     if (app.pbsCheck.state === "running" || app.offline) return;
     announced = "";
+    // "Wake the server and check again" sits inside the result, which is hidden while the new check
+    // runs: the focus goes to the main button first (it stays focusable, see aria-disabled) instead of
+    // falling to the page for minutes. At the end it moves to the result as after the first check.
+    const a0 = document.activeElement;
+    if (a0 && a0 !== button && resultEl?.contains(a0)) button?.focus();
     await app.checkPbs(wake);
     await tick();
     const a = document.activeElement;

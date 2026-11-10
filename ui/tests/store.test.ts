@@ -96,3 +96,28 @@ describe("connection check", () => {
     expect(app.pbsCheck).toEqual({ state: "error", message: "boom" });
   });
 });
+
+describe("other computers (GET /machines)", () => {
+  afterEach(() => {
+    app.machines = null;
+    app.machinesError = null;
+  });
+
+  it("a server that does not answer is an error of the list (the sidebar hint), a working one is not", async () => {
+    serve(new World("pbs_unreachable", "full"));
+    await app.loadMachines();
+    expect(app.machinesError).toMatchObject({ status: 503 });
+
+    serve(new World("ok", "full"));
+    await app.loadMachines();
+    expect(app.machinesError).toBeNull();
+    expect(app.machines?.machines.length).toBeGreaterThan(0);
+  });
+
+  it("an older daemon without the endpoint is no error", async () => {
+    serve(new World("pbs_unreachable", "today"));
+    await app.loadMachines();
+    expect(app.machinesError).toBeNull();
+    expect(app.machines).toBeFalsy();
+  });
+});

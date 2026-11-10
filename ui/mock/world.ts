@@ -78,6 +78,8 @@ export type Flavor = "full" | "today";
  * - `no_usage`: `GET /pbs` does not know the datastore usage
  * - `no_encryption`: encryption is switched off
  * - `unknown_stored`: `credentials_stored` and `key_present` are null (the daemon cannot tell)
+ * - `long_overdue`: an administrator set "overdue after" to 744 hours in the file: above the API's
+ *   limit of 168, so the settings page can only lower it (`limits` reports 744 as the maximum)
  */
 export const FAULTS = [
   "down",
@@ -95,6 +97,7 @@ export const FAULTS = [
   "no_usage",
   "no_encryption",
   "unknown_stored",
+  "long_overdue",
 ] as const;
 export type Fault = (typeof FAULTS)[number];
 
@@ -298,6 +301,8 @@ export class World {
   /** Settings the web UI can change (`PATCH /config`). */
   intervalHours = 24;
   overdueHours = 36;
+  /** `PATCH /config` has set the threshold: the `long_overdue` fault no longer applies. */
+  private overdueSet = false;
   excludes = ["**/.cache", "**/node_modules", "**/.local/share/Trash"];
   wakeEnabled = true;
   /** null: follows the `schedule_off` fault; set by `PATCH /config`. */
@@ -613,7 +618,7 @@ export class World {
   status(now = Date.now()): Status {
     const success = this.lastSuccess();
     const last = this.runs[0] ?? null;
-    const overdueH = this.overdueHours;
+    const overdueH = this.overdue();
     let health: Status["health"];
     if (!this.configured) health = "unconfigured";
     else if (this.active) health = "running";
@@ -681,6 +686,16 @@ export class World {
     return this.timerEnabled ?? !this.faults.has("schedule_off");
   }
 
+  /** "Overdue after" as the configuration file has it. */
+  private overdue(): number {
+    return !this.overdueSet && this.faults.has("long_overdue") ? 744 : this.overdueHours;
+  }
+
+  /** Is the backup server switched off (what the daemon finds out by trying to reach it)? */
+  private serverOff(): boolean {
+    return this.reachable === false || this.faults.has("check_down");
+  }
+
   private wakeConfigured(): boolean {
     return !this.faults.has("no_wake");
   }
@@ -698,12 +713,13 @@ export class World {
       schedule: `every ${this.intervalHours} h`,
       interval_hours: this.intervalHours,
       encryption: this.encryptionOn(),
-      overdue_after_hours: this.overdueHours,
+      overdue_after_hours: this.overdue(),
       automatic_backups: this.timerOn(),
       wake_on_lan: this.wakeOn(),
       wake_on_lan_configured: this.wakeConfigured(),
       editable: SETTING_KEYS.filter((k) => k !== "wake_on_lan" || this.wakeConfigured()),
-      limits: DEFAULT_LIMITS,
+      // Like the daemon: the API cap, or a larger value from the file (which can only be lowered).
+      limits: { ...DEFAULT_LIMITS, overdue_after_hours: { ...DEFAULT_LIMITS.overdue_after_hours, max: Math.max(DEFAULT_LIMITS.overdue_after_hours.max, this.overdue()) } },
     };
   }
 
@@ -711,11 +727,19 @@ export class World {
   updateConfig(body: unknown): Reply {
     const err = (status: number, code: string, message: string): Reply => ({ status, body: { code, message } });
     if (!this.configured) return err(500, "internal", "cannot read configuration /etc/nestegg/config.toml: No such file or directory (os error 2)");
-    const problem = settingsProblem(body, {
-      interval_hours: this.intervalHours,
-      overdue_after_hours: this.overdueHours,
-      wake_on_lan_configured: this.wakeConfigured(),
-    });
+    const current = this.config()!;
+    const sources = current.sources ?? [];
+    const problem = settingsProblem(
+      body,
+      {
+        interval_hours: this.intervalHours,
+        overdue_after_hours: this.overdue(),
+        wake_on_lan_configured: this.wakeConfigured(),
+        sources: sources.filter((x) => x.archive !== "inventory.pxar").map((x) => x.path),
+        excludes: this.excludes,
+      },
+      current.limits,
+    );
     if (problem) return err(400, "bad_request", problem);
     const change = body as SettingsChange;
     const timer = change.automatic_backups;
@@ -727,7 +751,10 @@ export class World {
       );
     }
     if (change.interval_hours != null) this.intervalHours = change.interval_hours;
-    if (change.overdue_after_hours != null) this.overdueHours = change.overdue_after_hours;
+    if (change.overdue_after_hours != null) {
+      this.overdueHours = change.overdue_after_hours;
+      this.overdueSet = true;
+    }
     if (change.excludes != null) this.excludes = [...change.excludes];
     if (change.wake_on_lan != null && this.wakeConfigured()) this.wakeEnabled = change.wake_on_lan;
     if (timer != null) this.timerEnabled = timer;
@@ -894,7 +921,7 @@ export class World {
       // unreadable configuration or a server that does not answer (200, never 503). It does not
       // change what /status says about the server.
       const wakeParam = query.get("wake") === "true";
-      const serverOff = this.reachable === false || this.faults.has("check_down");
+      const serverOff = this.serverOff();
       const delayMs = this.faults.has("check_slow") || wakeParam ? 6_000 : undefined;
       const checkedAt = iso(now + (delayMs ?? 0));
       if (!this.configured) {
@@ -944,7 +971,7 @@ export class World {
           item(
             "PBS reachable",
             "not_checked",
-            "no answer; the server may be asleep (Wake-on-LAN is configured). `nestegg check --wake` wakes it and checks again; a backup run wakes it by itself",
+            "no answer; the server may be asleep (Wake-on-LAN is configured, a backup run wakes it by itself)",
           ),
         );
       } else {
@@ -1018,7 +1045,12 @@ export class World {
     if (route === "PATCH /config") return this.updateConfig(body);
     // Proposed endpoints (API-REQUESTS.md).
     // Like the daemon: it reads the server first, which needs the configuration (500 without it).
-    if (route === "GET /machines" && !today) return this.configured ? { status: 200, body: this.machines(now) } : notConfigured();
+    if (route === "GET /machines" && !today) {
+      if (!this.configured) return notConfigured();
+      // The daemon probes the server first (3 s) and answers 503 when nobody answers.
+      if (this.serverOff()) return err(503, "pbs_unreachable", "PBS is not reachable");
+      return { status: 200, body: this.machines(now) };
+    }
     if (route === "GET /session" && !today) return { status: 200, body: { user: "alice", home: "/home/alice" } };
     return err(404, "not_found", "unknown endpoint");
   }

@@ -135,3 +135,15 @@ All of these are in `api/openapi.yaml` and the UI uses them:
 
 Not used by the UI: `MachinesResponse.complete` (the list simply shows who is
 visible), `PbsInfo.overview_configured` and `SessionInfo.uid` / `root`.
+
+## 5. The weekly rhythm cannot be chosen any more (decision 0022)
+
+`interval_hours` may be 1 to 168, but "overdue after" is now capped at 168 hours
+through the API and must be greater than the interval (`greater_than_interval`).
+So an interval of 168 can only be saved when the file already has a longer
+"overdue after". The settings page therefore no longer offers "weekly" (and a
+rhythm of 167 or less cannot be raised past the cap either: `limits` decides).
+If a weekly rhythm should stay possible for group members, either lower
+`limits.interval_hours.max` to 167 or allow "overdue after" up to 336 hours when
+the interval is raised in the same request. For now the page says that longer
+rhythms are set by an administrator in `/etc/nestegg/config.toml`.
