@@ -126,6 +126,25 @@ unencrypted snapshot into the machine's own group with the backup token while
 encryption is on and checks that browsing and restoring it as a non-root user
 stay forbidden.
 
+## Update 2026-11-10: restoring the archive itself names an unprotected snapshot
+
+Permissions no longer depend on an `Auto` key (the blob decides, above), but the
+restored **content** still did: with encryption configured, restoring a data
+archive with `RestoreKey::Auto` would restore an old or planted snapshot that is
+neither encrypted nor signed without any hint, exactly as if it had been made
+with the key. Unencrypted snapshots can be legitimate (made before encryption
+was switched on), so they are not refused outright, but the restore now says so:
+
+- With encryption configured, the restore first learns whether the archive is
+  protected (encrypted or signed) from a single listing. A protected archive is
+  restored with the configured key handed over explicitly, so the client
+  verifies the manifest signature — never decided by the restore's own second
+  listing. An archive that is neither encrypted nor signed is restored without a
+  key, but the daemon adds a **warning** to the restore job's `warnings` (shown
+  by the web UI), and the CLI **refuses** it unless `--no-key` is given, with a
+  message that names `--no-key` (and `--keyfile` for an older key generation).
+- With encryption off the behaviour is unchanged (`Auto`).
+
 ## Alternatives rejected
 
 - **Keep using notes, sign them with a key on this computer:** another key

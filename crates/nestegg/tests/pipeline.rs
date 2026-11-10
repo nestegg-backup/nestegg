@@ -67,6 +67,20 @@ case "$1" in
       echo '[{"backup-type":"host","backup-id":"test","backup-time":1794000000,"files":[{"filename":"home.pxar.didx","crypt-mode":"encrypt"}],"size":2048,"protected":false,"verification":{"state":"failed","upid":"x"}}]'
     fi
     if [ "$2" = "files" ]; then
+      # A test can make the Nth and later `snapshot files` calls block, to
+      # exercise a server that answers the first listings but then stops
+      # answering the listing the restore does on its own (encryption off).
+      if [ -n "$FAKE_BLOCK_LISTING_AFTER" ]; then
+        cnt_file="$FAKE_STORE/listing-count"
+        mkdir -p "$FAKE_STORE"
+        n=$(cat "$cnt_file" 2>/dev/null || echo 0)
+        n=$((n + 1))
+        echo "$n" > "$cnt_file"
+        if [ "$n" -gt "$FAKE_BLOCK_LISTING_AFTER" ]; then
+          touch "${FAKE_READBACK_BLOCK:-$FAKE_STORE/blocked}"
+          exec sleep 30
+        fi
+      fi
       # The read-back lists the files first; a test can make this call block
       # (touch a sentinel, then wait to be killed) to exercise a hanging or
       # cancelled read-back.
@@ -562,6 +576,91 @@ fn read_back_mismatch_fails_the_run() {
 }
 
 #[test]
+fn read_back_timeout_with_encryption_off_is_a_transient_failure() {
+    // With encryption off the read-back's metadata restore resolves its key
+    // from a listing of its own. That listing must be bounded and cancellable
+    // too, whatever the configuration (decision 0015): a server that answers
+    // the first listings but then stops answering must not hang the run. The
+    // run ends as a verification failure, but a transient one — a server
+    // availability problem that does not pause the retries (decision 0021).
+    let env = Env::new();
+    fs::remove_file(env.root().join("cred/encryption-key")).unwrap();
+    env.write_config("encryption = false");
+    let out = env
+        .command(&["run", "--trigger", "cli"])
+        // Answer the first two listings (read-back step 1 and the metadata
+        // fetch), then block the restore's own listing.
+        .env("FAKE_BLOCK_LISTING_AFTER", "2")
+        .env("NESTEGG_READBACK_TIMEOUT_SECS", "1")
+        .output()
+        .unwrap();
+    assert_ne!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let state = env.state();
+    assert_eq!(state["last_run"]["state"], "failed", "{state}");
+    assert_eq!(state["last_run"]["error"]["kind"], "verification_failed");
+    assert_eq!(state["last_run"]["transient"], true, "{state}");
+    // Like pbs_unreachable, it does not count towards the growing pause.
+    assert_eq!(state["consecutive_failures"], 0, "{state}");
+    assert!(!env.root().join("state/current.json").exists());
+
+    // So the next timer check retries at once instead of pausing.
+    let out = env.run(&["run", "--trigger", "timer"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("not retrying yet"),
+        "a transient read-back failure must not pause the retries"
+    );
+}
+
+#[test]
+fn a_read_back_mismatch_counts_as_a_failure() {
+    // A mismatch (content differs) is a real failure: it counts towards the
+    // growing pause, unlike a transient availability problem.
+    let env = Env::new();
+    let out = env
+        .command(&["run"])
+        .env("FAKE_TAMPER_META", "1")
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    let state = env.state();
+    assert_eq!(state["last_run"]["error"]["kind"], "verification_failed");
+    // Not transient, so it counts.
+    assert_eq!(state["last_run"]["transient"], serde_json::Value::Null);
+    assert_eq!(state["consecutive_failures"], 1, "{state}");
+}
+
+#[test]
+fn timer_retries_despite_a_failure_stamp_in_the_future() {
+    // The last run failed with a timestamp in the future (the clock was ahead
+    // and was corrected afterwards) and several failures in a row would mean a
+    // long pause. Capping the stamp at "now" would still push every attempt a
+    // full pause ahead and freeze the retries; a future stamp means no pause,
+    // so the timer must really start the run.
+    let env = Env::new();
+    let future = "2099-01-01T00:00:00Z";
+    let mut state = env.state();
+    state["last_run"] = serde_json::json!({
+        "id": "20990101T000000Z-timer-0000",
+        "trigger": "timer",
+        "state": "failed",
+        "started_at": future,
+        "finished_at": future,
+    });
+    state["consecutive_failures"] = serde_json::json!(5);
+    state["failed_config"] = serde_json::json!("some-old-stamp");
+    fs::write(env.root().join("state/state.json"), state.to_string()).unwrap();
+
+    let out = env.run(&["run", "--trigger", "timer"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        env.fake_log().contains("ARGS backup"),
+        "the timer run must really start, not stay frozen behind the future stamp"
+    );
+    assert_eq!(env.state()["last_run"]["state"], "succeeded");
+}
+
+#[test]
 fn timer_run_skips_when_not_due() {
     let env = Env::new();
     assert_eq!(code(&env.run(&["run", "--trigger", "timer"])), 0);
@@ -574,6 +673,37 @@ fn timer_run_skips_when_not_due() {
     // A manual run ignores the interval.
     assert_eq!(code(&env.run(&["run", "--trigger", "manual"])), 0);
     assert_eq!(env.fake_log().matches("ARGS backup").count(), 2);
+}
+
+#[test]
+fn status_errors_when_the_config_exists_but_cannot_be_read() {
+    // A config that exists but cannot be read (0640 root:root for a group
+    // member) must not be shown as the built-in defaults: status errors with a
+    // non-zero exit code. Only a missing file means "not configured".
+    let env = Env::new();
+    let cfg = env.root().join("etc/config.toml");
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = env.run(&["status", "--json"]);
+    assert_ne!(
+        code(&out),
+        0,
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("config"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Restore so the tempdir cleans up.
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // A missing config is "unconfigured", not an error.
+    fs::remove_file(&cfg).unwrap();
+    let out = env.run(&["status", "--json"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["health"], "unconfigured");
 }
 
 #[test]
@@ -1313,6 +1443,39 @@ fn a_file_listing_without_crypt_modes_still_passes_the_read_back() {
     assert_eq!(state["last_success"]["verified"], true);
     let log = env.fake_log();
     assert!(log.contains("ARGS restore host/test/"), "{log}");
+}
+
+#[test]
+fn cli_restore_refuses_an_unprotected_archive_when_encryption_is_on() {
+    // With encryption configured, an archive that is neither encrypted nor
+    // signed (an old snapshot, or one planted by someone without the key) is
+    // not restored silently: the CLI refuses it and names --no-key (decision
+    // 0016).
+    let env = Env::new();
+    env.set_files(r#"[{"filename":"home.pxar.didx","crypt-mode":"none","size":10}]"#);
+    let target = env.root().join("restore-out");
+    let snapshot = "host/test/2026-11-06T21:20:00Z";
+    let out = env.root_cmd(&["restore", snapshot, "home.pxar", target.to_str().unwrap()]);
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--no-key"), "{err}");
+    assert!(err.contains("not protected by the encryption key"), "{err}");
+    assert!(!target.exists(), "nothing was restored");
+
+    // With --no-key the key refusal is gone (it may still fail later for other
+    // reasons in this harness, but not for the missing key).
+    let out = env.root_cmd(&[
+        "restore",
+        "--no-key",
+        snapshot,
+        "home.pxar",
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("not protected by the encryption key"),
+        "--no-key must bypass the refusal: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

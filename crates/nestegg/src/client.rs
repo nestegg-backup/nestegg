@@ -934,8 +934,15 @@ impl<'a> Client<'a> {
             RestoreKey::Without => None,
             RestoreKey::File(secret) => Some(Secret::new(secret.as_bytes().to_vec())),
             RestoreKey::Auto => {
-                // One listing, both lookups (see [`auto_key_decision`]).
-                let files = self.snapshot_files(request.snapshot)?;
+                // One listing, both lookups (see [`auto_key_decision`]). On the
+                // read-back path a time limit is set; the listing must then be
+                // bounded and cancellable too, so a server that fell asleep
+                // after the upload cannot hang here before the restore's own
+                // time limit even applies (decision 0015).
+                let files = match timeout {
+                    Some(t) => self.snapshot_files_bounded(request.snapshot, t)?,
+                    None => self.snapshot_files(request.snapshot)?,
+                };
                 match auto_key_decision(&files, request.archive) {
                     AutoKey::None => None,
                     AutoKey::Key => Some(self.secrets.load(secrets::ENCRYPTION_KEY).context(

@@ -166,15 +166,21 @@ paths:
       operationId: checkPbs
       summary: Run the checks of `nestegg check` (configuration, client, secrets, sources, reachability, login).
       description: |
-        Always answers 200; problems are items. An item is `passed`,
-        `failed`, or `not_checked`. A check that could not be made is
-        never reported as passed: a server that does not answer while
-        Wake-on-LAN is configured and no wake was requested is
+        Always answers 200 (or 409 while another check runs); problems are
+        items. An item is `passed`, `failed`, or `not_checked`. A check that
+        could not be made is never reported as passed: a server that does not
+        answer while Wake-on-LAN is configured and no wake was requested is
         `not_checked` ("PBS reachable"), and so are the checks that need
         the server ("PBS login and datastore access", "overview access").
         With `wake=true` the server is woken first (this may take minutes);
         if it still does not answer, "PBS reachable" is `failed`. Without
         Wake-on-LAN, a server that does not answer is `failed`.
+
+        Only one check runs at a time: a request made while one is running is
+        refused with 409 `already_checking`. There is also a minimum interval
+        between wake attempts, so a wake asked for very soon after a previous
+        one is skipped (`wake_skipped: true`) and the check runs without
+        sending another wake-up burst.
       parameters:
         - name: wake
           in: query
@@ -190,6 +196,9 @@ paths:
                 required: [checks, checked_at]
                 properties:
                   checked_at: { type: string, format: date-time }
+                  wake_skipped:
+                    type: boolean
+                    description: A wake was asked for but skipped because one was sent very recently (minimum interval between wake attempts).
                   checks:
                     type: array
                     items:
@@ -211,6 +220,11 @@ paths:
                             has `ok: false`, so a client that only knows
                             `ok` shows it as a problem, never as fine.
                         detail: { type: string }
+        "409":
+          description: Another PBS check is already running (`already_checking`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
   /machines:
     get:
       operationId: listMachines
@@ -456,7 +470,7 @@ components:
         code:
           type: string
           description: Stable identifier.
-          enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
+          enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, already_checking, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
         message: { type: string, description: Human-readable English text. }
     Health:
       type: object
@@ -573,6 +587,15 @@ components:
         verified:
           type: boolean
           description: The snapshot was read back from the server after the upload and matched. Absent in records of older versions.
+        transient:
+          type: boolean
+          description: |
+            Only on a failed run: the failure is a server-availability problem,
+            not a persistent fault (the server was unreachable or stopped
+            answering during the read-back, so the snapshot may exist but
+            nothing was proven). Reported as `verification_failed`, but, like
+            `pbs_unreachable`, it does not pause the automatic retries. Absent
+            (false) otherwise and in records of older versions.
         error:
           oneOf:
             - $ref: "#/components/schemas/RunError"

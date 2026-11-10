@@ -49,6 +49,56 @@ if [ "$1" = "configure" ]; then
             systemctl restart nestegg.service || true
         fi
     fi
+    # Lock files an older nestegg left group/other-readable (0644) let a group
+    # member hold a shared lock on them and so block the daemon or a backup run
+    # (decision 0022). After the daemon was restarted above, replace such a file
+    # with a fresh 0600 one, so a stale shared lock a group member still holds on
+    # the old inode can no longer block anything. A lock a root-owned process
+    # still holds (a backup run started before the upgrade legitimately holds the
+    # run lock) is only tightened, never replaced: replacing the file under it
+    # would allow two runs at once. Must never abort the upgrade.
+    sanitize_locks() {
+        set +e
+        root_holds_flock() {  # major minor inode (decimal); 0 = a root process holds it
+            [ -r /proc/locks ] || return 0
+            while read -r _idx _typ _rest_mode _rest_rw _pid _devino _rest; do
+                [ "$_typ" = FLOCK ] || continue
+                case "$_pid" in ''|*[!0-9]*) continue ;; esac
+                _lmaj=${_devino%%:*}
+                _tmp=${_devino#*:}; _lmin=${_tmp%%:*}; _lino=${_tmp##*:}
+                case "$_lmaj" in ''|*[!0-9a-fA-F]*) continue ;; esac
+                case "$_lmin" in ''|*[!0-9a-fA-F]*) continue ;; esac
+                case "$_lino" in ''|*[!0-9]*) continue ;; esac
+                [ "$(( 0x$_lmaj ))" -eq "$1" ] || continue
+                [ "$(( 0x$_lmin ))" -eq "$2" ] || continue
+                [ "$_lino" -eq "$3" ] || continue
+                _owner=$(stat -c '%u' "/proc/$_pid" 2>/dev/null || echo 0)
+                [ "$_owner" = 0 ] && return 0
+            done < /proc/locks
+            return 1
+        }
+        for _f in /run/nestegg/run.lock \
+                  /var/lib/nestegg/.current.lock \
+                  /var/lib/nestegg/.notify.lock \
+                  /var/lib/nestegg/.notify-settings.lock; do
+            if [ ! -e "$_f" ] || [ -L "$_f" ]; then continue; fi
+            _perms=$(stat -c '%a' "$_f" 2>/dev/null) || continue
+            [ "$_perms" = 600 ] && continue
+            _d=$(stat -c '%d' "$_f" 2>/dev/null) || continue
+            _ino=$(stat -c '%i' "$_f" 2>/dev/null) || continue
+            case "$_d$_ino" in *[!0-9]*) continue ;; esac
+            _maj=$(( (_d >> 8) & 0xfff ))
+            _min=$(( (_d & 0xff) | ((_d >> 12) & 0xfff00) ))
+            if root_holds_flock "$_maj" "$_min" "$_ino"; then
+                chmod 0600 "$_f" 2>/dev/null || true
+            else
+                rm -f "$_f" 2>/dev/null || true
+                ( umask 077; : > "$_f" ) 2>/dev/null || true
+                chmod 0600 "$_f" 2>/dev/null || true
+            fi
+        done
+    }
+    ( sanitize_locks ) || true
     # Units that were enabled before an `apt remove` (see prerm, preinst).
     # They are enabled again only while the configuration still exists.
     marker=/var/lib/nestegg/enabled-units

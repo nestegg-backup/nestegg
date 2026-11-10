@@ -99,6 +99,33 @@ sums_before="$(config_sums)"
 run_record_before="$(on_client sha256sum "/var/lib/nestegg/runs/$old_run.json")"
 pid_before="$(daemon_pid)"
 
+echo "== a group member holds shared locks on the old lock files across the upgrade"
+# An older nestegg left its lock files group-readable (0644); a member who holds
+# a shared lock on one keeps a valid descriptor across the upgrade and could
+# block the daemon or a backup for good (decision 0022). The upgrade must break
+# that: it replaces a wrong-mode lock file with a fresh 0600 one when no
+# root-owned process holds it. The run above made run.lock and .current.lock;
+# make all four exist as the old 0644 so the whole set is exercised.
+on_client usermod -aG nestegg alice
+lock_files="/run/nestegg/run.lock /var/lib/nestegg/.current.lock /var/lib/nestegg/.notify.lock /var/lib/nestegg/.notify-settings.lock"
+for lf in $lock_files; do
+  on_client sh -c "mkdir -p \"\$(dirname '$lf')\"; [ -e '$lf' ] || : > '$lf'; chgrp nestegg '$lf' 2>/dev/null || true; chmod 0644 '$lf'"
+done
+held=/tmp/nestegg-held
+on_client rm -rf "$held"
+on_client install -d -o alice "$held"
+# Each holder opens the lock read-only on fd 9, takes a shared lock and keeps it
+# (its marker file tells us it is held); it stays alive across the upgrade.
+for lf in $lock_files; do
+  b="$(basename "$lf")"
+  docker exec -u alice -d "$client" sh -c "exec 9<'$lf' && flock -s 9 && { : > '$held/$b'; exec sleep 600; }"
+done
+for lf in $lock_files; do
+  b="$(basename "$lf")"
+  for _ in $(seq 1 50); do on_client test -e "$held/$b" && break; sleep 0.1; done
+  check "member holds a shared lock on $b before the upgrade" on_client test -e "$held/$b"
+done
+
 echo "== upgrade to the new package"
 check "new package installs over the old one" apt_in_client install -y -q /tmp/nestegg-new.deb
 check "new version installed" test "$(installed_version)" == "$new_version"
@@ -127,6 +154,22 @@ check "earlier run listed by the API" bash -c "docker exec $client curl -sf --un
 check "check passes after the upgrade" on_client nestegg check
 check "a key confirmed before the upgrade stays confirmed" bash -c "docker exec $client nestegg key show | grep -Eq 'exported: +yes'"
 check "the exported key file still verifies after the upgrade" bash -c "docker exec $client nestegg key verify /root/key.json | grep -q 'opens the newest backup: yes'"
+
+echo "== the upgrade cleared the member's stale locks; backups and the daemon work"
+for lf in $lock_files; do
+  b="$(basename "$lf")"
+  check "$b is 0600 after the upgrade" bash -c "[[ \$(docker exec $client stat -c '%a' '$lf' 2>/dev/null) == 600 ]]"
+done
+check "the daemon still answers while the member holds the stale locks" api_get /api/v1/status
+before_runs="$(succeeded_runs)"
+# Make a backup due and run it with the stale shared locks still held: it must
+# acquire the (now replaced) run lock and really back up.
+on_client sed -Ei 's/("finished_at": ?")[^"]*"/\12000-01-01T00:00:00Z"/g' /var/lib/nestegg/state.json
+check "a backup runs although a member still holds the old locks" on_client systemctl start nestegg-backup.service
+check "that backup result is success" test "$(on_client systemctl show -p Result --value nestegg-backup.service)" == success
+check "the backup really recorded a new success" test "$(succeeded_runs)" -gt "$before_runs"
+# Release the held locks (their descriptors now point at the replaced inodes).
+on_client pkill -u alice sleep 2>/dev/null || true
 
 echo "== timer backup and restore with the new version"
 # The timer only backs up when the last success is older than the interval:

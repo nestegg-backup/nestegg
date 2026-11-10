@@ -810,6 +810,21 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             );
             return Ok(());
         }
+        crate::verify::Outcome::Unavailable(message) => {
+            record_server_verification(rep, &client, &backup_id);
+            // Reported as a verification failure (the snapshot may exist,
+            // nothing was proven), but only a server-availability problem: it
+            // does not pause the retries (decisions 0015, 0021).
+            rep.run.transient = true;
+            rep.fail(
+                RunState::Failed,
+                RunError {
+                    kind: ErrorKind::VerificationFailed,
+                    message,
+                },
+            );
+            return Ok(());
+        }
     }
     // Verified: a cancel request that arrives now comes too late.
     record_server_verification(rep, &client, &backup_id);

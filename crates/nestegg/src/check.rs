@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::client::{self, Client};
 use crate::config::{Config, Paths};
@@ -12,7 +12,7 @@ use crate::state::Store;
 /// Result of one check. A check that could not be made is neither passed
 /// nor failed: reporting it as passed would claim something nobody looked
 /// at, reporting it as failed would blame something that may be fine.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Passed,
@@ -22,7 +22,7 @@ pub enum CheckStatus {
     NotChecked,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CheckItem {
     pub name: String,
     /// `status == passed`. Kept for clients that only know passed and

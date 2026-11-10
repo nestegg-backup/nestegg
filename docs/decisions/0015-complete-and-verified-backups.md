@@ -129,6 +129,29 @@ its cancel message, so it is in the run record and the run log.
   without having finished the run is recorded as `failed` with kind
   `internal`, never silently as `succeeded`.
 
+## Update 2026-11-10 (b): every read-back call is bounded, and an unavailable server does not pause the retries
+
+- **No read-back call without a time limit and cancellation, whatever the
+  configuration.** With encryption on, the read-back hands the key to the
+  client, so the restores pass no second listing. With encryption off, the
+  restores resolve the key from a `snapshot files` listing of their own; that
+  listing is now bounded and cancellable too (the restore's own time limit is
+  reused for it). Otherwise a server that answered the first listings but then
+  fell asleep could still hang the read-back on this second listing, whatever
+  the time limit on the restore itself.
+- **A read-back that could not be completed is a *transient* failure.** When the
+  read-back fails because the server stopped answering or a time limit was hit
+  (as opposed to a mismatch — something was read back and differs, or an archive
+  is missing), the run is still recorded as `failed` with kind
+  `verification_failed` (the snapshot may exist, nothing was proven), but it is
+  marked `transient`: it is a server-availability problem, not a persistent
+  fault. Like `pbs_unreachable` it does **not** count towards the growing pause
+  between automatic retries (decision 0021); the next hourly check tries again.
+  A mismatch stays a real failure and counts as before. The distinction is made
+  from the read-back error: a timeout or a transport/connection error (the
+  client's own "unreachable" classification) is transient; a content mismatch
+  comes back as a plain verification failure.
+
 ## Alternatives rejected
 
 - **Restore and compare every data archive:** as expensive as the backup.

@@ -31,8 +31,14 @@ pub struct Expected<'a> {
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
     Verified,
-    /// What did not match, or why reading it back failed.
+    /// Something was read back and did not match (content differs, an archive
+    /// is missing): a real verification failure.
     Failed(String),
+    /// The read-back could not be completed because the server stopped
+    /// answering or a time limit was hit. The snapshot may well exist; nothing
+    /// was proven. Reported as a verification failure, but it is a server
+    /// availability problem, not a persistent fault (decisions 0015, 0021).
+    Unavailable(String),
     Cancelled,
 }
 
@@ -131,11 +137,32 @@ pub fn read_back(
         Ok(outcome) => outcome,
         // A client stopped by a cancel request fails; report the cancel.
         Err(_) if cancelled() => Outcome::Cancelled,
-        Err(e) => Outcome::Failed(format!(
-            "the snapshot {} could not be read back from the server: {e:#}",
-            expected.snapshot
-        )),
+        Err(e) => {
+            let message = format!(
+                "the snapshot {} could not be read back from the server: {e:#}",
+                expected.snapshot
+            );
+            // A read-back that failed because the server stopped answering or a
+            // time limit was hit is only an availability problem (the snapshot
+            // may exist); it does not pause the retries. A mismatch comes back
+            // as `Ok(Outcome::Failed(..))` from the steps, not here.
+            if is_unavailable(&e) {
+                Outcome::Unavailable(message)
+            } else {
+                Outcome::Failed(message)
+            }
+        }
     }
+}
+
+/// Whether a read-back error is a server-availability problem (the server
+/// stopped answering, a connection failed, or a time limit was hit) rather than
+/// a real fault. Reuses the client's own transport-error classification plus the
+/// bounded calls' "timed out" wording.
+fn is_unavailable(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    text.to_lowercase().contains("timed out")
+        || crate::client::classify_failure(&[text]) == crate::state::ErrorKind::PbsUnreachable
 }
 
 fn read_back_steps(

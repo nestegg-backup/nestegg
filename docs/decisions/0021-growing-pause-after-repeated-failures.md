@@ -56,11 +56,29 @@ The pause is measured from the failed run's recorded time. If that time lies
 in the future — the clock was ahead when the run failed and was corrected
 afterwards — the pause would last until the (still future) failure time plus
 the doubling, which can be arbitrarily long and freeze the automatic retries.
-`retry_not_before` now takes the current time: a failure time in the future
-counts as "now". Since the pause itself is never longer than the backup
-interval, the next attempt can then never lie later than one interval from
-now (the code also states that bound explicitly; it cannot bind on its own). Both the timer check
-and the status view pass the same "now".
+`retry_not_before` takes the current time: the next attempt can never lie later
+than one backup interval from now (the code states that bound explicitly; it
+cannot bind on its own). Both the timer check and the status view pass the same
+"now".
+
+### Revision 2026-11-10: a future stamp means no pause at all
+
+Capping the future failure time at "now" (an earlier attempt at this fix) was
+not enough: the pause was then measured from "now" at *every* hourly check, so
+`not_before` stayed `now + pause` and still never arrived — the retries stayed
+frozen. A failure time in the future cannot be trusted at all, so
+`retry_not_before` now returns "no pause" for it: the next hourly check retries
+at once. A normal (past) failure still pauses as before, bounded by one backup
+interval.
+
+### A transient read-back failure does not count
+
+A run that failed only because the server was unavailable during the read-back
+(decision 0015) is marked `transient`. Like `pbs_unreachable` and `cancelled`
+it is neither a failure nor a success for `consecutive_failures`: it does not
+count and does not reset, and `retry_not_before` never pauses on it. The next
+hourly check tries again. A read-back *mismatch* (content differs, an archive
+is missing) is a real failure and counts as before.
 
 ## Alternatives rejected
 

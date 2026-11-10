@@ -68,6 +68,18 @@ pub struct Encryption {
     pub key_present: Option<bool>,
 }
 
+/// Load the configuration for a status view. A missing file means "not
+/// configured" (`Ok(None)`); a file that exists but cannot be read or parsed is
+/// an error, so a caller who may not read it (for example a group member facing
+/// a `0640 root:root` file) is not silently shown the built-in defaults as if
+/// they were the configuration.
+pub fn config_for_status(path: &std::path::Path) -> Result<Option<Config>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Config::load(path).map(Some)
+}
+
 pub fn timer_enabled(paths: &Paths) -> bool {
     systemctl_is_enabled(&paths.systemctl)
 }

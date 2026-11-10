@@ -1299,13 +1299,21 @@ fn write_user_file(path: &Path, data: &[u8]) -> Result<()> {
 
 fn check(paths: &Paths, wake: bool) -> Result<u8> {
     use nestegg::check::{CheckStatus, Outcome};
-    let items = nestegg::check::run(
-        paths,
-        &nestegg::check::CheckOptions {
-            wake,
-            login: is_root(),
-        },
-    );
+    // A non-root group member cannot log in to PBS itself (the login item would
+    // always be "not checked: needs root", exit code 2). Let the daemon run the
+    // full check, so the login is really checked — the same way `status` and
+    // `backup` reach the daemon. Only if the daemon cannot be reached does the
+    // local check with its "needs root" skips remain.
+    let items = if is_root() {
+        nestegg::check::run(paths, &nestegg::check::CheckOptions { wake, login: true })
+    } else {
+        match daemon_check(paths, wake)? {
+            Some(items) => items,
+            None => {
+                nestegg::check::run(paths, &nestegg::check::CheckOptions { wake, login: false })
+            }
+        }
+    };
     for item in &items {
         println!(
             "[{}] {}{}",
@@ -1368,6 +1376,32 @@ fn daemon_request(paths: &Paths, method: &str, path: &str) -> Result<(u16, serde
         .context("invalid daemon status line")?;
     let value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
     Ok((code, value))
+}
+
+/// Run the PBS check through the daemon (non-root path), so the PBS login is
+/// really checked. `Ok(None)` when the daemon socket cannot be reached, so the
+/// caller falls back to the local check that can only report "needs root".
+fn daemon_check(paths: &Paths, wake: bool) -> Result<Option<Vec<nestegg::check::CheckItem>>> {
+    if UnixStream::connect(paths.socket()).is_err() {
+        return Ok(None);
+    }
+    let path = format!(
+        "/api/v1/pbs/check?wake={}",
+        if wake { "true" } else { "false" }
+    );
+    let (code, body) = daemon_request(paths, "POST", &path)?;
+    if code == 409 {
+        bail!("a PBS check is already running; try again in a moment");
+    }
+    if code != 200 {
+        bail!(
+            "daemon answered {code}: {}",
+            body["message"].as_str().unwrap_or("")
+        );
+    }
+    let items: Vec<nestegg::check::CheckItem> = serde_json::from_value(body["checks"].clone())
+        .context("unexpected check response from the daemon")?;
+    Ok(Some(items))
 }
 
 fn backup_now(paths: &Paths) -> Result<u8> {
@@ -1448,7 +1482,10 @@ fn snapshots(paths: &Paths, json: bool) -> Result<u8> {
 }
 
 fn status(paths: &Paths, json: bool) -> Result<u8> {
-    let cfg = Config::load(&paths.config_file).ok();
+    // A missing config means "not configured"; a config that exists but cannot
+    // be read is an error, not a reason to show defaults (e.g. a 0640 root:root
+    // file for a non-root caller).
+    let cfg = nestegg::status::config_for_status(&paths.config_file)?;
     let status =
         nestegg::status::build(paths, cfg.as_ref(), nestegg::status::timer_enabled(paths))?;
     if json {
@@ -1457,6 +1494,12 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
     }
     let health = serde_json::to_value(status.health)?;
     println!("Health:       {}", health.as_str().unwrap_or("?"));
+    if let Some(note) = nestegg::state::health_message(
+        &Store::new(paths).load_state()?,
+        status.current_run.as_ref(),
+    ) {
+        println!("              note: {note}");
+    }
     println!(
         "Machine:      {} (backup id {})",
         status.machine.hostname, status.machine.backup_id
@@ -1629,11 +1672,38 @@ fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
     require_root("restore")?;
     let target = restore::absolute_target(args.target)?;
     let sudo = nestegg::identity::UserIdentity::from_sudo()?;
+    let cfg = Config::load(&paths.config_file)?;
     let key = if args.no_key {
         client::RestoreKey::Without
     } else if let Some(path) = args.keyfile {
         let path = absolute_user_path(path)?;
         client::RestoreKey::File(restore::read_user_key(&path, sudo.as_ref())?)
+    } else if cfg.backup.encryption {
+        // With encryption configured, hand the key over explicitly for a
+        // protected archive (so the client verifies the manifest signature),
+        // and refuse an unprotected one rather than restoring it silently: an
+        // old snapshot made before encryption was switched on, or one planted
+        // by someone without the key, is not verified against the key. The key
+        // is never decided by the restore's own second listing. (decision 0015)
+        let client = Client::new(&cfg, SecretStore::new(&paths.credentials_dir));
+        let protected = matches!(
+            client
+                .archive_crypt_mode(args.snapshot, args.archive)?
+                .as_deref(),
+            Some("encrypt") | Some("sign-only")
+        );
+        if protected {
+            client.configured_key()?
+        } else {
+            bail!(
+                "{} in {} is not protected by the encryption key (it was made before \
+                 encryption was switched on, or by someone without the key), so it cannot be \
+                 verified against the key. Restore it anyway with --no-key, or pass the \
+                 matching exported key with --keyfile <file>.",
+                args.archive,
+                args.snapshot
+            );
+        }
     } else {
         client::RestoreKey::Auto
     };
@@ -1648,7 +1718,6 @@ fn restore(paths: &Paths, args: &RestoreArgs<'_>) -> Result<u8> {
         }
         install_restore_signal_handlers();
     }
-    let cfg = Config::load(&paths.config_file)?;
     let mut stderr = std::io::stderr();
     let warnings = restore::execute(
         paths,

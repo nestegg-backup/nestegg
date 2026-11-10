@@ -42,7 +42,16 @@ struct App {
     metadata: Arc<Mutex<MetadataCache>>,
     /// Serialises settings changes (read, modify, write, switch the timer).
     settings: Arc<Mutex<()>>,
+    /// Lets only one PBS check run at a time: a second request while one runs
+    /// is told "already checking" instead of starting another wake-up burst.
+    check_gate: Arc<tokio::sync::Mutex<()>>,
+    /// When the last wake attempt was sent, to keep a minimum interval between
+    /// wake-ups so group members cannot make the daemon spam Wake-on-LAN.
+    last_wake: Arc<Mutex<Option<std::time::Instant>>>,
 }
+
+/// Shortest interval between two Wake-on-LAN attempts from `POST /pbs/check`.
+const MIN_WAKE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Key for the metadata cache. The blob a snapshot has, and whether it may
 /// be trusted, depends not only on the snapshot path but on the server
@@ -218,6 +227,8 @@ pub fn router(paths: Paths) -> Router {
             catalog: Default::default(),
             metadata: Default::default(),
             settings: Default::default(),
+            check_gate: Default::default(),
+            last_wake: Default::default(),
         })
 }
 
@@ -225,13 +236,11 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION"), "api_version": API_VERSION }))
 }
 
-fn load_config(paths: &Paths) -> Option<Config> {
-    Config::load(&paths.config_file).ok()
-}
-
 async fn status(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Value>> {
     let status = blocking(move || {
-        let config = load_config(&app.paths);
+        // A config that exists but cannot be read or parsed is an error, not a
+        // reason to report the built-in defaults as the configuration.
+        let config = crate::status::config_for_status(&app.paths.config_file)?;
         let status = crate::status::build(
             &app.paths,
             config.as_ref(),
@@ -1019,6 +1028,45 @@ async fn start_restore(
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
+/// Decide the restore key for `archive` in `snapshot` and, with encryption
+/// configured, warn when the archive is not protected by the key.
+///
+/// Permissions no longer depend on the key, but the content does: with
+/// encryption configured, a protected archive (encrypted or signed) is restored
+/// with the configured key handed over explicitly — never decided by the
+/// restore's own second listing — so the client verifies the manifest
+/// signature. An archive that is neither encrypted nor signed (an old snapshot
+/// made before encryption was switched on, or one planted by someone without
+/// the key) is restored without a key, but with a warning that it was not
+/// verified against the key. Without encryption configured the key is chosen as
+/// before (`Auto`). (decision 0015, 0016)
+fn restore_key_and_warning(
+    client: &crate::client::Client,
+    config: &Config,
+    snapshot: &str,
+    archive: &str,
+) -> Result<(crate::client::RestoreKey, Option<String>)> {
+    if !config.backup.encryption {
+        return Ok((crate::client::RestoreKey::Auto, None));
+    }
+    let protected = matches!(
+        client.archive_crypt_mode(snapshot, archive)?.as_deref(),
+        Some("encrypt") | Some("sign-only")
+    );
+    if protected {
+        Ok((client.configured_key()?, None))
+    } else {
+        Ok((
+            crate::client::RestoreKey::Without,
+            Some(format!(
+                "{archive} in this snapshot is not protected by the encryption key (it was \
+                 made before encryption was switched on, or by someone without the key); it \
+                 was restored without verifying it against the key"
+            )),
+        ))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_restore_job(
     paths: &Paths,
@@ -1082,6 +1130,10 @@ fn run_restore_job(
                 }
             })
         };
+        let (key, key_warning) = restore_key_and_warning(&client, config, snapshot, &sel.archive)?;
+        if let Some(w) = key_warning {
+            warnings.push(w);
+        }
         let mut log = Vec::new();
         let result = crate::restore::execute(
             paths,
@@ -1091,7 +1143,7 @@ fn run_restore_job(
                 archive: &sel.archive,
                 target: &sub,
                 patterns: &patterns,
-                key: crate::client::RestoreKey::Auto,
+                key,
                 staging_dir: None,
             },
             requester,
@@ -1201,11 +1253,17 @@ async fn cancel_run(
         {
             eprintln!("cannot record who cancelled run {id}: {e:#}");
         }
-        nix::sys::signal::kill(
+        match nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGTERM,
-        )?;
-        Ok(CancelOutcome::Signalled)
+        ) {
+            Ok(()) => Ok(CancelOutcome::Signalled),
+            // The run ended between the active-run check and the signal: there
+            // is no such process any more. That is "already over", not a server
+            // error (409 cannot_cancel, not 500).
+            Err(nix::errno::Errno::ESRCH) => Ok(CancelOutcome::Finished),
+            Err(e) => Err(e.into()),
+        }
     })
     .await?;
     let (log, message) = match outcome {
@@ -1247,18 +1305,48 @@ async fn pbs_check(
     AxState(app): AxState<App>,
     Query(q): Query<WakeQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let paths = app.paths.clone();
     let wake = q.wake.unwrap_or(false);
+    // Only one check at a time: a login, a reachability probe and possibly a
+    // Wake-on-LAN burst can take minutes, and any group member can ask for one.
+    // A second request while one runs is refused with a clear message rather
+    // than piling on more work and more wake-ups.
+    let Ok(_gate) = app.check_gate.try_lock() else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "already_checking",
+            "a PBS check is already running; try again in a moment",
+        ));
+    };
+    // Keep a minimum interval between wake attempts: if one was sent very
+    // recently, check without sending another wake-up burst.
+    let effective_wake = if wake {
+        let mut last = app.last_wake.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let recent = last.is_some_and(|t| now.duration_since(t) < MIN_WAKE_INTERVAL);
+        if !recent {
+            *last = Some(now);
+        }
+        !recent
+    } else {
+        false
+    };
+    let paths = app.paths.clone();
     let checks = blocking(move || {
         Ok(crate::check::run(
             &paths,
-            &crate::check::CheckOptions { wake, login: true },
+            &crate::check::CheckOptions {
+                wake: effective_wake,
+                login: true,
+            },
         ))
     })
     .await?;
     Ok(Json(json!({
         "checks": checks,
         "checked_at": crate::state::format_time(Utc::now()),
+        // True when a wake was asked for but skipped because one was sent very
+        // recently (the minimum interval between wake attempts).
+        "wake_skipped": wake && !effective_wake,
     })))
 }
 
@@ -1428,6 +1516,8 @@ mod tests {
             catalog: Default::default(),
             metadata: Default::default(),
             settings: Default::default(),
+            check_gate: Default::default(),
+            last_wake: Default::default(),
         }
     }
 
@@ -1667,5 +1757,51 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json(resp).await["code"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn only_one_pbs_check_runs_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        let app = app(dir.path());
+        // Simulate a check already in progress by holding the gate.
+        let held = app.check_gate.clone().lock_owned().await;
+        let err = pbs_check(AxState(app.clone()), Query(WakeQuery { wake: Some(false) }))
+            .await
+            .expect_err("a second check must be refused while one runs");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, "already_checking");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn cancel_of_a_just_ended_run_is_409_not_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir_all(&p.state_dir).unwrap();
+        std::fs::create_dir_all(&p.runtime_dir).unwrap();
+        let id = "20261108T120000Z-manual-abcd";
+        let store = Store::new(&p);
+        let mut run = Run::new(Trigger::Manual, Utc::now());
+        run.id = id.into();
+        store.record_run_only(&run).unwrap();
+        store.save_current(&run).unwrap();
+        // The run looks active: a held run lock and a fresh current.json.
+        let _lock = crate::run::RunLock::try_acquire(&p).unwrap().unwrap();
+        // The pid file points at a process that no longer exists, so the signal
+        // gets ESRCH. That is "already finished" (409 cannot_cancel), not a
+        // server error (500).
+        std::fs::write(p.runtime_dir.join("run.pid"), format!("2147483646 {id}\n")).unwrap();
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/runs/{id}/cancel"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(Peer { uid: Some(0) }));
+        let resp = router(p).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(json(resp).await["code"], "cannot_cancel");
     }
 }

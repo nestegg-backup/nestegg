@@ -36,9 +36,12 @@ pub enum RunState {
     Failed,
     PbsUnreachable,
     Cancelled,
-    /// A run state written by a newer version this one does not know. Only
-    /// finished runs are ever persisted, so an unknown state read back from a
-    /// file is treated as finished.
+    /// A run state written by a newer version this one does not know. It is
+    /// kept so state.json, current.json and run records of a newer version
+    /// stay readable. It may belong to a finished run or to a run still in
+    /// progress (current.json), so it is never read as a success: health and
+    /// the retry logic treat it as a failure (this version cannot understand
+    /// the record).
     #[serde(other)]
     Unknown,
 }
@@ -152,6 +155,15 @@ pub struct Run {
     /// matched (see decision 0015).
     #[serde(default)]
     pub verified: bool,
+    /// A failure that is only a server-availability problem, not a persistent
+    /// fault: the server was unreachable or stopped answering during the
+    /// read-back (decision 0015), so the snapshot may exist but nothing was
+    /// proven. It is still reported as `failed` with kind `verification_failed`,
+    /// but, like `pbs_unreachable`, it does not count towards the growing pause
+    /// between automatic retries (decision 0021) — the next hourly check tries
+    /// again. Defaults to false; older records read as false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transient: bool,
     #[serde(default)]
     pub error: Option<RunError>,
 }
@@ -173,6 +185,7 @@ impl Run {
             warnings: Vec::new(),
             incomplete: Vec::new(),
             verified: false,
+            transient: false,
             error: None,
         }
     }
@@ -315,8 +328,12 @@ pub fn health(
     let Some(success) = &state.last_success else {
         return Health::Never;
     };
+    // A failed last run is `failing`; so is a run whose state this version does
+    // not understand (written by a newer version) — it is not a success and
+    // not "nothing happened", so the safe reading is a failure that asks for an
+    // update (see `health_message`).
     if let Some(last) = &state.last_run
-        && last.state == RunState::Failed
+        && matches!(last.state, RunState::Failed | RunState::Unknown)
     {
         return Health::Failing;
     }
@@ -328,6 +345,22 @@ pub fn health(
         return Health::Incomplete;
     }
     Health::Ok
+}
+
+/// An explanatory note for the dashboard and `nestegg status` when the health
+/// needs one. Currently only the last run having a state this version does not
+/// understand: it is mapped to `failing`, and the note says why and that
+/// nestegg should be updated. `None` when nothing needs explaining.
+pub fn health_message(state: &State, current: Option<&Run>) -> Option<String> {
+    let unknown = |run: Option<&Run>| run.is_some_and(|r| r.state == RunState::Unknown);
+    if unknown(current) || unknown(state.last_run.as_ref()) {
+        return Some(
+            "the last run has a state this version of nestegg does not understand; it was \
+             written by a newer version. Update nestegg to read it correctly."
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// A run is due when there was no success within the interval.
@@ -357,26 +390,36 @@ const TIMER_SLACK_MINUTES: i64 = 30;
 /// pause ends; so it does after the commands that store credentials or keys
 /// ([`Store::clear_failures`]) and for every manually started run.
 ///
-/// `now` bounds the pause against a wrong clock (decision 0021): a failure
-/// time in the future (the clock was ahead and was corrected afterwards)
-/// counts as "now", and the pause can never end later than one backup
-/// interval from now.
+/// `now` guards against a wrong clock (decision 0021): if the failure time
+/// lies in the future (the clock was ahead when the run failed and was
+/// corrected afterwards), the recorded time cannot be trusted and there is no
+/// pause at all — the next hourly check retries at once. Otherwise the pause
+/// can never end later than one backup interval from now.
 pub fn retry_not_before(
     state: &State,
     interval_hours: u32,
     config_now: Option<&str>,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
+    // A transient failure (a server that was unreachable during the read-back,
+    // decision 0015) is not a persistent fault: like `pbs_unreachable` it does
+    // not pause the retries.
     let last = state
         .last_run
         .as_ref()
-        .filter(|run| run.state == RunState::Failed)?;
+        .filter(|run| run.state == RunState::Failed && !run.transient)?;
     if state.consecutive_failures < 2 {
         return None;
     }
-    // A failure time in the future (clock was ahead, later corrected) would
-    // otherwise freeze the retries arbitrarily long; cap it at "now".
-    let failed_at = last.finished_at.unwrap_or(last.started_at).min(now);
+    // A failure time in the future means the clock was ahead and was later
+    // corrected. Capping it at "now" would still push the next attempt a full
+    // pause into the future at every hourly check (now + pause), freezing the
+    // retries. The recorded time is not trustworthy, so do not hold the retries
+    // back at all.
+    let failed_at = last.finished_at.unwrap_or(last.started_at);
+    if failed_at > now {
+        return None;
+    }
     // Compared by content, not by time: file times and run times have
     // different precision, and a clock can be wrong. A state without a
     // recorded stamp (older version) never pauses.
@@ -494,7 +537,9 @@ impl Store {
         config_stamp: Option<String>,
     ) -> Result<()> {
         self.record_finished(run, keep)?;
-        if run.state == RunState::Failed {
+        // A transient failure (server unavailable during the read-back) does
+        // not pause the retries, so it does not tie the pause to the config.
+        if run.state == RunState::Failed && !run.transient {
             let mut state = self.load_state()?;
             state.failed_config = config_stamp;
             self.save_state(&state)?;
@@ -514,7 +559,10 @@ impl Store {
                 state.last_success = Some(run.clone());
                 state.consecutive_failures = 0;
             }
-            RunState::Failed => {
+            // A transient failure (server unavailable during the read-back,
+            // decision 0015) is treated like `pbs_unreachable`: it neither
+            // counts nor resets the failures in a row (decision 0021).
+            RunState::Failed if !run.transient => {
                 state.consecutive_failures = state.consecutive_failures.saturating_add(1);
             }
             _ => {}
@@ -614,14 +662,54 @@ impl Store {
 }
 
 /// Open (creating if needed) a lock file that only root processes need, with
-/// mode 0600 and no symlink following, and tighten an existing file to 0600
-/// when it is opened. A lock file left 0644 by an older version lets a group
-/// member open it read-only and hold a shared `flock`, which would block the
-/// root process that wants the exclusive lock; 0600 closes that (decision 0022,
-/// item 2). The caller takes the `flock` on the returned file.
+/// mode 0600 and no symlink following. The caller takes the `flock` on the
+/// returned file.
+///
+/// A lock file left 0644 by an older version lets a group member open it
+/// read-only and hold a shared `flock`, which blocks the root process that
+/// wants the exclusive lock (decision 0022, item 2). Tightening the mode alone
+/// does not help after an upgrade: a group member that opened the old 0644 file
+/// before the upgrade keeps a valid descriptor and can still hold the lock. So
+/// a lock file with the wrong mode is replaced by a fresh 0600 file, which
+/// leaves that stale descriptor pointing at the now-unlinked old inode where it
+/// can no longer block anything. The file is only replaced when no root-owned
+/// process holds a lock on it according to `/proc/locks`: a backup run started
+/// before the upgrade legitimately holds the run lock, and replacing the file
+/// under it would allow two runs at once; such a lock is only tightened in
+/// place (a non-root reader cannot share an inode with the root run's exclusive
+/// lock anyway).
 pub fn open_private_lock(path: &Path) -> Result<fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let file = fs::OpenOptions::new()
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let file = open_lock_file(path)?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("cannot stat lock file {}", path.display()))?;
+    if meta.mode() & 0o777 == 0o600 {
+        return Ok(file);
+    }
+    // Wrong (too open) mode: an old lock file. Only the root daemon or a root
+    // backup run replaces it (the hardening protects those root processes from
+    // a group member's stale shared lock); a non-root caller only tightens the
+    // mode. Replace it when no root-owned process holds a lock on it, so a
+    // running backup's lock is never pulled out from under it.
+    if nix::unistd::geteuid().is_root() && !root_holds_flock(meta.dev(), meta.ino()) {
+        // Unlink the old inode and create a fresh 0600 one. O_NOFOLLOW on the
+        // reopen guards against a symlink planted in between.
+        let _ = fs::remove_file(path);
+        let fresh = open_lock_file(path)?;
+        fresh
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("cannot set mode of {}", path.display()))?;
+        return Ok(fresh);
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot set mode of {}", path.display()))?;
+    Ok(file)
+}
+
+fn open_lock_file(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -629,10 +717,55 @@ pub fn open_private_lock(path: &Path) -> Result<fs::File> {
         .mode(0o600)
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(path)
-        .with_context(|| format!("cannot open lock file {}", path.display()))?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("cannot set mode of {}", path.display()))?;
-    Ok(file)
+        .with_context(|| format!("cannot open lock file {}", path.display()))
+}
+
+/// Whether any process owned by root currently holds a lock (read or write) on
+/// the file with `dev`/`ino`, according to `/proc/locks`. Blocked waiters (`->`)
+/// are not holders. When `/proc/locks` cannot be read the answer is a
+/// conservative `true`, so a lock file is never replaced while a root process
+/// might hold it.
+pub fn root_holds_flock(dev: u64, ino: u64) -> bool {
+    let Ok(locks) = fs::read_to_string("/proc/locks") else {
+        return true;
+    };
+    let major = nix::sys::stat::major(dev);
+    let minor = nix::sys::stat::minor(dev);
+    for line in locks.lines() {
+        if line.contains("->") {
+            continue; // a blocked waiter, not a holder
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // `1: FLOCK  ADVISORY  WRITE 1234 00:19:5678 0 EOF`
+        if fields.len() < 6 || fields[1] != "FLOCK" {
+            continue;
+        }
+        let mut id = fields[5].split(':');
+        let (Some(ma), Some(mi), Some(i)) = (id.next(), id.next(), id.next()) else {
+            continue;
+        };
+        if u64::from_str_radix(ma, 16).ok() != Some(major)
+            || u64::from_str_radix(mi, 16).ok() != Some(minor)
+            || i.parse::<u64>().ok() != Some(ino)
+        {
+            continue;
+        }
+        let Ok(pid) = fields[4].parse::<u32>() else {
+            continue;
+        };
+        if process_is_root(pid) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `/proc/<pid>` is owned by root (the process runs as uid 0).
+fn process_is_root(pid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(format!("/proc/{pid}"))
+        .map(|m| m.uid() == 0)
+        .unwrap_or(false)
 }
 
 pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -679,6 +812,12 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         return Err(e);
     }
     fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))?;
+    // Persist the rename itself: without an fsync on the directory a power loss
+    // right after the rename can lose the directory entry and bring the old
+    // file back. Best effort — some file systems refuse fsync on a directory.
+    if let Ok(dir_file) = fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
     Ok(())
 }
 
@@ -786,6 +925,16 @@ mod tests {
         assert_eq!(health(true, &state, None, 1, t(12)), Health::Overdue);
         state.last_run = Some(finished(RunState::Failed, t(11)));
         assert_eq!(health(true, &state, None, 36, t(12)), Health::Failing);
+
+        // A last run whose state this version does not understand (written by a
+        // newer version) is not read as a success: it is `failing` with a note
+        // that nestegg should be updated.
+        assert_eq!(health_message(&state, None), None);
+        state.last_run = Some(finished(RunState::Unknown, t(11)));
+        assert_eq!(health(true, &state, None, 36, t(12)), Health::Failing);
+        assert!(health_message(&state, None).unwrap().contains("Update"));
+        // Never read as ok even with a very long overdue window.
+        assert_eq!(health(true, &state, None, 1000, t(12)), Health::Failing);
     }
 
     #[test]
@@ -850,25 +999,59 @@ mod tests {
         };
         let same = Some("stamp-a");
 
-        // The failed run's time lies in the future (the clock was ahead and
-        // was corrected afterwards). It counts as "now", so the pause is
-        // measured from now, not from the bogus future time.
+        // The failed run's time lies in the future (the clock was ahead and was
+        // corrected afterwards). Capping it at "now" would still push the next
+        // attempt a full pause into the future at every hourly check and freeze
+        // the retries, so a future stamp means no pause at all: the timer
+        // retries at once.
         let now = t(2);
         let future = t(12);
         state.last_run = Some(finished(RunState::Failed, future));
-        let not_before = retry_not_before(&state, 24, same, now).unwrap();
-        // 16 h minus the 30 min tolerance from "now", and never beyond one
-        // interval from now.
-        assert_eq!((not_before - now).num_minutes(), 16 * 60 - 30);
-        assert!(not_before <= now + Duration::hours(24));
+        assert_eq!(retry_not_before(&state, 24, same, now), None);
 
-        // Even a huge configured pause can never push the next attempt beyond
-        // one backup interval from now.
+        // A normal (past) failure still pauses, and never beyond one backup
+        // interval from now.
         state.consecutive_failures = 40;
         let now = t(2);
         state.last_run = Some(finished(RunState::Failed, t(1)));
         let not_before = retry_not_before(&state, 3, same, now).unwrap();
         assert!(not_before <= now + Duration::hours(3));
+    }
+
+    #[test]
+    fn a_transient_verification_failure_does_not_pause_the_retries() {
+        // A read-back that could not be completed because the server was
+        // unavailable (decision 0015) is recorded as a failed run, but it must
+        // not pause the retries: the next hourly check tries again, like after
+        // `pbs_unreachable` (decision 0021).
+        let mut state = State {
+            failed_config: Some("stamp-a".into()),
+            consecutive_failures: 5,
+            ..State::default()
+        };
+        let mut run = finished(RunState::Failed, t(10));
+        run.transient = true;
+        state.last_run = Some(run);
+        assert_eq!(retry_not_before(&state, 24, Some("stamp-a"), t(11)), None);
+
+        // The counter does not move for a transient failure, the same as for
+        // `pbs_unreachable`.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: dir.path().join("config.toml"),
+            credentials_dir: dir.path().join("cred"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+            systemctl: PathBuf::from("systemctl"),
+        };
+        let store = Store::new(&paths);
+        store
+            .record_finished(&finished(RunState::Failed, t(1)), 50)
+            .unwrap();
+        let mut transient = finished(RunState::Failed, t(2));
+        transient.transient = true;
+        store.record_finished(&transient, 50).unwrap();
+        assert_eq!(store.load_state().unwrap().consecutive_failures, 1);
     }
 
     #[test]
@@ -887,8 +1070,8 @@ mod tests {
             serde_json::from_str::<RunState>("\"future_state\"").unwrap(),
             RunState::Unknown
         );
-        // Only finished runs are persisted, so an unknown state counts as
-        // finished.
+        // An unknown state (newer version) counts as finished for this
+        // process's own safety-net checks; it is never read as a success.
         assert!(RunState::Unknown.is_finished());
         assert_eq!(
             serde_json::from_str::<Trigger>("\"future_trigger\"").unwrap(),
