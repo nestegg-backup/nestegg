@@ -355,15 +355,22 @@ pub fn health(
     if current.is_some() {
         return Health::Running;
     }
+    // A last run whose state this version does not understand (written by a
+    // newer version) is not a success and not "nothing happened", with or
+    // without an earlier success: the safe reading is a failure that asks for
+    // an update (see `health_message`).
+    if state
+        .last_run
+        .as_ref()
+        .is_some_and(|last| last.state == RunState::Unknown)
+    {
+        return Health::Failing;
+    }
     let Some(success) = &state.last_success else {
         return Health::Never;
     };
-    // A failed last run is `failing`; so is a run whose state this version does
-    // not understand (written by a newer version) — it is not a success and
-    // not "nothing happened", so the safe reading is a failure that asks for an
-    // update (see `health_message`).
     if let Some(last) = &state.last_run
-        && matches!(last.state, RunState::Failed | RunState::Unknown)
+        && last.state == RunState::Failed
     {
         return Health::Failing;
     }
@@ -1067,6 +1074,15 @@ mod tests {
         assert_eq!(health_message(&state, None), None);
         state.last_run = Some(finished(RunState::Unknown, t(11)));
         assert_eq!(health(true, &state, None, 36, t(12)), Health::Failing);
+        // Also without any earlier success: not "never backed up".
+        let only_unknown = State {
+            last_run: Some(finished(RunState::Unknown, t(11))),
+            ..State::default()
+        };
+        assert_eq!(
+            health(true, &only_unknown, None, 36, t(12)),
+            Health::Failing
+        );
         assert!(health_message(&state, None).unwrap().contains("Update"));
         // Never read as ok even with a very long overdue window.
         assert_eq!(health(true, &state, None, 1000, t(12)), Health::Failing);
