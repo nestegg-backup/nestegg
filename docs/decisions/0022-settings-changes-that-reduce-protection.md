@@ -93,11 +93,13 @@ the value as root in `/etc/nestegg/config.toml`.
   backups silently useless — a month-long overdue window and excluding a whole
   source — are now out of reach through the web UI. root can still do anything
   in the file, which is the intended trust boundary.
-- The rule for excludes is deliberately a little stricter than the minimum: any
-  anchored single-component pattern is refused, not only the configured sources
-  and (in system mode) the system directories. Such a pattern can only ever
-  remove a whole top-level entry of an archive, so nothing useful is lost, and
-  the rule needs no special case for system mode.
+- The exclude rule is a guard against accidents and casual misuse, **not a
+  security boundary**. A group member can still narrow the backup in ways that
+  are not refused — excluding a user's folders one by one, for example — but
+  every such change is reported, named, to the owner and the hook. The refusal
+  only fences off the one-move "drop a whole home or source" cases; see the
+  2026-11-10 revision below for how the rule is actually evaluated (the first
+  version's claim that it "needs no special case for system mode" was wrong).
 - The `settings` announcement and the `automatic_off` condition are two more
   message kinds the hook may see (`NESTEGG_EVENT=settings`,
   `automatic_off`); existing hooks ignore unknown events.
@@ -122,3 +124,88 @@ the value as root in `/etc/nestegg/config.toml`.
   [decision 0013](0013-editable-settings-in-the-web-ui.md) — everyday changes
   without `sudo`. Most changes are harmless and useful; only the extremes need
   to be fenced off, and the rest is made visible rather than forbidden.
+
+## Revision 2026-11-10 (review follow-up)
+
+An independent review found gaps in the first implementation. The corrections:
+
+### The exclude rule is evaluated against what the backup client really does
+
+The first version matched patterns syntactically and was both too weak and too
+strong: with the default configuration it accepted `alice`, `/[a-z]*`,
+`alice/**` and other spellings that remove a whole user's home from
+`home.pxar`, while refusing harmless anchored names such as `/.cache` with a
+misleading message. The claim in *Consequences* that an anchored
+single-component pattern "can only ever remove a whole top-level entry" was
+simply not true (archive paths are relative to each source, so `/alice` in
+`home.pxar` is a whole home directory).
+
+The rule now builds the pattern exactly as `proxmox-backup-client` does — one
+`MatchEntry` from the `pathpatterns` crate (the client's own matcher,
+`AGPL-3.0-or-later`, so licence-compatible) — and tests whether, applied in the
+relevant archive, it would leave out a whole protected folder:
+
+- a **configured source** (`/home`, `/etc`, ...), tested by its path;
+- a **regular user's home directory** that lies inside a source
+  (`/home/alice`), taken from the account database (NSS), tested in that
+  source's archive (`/alice` in `home.pxar`); and
+- in **system mode**, a whole **top-level system directory**
+  (`/etc /home /root /usr /var /opt /boot /srv`) in `system.pxar`.
+
+"Leaves out the whole folder" means the pattern matches the folder itself, or
+matches every child (so `alice/**` and `alice/*` count). The cases above, the
+near misses (`**/.cache`, `/alice/Downloads`, `/home/*/Videos`, ...) and the
+real behaviour of each were confirmed with `pxar create --exclude` in the e2e
+client image and turned into a table-driven test. As noted above, this is a
+guard against accidents, not a security boundary.
+
+The pattern-length limit is now counted in **bytes** (256), so a few hundred
+multi-byte characters cannot slip past it, and invisible/format characters in a
+pattern are rejected like control characters.
+
+### The weekly rhythm keeps a valid "overdue after"
+
+Capping "overdue after" at 168 h while requiring it to exceed the interval left
+a weekly rhythm (interval 168 h) with no valid threshold. The API cap is now
+`max(168, interval + 72)` hours — evaluated against the interval in effect
+after the same request, since both keys can change together — so a weekly
+rhythm can be overdue after up to ten days. `limits.overdue_after_hours` reports
+`base` (168), `per_interval_extra` (72) and `file_minimum` so the web interface
+can recompute the cap for an interval it is about to set. Raising the threshold
+above 168 h this way is still reported as a reduction.
+
+### Delivery, flood control and honesty
+
+- **Durable record before the answer.** A change is written to a small inbox
+  with its own short lock *before* the HTTP response, so a daemon restart (a
+  package upgrade) while a slow check holds the main lock cannot lose it. The
+  next check drains the inbox under the main lock and announces it.
+- **No flood.** All pending changes for one recipient are combined into a
+  single message (identical reductions listed once), the stored list is capped,
+  and `nestegg-notify.service` keeps `StartLimitIntervalSec=0` because systemd
+  coalesces the repeated `start --no-block` triggers and one run now does all
+  the pending work.
+- **Every change that took effect is reported**, even when the request ends in
+  an error (the timer could not be started after the file was saved, or the
+  rollback failed).
+- **More reductions are reported:** removing a `!` re-include, and reordering
+  the exclude list when a re-include is present (later patterns win).
+- **"Automatic backups are off" is evaluated next to the other conditions**, so
+  it is announced even when the last run also failed, not only in the
+  else-branch of a failure.
+- The condition is named `automatic_off` everywhere now (the record and the
+  hook); records written as `automaticoff` by the first version still load.
+- Every message is held under a few kilobytes before it reaches `notify-send`,
+  the hook environment or the hook's stdin, and the stdin write cannot block
+  the check, so a huge exclude list can no longer make delivery fail or hang.
+
+### Packaging and `init`
+
+- `postinst` only **tightens** an over-permissive `config.toml` (readable by
+  users outside the group); a stricter `root:root 0600` chosen by an
+  administrator is kept, the mode is set only after the owner change worked, and
+  a symlink is never followed.
+- `nestegg init` creates the file `0640` from the start (no window at the umask
+  default). Without the `nestegg` group it stays `root:root 0640` (root-only,
+  safe) with a note telling the administrator how to let group members read the
+  status once the group exists.

@@ -16,6 +16,7 @@ hyper = { version = "1.12.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "client-legacy", "http1"] }
 mime_guess = "2.0.5"
 nix = { version = "0.31.3", features = ["fs", "user", "process", "signal", "term", "hostname"] }
+pathpatterns = "0.1.2"
 rand = "0.10.3"
 rust-embed = { version = "8.13.0", features = ["interpolate-folder-path"] }
 serde = { version = "1.0.229", features = ["derive"] }

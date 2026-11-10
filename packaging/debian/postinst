@@ -8,11 +8,23 @@ if [ "$1" = "configure" ]; then
     chgrp nestegg /var/lib/nestegg 2>/dev/null || true
     chmod 0750 /var/lib/nestegg
     # The configuration may carry a token in [notify] command and is readable
-    # by group members (for `nestegg status`), but not by anyone else. Correct
-    # an existing world-readable file from an older version (decision 0022).
-    if [ -e /etc/nestegg/config.toml ]; then
-        chown root:nestegg /etc/nestegg/config.toml 2>/dev/null || true
-        chmod 0640 /etc/nestegg/config.toml 2>/dev/null || true
+    # by group members (for `nestegg status`), but not by anyone else. Only
+    # tighten an over-permissive file (one readable, writable or executable by
+    # users outside the group); a stricter root:root 0600 an administrator chose
+    # is kept. Never follow a symlink, and set the mode only after the
+    # owner/group change worked, so a failed chown cannot leave a looser mode
+    # (decision 0022).
+    cfg=/etc/nestegg/config.toml
+    if [ -f "$cfg" ] && [ ! -L "$cfg" ]; then
+        perms=$(stat -c '%a' "$cfg" 2>/dev/null || echo "")
+        case "$perms" in
+            ''|*[!0-7]*) perms="" ;;  # not a plain octal mode: skip
+        esac
+        if [ -n "$perms" ] && [ $(( 0$perms & 0007 )) -ne 0 ]; then
+            if chown root:nestegg "$cfg" 2>/dev/null; then
+                chmod 0640 "$cfg" 2>/dev/null || true
+            fi
+        fi
     fi
     running=no
     if [ -d /run/systemd/system ]; then

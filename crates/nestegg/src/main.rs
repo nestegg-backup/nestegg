@@ -447,16 +447,44 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
         std::fs::create_dir_all(dir)?;
     }
     let group = ensure_group();
-    std::fs::write(&paths.config_file, config_header() + &cfg.to_toml()?)?;
-    // 0640 root:nestegg: group members read it (for `nestegg status`), but a
-    // user outside the group cannot, because `[notify] command` may carry a
-    // token (decision 0022). The settings writer keeps this mode.
+    // 0640 root:nestegg from the start (no window at the umask default): group
+    // members read it (for `nestegg status`), but a user outside the group
+    // cannot, because `[notify] command` may carry a token (decision 0022). The
+    // settings writer creates its temporary file the same way.
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o640)
+            .open(&paths.config_file)?;
+        file.write_all((config_header() + &cfg.to_toml()?).as_bytes())?;
+    }
+    // On `--force` the file already existed, so its mode was kept above; set it
+    // again to be sure it is not looser than 0640.
     std::fs::set_permissions(&paths.config_file, std::fs::Permissions::from_mode(0o640))?;
     if let Some(gid) = group {
         let _ = nix::unistd::chown(
             &paths.config_file,
             Some(nix::unistd::Uid::from_raw(0)),
             Some(gid),
+        );
+    } else {
+        // Without the group, the file stays root:root 0640: only root can read
+        // it, which is safe but means `nestegg status` as a group member cannot
+        // until the group exists. The package creates it; a build without the
+        // package may not have it.
+        eprintln!(
+            "note: group '{}' does not exist, so {} stays root-only (mode 0640). \
+             Install the package or create the group, then re-run 'nestegg init --force' \
+             (or: chgrp {} {} && chmod 0640 {}) to let group members read the status.",
+            nestegg::daemon::GROUP,
+            paths.config_file.display(),
+            nestegg::daemon::GROUP,
+            paths.config_file.display(),
+            paths.config_file.display(),
         );
     }
     secrets::create_private_dir(&paths.credentials_dir)?;

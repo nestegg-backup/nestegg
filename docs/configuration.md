@@ -252,8 +252,8 @@ The daemon identifies the caller by the socket credentials:
   | Setting | Key in `config.toml` | Allowed |
   |---|---|---|
   | Backup rhythm | `schedule.interval_hours` | 1 to 168 hours |
-  | "Overdue" after | `overdue_after_hours` | 2 to 168 hours (7 days), more than the rhythm |
-  | Excludes | `backup.excludes` | up to 200 patterns, none that excludes everything (`*`, `**`, `/`, ...) or a whole source / top-level directory (`/home`, `/etc`, `/alice`, `home`) |
+  | "Overdue" after | `overdue_after_hours` | 2 hours up to `max(168, interval + 72)` hours, and more than the rhythm (so a weekly rhythm can be overdue after up to 10 days) |
+  | Excludes | `backup.excludes` | up to 200 patterns of at most 256 bytes each, none that excludes everything (`*`, `**`, `/`, ...) or that would leave out a whole source, a whole user home directory, or (in system mode) a whole top-level system directory |
   | Wake-on-LAN on/off | `wake.enabled` | only with a `[wake]` section; switching off keeps the MAC |
   | Automatic backups on/off | `nestegg-backup.timer` | `systemctl enable/disable --now` |
 
@@ -268,9 +268,10 @@ The daemon identifies the caller by the socket credentials:
   narrowed through the web interface, never widened past it
   ([decision 0022](decisions/0022-settings-changes-that-reduce-protection.md)).
   A change by a group member that lowers the protection (automatic backups
-  off, an exclude added, "overdue after" or the interval raised, Wake-on-LAN
-  off) is reported to the logged-in users and the notification hook (see
-  "Notifications"); a change made as root in the file is not.
+  off, an exclude added, a `!` re-include removed, the exclude list reordered,
+  "overdue after" or the interval raised, Wake-on-LAN off) is reported to the
+  logged-in users and the notification hook (see "Notifications"); a change
+  made as root in the file is not.
 - Everything else stays terminal-only (root): server, port, datastore,
   namespace, auth id, fingerprint, backup id, credentials, encryption and
   the key, sources, the `[wake]` details, the overview credentials and the
@@ -309,15 +310,17 @@ Switch it off with `sudo systemctl disable --now nestegg-notify.timer`.
 | `automatic_off` – "Automatic backups are off" | The backup timer is switched off while nestegg is set up. Reported at once, independent of the overdue threshold. The text says how old the last backup is. | every 7 days |
 | `incomplete` – "Backup is incomplete" | The last backup worked but left something out (for example the full system backup was skipped). | every 7 days |
 | `damaged` – "Damaged backups on the server" | The server's own verification reports damaged snapshots of this computer. | every 24 h |
-| `settings` – "Backup settings changed" | A group member lowered the protection through the web interface (automatic backups off, an exclude added, "overdue after" or the interval raised, Wake-on-LAN off). Names who changed what. A change made as root in the file is not reported. | once |
+| `settings` – "Backup settings changed" | A group member lowered the protection through the web interface (automatic backups off, an exclude added or a `!` re-include removed, the exclude list reordered, "overdue after" or the interval raised, Wake-on-LAN off). Names who changed what; several changes are combined into one message. A change made as root in the file is not reported. | once |
 | `recovered` – "Backups work again" | Everything is fine again after one of the above problems was reported. | once |
 
 A different problem (another error, another kind) is reported at once. Each
 message goes to every logged-in user and, if configured, to your command;
-someone who logs in later still gets it once. Nothing is reported while a
-backup is running (the settings change waits for the next check). An
-unreachable server alone is not reported on every attempt, only when it
-becomes `overdue`.
+someone who logs in later still gets it once. Problem messages (`failing`,
+`overdue`, ...) are not judged while a backup is running, but a `settings`
+change is still delivered then, so lowering the protection during a backup is
+reported without waiting. A flurry of settings changes is combined into one
+message per recipient. An unreachable server alone is not reported on every
+attempt, only when it becomes `overdue`.
 A configuration file that cannot be read (a typo, an unknown key) is reported
 as `failing` with the parser's message; the `[notify]` section is still
 honoured in that case, if it is valid.
@@ -352,6 +355,14 @@ English. No `notify-send`, no session: nothing is sent and the check logs it
 If the command fails or does not finish, the check logs it, `nestegg notify`
 ends with a non-zero exit code so `systemctl --failed` shows it, and the
 delivery is tried again an hour later; the desktop message is not held back.
+
+**The message contains text people typed.** `NESTEGG_TITLE` and
+`NESTEGG_MESSAGE` can contain an exclude pattern, a file name or a user name a
+group member chose, with control and invisible characters already replaced.
+Still, pass these values as arguments or over stdin to the programs you call
+(`curl --data-binary @-`, `mail`, ...); never build a shell command string out
+of them (`sh -c "... $NESTEGG_MESSAGE ..."`), or a crafted value could run as
+root. Each value is capped to a few kilobytes.
 
 **Keep secrets out of `config.toml`.** The file is readable by group `nestegg`
 (mode 0640, so members can run `nestegg status`), so do not put an access

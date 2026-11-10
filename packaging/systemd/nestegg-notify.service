@@ -6,7 +6,11 @@ After=network-online.target
 # (OnSuccess=/OnFailure=) and right after a protection-reducing settings
 # change (decision 0022). Several of these can land within seconds, which is
 # normal, not a crash loop, so the default start rate limit must not trip.
-# The unit has no OnFailure= of its own, so it cannot loop.
+# The unit has no OnFailure= of its own, so it cannot loop. A flood of settings
+# changes cannot turn into a flood of expensive runs either: the daemon writes
+# each change to a small inbox and systemd coalesces repeated `start --no-block`
+# jobs, and one run then combines all pending changes into a single message
+# (decision 0022), so keeping the rate limit off is safe.
 StartLimitIntervalSec=0
 
 [Service]

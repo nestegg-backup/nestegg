@@ -41,6 +41,21 @@ const RECOVERY_KEEP: Duration = Duration::days(3);
 const REPEAT_MARGIN: Duration = Duration::minutes(30);
 /// Longest piece of an error text or reason that goes into a message.
 const MAX_DETAIL: usize = 300;
+/// Hard upper bound on the length of any message body in bytes before it is
+/// handed to `notify-send`, the hook environment or the hook's stdin
+/// (decision 0022). Far below the kernel's argument and environment limits
+/// (128 KiB each) and the pipe buffer (64 KiB), so a message can never make
+/// `notify-send`/the hook fail with "Argument list too long" or block the
+/// check on a full stdin pipe.
+const MAX_BODY_BYTES: usize = 4096;
+/// At most this many exclude patterns are named in a `settings` message; the
+/// rest are summarised as "and N more" (decision 0022).
+const MAX_LISTED_PATTERNS: usize = 5;
+/// Each named pattern in a message is shortened to this many bytes.
+const MAX_PATTERN_BYTES: usize = 80;
+/// Most settings announcements kept at once (across the inbox and the record),
+/// a brake on a flood from switching a setting back and forth (decision 0022).
+const MAX_SETTINGS: usize = 50;
 /// Regular (non-system) accounts: from `UID_MIN` of `/etc/login.defs`
 /// (default 1000) up to the end of the systemd-homed range. Above that come
 /// container, dynamic-service and `nobody` ids.
@@ -73,7 +88,10 @@ pub enum Event {
     Failing,
     Overdue,
     /// The backup timer is switched off while nestegg is configured (its own
-    /// condition, decision 0022). Independent of the overdue threshold.
+    /// condition, decision 0022). Independent of the overdue threshold. Stored
+    /// and shown as `automatic_off` everywhere (the hook env, `notify.json`);
+    /// the alias keeps records written by the first version readable.
+    #[serde(rename = "automatic_off", alias = "automaticoff")]
     AutomaticOff,
     Incomplete,
     Damaged,
@@ -216,23 +234,25 @@ pub fn evaluate(
         c.error = error;
         c.age_hours = age_hours;
         conditions.push(c);
-    } else {
-        // The backup timer is switched off while nestegg is configured: its
-        // own condition, reported at once and repeated weekly, independent of
-        // the overdue threshold (decision 0022). It replaces the "overdue
-        // while the timer is off" variant; the text still says how old the
-        // last successful backup is.
-        if !timer_enabled {
-            let mut c = Condition::new(Event::AutomaticOff, "off".to_string());
-            c.age_hours = age_hours;
-            c.timer_off = true;
-            conditions.push(c);
-        }
+    }
+    // The backup timer is switched off while nestegg is configured: its own
+    // condition, reported at once and repeated weekly, independent of the
+    // overdue threshold and of whether the last run failed (decision 0022). It
+    // replaces the "overdue while the timer is off" variant; the text still
+    // says how old the last successful backup is.
+    if !timer_enabled {
+        let mut c = Condition::new(Event::AutomaticOff, "off".to_string());
+        c.age_hours = age_hours;
+        c.timer_off = true;
+        conditions.push(c);
+    }
+    // Overdue and incomplete are only judged when the last run did not fail (a
+    // failure is the louder message), and overdue only while the timer is on; a
+    // switched-off timer is covered by `automatic_off` above.
+    if failed.is_none() {
         let overdue_limit = Duration::hours(i64::from(status.overdue_after_hours));
         let never_and_old = status.health == Health::Never
             && unbacked_since.is_some_and(|since| now - since > overdue_limit);
-        // Overdue only while the timer is on; a switched-off timer is covered
-        // by `automatic_off` above. Incomplete is reported either way.
         if timer_enabled && (status.health == Health::Overdue || never_and_old) {
             let mut c = Condition::new(Event::Overdue, "timer on".to_string());
             c.age_hours = age_hours;
@@ -379,6 +399,48 @@ fn shorten(text: &str) -> String {
     } else {
         first
     }
+}
+
+/// Truncate `text` to at most `max` bytes on a character boundary, adding an
+/// ellipsis when it was cut.
+fn truncate_bytes(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(3);
+    let mut end = keep.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// Control characters and invisible Unicode format characters (bidirectional
+/// overrides, zero-width) become `?`, so pattern text or an error message typed
+/// by a user cannot hide or reorder a notification (decision 0022). Kept in
+/// step with the same filter in `crate::rescue`; duplicated so this module does
+/// not depend on it.
+fn visible(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(c,
+                    '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{2069}' | '\u{feff}')
+            {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Finish a message body: make it printable and hold it under the hard byte
+/// cap (decision 0022), so no event can produce a message that breaks
+/// `notify-send`, the environment or the hook's stdin.
+fn cap_body(body: String) -> String {
+    truncate_bytes(&visible(&body), MAX_BODY_BYTES)
 }
 
 /// "5 hours", "3 days" / "5 Stunden", "3 Tage".
@@ -627,7 +689,11 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>, detail: 
         Detail::Generic => generic_body(lang, event).unwrap_or(full_body),
         Detail::Full => full_body,
     };
-    Message { event, title, body }
+    Message {
+        event,
+        title,
+        body: cap_body(body),
+    }
 }
 
 /// Words for a `settings` message: who lowered the protection and how
@@ -639,42 +705,81 @@ pub fn compose_settings(
     reductions: &[crate::settings::Reduction],
     detail: Detail,
 ) -> Message {
+    compose_settings_many(lang, &[(user.to_string(), reductions.to_vec())], detail)
+}
+
+/// Words for a combined `settings` message (decision 0022): one message that
+/// names each group member who lowered the protection and how, so a flurry of
+/// changes becomes a single notification per recipient. The generic version
+/// only says the settings were changed.
+pub fn compose_settings_many(
+    lang: Lang,
+    groups: &[(String, Vec<crate::settings::Reduction>)],
+    detail: Detail,
+) -> Message {
     let title = tr(
         lang,
         "Backup settings changed",
         "Sicherungseinstellungen geändert",
     );
-    if detail == Detail::Generic {
+    if detail == Detail::Generic || groups.is_empty() {
         return Message {
             event: Event::Settings,
             title,
-            body: generic_body(lang, Event::Settings).unwrap_or_default(),
+            body: cap_body(generic_body(lang, Event::Settings).unwrap_or_default()),
         };
     }
-    let parts: Vec<String> = reductions
+    let sentences: Vec<String> = groups
         .iter()
-        .map(|r| reduction_phrase(lang, r))
+        .map(|(user, reductions)| {
+            let user = visible(user);
+            let list = reductions
+                .iter()
+                .map(|r| reduction_phrase(lang, r))
+                .collect::<Vec<_>>()
+                .join("; ");
+            match lang {
+                Lang::En => format!(
+                    "{user} changed the backup settings of this computer so that it is \
+                     protected less: {list}."
+                ),
+                Lang::De => format!(
+                    "{user} hat die Sicherungseinstellungen dieses Computers so geändert, dass \
+                     es weniger geschützt ist: {list}."
+                ),
+            }
+        })
         .collect();
-    let list = parts.join(match lang {
-        Lang::En => "; ",
-        Lang::De => "; ",
-    });
-    let body = match lang {
-        Lang::En => format!(
-            "{user} changed the backup settings of this computer so that it is protected less: \
-             {list}. If that was not meant to happen, check it: \"nestegg ui\"."
-        ),
-        Lang::De => format!(
-            "{user} hat die Sicherungseinstellungen dieses Computers so geändert, dass es \
-             weniger geschützt ist: {list}. Falls das nicht gewollt war, bitte prüfen: \
-             \"nestegg ui\"."
-        ),
-    };
+    let closing = tr(
+        lang,
+        "If that was not meant to happen, check it: \"nestegg ui\".",
+        "Falls das nicht gewollt war, bitte prüfen: \"nestegg ui\".",
+    );
+    let body = format!("{} {closing}", sentences.join(" "));
     Message {
         event: Event::Settings,
         title,
-        body,
+        body: cap_body(body),
     }
+}
+
+/// Name a few patterns, each shortened, plus "and N more" for the rest, so a
+/// long exclude list cannot blow up the message (decision 0022).
+fn pattern_list(lang: Lang, patterns: &[String]) -> String {
+    let shown: Vec<String> = patterns
+        .iter()
+        .take(MAX_LISTED_PATTERNS)
+        .map(|p| format!("\"{}\"", truncate_bytes(&visible(p), MAX_PATTERN_BYTES)))
+        .collect();
+    let mut list = shown.join(", ");
+    let rest = patterns.len().saturating_sub(MAX_LISTED_PATTERNS);
+    if rest > 0 {
+        list.push_str(&match lang {
+            Lang::En => format!(", and {rest} more"),
+            Lang::De => format!(" und {rest} weitere"),
+        });
+    }
+    list
 }
 
 /// One phrase for a single protection-reducing change (full version).
@@ -687,13 +792,32 @@ fn reduction_phrase(lang: Lang, reduction: &crate::settings::Reduction) -> Strin
             "automatische Sicherungen wurden ausgeschaltet",
         ),
         Reduction::ExcludesAdded { patterns } => {
-            let shown: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
-            let joined = shown.join(", ");
+            let joined = pattern_list(lang, patterns);
             match lang {
                 Lang::En => format!("these patterns are no longer backed up: {joined}"),
                 Lang::De => format!("diese Muster werden nicht mehr gesichert: {joined}"),
             }
         }
+        Reduction::ReincludesRemoved { patterns } => {
+            let joined = pattern_list(lang, patterns);
+            match lang {
+                Lang::En => {
+                    format!(
+                        "these re-include patterns were removed, so what they kept is excluded again: {joined}"
+                    )
+                }
+                Lang::De => format!(
+                    "diese Wieder-Einschluss-Muster wurden entfernt, das von ihnen Bewahrte \
+                     wird also wieder ausgeschlossen: {joined}"
+                ),
+            }
+        }
+        Reduction::ExcludesReordered => tr(
+            lang,
+            "the exclude patterns were reordered, so a re-include may no longer take effect",
+            "die Ausschlussmuster wurden umsortiert, ein Wieder-Einschluss greift dadurch \
+             vielleicht nicht mehr",
+        ),
         Reduction::OverdueRaised { from, to } => match lang {
             Lang::En => format!(
                 "the time before a stopped backup is reported was raised from {from} to {to} hours"
@@ -1080,11 +1204,47 @@ pub fn apply(
     ApplyOutcome { log, hook_failed }
 }
 
+/// The reductions of the given announcements merged per actor, in order and
+/// without repeating an identical reduction, so a change undone and redone
+/// before delivery is listed once (decision 0022).
+fn combine_reductions(
+    settings: &[SettingsAnnouncement],
+    idx: &[usize],
+) -> Vec<(String, Vec<crate::settings::Reduction>)> {
+    let mut groups: Vec<(String, Vec<crate::settings::Reduction>)> = Vec::new();
+    for &i in idx {
+        let a = &settings[i];
+        let pos = match groups.iter().position(|(u, _)| *u == a.user) {
+            Some(p) => p,
+            None => {
+                groups.push((a.user.clone(), Vec::new()));
+                groups.len() - 1
+            }
+        };
+        for r in &a.reductions {
+            if !groups[pos].1.contains(r) {
+                groups[pos].1.push(r.clone());
+            }
+        }
+    }
+    groups
+}
+
+/// Keep at most the newest [`MAX_SETTINGS`] announcements, so endless
+/// back-and-forth cannot grow the record without bound (decision 0022).
+fn cap_settings(settings: &mut Vec<SettingsAnnouncement>) {
+    if settings.len() > MAX_SETTINGS {
+        let drop = settings.len() - MAX_SETTINGS;
+        settings.drain(0..drop);
+    }
+}
+
 /// Deliver the recorded protection-reducing settings changes (decision 0022):
 /// once to every logged-in user (per-user bookkeeping, so a late login still
-/// gets it) and once to the hook (retried on failure). Independent of the
-/// problem conditions, so it runs even while a backup is in progress. The
-/// record is saved after each delivery.
+/// gets it) and once to the hook (retried on failure). All pending changes for
+/// one recipient are combined into a single message, so a flurry of changes
+/// does not flood anyone. Independent of the problem conditions, so it runs
+/// even while a backup is in progress. The record is saved after each delivery.
 pub fn deliver_settings(
     state: &mut NotifyState,
     now: DateTime<Utc>,
@@ -1099,40 +1259,48 @@ pub fn deliver_settings(
     }
     let sessions = channels.sessions();
     let command = channels.command_enabled();
-    for i in 0..state.settings.len() {
-        let (user, reductions) = {
-            let a = &state.settings[i];
-            (a.user.clone(), a.reductions.clone())
-        };
-        for session in &sessions {
-            if state.settings[i].users_done.contains(&session.uid) {
-                continue;
-            }
-            let message = compose_settings(lang, &user, &reductions, session.detail());
-            match channels.send_desktop(session, &message) {
-                Ok(Delivery::Sent) => {
-                    state.settings[i].users_done.insert(session.uid);
-                    save(state);
-                    log.push(format!(
-                        "settings: desktop notification to {}",
-                        session.name
-                    ));
-                }
-                Ok(Delivery::Unavailable(why)) => log.push(format!(
-                    "settings: no desktop notification to {} ({why})",
-                    session.name
-                )),
-                Err(e) => log.push(format!(
-                    "settings: desktop notification to {} failed: {e:#}",
-                    session.name
-                )),
-            }
+    for session in &sessions {
+        let pending: Vec<usize> = (0..state.settings.len())
+            .filter(|&i| !state.settings[i].users_done.contains(&session.uid))
+            .collect();
+        if pending.is_empty() {
+            continue;
         }
-        if command && !state.settings[i].command_done {
-            let message = compose_settings(lang, &user, &reductions, Detail::Full);
+        let groups = combine_reductions(&state.settings, &pending);
+        let message = compose_settings_many(lang, &groups, session.detail());
+        match channels.send_desktop(session, &message) {
+            Ok(Delivery::Sent) => {
+                for &i in &pending {
+                    state.settings[i].users_done.insert(session.uid);
+                }
+                save(state);
+                log.push(format!(
+                    "settings: desktop notification to {}",
+                    session.name
+                ));
+            }
+            Ok(Delivery::Unavailable(why)) => log.push(format!(
+                "settings: no desktop notification to {} ({why})",
+                session.name
+            )),
+            Err(e) => log.push(format!(
+                "settings: desktop notification to {} failed: {e:#}",
+                session.name
+            )),
+        }
+    }
+    if command {
+        let pending: Vec<usize> = (0..state.settings.len())
+            .filter(|&i| !state.settings[i].command_done)
+            .collect();
+        if !pending.is_empty() {
+            let groups = combine_reductions(&state.settings, &pending);
+            let message = compose_settings_many(lang, &groups, Detail::Full);
             match channels.send_command(&message) {
                 Ok(()) => {
-                    state.settings[i].command_done = true;
+                    for &i in &pending {
+                        state.settings[i].command_done = true;
+                    }
                     save(state);
                     log.push("settings: command ran".to_string());
                 }
@@ -1278,10 +1446,15 @@ fn run_with_timeout(mut cmd: Command, input: &[u8], timeout: StdDuration) -> Res
     let mut child = cmd.spawn()?;
     // `cmd` holds the write ends until it is dropped.
     drop(cmd);
-    if let Some(mut stdin) = child.stdin.take() {
-        // The messages are far smaller than the pipe buffer. A program that
-        // ignores its input and exits early is fine.
+    if let Some(stdin) = child.stdin.take() {
+        // Write without blocking: the message is capped well below the pipe
+        // buffer (decision 0022), but a hook that never reads its stdin must
+        // not be able to hang the check even so. A partial or refused write is
+        // fine - the data on stdin is a convenience, not the only channel.
+        let _ = fcntl(&stdin, FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
+        let mut stdin = stdin;
         let _ = stdin.write_all(input);
+        // Dropping `stdin` closes the write end so the hook sees EOF.
     }
     let mut reader = fs::File::from(read_end);
     let mut output = Vec::new();
@@ -1575,6 +1748,13 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
     }
 
     let mut state = load_state(paths);
+    // Fold in the settings changes the daemon wrote to the inbox (its own short
+    // lock) since the last check. The inbox is the durable record written
+    // before the HTTP answer; draining it here, under this check's lock, is
+    // what finally delivers it (decision 0022).
+    if !options.dry_run {
+        drain_settings_inbox(paths, &mut state);
+    }
     // Since when the computer has been set up without a successful backup.
     let never = status.as_ref().is_some_and(|s| s.health == Health::Never);
     if never {
@@ -1686,11 +1866,35 @@ pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
     Ok(u8::from(outcome.hook_failed))
 }
 
+/// The inbox of settings changes the daemon has recorded but no check has
+/// delivered yet: a small file with its own short lock, so the daemon never
+/// waits for a running check to record a change (decision 0022).
+fn settings_inbox_file(paths: &Paths) -> PathBuf {
+    paths.state_dir.join("notify-settings.json")
+}
+
+/// Short lock for the settings inbox, separate from the main notification lock,
+/// so a running check (which holds the main lock for the length of a slow hook)
+/// never blocks the daemon from recording a change.
+fn settings_inbox_lock(paths: &Paths) -> Result<nix::fcntl::Flock<fs::File>> {
+    fs::create_dir_all(&paths.state_dir)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(paths.state_dir.join(".notify-settings.lock"))?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| e)
+        .context("cannot lock the settings inbox")
+}
+
 /// Record a protection-reducing settings change for `nestegg notify` to
-/// deliver (decision 0022). The daemon calls this under the notification lock
-/// after a settings change through the API; the hourly check and the trigger
-/// right after then announce it. Root's own changes are not recorded by the
-/// caller (root is trusted).
+/// deliver (decision 0022). The daemon calls this synchronously, before it
+/// answers the HTTP request, so a daemon restart (a package upgrade) in the
+/// minutes a slow check may hold the main lock cannot lose it. It writes to a
+/// small inbox under a short lock of its own and never waits for a running
+/// check; the next check drains the inbox and announces it. Root's own changes
+/// are not recorded by the caller (root is trusted).
 pub fn record_settings_change(
     paths: &Paths,
     user: &str,
@@ -1699,17 +1903,60 @@ pub fn record_settings_change(
     if reductions.is_empty() {
         return Ok(());
     }
-    let _lock = lock(paths)?;
-    let mut state = load_state(paths);
-    state.settings.push(SettingsAnnouncement {
+    let _lock = settings_inbox_lock(paths)?;
+    let file = settings_inbox_file(paths);
+    let mut inbox: Vec<SettingsAnnouncement> = if file.exists() {
+        read_json(&file).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    inbox.push(SettingsAnnouncement {
         user: user.to_string(),
         reductions,
         at: Utc::now(),
         users_done: BTreeSet::new(),
         command_done: false,
     });
-    write_json_atomic(&paths.notify_state_file(), &state)
+    cap_settings(&mut inbox);
+    write_json_atomic(&file, &inbox)
         .context("cannot record the settings change for the health check")
+}
+
+/// Move everything the daemon left in the inbox into the check's record and
+/// clear the inbox. Called under the main notification lock; takes the inbox's
+/// own short lock only for the moment it reads and clears the file. The record
+/// is persisted before the inbox is cleared, so a crash in between re-delivers
+/// at worst, never drops a change (decision 0022).
+fn drain_settings_inbox(paths: &Paths, state: &mut NotifyState) {
+    let file = settings_inbox_file(paths);
+    if !file.exists() {
+        return;
+    }
+    let _lock = match settings_inbox_lock(paths) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("warning: cannot read the settings inbox: {e:#}");
+            return;
+        }
+    };
+    let inbox: Vec<SettingsAnnouncement> = match read_json(&file) {
+        Ok(inbox) => inbox,
+        Err(e) => {
+            eprintln!("warning: cannot read the settings inbox: {e:#}");
+            let _ = fs::remove_file(&file);
+            return;
+        }
+    };
+    if inbox.is_empty() {
+        let _ = fs::remove_file(&file);
+        return;
+    }
+    state.settings.extend(inbox);
+    cap_settings(&mut state.settings);
+    // Persist the merged record first, then clear the inbox.
+    if write_json_atomic(&paths.notify_state_file(), state).is_ok() {
+        let _ = fs::remove_file(&file);
+    }
 }
 
 fn send_test(mut channels: SystemChannels<'_>, dry_run: bool) -> Result<()> {
@@ -2163,12 +2410,13 @@ mod tests {
     fn the_record_is_saved_after_each_delivery() {
         // A check that is killed halfway must not resend what it already sent
         // (decision 0022): the record is saved after every delivery, not only
-        // at the end.
+        // at the end, and each saved snapshot already reflects the delivery
+        // just made (item 11 checks the content, not only the call count).
         let mut state = NotifyState::default();
         let mut ch = Fake::new(&[(1000, "alice"), (1001, "bob")], true);
-        let mut saves = 0usize;
+        let snapshots = std::cell::RefCell::new(Vec::<NotifyState>::new());
         {
-            let mut save = |_: &NotifyState| saves += 1;
+            let mut save = |s: &NotifyState| snapshots.borrow_mut().push(s.clone());
             apply(
                 &mut state,
                 &[failing("x")],
@@ -2179,9 +2427,69 @@ mod tests {
                 &mut save,
             );
         }
-        // Two desktop notifications and one hook: at least three saves.
         assert_eq!(ch.desktop.len(), 2);
-        assert!(saves >= 3, "saved only {saves} times");
+        let snaps = snapshots.into_inner();
+        assert!(snaps.len() >= 3, "saved only {} times", snaps.len());
+        // Each snapshot records a monotonically growing set of recipients; the
+        // final one has both users and the hook marked as done.
+        let done = |s: &NotifyState| {
+            let a = &s.active[&Event::Failing];
+            (a.users.len(), a.command_seq)
+        };
+        let mut users_seen = 0;
+        for s in &snaps {
+            let (users, _cmd) = done(s);
+            assert!(users >= users_seen, "the recipient set must not shrink");
+            users_seen = users;
+        }
+        let last = done(snaps.last().unwrap());
+        assert_eq!(last.0, 2, "both users recorded as notified");
+        assert_eq!(last.1, 1, "the hook recorded as notified");
+    }
+
+    #[test]
+    fn automatic_off_is_stored_and_read_as_automatic_off() {
+        // One name for the condition across notify.json and the hook (item 10),
+        // with the first version's spelling still readable.
+        assert_eq!(Event::AutomaticOff.as_str(), "automatic_off");
+        assert_eq!(
+            serde_json::to_string(&Event::AutomaticOff).unwrap(),
+            "\"automatic_off\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Event>("\"automatic_off\"").unwrap(),
+            Event::AutomaticOff
+        );
+        // A notify.json written by the first version used "automaticoff".
+        assert_eq!(
+            serde_json::from_str::<Event>("\"automaticoff\"").unwrap(),
+            Event::AutomaticOff
+        );
+    }
+
+    #[test]
+    fn automatic_off_is_reported_even_when_the_last_run_failed() {
+        // The switched-off timer is its own condition next to a failure, not
+        // hidden in the else-branch of "last run failed" (item 7).
+        let mut bad = run_with(RunState::Failed, hours(-1));
+        bad.error = Some(RunError {
+            kind: ErrorKind::ClientFailed,
+            message: "upload failed".into(),
+        });
+        let s = status(Health::Failing, Some(bad), None, &[]);
+        let (list, _) = checked(evaluate(&s, false, None, t0()));
+        let kinds: Vec<Event> = list.iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&Event::Failing), "{kinds:?}");
+        assert!(kinds.contains(&Event::AutomaticOff), "{kinds:?}");
+        // With the timer on, only the failure is reported.
+        let s = status(
+            Health::Failing,
+            Some(run_with(RunState::Failed, hours(-1))),
+            None,
+            &[],
+        );
+        let (on, _) = checked(evaluate(&s, true, None, t0()));
+        assert!(on.iter().all(|c| c.kind != Event::AutomaticOff));
     }
 
     #[test]
@@ -2318,6 +2626,121 @@ mod tests {
         let out = deliver_settings(&mut state, hours(1), Lang::En, &mut ch, &mut |_| {});
         assert!(!out.hook_failed);
         assert_eq!(ch.hook, [Event::Settings]);
+    }
+
+    #[test]
+    fn pending_settings_changes_are_combined_into_one_message() {
+        use crate::settings::Reduction;
+        // Several pending changes (even from switching a setting back and
+        // forth) become a single message per recipient (decision 0022, item 8).
+        let mut state = NotifyState::default();
+        for _ in 0..3 {
+            state.settings.push(SettingsAnnouncement {
+                user: "alice".into(),
+                reductions: vec![Reduction::AutomaticBackupsOff],
+                at: hours(0),
+                users_done: BTreeSet::new(),
+                command_done: false,
+            });
+        }
+        state.settings.push(SettingsAnnouncement {
+            user: "bob".into(),
+            reductions: vec![Reduction::WakeOnLanOff],
+            at: hours(0),
+            users_done: BTreeSet::new(),
+            command_done: false,
+        });
+        let mut ch = Fake::new(&[(1000, "carol")], true);
+        deliver_settings(&mut state, hours(0), Lang::En, &mut ch, &mut |_| {});
+        // One desktop message and one hook call, not four each.
+        assert_eq!(ch.desktop, [(1000, Event::Settings)]);
+        assert_eq!(ch.hook, [Event::Settings]);
+        // The identical reduction from alice is listed once; bob is named too.
+        let body = &ch.bodies[0];
+        assert_eq!(
+            body.matches("automatic backups were switched off").count(),
+            1
+        );
+        assert!(body.contains("alice") && body.contains("bob"), "{body}");
+        // All announcements are marked delivered.
+        assert!(
+            state
+                .settings
+                .iter()
+                .all(|a| a.users_done.contains(&1000) && a.command_done)
+        );
+    }
+
+    #[test]
+    fn the_inbox_is_recorded_before_the_check_and_drained_by_it() {
+        use crate::settings::Reduction;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: dir.path().join("config.toml"),
+            credentials_dir: dir.path().join("cred"),
+            state_dir: dir.path().to_path_buf(),
+            runtime_dir: dir.path().join("run"),
+            systemctl: PathBuf::from("systemctl"),
+        };
+        // The daemon records two changes (its own short lock), before any
+        // check runs (decision 0022, item 4).
+        record_settings_change(&paths, "alice", vec![Reduction::AutomaticBackupsOff]).unwrap();
+        record_settings_change(&paths, "bob", vec![Reduction::WakeOnLanOff]).unwrap();
+        assert!(settings_inbox_file(&paths).exists());
+        // A check drains the inbox into its record and clears the inbox.
+        let mut state = NotifyState::default();
+        drain_settings_inbox(&paths, &mut state);
+        assert_eq!(state.settings.len(), 2);
+        assert_eq!(state.settings[0].user, "alice");
+        assert_eq!(state.settings[1].user, "bob");
+        assert!(!settings_inbox_file(&paths).exists(), "inbox cleared");
+        // The merged record was persisted to notify.json before clearing.
+        let saved: NotifyState = read_json(&paths.notify_state_file()).unwrap();
+        assert_eq!(saved.settings.len(), 2);
+        // A second drain with an empty inbox changes nothing.
+        drain_settings_inbox(&paths, &mut state);
+        assert_eq!(state.settings.len(), 2);
+    }
+
+    #[test]
+    fn a_settings_message_names_only_a_few_patterns_and_stays_small() {
+        use crate::settings::Reduction;
+        // A huge exclude list must not blow up the message: a few shortened
+        // patterns, "and N more", and a hard byte cap (decision 0022, item 1).
+        let patterns: Vec<String> = (0..200)
+            .map(|i| format!("/home/alice/{}", "x".repeat(300) + &i.to_string()))
+            .collect();
+        let msg = compose_settings(
+            Lang::En,
+            "alice",
+            &[Reduction::ExcludesAdded { patterns }],
+            Detail::Full,
+        );
+        assert!(
+            msg.body.len() <= MAX_BODY_BYTES,
+            "body is {} bytes",
+            msg.body.len()
+        );
+        assert!(msg.body.contains("and 195 more"), "{}", msg.body);
+        // No single pattern is shown in full (each is shortened).
+        assert!(!msg.body.contains(&"x".repeat(300)));
+    }
+
+    #[test]
+    fn invisible_characters_in_a_settings_message_are_made_visible() {
+        use crate::settings::Reduction;
+        // A user name or pattern with a bidi override or zero-width character
+        // cannot hide or reorder the message (decision 0022, item 10).
+        let msg = compose_settings(
+            Lang::En,
+            "al\u{202e}ice",
+            &[Reduction::ExcludesAdded {
+                patterns: vec!["/home/\u{200b}secret".into()],
+            }],
+            Detail::Full,
+        );
+        assert!(!msg.body.contains('\u{202e}'), "{}", msg.body);
+        assert!(!msg.body.contains('\u{200b}'), "{}", msg.body);
     }
 
     #[test]

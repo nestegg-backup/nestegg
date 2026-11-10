@@ -13,11 +13,13 @@
 use std::fs;
 use std::io::Write;
 use std::ops::RangeInclusive;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
+use pathpatterns::{MatchEntry, MatchType, PatternFlag};
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 
@@ -29,14 +31,40 @@ pub const INTERVAL_HOURS: RangeInclusive<u32> = 1..=168;
 /// Smallest overdue threshold the API accepts (two hours). It must also be
 /// greater than the backup interval.
 pub const OVERDUE_MIN_HOURS: u32 = 2;
-/// Largest overdue threshold the API accepts: seven days. A larger value set
-/// by root in the file is kept and can only be lowered through the API
-/// (decision 0022), so the extreme "a month without a message" stays out of
-/// reach of a group member.
+/// Base cap on the overdue threshold through the API: seven days. The real cap
+/// is this or the backup interval plus [`OVERDUE_INTERVAL_EXTRA_HOURS`],
+/// whichever is larger (so a weekly rhythm can still be overdue after up to ten
+/// days), and a larger value set by root in the file is kept and can only be
+/// lowered through the API (decision 0022). The extreme "a month without a
+/// message" stays out of reach of a group member.
 pub const OVERDUE_API_MAX_HOURS: u32 = 168;
+/// How far above the backup interval the overdue threshold may be set through
+/// the API when that is larger than [`OVERDUE_API_MAX_HOURS`] (decision 0022,
+/// item on the weekly rhythm): three days.
+pub const OVERDUE_INTERVAL_EXTRA_HOURS: u32 = 72;
 pub const MAX_EXCLUDES: usize = 200;
-/// Maximum length of one exclude pattern, in characters.
+/// Maximum length of one exclude pattern, in bytes (an argument to
+/// `proxmox-backup-client` and part of a notification; counted in bytes so a
+/// few hundred multi-byte characters cannot blow past the kernel's argument
+/// and environment limits, decision 0022).
 pub const MAX_EXCLUDE_LEN: usize = 256;
+
+/// The overdue threshold the API accepts for a given backup interval and the
+/// value currently in the file: the base cap, or the interval plus the extra,
+/// whichever is larger, but never below a larger value root already set (which
+/// can then only be lowered, decision 0022).
+pub fn overdue_cap(interval_hours: u32, current_overdue: u32) -> u32 {
+    OVERDUE_API_MAX_HOURS
+        .max(interval_hours.saturating_add(OVERDUE_INTERVAL_EXTRA_HOURS))
+        .max(current_overdue)
+}
+
+/// Top-level directories that make up the operating system. In system mode a
+/// pattern that would take a whole one of these out of `system.pxar` is refused
+/// (decision 0022).
+const SYSTEM_DIRS: &[&str] = &[
+    "/etc", "/home", "/root", "/usr", "/var", "/opt", "/boot", "/srv",
+];
 
 /// A change, made through the API, that lowers the protection of the backups
 /// (decision 0022). Each variant carries enough to name the change to the
@@ -51,6 +79,12 @@ pub enum Reduction {
     /// Patterns were added to the exclude list, so that data is no longer
     /// backed up.
     ExcludesAdded { patterns: Vec<String> },
+    /// A `!` re-include pattern was removed, so what it kept in the backup is
+    /// now excluded again.
+    ReincludesRemoved { patterns: Vec<String> },
+    /// The exclude list kept the same patterns but in a different order; later
+    /// patterns win, so a re-include may no longer take effect.
+    ExcludesReordered,
     /// The "overdue after" threshold was raised, so a stopped backup is
     /// noticed later.
     OverdueRaised { from: u32, to: u32 },
@@ -74,8 +108,8 @@ pub fn reductions(
     if was_enabled && !now_enabled {
         out.push(Reduction::AutomaticBackupsOff);
     }
-    // Added patterns only (a `!` re-include widens the backup, so it is not a
-    // reduction). Reordering or removing patterns is not reported either.
+    // Added exclude patterns lower the protection (a `!` re-include added
+    // widens the backup, so it is not reported).
     let added: Vec<String> = new
         .backup
         .excludes
@@ -85,6 +119,29 @@ pub fn reductions(
         .collect();
     if !added.is_empty() {
         out.push(Reduction::ExcludesAdded { patterns: added });
+    }
+    // A removed `!` re-include lowers the protection: what it kept in the
+    // backup is now excluded again (decision 0022).
+    let removed_reincludes: Vec<String> = old
+        .backup
+        .excludes
+        .iter()
+        .filter(|p| p.starts_with('!') && !new.backup.excludes.contains(p))
+        .cloned()
+        .collect();
+    if !removed_reincludes.is_empty() {
+        out.push(Reduction::ReincludesRemoved {
+            patterns: removed_reincludes,
+        });
+    }
+    // Reordering the same patterns can lower the protection when a `!`
+    // re-include is involved (later patterns win), so it is reported too. A
+    // pure reorder of plain excludes changes nothing and is not reported.
+    if old.backup.excludes != new.backup.excludes
+        && same_multiset(&old.backup.excludes, &new.backup.excludes)
+        && new.backup.excludes.iter().any(|p| p.starts_with('!'))
+    {
+        out.push(Reduction::ExcludesReordered);
     }
     if new.overdue_after_hours > old.overdue_after_hours {
         out.push(Reduction::OverdueRaised {
@@ -102,6 +159,18 @@ pub fn reductions(
         out.push(Reduction::WakeOnLanOff);
     }
     out
+}
+
+/// Whether two lists hold the same patterns, regardless of order.
+fn same_multiset(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<&String> = a.iter().collect();
+    let mut b: Vec<&String> = b.iter().collect();
+    a.sort();
+    b.sort();
+    a == b
 }
 
 /// Keys a settings change may contain.
@@ -207,19 +276,35 @@ impl SettingsPatch {
 /// is the API cap, or a larger value already in the file (which can then only
 /// be lowered through the API, decision 0022).
 pub fn limits_json(current: &Config) -> serde_json::Value {
+    let interval = current.schedule.interval_hours;
     serde_json::json!({
         "interval_hours": { "min": INTERVAL_HOURS.start(), "max": INTERVAL_HOURS.end() },
         "overdue_after_hours": {
             "min": OVERDUE_MIN_HOURS,
-            "max": OVERDUE_API_MAX_HOURS.max(current.overdue_after_hours),
+            // The effective maximum for the interval that is in the file now.
+            // Both keys can change in one request, so the web interface
+            // recomputes this from `base` and `per_interval_extra` for the
+            // interval it is about to set (decision 0022).
+            "max": overdue_cap(interval, current.overdue_after_hours),
             "greater_than_interval": true,
+            // The rule: max(base, interval + per_interval_extra), and never
+            // below a larger value already in the file.
+            "base": OVERDUE_API_MAX_HOURS,
+            "per_interval_extra": OVERDUE_INTERVAL_EXTRA_HOURS,
+            "file_minimum": current.overdue_after_hours,
         },
         "excludes": { "max_items": MAX_EXCLUDES, "max_length": MAX_EXCLUDE_LEN },
     })
 }
 
-/// Check a change against the current configuration.
-pub fn validate(patch: &SettingsPatch, current: &Config) -> Result<(), SettingsError> {
+/// Check a change against the current configuration. `home_dirs` are the home
+/// directories of regular users, from the account database, used to refuse an
+/// exclude that would drop a whole home directory (decision 0022).
+pub fn validate(
+    patch: &SettingsPatch,
+    current: &Config,
+    home_dirs: &[PathBuf],
+) -> Result<(), SettingsError> {
     if let Some(h) = patch.interval_hours
         && !INTERVAL_HOURS.contains(&h)
     {
@@ -230,10 +315,15 @@ pub fn validate(patch: &SettingsPatch, current: &Config) -> Result<(), SettingsE
         )));
     }
     if let Some(h) = patch.overdue_after_hours {
-        // The API accepts at most 7 days, so automatic backups cannot be
-        // switched off together with a month-long silence. A larger value
-        // that root put in the file is kept and can only be lowered here.
-        let max = OVERDUE_API_MAX_HOURS.max(current.overdue_after_hours);
+        // The API cap is seven days, or the backup interval plus three days
+        // when that is larger (so a weekly rhythm can still be overdue after up
+        // to ten days), evaluated against the interval in effect after this
+        // same request. A larger value that root put in the file is kept and
+        // can only be lowered here (decision 0022).
+        let interval = patch
+            .interval_hours
+            .unwrap_or(current.schedule.interval_hours);
+        let max = overdue_cap(interval, current.overdue_after_hours);
         if h < OVERDUE_MIN_HOURS || h > max {
             let extra = if current.overdue_after_hours > OVERDUE_API_MAX_HOURS {
                 format!(
@@ -245,7 +335,7 @@ pub fn validate(patch: &SettingsPatch, current: &Config) -> Result<(), SettingsE
             };
             return Err(invalid(format!(
                 "overdue_after_hours must be between {OVERDUE_MIN_HOURS} and \
-                 {OVERDUE_API_MAX_HOURS} hours (7 days) through the web interface{extra}. \
+                 {max} hours through the web interface{extra}. \
                  A longer time can only be set as root in /etc/nestegg/config.toml."
             )));
         }
@@ -269,14 +359,20 @@ pub fn validate(patch: &SettingsPatch, current: &Config) -> Result<(), SettingsE
     }
     if let Some(list) = &patch.excludes {
         validate_excludes(list).map_err(invalid)?;
-        // A pattern that removes a whole source or a whole top-level
-        // directory of an archive is refused when it is newly added; one that
-        // root already put in the file is kept (decision 0022).
+        // A pattern that would leave out a whole configured source, a whole
+        // home directory of a regular user, or (in system mode) a whole
+        // top-level system directory is refused when it is newly added; one
+        // that root already put in the file is kept (decision 0022).
         for pattern in list {
             if current.backup.excludes.contains(pattern) {
                 continue;
             }
-            if let Some(why) = removes_whole_source(pattern, &current.backup.sources) {
+            if let Some(why) = removes_whole_folder(
+                pattern,
+                &current.backup.sources,
+                home_dirs,
+                current.backup.system,
+            ) {
                 return Err(invalid(why));
             }
         }
@@ -311,14 +407,15 @@ pub fn validate_exclude(pattern: &str) -> Result<(), String> {
     if pattern.is_empty() || pattern == "!" {
         return Err("exclude patterns must not be empty".into());
     }
-    if pattern.chars().count() > MAX_EXCLUDE_LEN {
+    if pattern.len() > MAX_EXCLUDE_LEN {
         return Err(format!(
-            "exclude patterns may have at most {MAX_EXCLUDE_LEN} characters"
+            "exclude patterns may have at most {MAX_EXCLUDE_LEN} bytes"
         ));
     }
-    if pattern.chars().any(char::is_control) {
+    if pattern.chars().any(unprintable) {
         return Err(format!(
-            "exclude pattern {pattern:?} contains a control character (line break, tab, NUL, ...)"
+            "exclude pattern {pattern:?} contains a control character or an invisible \
+             format character (line break, tab, NUL, zero-width or bidirectional override, ...)"
         ));
     }
     if pattern.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}') != pattern {
@@ -356,80 +453,164 @@ fn excludes_everything(pattern: &str) -> bool {
         .all(|part| part.contains('*') && part.chars().all(|c| matches!(c, '*' | '?')))
 }
 
-/// Whether a path component is made only of the wildcards `*`/`**`/`?`.
-fn is_all_wildcards(part: &str) -> bool {
-    !part.is_empty() && part.chars().all(|c| matches!(c, '*' | '?'))
+/// Control characters, and the invisible Unicode format characters that
+/// reorder or hide text in a terminal or a notification (bidirectional
+/// overrides, zero-width characters). Kept in step with the same filter in
+/// `crate::rescue` (decision 0022); duplicated on purpose so the settings path
+/// does not depend on the rescue module.
+pub fn unprintable(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}' | '\u{feff}')
 }
 
-/// Whether a path component contains a wildcard at all.
-fn has_wildcard(part: &str) -> bool {
-    part.chars().any(|c| matches!(c, '*' | '?'))
-}
-
-/// Split a pattern into its anchor, the leading components before the first
-/// one that contains a wildcard (the "fixed part"), and whether every
-/// component after the fixed part is made of wildcards only (so the pattern
-/// takes out everything below the fixed part).
-fn fixed_prefix(pattern: &str) -> (bool, Vec<&str>, bool) {
-    let anchored = pattern.starts_with('/');
-    let parts: Vec<&str> = pattern.split('/').filter(|p| !p.is_empty()).collect();
-    let cut = parts
-        .iter()
-        .position(|p| has_wildcard(p))
-        .unwrap_or(parts.len());
-    let only_wildcards_after = parts[cut..].iter().all(|p| is_all_wildcards(p));
-    (anchored, parts[..cut].to_vec(), only_wildcards_after)
-}
-
-/// Reject an exclude that would drop a whole configured source or a whole
-/// top-level directory of an archive (decision 0022). Returns the plain-words
-/// reason, or `None` when the pattern is fine. Ordinary patterns
-/// (`**/.cache`, `**/node_modules`, `/alice/Downloads`) pass.
-fn removes_whole_source(pattern: &str, sources: &[crate::config::Source]) -> Option<String> {
+/// Build the exclude [`MatchEntry`] exactly as `proxmox-backup-client` does for
+/// one `--exclude <pattern>` (gitignore-style, `PatternFlag::PATH_NAME`). A `!`
+/// re-include widens the backup and never removes anything, so it yields
+/// `None`; a pattern that cannot be parsed is treated as harmless here (it is
+/// not our job to reject it, the client will).
+fn exclude_entry(pattern: &str) -> Option<MatchEntry> {
     if pattern.starts_with('!') {
-        // Re-includes widen the backup; they never drop anything.
         return None;
     }
-    let advice = "; an administrator can still set it as root in /etc/nestegg/config.toml";
-    let (anchored, fixed, only_wildcards_after) = fixed_prefix(pattern);
-    // A bare name (one fixed component, no slash, no wildcard) equal to the
-    // last component of a source path matches that directory in every
-    // archive, e.g. `home` or `etc`.
-    if !anchored && fixed.len() == 1 && only_wildcards_after && !has_wildcard(pattern) {
-        let name = fixed[0];
-        if sources
-            .iter()
-            .any(|s| s.path.file_name().and_then(|n| n.to_str()) == Some(name))
-        {
-            return Some(format!(
-                "exclude pattern `{pattern}` matches the whole backup source `{name}` in every \
-                 archive, which would leave it out of the backup{advice}."
-            ));
-        }
-        return None;
+    MatchEntry::parse_pattern(pattern, PatternFlag::PATH_NAME, MatchType::Exclude).ok()
+}
+
+/// Two arbitrary, structurally different child names. A pattern that excludes
+/// both of them excludes *every* child, so the folder would be emptied even if
+/// the folder entry itself stays (`alice/**`, `alice/*`). They are chosen so
+/// that an ordinary narrow pattern (`alice/Downloads`, `**/.cache`) matches
+/// neither.
+const PROBE_A: &str = "0_nestegg_probe_one";
+const PROBE_B: &str = "Zq.keep-me_two";
+
+/// Whether this single exclude pattern, applied in one archive, would leave
+/// nothing of the folder at archive-relative path `rel` (like `/alice`): the
+/// folder itself is excluded, or every one of its children is.
+fn removes_folder(entry: &MatchEntry, rel: &str) -> bool {
+    let dir = Some(nix::libc::S_IFDIR);
+    let hits = |p: &str| entry.matches(p.as_bytes(), dir);
+    hits(rel) || (hits(&format!("{rel}/{PROBE_A}")) && hits(&format!("{rel}/{PROBE_B}")))
+}
+
+/// The path of `folder` inside an archive rooted at `root`, with a leading
+/// slash (`/` when `folder == root`); `None` when `folder` is not inside
+/// `root`.
+fn archive_rel(root: &Path, folder: &Path) -> Option<String> {
+    let rel = folder.strip_prefix(root).ok()?;
+    if rel.as_os_str().is_empty() {
+        return Some("/".to_string());
     }
-    // Anchored patterns whose fixed part is a whole directory (nothing, or
-    // only wildcards, below it).
-    if anchored && !fixed.is_empty() && only_wildcards_after {
-        if fixed.len() == 1 {
-            return Some(format!(
-                "exclude pattern `{pattern}` would drop the whole top-level directory `/{}` from \
-                 every archive that contains it{advice}.",
-                fixed[0]
-            ));
+    Some(format!(
+        "/{}",
+        String::from_utf8_lossy(rel.as_os_str().as_bytes())
+    ))
+}
+
+/// The deepest configured source that strictly contains `folder`, if any.
+fn deepest_source<'a>(
+    folder: &Path,
+    sources: &'a [crate::config::Source],
+) -> Option<&'a crate::config::Source> {
+    sources
+        .iter()
+        .filter(|s| folder != s.path && folder.starts_with(&s.path))
+        .max_by_key(|s| s.path.as_os_str().len())
+}
+
+/// Reject an exclude that would, as `proxmox-backup-client` applies it to each
+/// archive, leave out a whole configured source, a whole home directory of a
+/// regular user inside a source, or (in system mode) a whole top-level system
+/// directory (decision 0022). Returns the plain-words reason, or `None` when
+/// the pattern is fine. Ordinary patterns (`**/.cache`, `**/node_modules`,
+/// `/alice/Downloads`, `/home/*/Videos`) pass. This is a guard against
+/// accidents, not a security boundary: a group member can still exclude a
+/// user's folders one by one, which is reported.
+fn removes_whole_folder(
+    pattern: &str,
+    sources: &[crate::config::Source],
+    home_dirs: &[PathBuf],
+    system: bool,
+) -> Option<String> {
+    let entry = exclude_entry(pattern)?;
+    let root = PathBuf::from("/");
+    // (archive root, protected folder) pairs to test. A source is tested as a
+    // top-level entry ("/home" in a parent archive); a home directory in the
+    // archive of the source that holds it ("/alice" in home.pxar), and in
+    // system mode also in system.pxar ("/home/alice" at "/").
+    let mut checks: Vec<(&Path, &Path)> = Vec::new();
+    for s in sources {
+        checks.push((&root, s.path.as_path()));
+    }
+    for h in home_dirs {
+        if let Some(src) = deepest_source(h, sources) {
+            checks.push((src.path.as_path(), h.as_path()));
         }
-        let fixed_path = PathBuf::from(format!("/{}", fixed.join("/")));
-        if sources
-            .iter()
-            .any(|s| s.path == fixed_path || s.path.starts_with(&fixed_path))
-        {
+        if system {
+            checks.push((&root, h.as_path()));
+        }
+    }
+    let system_dirs: Vec<PathBuf> = if system {
+        SYSTEM_DIRS.iter().map(PathBuf::from).collect()
+    } else {
+        Vec::new()
+    };
+    for d in &system_dirs {
+        checks.push((&root, d.as_path()));
+    }
+    for (archive_root, folder) in checks {
+        let Some(rel) = archive_rel(archive_root, folder) else {
+            continue;
+        };
+        // The whole-archive case (`rel == "/"`) is an empty backup, caught by
+        // `excludes_everything` in `validate_exclude`.
+        if rel != "/" && removes_folder(&entry, &rel) {
             return Some(format!(
-                "exclude pattern `{pattern}` would drop the whole backup source `{}`{advice}.",
-                fixed_path.display()
+                "exclude pattern `{pattern}` would leave out the whole folder {} from the backup; \
+                 an administrator can still set it as root in /etc/nestegg/config.toml.",
+                folder.display()
             ));
         }
     }
     None
+}
+
+/// The home directories of regular users, from the account database (NSS, not
+/// a directory listing), for the exclude guard (decision 0022). Only uids in
+/// the regular range with an absolute, non-root home are returned.
+pub fn regular_home_dirs() -> Vec<PathBuf> {
+    use std::sync::Mutex;
+    // `getpwent` walks a process-global cursor, so serialise the walk.
+    static PWENT: Mutex<()> = Mutex::new(());
+    let _guard = PWENT.lock().unwrap_or_else(|e| e.into_inner());
+    let regular = crate::notify::regular_uids();
+    let mut out: Vec<PathBuf> = Vec::new();
+    // SAFETY: the walk is serialised by the mutex above; the returned pointers
+    // are read before the next `getpwent`/`endpwent` and not kept.
+    unsafe {
+        nix::libc::setpwent();
+        loop {
+            let ent = nix::libc::getpwent();
+            if ent.is_null() {
+                break;
+            }
+            let uid = (*ent).pw_uid;
+            if !regular.contains(&uid) {
+                continue;
+            }
+            if (*ent).pw_dir.is_null() {
+                continue;
+            }
+            let dir = std::ffi::CStr::from_ptr((*ent).pw_dir);
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+            if path.is_absolute() && path != Path::new("/") && !out.contains(&path) {
+                out.push(path);
+            }
+        }
+        nix::libc::endpwent();
+    }
+    out
 }
 
 /// Apply `patch` to the text of the configuration file. Only the touched
@@ -618,7 +799,7 @@ impl Timer for SystemdTimer<'_> {
     }
 }
 
-/// Result of a successful [`update`].
+/// Result of an [`update`] whose change took effect, in whole or in part.
 #[derive(Debug)]
 pub struct Outcome {
     pub config: Config,
@@ -627,8 +808,14 @@ pub struct Outcome {
     /// nothing did.
     pub changes: Vec<String>,
     /// Changes that lowered the protection, for the `settings` notification
-    /// (decision 0022). Empty if the change only raised it.
+    /// (decision 0022). Empty if the change only raised it. Reported even when
+    /// `error` is set: the change took effect, so it must be announced.
     pub reductions: Vec<Reduction>,
+    /// A problem that happened after the change already took effect (the timer
+    /// could not be switched, the old file could not be put back). The settings
+    /// are saved; the caller returns this as an error to the client but still
+    /// reports the reductions.
+    pub error: Option<anyhow::Error>,
 }
 
 /// Validate and apply a change: rewrite the configuration file, then switch
@@ -647,7 +834,7 @@ pub fn update(
             config_file.display()
         )
     })?;
-    validate(patch, &current)?;
+    validate(patch, &current, &regular_home_dirs())?;
     let new_text = rewrite(&old_text, patch)?;
     let new = Config::parse(&new_text).map_err(|e| {
         invalid(format!(
@@ -662,6 +849,10 @@ pub fn update(
     }
     let was_enabled = timer.enabled();
     let mut timer_enabled = was_enabled;
+    // A problem that happens after the file was already written. The settings
+    // then took effect, so the outcome still carries the reductions to report
+    // (decision 0022); only the timer switch or the rollback failed.
+    let mut after_write_error: Option<anyhow::Error> = None;
     if let Some(on) = patch.automatic_backups
         && on != was_enabled
     {
@@ -671,34 +862,48 @@ pub fn update(
             // `disable --now` unlinks before stopping), so a failure can leave
             // the switch changed. Report what actually happened then.
             if timer.enabled() == on {
-                return Err(SettingsError::Failed(e.context(format!(
+                timer_enabled = on;
+                changes.push(format!(
+                    "automatic_backups: {} -> {}",
+                    on_off(was_enabled),
+                    on_off(on)
+                ));
+                after_write_error = Some(e.context(format!(
                     "automatic backups were switched {what} and the settings saved, but the timer could not be {}",
                     if on { "started" } else { "stopped" }
-                ))));
-            }
-            if wrote && let Err(restore) = write_atomically(config_file, &old_text) {
-                return Err(SettingsError::Failed(anyhow!(
+                )));
+            } else if wrote && let Err(restore) = write_atomically(config_file, &old_text) {
+                // The timer did not switch and the other settings could not be
+                // put back: they took effect, so they are still reported.
+                after_write_error = Some(anyhow!(
                     "cannot switch automatic backups {what}: {e:#}; the other settings were \
                      saved, putting the old file back failed: {restore:#}"
-                )));
+                ));
+            } else {
+                // Nothing took effect: a clean refusal, no report.
+                return Err(SettingsError::Failed(e.context(format!(
+                    "cannot switch automatic backups {what}; nothing was changed"
+                ))));
             }
-            return Err(SettingsError::Failed(e.context(format!(
-                "cannot switch automatic backups {what}; nothing was changed"
-            ))));
+        } else {
+            timer_enabled = on;
+            changes.push(format!(
+                "automatic_backups: {} -> {}",
+                on_off(was_enabled),
+                on_off(on)
+            ));
         }
-        timer_enabled = on;
-        changes.push(format!(
-            "automatic_backups: {} -> {}",
-            on_off(was_enabled),
-            on_off(on)
-        ));
     }
+    // Whenever this point is reached with `after_write_error` set, the new file
+    // is in place (either the timer switched but could not start, or the
+    // rollback itself failed); the clean "nothing changed" case returned above.
     let reductions = reductions(&current, &new, was_enabled, timer_enabled);
     Ok(Outcome {
         config: new,
         timer_enabled,
         changes,
         reductions,
+        error: after_write_error,
     })
 }
 
@@ -916,7 +1121,7 @@ interval_hours = 24
     #[test]
     fn ranges_are_enforced() {
         let c = current(); // interval 24, overdue 36
-        let check = |p: SettingsPatch| validate(&p, &c);
+        let check = |p: SettingsPatch| validate(&p, &c, &[]);
         for h in [0, 169, 1000] {
             let p = SettingsPatch {
                 interval_hours: Some(h),
@@ -933,7 +1138,8 @@ interval_hours = 24
             };
             assert_eq!(check(p).is_ok(), h == 2 || h == 168, "overdue {h}");
         }
-        // The API cap is 7 days (168 h): a larger value is refused.
+        // With the default interval (24 h) the cap is 7 days (168 h): a larger
+        // value is refused (the weekly-rhythm case is covered separately).
         assert!(
             check(SettingsPatch {
                 overdue_after_hours: Some(169),
@@ -944,14 +1150,6 @@ interval_hours = 24
         assert!(
             check(SettingsPatch {
                 overdue_after_hours: Some(744),
-                ..patch()
-            })
-            .is_err()
-        );
-        assert!(
-            check(SettingsPatch {
-                interval_hours: Some(168),
-                overdue_after_hours: Some(169),
                 ..patch()
             })
             .is_err()
@@ -967,6 +1165,7 @@ interval_hours = 24
                     ..patch()
                 },
                 &grandfathered,
+                &[],
             )
             .is_ok(),
             "lowering a grandfathered value stays allowed"
@@ -978,6 +1177,7 @@ interval_hours = 24
                     ..patch()
                 },
                 &grandfathered,
+                &[],
             )
             .is_err(),
             "raising above the file value is refused"
@@ -989,9 +1189,70 @@ interval_hours = 24
                     ..patch()
                 },
                 &grandfathered,
+                &[],
             )
             .is_ok(),
             "lowering back into the normal range is allowed"
+        );
+    }
+
+    #[test]
+    fn a_weekly_rhythm_allows_a_longer_overdue_threshold() {
+        // The cap is max(168, interval + 72): a weekly rhythm (interval 168)
+        // can be overdue after up to 240 h (10 days), evaluated against the
+        // interval in effect after the same request (decision 0022, item 12).
+        let c = current(); // interval 24, overdue 36
+        let v = |interval: Option<u32>, overdue: u32, cfg: &Config| {
+            validate(
+                &SettingsPatch {
+                    interval_hours: interval,
+                    overdue_after_hours: Some(overdue),
+                    ..patch()
+                },
+                cfg,
+                &[],
+            )
+        };
+        // Interval 24 alone: cap 168.
+        assert!(v(Some(24), 168, &c).is_ok());
+        assert!(v(Some(24), 169, &c).is_err());
+        // Interval 48 alone: cap max(168, 120) = 168.
+        assert!(v(Some(48), 168, &c).is_ok());
+        assert!(v(Some(48), 169, &c).is_err());
+        // Interval 168 alone: cap max(168, 240) = 240; must still exceed the
+        // interval, so 168 is refused but 169..=240 is allowed.
+        assert!(
+            v(Some(168), 168, &c).is_err(),
+            "overdue must exceed interval"
+        );
+        assert!(v(Some(168), 169, &c).is_ok());
+        assert!(v(Some(168), 240, &c).is_ok());
+        assert!(v(Some(168), 241, &c).is_err());
+        // Both keys changed together: the cap follows the new interval.
+        let mut weekly = c.clone();
+        weekly.schedule.interval_hours = 168;
+        assert!(
+            v(None, 240, &weekly).is_ok(),
+            "overdue 240 with weekly in file"
+        );
+        assert!(v(None, 241, &weekly).is_err());
+        // Lowering the interval while "overdue after" stays above the new cap:
+        // the value is grandfathered, so only lowering it is then possible.
+        let mut weekly_long = c.clone();
+        weekly_long.schedule.interval_hours = 168;
+        weekly_long.overdue_after_hours = 240;
+        // Lower the interval to 24 (new base cap 168) but keep overdue 240.
+        assert!(
+            v(Some(24), 240, &weekly_long).is_ok(),
+            "keeping the grandfathered overdue while lowering the interval is allowed"
+        );
+        assert!(
+            v(Some(24), 230, &weekly_long).is_ok(),
+            "lowering the overdue is allowed"
+        );
+        assert!(
+            v(Some(24), 241, &weekly_long).is_err(),
+            "raising past the grandfathered value is refused"
         );
     }
 
@@ -1004,6 +1265,7 @@ interval_hours = 24
                 ..patch()
             },
             &c,
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -1017,7 +1279,8 @@ interval_hours = 24
                     overdue_after_hours: Some(24),
                     ..patch()
                 },
-                &c
+                &c,
+                &[],
             )
             .is_err()
         );
@@ -1028,7 +1291,8 @@ interval_hours = 24
                     overdue_after_hours: Some(60),
                     ..patch()
                 },
-                &c
+                &c,
+                &[],
             )
             .is_ok()
         );
@@ -1041,7 +1305,8 @@ interval_hours = 24
                     excludes: Some(vec![]),
                     ..patch()
                 },
-                &odd
+                &odd,
+                &[],
             )
             .is_ok()
         );
@@ -1067,6 +1332,15 @@ interval_hours = 24
         }
         assert!(validate_exclude(&"a".repeat(MAX_EXCLUDE_LEN)).is_ok());
         assert!(validate_exclude(&"a".repeat(MAX_EXCLUDE_LEN + 1)).is_err());
+        // The limit is in bytes: a pattern of multi-byte characters that is
+        // short in characters but long in bytes is refused (decision 0022).
+        let two_byte = "ä".repeat(MAX_EXCLUDE_LEN); // 2 bytes each => over the limit
+        assert_eq!(two_byte.chars().count(), MAX_EXCLUDE_LEN);
+        assert!(two_byte.len() > MAX_EXCLUDE_LEN);
+        assert!(validate_exclude(&two_byte).is_err());
+        // Invisible format characters are rejected like control characters.
+        assert!(validate_exclude("foo\u{200b}bar").is_err());
+        assert!(validate_exclude("a\u{202e}b").is_err());
         assert!(validate_excludes(&strings(&["a", "a"])).is_err());
         let many: Vec<String> = (0..=MAX_EXCLUDES).map(|i| format!("p{i}")).collect();
         assert!(validate_excludes(&many).is_err());
@@ -1075,51 +1349,99 @@ interval_hours = 24
     }
 
     #[test]
-    fn whole_source_excludes_are_refused_but_ordinary_ones_pass() {
+    fn whole_folder_excludes_are_refused_but_ordinary_ones_pass() {
         // current() has the default sources: /home, /etc, /root, /usr/local.
-        let sources = &current().backup.sources;
+        // alice and bob are regular users with homes inside the /home source.
+        // The expected outcomes below were confirmed with the real tool
+        // (`pxar create --exclude`) in the e2e client image (decision 0022).
+        let sources = current().backup.sources;
+        let homes = [PathBuf::from("/home/alice"), PathBuf::from("/home/bob")];
+        let refused = |p: &str, system: bool| removes_whole_folder(p, &sources, &homes, system);
+
+        // Refused in every mode: a whole source, or a whole home directory
+        // inside the /home source.
         for bad in [
             "/home",
             "/home/",
             "/home/*",
-            "/home/**", // a source, with wildcards
+            "/home/**", // the whole /home source
             "/etc",
             "/root",
-            "/usr",
-            "/var",   // a top-level directory of an archive
-            "/alice", // a whole home inside home.pxar
             "/usr/local",
             "/usr/local/*",
-            "/usr/local/**", // a source with sub-dirs
+            "/usr/local/**", // other sources
             "home",
             "etc",
-            "local", // a bare name = a source's last part
+            "local", // a bare name = a source's last component
+            "/alice",
+            "alice",
+            "alice/",
+            "**/alice",
+            "alice/**", // alice's home in home.pxar
+            "/[a-z]*",
+            "/a*",
+            "/*[a-z0-9]", // match alice (and more) in home.pxar
         ] {
-            assert!(
-                removes_whole_source(bad, sources).is_some(),
-                "{bad} should be refused"
-            );
+            assert!(refused(bad, false).is_some(), "{bad} should be refused");
         }
+
+        // Harmless in the default configuration: ordinary subfolder patterns,
+        // and anchored single-component names that are not a home directory or
+        // a source (they used to be refused with a misleading message).
         for ok in [
             "**/.cache",
             "**/node_modules",
             "**/lost+found",
-            "/alice/Downloads", // not a whole top-level entry
-            "/home/*/Videos",   // a sub-directory, not the whole source
+            "/alice/Downloads", // a subfolder of a home, not the whole home
+            "/home/*/Videos",   // a subfolder, not the whole source
             "*.iso",
-            "node_modules", // not a source's last part
+            "node_modules", // not a source's last component
             "/usr/lib",     // not a source nor its parent
             "!/home",       // a re-include widens the backup
+            "/.cache",      // anchored one component, but not a home or source
+            "/Downloads",   // likewise
+            "Downloads",    // a subfolder name, not a home
+            "/usr",         // not a source; only a system directory in system mode
+            "/var",         // likewise
+            "/home/[a-z]*", // no-op in home.pxar (entries are /alice, not /home/alice)
+            "/home/[!.]*",  // matches only dot-names, confirmed with the real tool
+        ] {
+            assert!(refused(ok, false).is_none(), "{ok} should pass");
+        }
+
+        // System mode adds system.pxar rooted at "/": a pattern that names a
+        // whole top-level system directory, or a home directory by its full
+        // path, is refused there.
+        for bad in [
+            "/usr",
+            "/var",
+            "/opt",
+            "/boot",
+            "/srv",         // top-level system directories
+            "/home/[a-z]*", // matches /home/alice in system.pxar
+            "/home/alice",  // a home by its full path
         ] {
             assert!(
-                removes_whole_source(ok, sources).is_none(),
-                "{ok} should pass"
+                refused(bad, true).is_some(),
+                "{bad} should be refused in system mode"
+            );
+        }
+        // Still harmless in system mode.
+        for ok in [
+            "**/.cache",
+            "/home/*/Videos",
+            "/alice/Downloads",
+            "/home/[!.]*",
+        ] {
+            assert!(
+                refused(ok, true).is_none(),
+                "{ok} should pass in system mode"
             );
         }
     }
 
     #[test]
-    fn an_added_whole_source_exclude_is_refused_but_an_existing_one_is_kept() {
+    fn an_added_whole_folder_exclude_is_refused_but_an_existing_one_is_kept() {
         let c = current();
         let e = validate(
             &SettingsPatch {
@@ -1127,8 +1449,10 @@ interval_hours = 24
                 ..patch()
             },
             &c,
+            &[],
         )
         .unwrap_err();
+        assert!(e.to_string().contains("whole folder"), "{e}");
         assert!(e.to_string().contains("/etc/nestegg/config.toml"), "{e}");
         // Root already put /home in the file: a change that keeps it passes
         // and may add ordinary patterns.
@@ -1141,9 +1465,21 @@ interval_hours = 24
                     ..patch()
                 },
                 &with,
+                &[],
             )
             .is_ok()
         );
+        // A home directory from the account database is refused by its path.
+        let e = validate(
+            &SettingsPatch {
+                excludes: Some(strings(&["/alice"])),
+                ..patch()
+            },
+            &c,
+            &[PathBuf::from("/home/alice")],
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("/home/alice"), "{e}");
     }
 
     #[test]
@@ -1197,12 +1533,53 @@ interval_hours = 24
     }
 
     #[test]
+    fn removing_a_reinclude_or_reordering_is_a_reduction() {
+        // Removing a `!` re-include excludes again what it kept (decision 0022,
+        // item 5).
+        let mut old = current();
+        old.backup.excludes = strings(&["**/node_modules", "!**/node_modules/keep"]);
+        let mut without = old.clone();
+        without.backup.excludes = strings(&["**/node_modules"]);
+        assert_eq!(
+            reductions(&old, &without, true, true),
+            vec![Reduction::ReincludesRemoved {
+                patterns: vec!["!**/node_modules/keep".into()]
+            }]
+        );
+        // Reordering the same patterns while a re-include is present is a
+        // reduction (later patterns win).
+        let mut reordered = old.clone();
+        reordered.backup.excludes = strings(&["!**/node_modules/keep", "**/node_modules"]);
+        assert_eq!(
+            reductions(&old, &reordered, true, true),
+            vec![Reduction::ExcludesReordered]
+        );
+        // A pure reorder of plain excludes (no re-include) changes nothing.
+        let mut plain = current();
+        plain.backup.excludes = strings(&["a", "b"]);
+        let mut swapped = plain.clone();
+        swapped.backup.excludes = strings(&["b", "a"]);
+        assert!(reductions(&plain, &swapped, true, true).is_empty());
+    }
+
+    #[test]
     fn limits_report_the_api_cap_and_a_grandfathered_value() {
-        let c = current();
-        assert_eq!(limits_json(&c)["overdue_after_hours"]["max"], 168);
+        let c = current(); // interval 24
+        let overdue = &limits_json(&c)["overdue_after_hours"];
+        assert_eq!(overdue["max"], 168);
+        // The rule's numbers are reported so the UI can recompute the cap for
+        // an interval it is about to set (decision 0022, item 12).
+        assert_eq!(overdue["base"], 168);
+        assert_eq!(overdue["per_interval_extra"], 72);
+        assert_eq!(overdue["file_minimum"], 36);
+        assert_eq!(overdue["greater_than_interval"], true);
         let mut g = c.clone();
         g.overdue_after_hours = 744;
         assert_eq!(limits_json(&g)["overdue_after_hours"]["max"], 744);
+        // A weekly rhythm raises the reported max to interval + 72.
+        let mut weekly = c.clone();
+        weekly.schedule.interval_hours = 168;
+        assert_eq!(limits_json(&weekly)["overdue_after_hours"]["max"], 240);
     }
 
     #[test]
@@ -1214,7 +1591,8 @@ interval_hours = 24
                     wake_on_lan: Some(true),
                     ..patch()
                 },
-                &c
+                &c,
+                &[],
             )
             .is_ok()
         );
@@ -1225,6 +1603,7 @@ interval_hours = 24
                 ..patch()
             },
             &c,
+            &[],
         )
         .unwrap_err();
         assert!(e.to_string().contains("[wake]"), "{e}");
@@ -1235,7 +1614,8 @@ interval_hours = 24
                     wake_on_lan: Some(false),
                     ..patch()
                 },
-                &c
+                &c,
+                &[],
             )
             .is_ok()
         );
@@ -1709,7 +2089,10 @@ interval_hours = 24
     fn timer_switched_but_not_started_is_reported_honestly() {
         let (_dir, path) = config_file(COMMENTED, 0o644);
         let timer = HalfTimer(Cell::new(false));
-        let e = update(
+        // The change took effect (the file was written, the timer switched on),
+        // so `update` returns Ok with an `error`: the caller answers with an
+        // error but still reports the change (decision 0022, item 3).
+        let out = update(
             &path,
             &SettingsPatch {
                 interval_hours: Some(12),
@@ -1718,13 +2101,16 @@ interval_hours = 24
             },
             &timer,
         )
-        .unwrap_err();
-        let msg = format!("{e:#}");
+        .unwrap();
+        let msg = format!("{:#}", out.error.as_ref().expect("an error is reported"));
         assert!(
             msg.contains("switched on and the settings saved")
                 && !msg.contains("nothing was changed"),
             "{msg}"
         );
+        // The timer switch counts as applied, so it is in the changes list.
+        assert!(out.timer_enabled);
+        assert!(out.changes.iter().any(|c| c.contains("automatic_backups")));
         // The file matches the switch: the change is kept.
         assert!(
             fs::read_to_string(&path)

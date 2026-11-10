@@ -490,17 +490,33 @@ async fn update_config(
             }
             // A group member who lowered the protection is reported to the
             // users and the hook; root is trusted and not reported (decision
-            // 0022). Done after the settings lock is released and detached
-            // from the response: recording takes the notification lock, which
-            // a slow in-progress check may hold.
+            // 0022). Recorded synchronously, before the HTTP answer, into a
+            // small inbox with its own short lock (never waits for a running
+            // check), so a daemon restart cannot lose it; then the check is
+            // triggered. A change that took effect but ended in an error
+            // (`outcome.error`) is reported too.
             if uid != 0 && !outcome.reductions.is_empty() {
                 let reductions = outcome.reductions.clone();
-                tokio::task::spawn_blocking(move || {
-                    match crate::notify::record_settings_change(&paths, &user_name, reductions) {
-                        Ok(()) => spawn_notify(&paths),
-                        Err(e) => eprintln!("warning: {e:#}"),
+                let record_paths = paths.clone();
+                let record_user = user_name.clone();
+                let recorded = tokio::task::spawn_blocking(move || {
+                    crate::notify::record_settings_change(&record_paths, &record_user, reductions)
+                })
+                .await;
+                match recorded {
+                    Ok(Ok(())) => {
+                        // Triggering the check runs `systemctl start`; keep it
+                        // off the async reactor.
+                        let notify_paths = paths.clone();
+                        tokio::task::spawn_blocking(move || spawn_notify(&notify_paths));
                     }
-                });
+                    Ok(Err(e)) => eprintln!("warning: {e:#}"),
+                    Err(e) => eprintln!("warning: cannot record the settings change: {e}"),
+                }
+            }
+            if let Some(err) = outcome.error {
+                eprintln!("settings change by {caller} partly failed: {err:#}");
+                return Err(ApiError::internal(err));
             }
             Ok(Json(crate::status::config_view(
                 &outcome.config,

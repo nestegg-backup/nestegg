@@ -330,6 +330,27 @@ check "config.toml still 0640 root:nestegg after the change" bash -c "[[ \$(dock
 patch_config as_alice '{"automatic_backups":true}' >/dev/null
 check "automatic backups on again" on_client systemctl is-enabled --quiet nestegg-backup.timer
 
+echo "-- a failing hook makes 'nestegg notify' exit non-zero and the unit fail (decision 0022)"
+# Point the hook at a script that always fails, and create a failing backup.
+docker exec -i "$client" tee /usr/local/bin/nestegg-failing-hook >/dev/null <<'HOOK'
+#!/bin/sh
+exit 7
+HOOK
+on_client chmod 755 /usr/local/bin/nestegg-failing-hook
+on_client sed -i 's#^command = .*#command = ["/usr/local/bin/nestegg-failing-hook"]#' "$cfg"
+on_client bash -c "printf '\n[[backup.sources]]\narchive = \"e2e-missing2\"\npath = \"/nonexistent-dir-3\"\n' >> $cfg"
+age_state
+on_client rm -f /var/lib/nestegg/notify.json
+check "backup fails for the failing-hook test" exits_with 1 on_client systemctl start nestegg-backup.service
+# The check runs the hook, which fails, so 'nestegg notify' exits non-zero ...
+check "nestegg notify exits non-zero when the hook fails" exits_with 1 on_client nestegg notify
+# ... and the oneshot unit ends in the failed state.
+on_client systemctl start nestegg-notify.service >/dev/null 2>&1 || true
+check "the notify unit is marked failed" on_client systemctl is-failed --quiet nestegg-notify.service
+on_client systemctl reset-failed nestegg-notify.service >/dev/null 2>&1 || true
+# Restore a good configuration for the rest of the run.
+on_client bash -c "cat /root/config.good > $cfg"
+
 echo "== removal keeps credentials"
 check "package removes cleanly" on_client bash -c 'DEBIAN_FRONTEND=noninteractive apt-get remove -y -q nestegg >/tmp/apt-rm.log 2>&1'
 check "health check timer stopped by the removal" bash -c "! docker exec $client systemctl is-active --quiet nestegg-notify.timer"

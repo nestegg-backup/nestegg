@@ -730,14 +730,23 @@ components:
         overdue_after_hours:
           type: object
           description: |
-            `max` is the API cap (168), or a larger value already in the file
-            (which can then only be lowered through the API; decision 0022).
+            `max` is the effective cap for the interval currently in the file:
+            `max(base, interval + per_interval_extra)`, and never below a larger
+            value root already set (which can then only be lowered through the
+            API; decision 0022). Both keys can change in one request, so the web
+            interface recomputes the cap from `base` and `per_interval_extra`
+            for the interval it is about to set (so a weekly rhythm can be
+            overdue after up to 10 days).
           properties:
             min: { type: integer }
             max: { type: integer }
             greater_than_interval: { type: boolean }
+            base: { type: integer, description: "Base cap in hours (168)." }
+            per_interval_extra: { type: integer, description: "Hours added on top of the interval (72)." }
+            file_minimum: { type: integer, description: "A larger value already in the file; the cap is never below it." }
         excludes:
           type: object
+          description: "`max_length` is a byte count (decision 0022)."
           properties: { max_items: { type: integer }, max_length: { type: integer } }
     SessionInfo:
       type: object
