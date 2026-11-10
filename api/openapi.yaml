@@ -496,7 +496,7 @@ components:
             server: { type: string, examples: ["pbs.example.com:8007"] }
             datastore: { type: string, examples: ["backups"] }
             namespace: { type: [string, "null"], examples: ["desktops"] }
-            reachable: { type: [boolean, "null"], description: Result of the last check; null if never checked. }
+            reachable: { type: [boolean, "null"], description: "Whether the server answered at the newest of the last backup run and the last `POST /pbs/check` (the check is remembered until the daemon restarts); null if never checked." }
             checked_at: { type: [string, "null"], format: date-time }
             wake_on_lan: { type: boolean, description: "Wake-on-LAN is configured and switched on (`wake.enabled`)." }
             credentials_stored: { type: [boolean, "null"], description: "The token secret (or password) is stored on this computer (`nestegg credentials set-password`). Null or absent: unknown." }

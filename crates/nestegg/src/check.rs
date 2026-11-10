@@ -22,6 +22,10 @@ pub enum CheckStatus {
     NotChecked,
 }
 
+/// Name of the item that says whether the server answered. The daemon and
+/// the web UI look for it by this name.
+pub const REACHABLE_ITEM: &str = "PBS reachable";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CheckItem {
     pub name: String,
@@ -191,12 +195,12 @@ pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
     }
     let server = format!("{}:{}", cfg.pbs.server, cfg.pbs.port);
     if reachable {
-        r.report(true, "PBS reachable", server);
+        r.report(true, REACHABLE_ITEM, server);
     } else if wake_tried {
         // The caller asked to wake the server and it did not come up.
         r.report(
             false,
-            "PBS reachable",
+            REACHABLE_ITEM,
             match &wake_send_problem {
                 // Say why, instead of claiming a wake-up attempt that never
                 // left this computer.
@@ -209,18 +213,18 @@ pub fn run(paths: &Paths, options: &CheckOptions) -> Vec<CheckItem> {
     } else if wake_on {
         // Asleep or off, and nobody asked to wake it: nothing is known.
         r.not_checked(
-            "PBS reachable",
+            REACHABLE_ITEM,
             "no answer; the server may be asleep (Wake-on-LAN is configured, a backup run \
              wakes it by itself)",
         );
     } else if options.wake {
         r.report(
             false,
-            "PBS reachable",
+            REACHABLE_ITEM,
             "no answer (Wake-on-LAN is not configured, so the server could not be woken)".into(),
         );
     } else {
-        r.report(false, "PBS reachable", "no answer".into());
+        r.report(false, REACHABLE_ITEM, "no answer".into());
     }
     if !reachable {
         let why = if wake_on && !wake_tried {
@@ -363,7 +367,7 @@ mod run_tests {
                 login: true,
             },
         );
-        let reach = item(&items, "PBS reachable");
+        let reach = item(&items, REACHABLE_ITEM);
         assert_eq!(reach.status, CheckStatus::NotChecked);
         assert!(!reach.ok, "old clients must not read it as fine");
         assert_eq!(
@@ -383,7 +387,7 @@ mod run_tests {
                 login: true,
             },
         );
-        let reach = item(&items, "PBS reachable");
+        let reach = item(&items, REACHABLE_ITEM);
         assert_eq!(reach.status, CheckStatus::Failed);
         assert!(
             reach.detail.contains("Wake-on-LAN attempt"),
@@ -399,7 +403,7 @@ mod run_tests {
         let (_dir, paths) = setup(false);
         for wake in [false, true] {
             let items = run(&paths, &CheckOptions { wake, login: false });
-            assert_eq!(item(&items, "PBS reachable").status, CheckStatus::Failed);
+            assert_eq!(item(&items, REACHABLE_ITEM).status, CheckStatus::Failed);
             assert_eq!(item(&items, LOGIN_ITEM).status, CheckStatus::NotChecked);
         }
     }

@@ -61,22 +61,19 @@ impl RunLock {
         // exclusive lock below block and so keep backups from starting. Status
         // queries no longer need to open it — they read `/proc/locks` instead
         // (decision 0022, item 2).
-        let file = crate::state::open_private_lock(&paths.lock_file())?;
         // A short retry: a reader that briefly holds a shared lock (older
         // versions, fallback probe) must not make a start fail.
-        let mut file = file;
         for attempt in 0..10 {
-            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(lock) => return Ok(Some(RunLock { _lock: lock })),
-                Err((f, nix::errno::Errno::EWOULDBLOCK)) => {
-                    if attempt == 9 || lock_is_held(paths) == Some(true) {
-                        return Ok(None);
-                    }
-                    file = f;
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err((_, e)) => return Err(e).context("cannot lock run file"),
+            let one_try = std::time::Duration::ZERO;
+            if let Some(lock) = crate::state::lock_private(&paths.lock_file(), one_try)
+                .context("cannot lock run file")?
+            {
+                return Ok(Some(RunLock { _lock: lock }));
             }
+            if attempt == 9 || lock_is_held(paths) == Some(true) {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         Ok(None)
     }

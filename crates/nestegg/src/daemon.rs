@@ -48,6 +48,28 @@ struct App {
     /// When the last wake attempt was sent, to keep a minimum interval between
     /// wake-ups so group members cannot make the daemon spam Wake-on-LAN.
     last_wake: Arc<Mutex<Option<std::time::Instant>>>,
+    /// What the last `POST /pbs/check` found out about reachability, and
+    /// when. `GET /status` reports it while it is newer than what the last
+    /// backup run recorded, so every page shows the newest thing known
+    /// instead of "reachable" from a run hours ago right after a check that
+    /// got no answer. Kept in memory only: after a restart of the daemon the
+    /// last run's value is the newest again.
+    last_check: Arc<Mutex<Option<LastCheck>>>,
+}
+
+/// Whether the server answered at the last connection check, and when.
+type LastCheck = (bool, chrono::DateTime<Utc>);
+
+/// Overlay the last connection check on the status when it is the newer
+/// information.
+fn newest_reachability(pbs: &mut crate::status::PbsStatus, last_check: Option<LastCheck>) {
+    let Some((reachable, at)) = last_check else {
+        return;
+    };
+    if pbs.checked_at.is_none_or(|run| at > run) {
+        pbs.reachable = Some(reachable);
+        pbs.checked_at = Some(at);
+    }
 }
 
 /// Shortest interval between two Wake-on-LAN attempts from `POST /pbs/check`.
@@ -229,6 +251,7 @@ pub fn router(paths: Paths) -> Router {
             settings: Default::default(),
             check_gate: Default::default(),
             last_wake: Default::default(),
+            last_check: Default::default(),
         })
 }
 
@@ -241,11 +264,13 @@ async fn status(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Value>
         // A config that exists but cannot be read or parsed is an error, not a
         // reason to report the built-in defaults as the configuration.
         let config = crate::status::config_for_status(&app.paths.config_file)?;
-        let status = crate::status::build(
+        let mut status = crate::status::build(
             &app.paths,
             config.as_ref(),
             crate::status::timer_enabled(&app.paths),
         )?;
+        let last_check = *app.last_check.lock().unwrap_or_else(|e| e.into_inner());
+        newest_reachability(&mut status.pbs, last_check);
         Ok(serde_json::to_value(status)?)
     })
     .await?;
@@ -1341,9 +1366,20 @@ async fn pbs_check(
         ))
     })
     .await?;
+    let checked_at = Utc::now();
+    // The server answered, or it did not (failed, or asleep and not woken):
+    // either way that is now the newest thing known about it. No such item
+    // (the configuration could not be read): nothing was learned.
+    if let Some(item) = checks
+        .iter()
+        .find(|i| i.name == crate::check::REACHABLE_ITEM)
+    {
+        let reachable = item.status == crate::check::CheckStatus::Passed;
+        *app.last_check.lock().unwrap_or_else(|e| e.into_inner()) = Some((reachable, checked_at));
+    }
     Ok(Json(json!({
         "checks": checks,
-        "checked_at": crate::state::format_time(Utc::now()),
+        "checked_at": crate::state::format_time(checked_at),
         // True when a wake was asked for but skipped because one was sent very
         // recently (the minimum interval between wake attempts).
         "wake_skipped": wake && !effective_wake,
@@ -1518,6 +1554,7 @@ mod tests {
             settings: Default::default(),
             check_gate: Default::default(),
             last_wake: Default::default(),
+            last_check: Default::default(),
         }
     }
 
@@ -1803,5 +1840,34 @@ mod tests {
         let resp = router(p).oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert_eq!(json(resp).await["code"], "cannot_cancel");
+    }
+    #[test]
+    fn the_status_reports_the_newer_of_run_and_connection_check() {
+        let t = |h: u32| chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 5, h, 0, 0).unwrap();
+        let pbs = |reachable, checked_at| crate::status::PbsStatus {
+            server: "pbs.example.com".into(),
+            datastore: "datastore".into(),
+            namespace: None,
+            reachable,
+            checked_at,
+            wake_on_lan: false,
+            credentials_stored: None,
+        };
+        // A check after the last run that got no answer wins.
+        let mut s = pbs(Some(true), Some(t(8)));
+        newest_reachability(&mut s, Some((false, t(9))));
+        assert_eq!((s.reachable, s.checked_at), (Some(false), Some(t(9))));
+        // A run after the check wins again.
+        let mut s = pbs(Some(true), Some(t(10)));
+        newest_reachability(&mut s, Some((false, t(9))));
+        assert_eq!((s.reachable, s.checked_at), (Some(true), Some(t(10))));
+        // Nothing known from a run yet: the check is all there is.
+        let mut s = pbs(None, None);
+        newest_reachability(&mut s, Some((true, t(9))));
+        assert_eq!((s.reachable, s.checked_at), (Some(true), Some(t(9))));
+        // No check made: unchanged.
+        let mut s = pbs(Some(true), Some(t(8)));
+        newest_reachability(&mut s, None);
+        assert_eq!((s.reachable, s.checked_at), (Some(true), Some(t(8))));
     }
 }

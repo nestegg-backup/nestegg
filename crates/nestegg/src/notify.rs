@@ -1974,24 +1974,15 @@ fn lock(paths: &Paths) -> Result<nix::fcntl::Flock<fs::File>> {
 
 fn lock_with_timeout(paths: &Paths, timeout: StdDuration) -> Result<nix::fcntl::Flock<fs::File>> {
     fs::create_dir_all(&paths.state_dir)?;
-    let mut file = crate::state::open_private_lock(&paths.state_dir.join(".notify.lock"))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => return Ok(lock),
-            Err((f, nix::errno::Errno::EWOULDBLOCK)) => {
-                if Instant::now() >= deadline {
-                    bail!(
-                        "the notification state is locked by another nestegg notify \
-                         (waited {} s); the timer will try again",
-                        timeout.as_secs()
-                    );
-                }
-                file = f;
-                std::thread::sleep(StdDuration::from_millis(100));
-            }
-            Err((_, e)) => return Err(e).context("cannot lock the notification state"),
-        }
+    match crate::state::lock_private(&paths.state_dir.join(".notify.lock"), timeout)
+        .context("cannot lock the notification state")?
+    {
+        Some(lock) => Ok(lock),
+        None => bail!(
+            "the notification state is locked by another nestegg notify \
+             (waited {} s); the timer will try again",
+            timeout.as_secs()
+        ),
     }
 }
 
@@ -2335,20 +2326,12 @@ const INBOX_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 /// cannot hold a shared lock on it; the wait is bounded (decision 0022, item 2).
 fn settings_inbox_lock(paths: &Paths) -> Result<nix::fcntl::Flock<fs::File>> {
     fs::create_dir_all(&paths.state_dir)?;
-    let mut file = crate::state::open_private_lock(&paths.state_dir.join(".notify-settings.lock"))?;
-    let deadline = std::time::Instant::now() + INBOX_LOCK_TIMEOUT;
-    loop {
-        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => return Ok(lock),
-            Err((f, nix::errno::Errno::EWOULDBLOCK)) => {
-                if std::time::Instant::now() >= deadline {
-                    bail!("the settings inbox is locked by another process; try again");
-                }
-                file = f;
-                std::thread::sleep(StdDuration::from_millis(50));
-            }
-            Err((_, e)) => return Err(e).context("cannot lock the settings inbox"),
-        }
+    let path = paths.state_dir.join(".notify-settings.lock");
+    match crate::state::lock_private(&path, INBOX_LOCK_TIMEOUT)
+        .context("cannot lock the settings inbox")?
+    {
+        Some(lock) => Ok(lock),
+        None => bail!("the settings inbox is locked by another process; try again"),
     }
 }
 

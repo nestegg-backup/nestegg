@@ -519,10 +519,14 @@ impl Store {
         fs::create_dir_all(&self.paths.state_dir)?;
         // 0600 so a group member cannot hold a shared lock on it and block the
         // daemon (decision 0022, item 2).
-        let file = open_private_lock(&self.paths.state_dir.join(".current.lock"))?;
-        let _guard = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
-            .map_err(|(_, e)| e)
-            .context("cannot lock current run file")?;
+        // The lock is held only for a read or a small write, so a wait this
+        // long means something is stuck: give up instead of hanging a request
+        // or a unit forever.
+        let _guard = lock_private(
+            &self.paths.state_dir.join(".current.lock"),
+            CURRENT_LOCK_WAIT,
+        )?
+        .context("the record of the running backup is locked by another process; try again")?;
         f()
     }
 
@@ -737,6 +741,57 @@ pub fn open_private_lock(path: &Path) -> Result<fs::File> {
     Ok(file)
 }
 
+/// Longest wait for the short lock around `current.json`.
+const CURRENT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Take the exclusive lock on the private lock file at `path`, waiting at most
+/// `wait` (zero: one attempt). `None` when another process still holds it at
+/// the deadline.
+///
+/// After the lock is taken the path is looked up again: [`open_private_lock`]
+/// and the package's `postinst` may replace an old lock file, and a lock on an
+/// inode that is no longer at the path excludes nobody. In that case the
+/// attempt starts over with the file that is there now, so two processes can
+/// never both believe they hold the lock.
+pub fn lock_private(
+    path: &Path,
+    wait: std::time::Duration,
+) -> Result<Option<nix::fcntl::Flock<fs::File>>> {
+    use std::os::unix::fs::MetadataExt;
+    let deadline = std::time::Instant::now() + wait;
+    let mut file = open_private_lock(path)?;
+    loop {
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => {
+                let mine = lock
+                    .metadata()
+                    .with_context(|| format!("cannot stat lock file {}", path.display()))?;
+                let same = fs::symlink_metadata(path)
+                    .is_ok_and(|at| at.dev() == mine.dev() && at.ino() == mine.ino());
+                if same {
+                    return Ok(Some(lock));
+                }
+                // Replaced while this process opened or waited for it.
+                drop(lock);
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                file = open_private_lock(path)?;
+            }
+            Err((f, nix::errno::Errno::EWOULDBLOCK)) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                file = f;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err((_, e)) => {
+                return Err(e).with_context(|| format!("cannot lock {}", path.display()));
+            }
+        }
+    }
+}
+
 fn open_lock_file(path: &Path) -> Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()
@@ -896,6 +951,56 @@ pub(crate) mod rfc3339_opt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_private_lock_is_not_waited_for_past_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".x.lock");
+        let held = lock_private(&path, std::time::Duration::ZERO)
+            .unwrap()
+            .expect("free lock");
+        let started = std::time::Instant::now();
+        let second = lock_private(&path, std::time::Duration::from_millis(200)).unwrap();
+        assert!(second.is_none(), "the lock is held by another descriptor");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(held);
+        assert!(
+            lock_private(&path, std::time::Duration::ZERO)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_lock_on_a_replaced_file_is_not_taken_for_the_lock() {
+        use std::os::unix::fs::MetadataExt;
+        // A waiter has the old file open; the file is replaced (as an upgrade
+        // does with an old lock file) and the old holder lets go. The waiter
+        // must end up with the lock on the file that is at the path now, not
+        // on the old inode that nobody else will ever look at again.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".x.lock");
+        let old = lock_private(&path, std::time::Duration::ZERO)
+            .unwrap()
+            .expect("free lock");
+        let old_ino = old.metadata().unwrap().ino();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                lock_private(&path, std::time::Duration::from_secs(20)).unwrap()
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Keep the old inode alive (so the new file cannot reuse its number).
+        fs::remove_file(&path).unwrap();
+        let fresh = open_lock_file(&path).unwrap();
+        let fresh_ino = fresh.metadata().unwrap().ino();
+        assert_ne!(old_ino, fresh_ino);
+        drop(fresh);
+        drop(old);
+        let got = waiter.join().unwrap().expect("the waiter gets the lock");
+        assert_eq!(got.metadata().unwrap().ino(), fresh_ino);
+    }
     use chrono::TimeZone;
 
     fn t(h: u32) -> DateTime<Utc> {
