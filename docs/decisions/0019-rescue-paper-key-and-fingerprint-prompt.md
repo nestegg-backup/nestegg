@@ -177,3 +177,30 @@ Changes:
 
 Rejected: allowing `sign-only` without a question. A signed backup is
 authentic, but nestegg never makes one, so it is unusual enough to ask.
+
+## Amendment: second review (2026-11-10)
+
+A re-check of the changes above found more:
+
+1. Decoding html entities was still quadratic for a text full of `&`
+   without `;` (a crafted 1 MB file stalled the wizard for many seconds).
+   The end of an entity is now looked for only in the next few bytes.
+2. A backup whose signed manifest lists an archive that is neither encrypted
+   nor signed is refused outright, also with `--allow-unprotected-backup`:
+   the client cannot read such an archive without the key, which would only
+   show after the disk was erased. A backup that is signed but not encrypted
+   is restored with the key passed for every archive, so the client checks
+   the signature each time.
+3. Only client messages about the key ("wrong key", "missing key",
+   "signature", ...) are reported as "the key does not open this backup"; a
+   network or server error while reading the manifest is reported as such,
+   so the wizard offers "try again" instead of "another key".
+4. Text read from attached drives (settings values, file names) is printed
+   with control characters replaced, so an escape sequence cannot rewrite
+   the lines that show the certificate fingerprint or a warning.
+5. The search on attached drives counts directory entries one by one (the
+   limit also holds inside one huge directory), looks at files whose name
+   starts with `nestegg` first, then at the ones nearest the top, and gives
+   a drive 20 seconds to mount.
+6. The warning for a backup that is signed but not encrypted no longer says
+   that the key cannot vouch for it (it did verify the signature).

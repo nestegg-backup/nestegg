@@ -960,8 +960,12 @@ fn accept_protection(
             eprintln!();
             eprintln!("!!! WARNING: {concern}");
             eprintln!(
-                "!!! Restore it only if you know that this backup was made this way. Your key \
-                 cannot vouch for it."
+                "!!! Restore it only if you know that this backup was made this way.{}",
+                if matches!(other, Protection::Unsigned) {
+                    " Your key cannot vouch for it."
+                } else {
+                    ""
+                }
             );
             yes_no("Restore this backup anyway?", false)
         }

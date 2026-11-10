@@ -346,10 +346,15 @@ fn decode_entities(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let decoded = rest[1..]
-            .find(';')
-            .filter(|&end| end <= 10)
-            .and_then(|end| Some((entity(&rest[1..1 + end])?, end + 2)));
+        // Look for the `;` only where an entity can end: a text full of `&`
+        // without `;` must not be scanned to its end for each of them.
+        let decoded = rest
+            .as_bytes()
+            .iter()
+            .skip(1)
+            .take(11)
+            .position(|b| *b == b';')
+            .and_then(|end| Some((entity(rest.get(1..1 + end)?)?, end + 2)));
         match decoded {
             Some((c, len)) => {
                 out.push(c);
@@ -717,6 +722,28 @@ mod tests {
         // A header that names both markers is not a block.
         let text = format!("Copy what is between {BEGIN} and {END}.\n{}", block());
         assert_eq!(from_file_text(&text).unwrap().note, None);
+    }
+
+    #[test]
+    fn a_flood_of_ampersands_is_decoded_in_linear_time() {
+        // Each `&` without a `;` used to scan the rest of the text.
+        let mut text = String::from("<html>-----BEGIN PROXMOX BACKUP KEY-----\n");
+        text.push_str(&"&".repeat(1_000_000));
+        let start = std::time::Instant::now();
+        let out = decode_entities(&text);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(out.len(), text.len());
+        // Entities are still decoded, also right at the end of the text.
+        assert_eq!(decode_entities("a&#x2B;b&amp;&quot;&#61;"), "a+b&\"=");
+        assert_eq!(decode_entities("x&"), "x&");
+        assert_eq!(
+            decode_entities("&;&#;&toolongtobeanentity;"),
+            "&;&#;&toolongtobeanentity;"
+        );
     }
 
     #[test]

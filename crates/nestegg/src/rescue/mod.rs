@@ -61,6 +61,22 @@ fn default_port() -> u16 {
 pub const SETTINGS_FILE: &str = "nestegg-rescue.toml";
 
 impl Settings {
+    /// The same settings with control characters removed from every text
+    /// (they come from a file on an attached drive and are shown as
+    /// defaults and in warnings).
+    pub fn printable(self) -> Settings {
+        Settings {
+            server: printable(&self.server),
+            port: self.port,
+            datastore: printable(&self.datastore),
+            namespace: self.namespace.as_deref().map(printable),
+            auth_id: printable(&self.auth_id),
+            fingerprint: self.fingerprint.as_deref().map(printable),
+            backup_id: self.backup_id.as_deref().map(printable),
+            wake_mac: self.wake_mac.as_deref().map(printable),
+        }
+    }
+
     pub fn from_config(c: &Config) -> Settings {
         Settings {
             server: c.pbs.server.clone(),
@@ -187,7 +203,14 @@ impl Session {
             Err(e) if format!("{e:#}").contains("manifest has no signature") => {
                 Ok(Protection::Unsigned)
             }
-            Err(e) => Err(e.context(format!("the key does not open {snapshot}"))),
+            // Only a failure that is about the key is called one; a network
+            // or server error must not send the user looking for another key.
+            Err(e) if client_blames_the_key(&format!("{e:#}")) => {
+                Err(e.context(format!("the key does not open {snapshot}")))
+            }
+            Err(e) => Err(e.context(format!(
+                "cannot read the table of contents of {snapshot} from the backup server"
+            ))),
         }
     }
 
@@ -248,6 +271,32 @@ impl Inventory {
     }
 }
 
+/// Whether a message of the client is about the key (wrong key, damaged key
+/// file) rather than about the network or the server.
+pub fn client_blames_the_key(message: &str) -> bool {
+    let m = message.to_lowercase();
+    [
+        "wrong key",
+        "missing key",
+        "signature",
+        "decrypt",
+        "base64",
+        "key file",
+        "keyfile",
+    ]
+    .iter()
+    .any(|w| m.contains(w))
+}
+
+/// Text from an attached drive or a settings file, safe to print on the
+/// console: control characters (escape sequences could rewrite the lines
+/// with the certificate fingerprint or a warning) become `?`.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// The archives a restore reads: all of them must be protected by the key.
 pub const RESTORED_ARCHIVES: &[&str] = &["inventory.pxar", "system.pxar"];
 
@@ -304,8 +353,9 @@ impl Protection {
             // Always pass the key: the client then refuses any manifest
             // that is not signed with it.
             (Protection::Encrypted, Some(k)) => RestoreKey::File(k),
-            // Signed, some archives not encrypted: per archive, as usual.
-            (Protection::NotEncrypted(_), _) => RestoreKey::Auto,
+            // Signed with the key, archives signed but not encrypted: the
+            // key is passed as well, so the client checks the signature.
+            (Protection::NotEncrypted(_), Some(k)) => RestoreKey::File(k),
             _ => RestoreKey::Without,
         }
     }
@@ -327,6 +377,17 @@ pub fn protection_from_manifest(
         if let Some(m) = modes.iter().find(|m| *m != "encrypt") {
             weak.push((archive.to_string(), m.clone()));
         }
+    }
+    // A signed manifest with an archive that is neither encrypted nor signed
+    // is something neither nestegg nor the client produces. The client
+    // refuses to read such an archive without the key, which would only show
+    // after the disk was erased: stop here, whatever the user allows.
+    if let Some((archive, _)) = weak.iter().find(|(_, mode)| mode == "none") {
+        bail!(
+            "this backup mixes protected and unprotected archives ({archive} is neither \
+             encrypted nor signed although the backup is signed); nestegg rescue does not \
+             restore such a backup"
+        );
     }
     Ok(if weak.is_empty() {
         Protection::Encrypted
@@ -578,8 +639,9 @@ pub fn scan_media() -> MediaScan {
             if fs::create_dir_all(&point).is_err() {
                 continue;
             }
-            let ok = std::process::Command::new("mount")
-                .args(["-o", options])
+            // A drive that hangs while mounting must not hold up the wizard.
+            let ok = std::process::Command::new("timeout")
+                .args(["20", "mount", "-o", options])
                 .arg(&dev)
                 .arg(&point)
                 .stderr(std::process::Stdio::null())
@@ -597,8 +659,8 @@ pub fn scan_media() -> MediaScan {
         }
         if let Some(limit) = budget.exhausted {
             scan.notes.push(format!(
-                "Stopped looking on {dev} after {limit}; give a key or settings file \
-                 there by its path."
+                "Stopped looking on {dev} after {limit}. A key file there can still be \
+                 given by its path; settings can be typed in."
             ));
         }
     }
@@ -691,8 +753,8 @@ fn search_media(
             }
             if let Ok(Ok(s)) = fs::read_to_string(&path).map(|t| toml::from_str::<Settings>(&t)) {
                 scan.settings.push(FoundSettings {
-                    origin: origin(&path),
-                    settings: s,
+                    origin: printable(&origin(&path)),
+                    settings: s.printable(),
                 });
             }
             continue;
@@ -738,10 +800,11 @@ fn walk(dir: &Path, depth: u32, budget: &mut Budget) -> Vec<(PathBuf, u64)> {
             let Ok(entries) = fs::read_dir(&dir) else {
                 continue;
             };
-            let mut entries: Vec<_> = entries.flatten().collect();
-            entries.sort_by_key(|e| e.file_name());
-            for e in entries {
+            // Entry by entry, so that the limit also holds inside one huge
+            // directory (nothing is collected or sorted beyond it).
+            for e in entries.flatten() {
                 if !budget.entry() {
+                    prioritise(&mut out);
                     return out;
                 }
                 match e.file_type() {
@@ -755,7 +818,27 @@ fn walk(dir: &Path, depth: u32, budget: &mut Budget) -> Vec<(PathBuf, u64)> {
         }
         level = next;
     }
+    prioritise(&mut out);
     out
+}
+
+/// Files whose name starts with `nestegg` first (the settings file and the
+/// names the documentation suggests for keys), then the ones nearest the top
+/// (keys usually lie there), then by path: the limit on opened files is
+/// spent on the likely candidates, and the order does not depend on the
+/// file system.
+fn prioritise(files: &mut [(PathBuf, u64)]) {
+    files.sort_by_cached_key(|(path, _)| {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        (
+            !name.starts_with("nestegg"),
+            path.components().count(),
+            path.clone(),
+        )
+    });
 }
 
 /// Largest file looked at as a key: a paper key as html carries a QR code
@@ -1171,15 +1254,21 @@ mod tests {
             protection_from_manifest(&all, RESTORED_ARCHIVES).unwrap(),
             Protection::Encrypted
         );
-        // Inventory encrypted, system not: found before the disk step.
+        // Inventory encrypted, system neither encrypted nor signed: refused
+        // before the disk step, whatever the user would allow (the client
+        // could not read that archive after the disk was erased).
         let mixed = manifest(&[
             ("inventory.pxar.didx", "encrypt"),
             ("system.pxar.didx", "none"),
         ]);
-        assert_eq!(
-            protection_from_manifest(&mixed, RESTORED_ARCHIVES).unwrap(),
-            Protection::NotEncrypted(vec![("system.pxar".into(), "none".into())])
+        let e = protection_from_manifest(&mixed, RESTORED_ARCHIVES).unwrap_err();
+        assert!(
+            e.to_string().contains("mixes protected and unprotected")
+                && e.to_string().contains("system.pxar"),
+            "{e}"
         );
+        // That message must not be taken for a wrong key.
+        assert!(!client_blames_the_key(&e.to_string()), "{e}");
         let signed = manifest(&[
             ("inventory.pxar.didx", "sign-only"),
             ("system.pxar.didx", "sign-only"),
@@ -1220,14 +1309,78 @@ mod tests {
             Protection::Plain.restore_key(None),
             RestoreKey::Without
         ));
+        // Signed but not encrypted: the key goes along, so the client
+        // checks the signature for every archive.
         assert!(matches!(
             Protection::NotEncrypted(vec![]).restore_key(key()),
-            RestoreKey::Auto
+            RestoreKey::File(_)
         ));
         let c = Protection::Unsigned.concern().unwrap();
         assert!(c.contains("not protected by your key") && c.contains("could have changed it"));
         assert_eq!(Protection::Plain.concern(), None);
         assert_eq!(Protection::Encrypted.concern(), None);
+    }
+
+    #[test]
+    fn only_key_messages_are_blamed_on_the_key() {
+        for m in [
+            "wrong key - unable to verify signature since manifest's key aa does not match provided key bb",
+            "missing key - manifest was created with key aa",
+            "Error: error decoding base64 data at line 1 column 143",
+            "unable to decrypt chunk",
+        ] {
+            assert!(client_blames_the_key(m), "{m}");
+        }
+        for m in [
+            "error trying to connect: tcp connect error: Connection refused (os error 111)",
+            "no such snapshot host/desktop/2026-11-08T21:30:12Z",
+            "permission check failed",
+        ] {
+            assert!(!client_blames_the_key(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn text_from_a_drive_cannot_rewrite_the_console() {
+        assert_eq!(printable("pbs.example.com"), "pbs.example.com");
+        assert_eq!(
+            printable("aa:bb\u{1b}[2K\r!!! all fine\nnext"),
+            "aa:bb?[2K?!!! all fine?next"
+        );
+        let s = Settings {
+            server: "pbs\u{7}.example.com".into(),
+            fingerprint: Some("aa\u{1b}[1A".into()),
+            ..Default::default()
+        }
+        .printable();
+        assert_eq!(s.server, "pbs?.example.com");
+        assert_eq!(s.fingerprint.as_deref(), Some("aa?[1A"));
+    }
+
+    #[test]
+    fn likely_key_files_are_looked_at_first() {
+        let mut files: Vec<(PathBuf, u64)> = [
+            "/m/a/b/paper.txt",
+            "/m/zeta.json",
+            "/m/a/Nestegg-Paperkey.txt",
+            "/m/alpha.txt",
+            "/m/nestegg-rescue.toml",
+        ]
+        .iter()
+        .map(|p| (PathBuf::from(p), 1))
+        .collect();
+        prioritise(&mut files);
+        let order: Vec<&str> = files.iter().map(|(p, _)| p.to_str().unwrap()).collect();
+        assert_eq!(
+            order,
+            [
+                "/m/nestegg-rescue.toml",
+                "/m/a/Nestegg-Paperkey.txt",
+                "/m/alpha.txt",
+                "/m/zeta.json",
+                "/m/a/b/paper.txt",
+            ]
+        );
     }
 
     #[test]
