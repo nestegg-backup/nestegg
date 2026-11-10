@@ -215,6 +215,6 @@ export function settingsProblem(
       }
   }
   if (change.wake_on_lan === true && !current.wake_on_lan_configured)
-    return "Wake-on-LAN is not set up: the configuration has no [wake] section with the MAC address of the backup server. Add it in the terminal (see docs/configuration.md), then switch it on here.";
+    return "Wake-on-LAN is not set up: the configuration has no [wake] section with the MAC address of the backup server. Add it in the terminal (see /usr/share/doc/nestegg/configuration.md), then switch it on here.";
   return null;
 }
