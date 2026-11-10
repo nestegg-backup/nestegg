@@ -238,6 +238,31 @@ describe("what the server line shows after a connection check", () => {
   });
 });
 
+describe("a last backup whose time lies in the future", () => {
+  const ahead = run("2026-11-12T03:00:00Z", "succeeded", { finished_at: "2026-11-12T03:10:00Z" });
+  const s = (over: Partial<Status> = {}) => status({ health: "overdue", last_run: ahead, last_success: ahead, ...over });
+
+  it("is explained by the clock, not counted as 'not backed up for 0 hours'", () => {
+    for (const [, t, f] of both) {
+      const sum = selfSummary(s(), t, f, now);
+      expect(sum.lead).toBe(t.self.clockLead);
+      expect(sum.text).not.toMatch(/\b0 (hours|Stunden)\b/);
+      expect(sum.autoOff).toBeUndefined();
+    }
+    expect(selfSummary(s(), de, fde, now).text).toContain("Zeit in der Zukunft");
+    expect(selfSummary(s(), en, fen, now).text).toContain("time in the future");
+  });
+
+  it("names switched-off automatic backups too; a few minutes ahead is ordinary", () => {
+    const off = selfSummary(s({ schedule: { enabled: false, interval_hours: 24 } }), en, fen, now);
+    expect(off.autoOff).toBe(true);
+    expect(off.text).toContain(en.self.scheduleOff);
+    const slightly = run("2026-11-08T18:03:00Z", "succeeded");
+    const sum = selfSummary(status({ health: "overdue", last_run: slightly, last_success: slightly }), en, fen, now);
+    expect(sum.lead).not.toBe(en.self.clockLead);
+  });
+});
+
 describe("automatic backups switched off", () => {
   const off = (over: Partial<Status> = {}) => status({ schedule: { enabled: false, interval_hours: 24 }, ...over });
 

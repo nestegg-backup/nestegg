@@ -167,6 +167,9 @@ const de = {
     unknownLead: (m: Moment) => `Der letzte Eintrag im Verlauf, ${at(m)}, wird von dieser Version von nestegg nicht verstanden.`,
     unknownText:
       "Er stammt vermutlich von einer neueren Version von nestegg. Ob diese Sicherung geklappt hat, ist deshalb unklar. Aktualisiere nestegg.",
+    clockLead: "Die Uhr dieses PCs ging falsch.",
+    clockText: (m: Moment) =>
+      `Die letzte Sicherung trägt eine Zeit in der Zukunft (${at(m)}). Wie alt sie wirklich ist, lässt sich daran nicht ablesen. nestegg sichert beim nächsten Lauf neu.`,
     overdueLead: (days: number, hours: number) =>
       days >= 2 ? `Seit ${days} Tagen nicht gesichert.` : `Seit ${hours} Stunden nicht gesichert.`,
     overduePbs:

@@ -169,6 +169,9 @@ const en = {
     unknownLead: (m: Moment) => `The last entry in the history, ${at(m)}, is not understood by this version of nestegg.`,
     unknownText:
       "It was probably written by a newer version of nestegg, so it is unclear whether that backup worked. Update nestegg.",
+    clockLead: "The clock of this computer was wrong.",
+    clockText: (m: Moment) =>
+      `The last backup carries a time in the future (${at(m)}). That says nothing about how old it really is. nestegg backs up again at the next run.`,
     overdueLead: (days: number, hours: number) =>
       days >= 2 ? `Not backed up for ${days} days.` : `Not backed up for ${hours} hours.`,
     overduePbs: "The backup server was not reachable during the last attempts. This computer did nothing wrong.",

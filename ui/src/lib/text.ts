@@ -12,6 +12,9 @@ function cancelledAfter(last: Run | null, success: Run | null): Run | null {
   return last && last.state === "cancelled" && (!success || last.started_at > success.started_at) ? last : null;
 }
 
+/** As in the daemon (`FUTURE_TOLERANCE_MINUTES`): a stamp further ahead than this says nothing about the age. */
+const CLOCK_TOLERANCE_MS = 5 * 60_000;
+
 export interface Summary {
   kind: SelfKind;
   lead: string;
@@ -73,6 +76,13 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       };
     }
     case "overdue": {
+      // The time of the last backup lies in the future: the clock was wrong when it was written. Counting
+      // hours from it ("not backed up for 0 hours") would be nonsense; say what is known instead.
+      if (successAt && new Date(successAt).getTime() - now.getTime() > CLOCK_TOLERANCE_MS) {
+        const parts = [t.self.clockText(m(successAt))];
+        if (!s.schedule.enabled) parts.push(t.self.scheduleOff);
+        return { kind, lead: t.self.clockLead, text: parts.join(" "), ...(s.schedule.enabled ? {} : { autoOff: true }) };
+      }
       const age = ageOf(success ? runEnd(success) : (successAt ?? last?.started_at ?? now.toISOString()), now);
       const parts = [lastSuccessText];
       if (last?.state === "pbs_unreachable") parts.push(t.self.overduePbs);

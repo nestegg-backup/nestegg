@@ -898,15 +898,6 @@ impl<'a> Client<'a> {
         Ok(())
     }
 
-    /// Crypt mode (`none`, `sign-only`, `encrypt`) of an archive in a
-    /// snapshot, from `snapshot files`. `None` if the archive is not found.
-    pub fn archive_crypt_mode(&self, snapshot: &str, archive: &str) -> Result<Option<String>> {
-        Ok(crypt_mode_for_archive(
-            &self.snapshot_files(snapshot)?,
-            archive,
-        ))
-    }
-
     /// Size in bytes of an archive (sum of its index files), if listed.
     pub fn archive_size(&self, snapshot: &str, archive: &str) -> Result<Option<u64>> {
         Ok(size_for_archive(&self.snapshot_files(snapshot)?, archive))
