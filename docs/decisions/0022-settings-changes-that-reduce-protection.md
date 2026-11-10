@@ -210,9 +210,12 @@ the value as root in `/etc/nestegg/config.toml`.
 
 - **Nothing leaves the record undelivered.** An announcement is removed only
   after it has reached every channel that is switched on (the command, if one
-  is configured, succeeded; the desktop message reached at least one user),
-  never by time alone: a long weekend without a login or a command that keeps
-  failing does not lose it. After that it is kept for the keep window (three
+  is configured, succeeded; the desktop message reached at least one member
+  of group `nestegg`, who gets the full text): a long weekend without a login
+  or a command that keeps failing does not lose it. The one limit by time: if
+  no member logs in at all, the wait for one ends 30 days after the newest
+  change, with a line in the system log; an announcement the command has not
+  received is never dropped for time. After that it is kept for the keep window (three
   days) so that a user who logs in later still gets it, counted from the
   newest change in a combined entry. A command that keeps failing is retried
   without end, with a pause that doubles from five minutes up to six hours
