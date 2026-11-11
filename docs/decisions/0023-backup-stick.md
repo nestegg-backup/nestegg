@@ -66,11 +66,14 @@ and decrypted restore; verify alone does not repair a filesystem.
 1. **The stick carries its own PBS for the booted case; the desktop uses its
    own copy.** The drive holds the rescue live system (Debian, now with
    `proxmox-backup-server` added) and an ext4 data partition with a PBS
-   datastore in a fixed subdirectory (`nestegg/`), so a real PBS can later
+   datastore in a fixed subdirectory (`nestegg/store/`, below a root-owned
+   `nestegg/` mount anchor), so a real PBS can later
    reuse it as a removable datastore. When the desktop backs up to the
    stick, it starts the PBS from a copy of the live image kept on its own
    disk (`/var/lib/nestegg/stick/`), written by `stick create`, `stick
-   update` or `stick add` from a release image whose checksum was verified.
+   update` or `stick add` from a root-owned release image on fixed local storage.
+   SHA-256 verifies integrity, not authenticity; an independently obtained
+   `--sha256` pin takes precedence over an adjacent checksum.
    **The desktop never runs code from the stick.** A stick is recognised by a
    UUID that anyone can copy, and its partitions can be rewritten on any
    computer, so running its system as root would hand root to whoever made
@@ -222,7 +225,8 @@ else is built. The feature is released only after phase 6.
   The documentation says so and suggests keeping it elsewhere, or two
   sticks in turn.
 - The stick boots like the rescue stick of 0006: Secure Boot may have to be
-  switched off. The image is checked against the release checksum; signed
-  images are a later improvement.
+  switched off. The image is checked against a supplied SHA-256 pin or adjacent checksum;
+  an adjacent checksum alone does not authenticate it. Signed images are a
+  later improvement.
 - The PBS is AGPL-3.0 like nestegg; the image ships its packages unchanged
   from the Proxmox repository, with the usual source offer.
