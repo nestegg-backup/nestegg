@@ -65,6 +65,16 @@ Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
 - Read-only from the PBS (Audit role) plus the status report each machine
   uploads with its snapshot; no central service (decision 0003).
 
+## v0.4 – Backup stick (planned)
+
+- One USB drive that backs up the desktop, boots it, restores it onto an
+  empty disk and backs up a computer whose system no longer starts. Works
+  without a PBS or as a second copy next to one.
+- The stick holds a PBS datastore; a PBS started only on loopback writes
+  to it (on the desktop from the desktop's own copy, never from the stick).
+  Phases: `docs/decisions/0023-backup-stick.md`. Phase 0 (feasibility)
+  comes first.
+
 ## Not planned
 
 - An allowed time window for backups and the desktop keyring as a credential
