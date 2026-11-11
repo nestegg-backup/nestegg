@@ -40,6 +40,27 @@ Facts this builds on (checked against the PBS documentation and source,
   `proxmox-backup-client key create --kdf scrypt` and `key change-passphrase`
   need a terminal.
 
+## Phase-0 result (2026-11-11)
+
+[The disposable loop/KVM spike](../research/backup-stick-spike.md) gives a
+**GO for points 1–3 with privileged startup and kernel IPv6 support**. Ubuntu
+24.04 and a Debian 13 VM started the trusted PBS squashfs with fresh RAM-only
+configuration; encrypted backup/restore, owner preservation, maintenance jobs,
+EIO recovery and removable-datastore reuse worked. SeaBIOS and OVMF booted a
+UUID-pinned GPT medium. This is not feature acceptance; status stays proposed.
+
+The proxy fails with `ipv6.disable=1` (no AF_INET6 support). Disabling only
+interface IPv6 addresses is a different case and still works. The desktop must
+probe kernel IPv6 socket support and report the stick target as unsupported
+when absent, without changing host settings. A single mapped-root UID is also
+insufficient: PBS needs its separate `backup` UID/GID. Rootless operation is not
+part of this implementation; a subordinate-ID solution remains untested.
+
+There was no real USB stick/SSD. Physical performance, endurance, firmware boot
+quirks and actual unplug/power-loss recovery remain hardware gates in phase 6.
+The measured EIO case required offline ext4 checking before successful verify
+and decrypted restore; verify alone does not repair a filesystem.
+
 ## Decision
 
 1. **The stick carries its own PBS for the booted case; the desktop uses its
@@ -61,14 +82,22 @@ Facts this builds on (checked against the PBS documentation and source,
    datastore path only. A fixed token name (`nestegg@pbs!stick`) is used
    everywhere, because the server checks that the owner of a backup group
    stays the same. The certificate fingerprint is read from the freshly
-   created `proxy.pem`.
+   created `proxy.pem`. The writable image overlay is in tmpfs; `/run` must
+   additionally be a real tmpfs because PBS checks its shared-memory storage.
+   The config directory is a separate fresh tmpfs with the image's `backup`
+   ownership. Preserve PBS's datastore directory permissions; restrict secret
+   files individually instead of applying a restrictive global umask.
 3. **The local PBS is never reachable from the network.** It runs in its own
    network namespace with only a loopback interface, plus mount and PID
    namespaces and a private `/dev`. The client joins only that network
    namespace and still sees the host's files. These namespaces keep the PBS
    off the network; they are not a security boundary against a malicious
-   PBS, which is why point 1 keeps the code on the desktop. Phase 0 checks
-   whether the PBS can also run in a user namespace without real root.
+   PBS, which is why point 1 keeps the code on the desktop. Phase 0 found
+   that a single mapped-root user namespace cannot also run
+   the `backup` identity. The launcher needs a privileged helper; rootless
+   startup is not supported. Kernel IPv6 socket support is a prerequisite,
+   including for IPv4 loopback clients; fail the host preflight clearly if it
+   is absent. Do not alter the host's IPv6 configuration as a workaround.
    In the live image the PBS units, `ssh` and the mail service the PBS
    package pulls in are masked; the wizard starts the PBS the same way.
 4. **nestegg writes the stick itself**: `nestegg stick create /dev/sdX` with
@@ -89,7 +118,10 @@ Facts this builds on (checked against the PBS documentation and source,
    backup when one is due, with a notification at the start and "safe to
    unplug" at the end. A udev rule hides the stick's partitions from the
    desktop's automounter (`UDISKS_IGNORE`). Unknown drives are never mounted
-   by nestegg; the data partition is mounted `nodev,nosuid,noexec`. Parsing
+   by nestegg; the data partition is mounted `nodev,nosuid,noexec`. After
+   unclean removal, check filesystem health and require an appropriate repair
+   step before normal reuse; distinguish filesystem damage from failed PBS
+   verification, which cannot repair ext4. Parsing
    a crafted ext4 file system remains a kernel risk, the same as any USB
    drive a desktop mounts.
 6. **Targets.** The configuration may have a PBS, a stick, or both. Each
@@ -110,8 +142,10 @@ Facts this builds on (checked against the PBS documentation and source,
 8. **The stick prunes itself.** After each backup nestegg prunes the
    machine's group (default: last 3, 7 daily, 4 weekly, 6 monthly) and runs
    garbage collection with a small `gc-atime-cutoff`, which is safe because
-   nothing else writes to the stick at the same time. Before a backup it
-   checks the space available to the PBS user; a stick that is too full
+   nothing else writes to the stick at the same time. Keep PBS's atime safety
+   check enabled; the cutoff still delays collection of newly orphaned chunks.
+   Phase 2 must test actual space reclamation, not just successful GC startup.
+   Before a backup it checks the space available to the PBS user; a stick that is too full
    fails with its own state ("stick full") instead of deleting more than the
    policy allows.
 9. **One stick, several machines.** The stick can hold backups of every
