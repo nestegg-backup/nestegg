@@ -24,6 +24,9 @@ pub struct BackupArgs {
     /// Confirm the computer's backup ID (from its config or hostname).
     #[arg(long)]
     pub backup_id: String,
+    /// Explicitly allow an existing ID belonging to another/unknown computer.
+    #[arg(long)]
+    pub force_id: bool,
     #[arg(long)]
     pub luks_passphrase_file: Option<PathBuf>,
     /// Exported or saved paper key instead of the stick's protected copy.
@@ -179,7 +182,7 @@ pub fn run(args: BackupArgs) -> Result<u8> {
         args.confirm_clock || args.time.is_some(),
         "confirm the live clock with --confirm-clock or --time"
     );
-    let result = perform(&session, sources, &args.backup_id);
+    let result = perform(&session, sources, &args.backup_id, args.force_id);
     let closed = session.close();
     let code = result?;
     closed?;
@@ -276,6 +279,20 @@ pub fn wizard() -> Result<u8> {
     };
     session.set_key(Some(&key))?;
     session.client().check_group_key(&id)?;
+    let collision = identity_warning(&session, &sources.root, &id)?;
+    let force_id = if let Some(reason) = collision {
+        eprintln!("Backup ID collision: {}", super::printable_block(&reason));
+        ensure!(
+            ask_yes(
+                "Use this ID anyway, combining this computer's backups and retention with the existing group",
+                false
+            )?,
+            "choose a distinct backup ID for this computer"
+        );
+        true
+    } else {
+        false
+    };
     let snapshots = session.client().list_snapshots(&id)?;
     let newest = snapshots
         .iter()
@@ -305,7 +322,7 @@ pub fn wizard() -> Result<u8> {
         ask_yes("Start the encrypted backup to this stick", false)?,
         "backup cancelled"
     );
-    let result = perform(&session, sources, &id);
+    let result = perform(&session, sources, &id, force_id);
     let closed = session.close();
     let code = result?;
     closed?;
@@ -313,7 +330,7 @@ pub fn wizard() -> Result<u8> {
     Ok(code)
 }
 
-fn perform(session: &Session, sources: Sources, id: &str) -> Result<u8> {
+fn perform(session: &Session, sources: Sources, id: &str, force_id: bool) -> Result<u8> {
     let layout = sources.layout()?;
     ensure!(
         layout.bootloader == "grub",
@@ -369,12 +386,19 @@ fn perform(session: &Session, sources: Sources, id: &str) -> Result<u8> {
         clock_problem(now, newest).is_none(),
         "correct the live clock before backing up"
     );
+    if let Some(reason) = identity_warning(session, &sources.root, id)? {
+        ensure!(
+            force_id,
+            "backup ID collision: {reason}; choose a distinct --backup-id or explicitly pass --force-id"
+        );
+    }
     let snapshot = snapshot_path(id, now.timestamp());
     let meta = crate::metadata::BackupMetadata {
         format: crate::metadata::FORMAT,
         nestegg_version: env!("CARGO_PKG_VERSION").into(),
         backup_id: id.into(),
         hostname: layout.hostname.clone(),
+        machine_id: offline_machine_identity(&sources.root),
         backup_time: now.timestamp(),
         snapshot: snapshot.clone(),
         archive_sources: BTreeMap::from([("system.pxar".into(), "/".into())]),
@@ -472,6 +496,61 @@ fn perform(session: &Session, sources: Sources, id: &str) -> Result<u8> {
     Ok(0)
 }
 
+fn offline_machine_identity(root: &Path) -> Option<String> {
+    text_root(root, "/etc/machine-id")
+        .ok()
+        .and_then(|s| crate::metadata::machine_identity(&s))
+}
+
+fn identity_difference(
+    hostname: &str,
+    machine: Option<&str>,
+    previous: Option<&crate::metadata::BackupMetadata>,
+) -> Option<&'static str> {
+    let Some(previous) = previous else {
+        return Some("the newest snapshot has no signed computer identity");
+    };
+    if previous.hostname != hostname {
+        Some("the newest snapshot belongs to a different hostname")
+    } else {
+        match (machine, previous.machine_id.as_deref()) {
+            (Some(current), Some(old)) if current == old => None,
+            (Some(_), Some(_)) => {
+                Some("the newest snapshot belongs to a different machine identity")
+            }
+            _ => Some("the computer identity cannot be compared with the newest snapshot"),
+        }
+    }
+}
+
+fn identity_warning(session: &Session, root: &Path, id: &str) -> Result<Option<String>> {
+    let client = session.client();
+    let snapshots = client.list_snapshots_bounded(id, crate::client::readback_list_timeout())?;
+    let Some(newest) = snapshots.iter().max_by_key(|s| snapshot_epoch(&s.snapshot)) else {
+        return Ok(None);
+    };
+    let scratch = tempfile::Builder::new()
+        .prefix("identity-")
+        .tempdir_in(work_dir())?;
+    // fetch always supplies the configured key, verifying the manifest's
+    // signature; malformed/tampered metadata is an error, never an override.
+    let previous = crate::metadata::fetch(&client, &newest.snapshot, scratch.path())?
+        .map(|f| crate::metadata::BackupMetadata::parse(&f.bytes))
+        .transpose()?;
+    if let Some(meta) = &previous {
+        ensure!(
+            meta.belongs_to(&newest.snapshot),
+            "computer metadata belongs to a different snapshot"
+        );
+    }
+    let hostname = text_root(root, "/etc/hostname")?;
+    let machine = offline_machine_identity(root);
+    Ok(
+        identity_difference(hostname.trim(), machine.as_deref(), previous.as_ref())
+            .map(str::to_owned),
+    )
+}
+
 /// Separating the maintenance boundary lets tests prove that unrelated
 /// datastore damage cannot starve retention, while a bad new snapshot can.
 trait StickMaintenance {
@@ -563,6 +642,32 @@ impl StickMaintenance for SessionMaintenance<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_key_and_hostname_do_not_hide_an_id_collision() {
+        let mut previous = crate::metadata::BackupMetadata {
+            format: crate::metadata::FORMAT,
+            nestegg_version: "test".into(),
+            backup_id: "desktop".into(),
+            hostname: "same-name".into(),
+            machine_id: Some("first-machine".into()),
+            backup_time: 1,
+            snapshot: snapshot_path("desktop", 1),
+            archive_sources: BTreeMap::new(),
+            sources: vec![],
+            system_mode: true,
+            incomplete: vec![],
+        };
+        assert!(identity_difference("same-name", Some("first-machine"), Some(&previous)).is_none());
+        assert!(
+            identity_difference("same-name", Some("second-machine"), Some(&previous)).is_some()
+        );
+        assert!(identity_difference("renamed", Some("first-machine"), Some(&previous)).is_some());
+        assert!(identity_difference("same-name", None, Some(&previous)).is_some());
+        previous.machine_id = None;
+        assert!(identity_difference("same-name", Some("first-machine"), Some(&previous)).is_some());
+        assert!(identity_difference("same-name", Some("first-machine"), None).is_some());
+    }
+
     #[derive(Default)]
     struct TestMaintenance {
         calls: Vec<&'static str>,

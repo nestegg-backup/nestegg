@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Phases 3/4 acceptance. ONLY disposable files, loops, containers and KVM VMs.
-# Usage: sudo tests/stick/rescue.sh BINARY RESCUE_ISO [desktop|plain|luks-lvm|dirty|no-nestegg|btrfs|all]
+# Usage: sudo tests/stick/rescue.sh BINARY RESCUE_ISO [desktop|plain|luks-lvm|dirty|no-nestegg|btrfs|id-collision|all]
 set -Eeuo pipefail
 [[ $EUID == 0 && -e /dev/kvm ]] || { echo 'root and KVM required' >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
@@ -90,7 +90,7 @@ send mkdir -p /media/test; mount -o ro,noload /dev/vdc /media/test; cp /media/te
 expect root@.*# 30
 EOF
 }
-if [[ $modes == all ]]; then modes='desktop plain luks-lvm dirty no-nestegg btrfs'; fi
+if [[ $modes == all ]]; then modes='desktop plain id-collision luks-lvm dirty no-nestegg btrfs'; fi
 for mode in $modes; do
     echo "== $mode"
     if [[ $mode == btrfs ]]; then
@@ -105,6 +105,7 @@ for mode in $modes; do
     docker run --rm --name "$container" --privileged -v /dev:/dev -v "$work:/work" -v "$here:/t:ro" \
         -e MODE="$mode" -e DATA_UUID="$uuid" ubuntu:24.04 bash /t/prepare-offline-source.sh > "$work/prepare-$mode.log" 2>&1
     id=offline-$mode
+    [[ $mode != id-collision ]] || id=offline-plain
     if [[ $mode == desktop ]]; then
         id=e2e-src
         timeout 1800 qemu-system-x86_64 -enable-kvm -cpu host -m 4096 -smp 2 -display none -monitor none \
@@ -158,6 +159,13 @@ EOF
             else
                 extra=
                 [[ $mode != luks-lvm ]] || extra='--luks-passphrase-file /media/test/luks-password'
+                if [[ $mode == id-collision ]]; then
+                    cat <<'EOF'
+send nestegg rescue backup --disk /dev/vdb --backup-id offline-plain --keyfile /media/test/nestegg-paperkey.txt --confirm-clock >/run/collision.log 2>&1; code=$?; cat /run/collision.log; test "$code" != 0 && grep -q 'backup ID collision:.*different machine identity' /run/collision.log; printf 'COLLISION-%s=%s\n' EXIT "$?"
+expect COLLISION-EXIT=0 300
+EOF
+                    extra=--force-id
+                fi
                 printf '%s\n' "send nestegg rescue backup --disk /dev/vdb --backup-id $id --keyfile /media/test/nestegg-paperkey.txt --confirm-clock $extra; printf 'BACKUP-%s=%s\\n' EXIT \"\$?\""
                 echo 'expect BACKUP-EXIT=0 1800'
             fi

@@ -1581,6 +1581,9 @@ fn backup_metadata(
         nestegg_version: env!("CARGO_PKG_VERSION").into(),
         backup_id: backup_id.into(),
         hostname: ctx.hostname.clone(),
+        machine_id: fs::read_to_string("/etc/machine-id")
+            .ok()
+            .and_then(|s| crate::metadata::machine_identity(&s)),
         backup_time,
         snapshot: snapshot_path(backup_id, backup_time),
         archive_sources: ctx

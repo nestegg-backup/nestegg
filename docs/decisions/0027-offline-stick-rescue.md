@@ -146,3 +146,12 @@ key-guarded prune or GC. Cancellation and media removal are checked between
 maintenance steps, including before interpreting a failed full pass as damage.
 A cancelled read-back is labelled cancelled. Unit tests cover foreign corruption,
 new-snapshot failure, cancellation during the full pass and missing media.
+
+The immutable encrypted metadata now optionally includes a normalized SHA-256
+of `/etc/machine-id`, populated by desktop and offline backups. Before upload,
+offline backup compares hostname and machine identity with the newest group's
+signed metadata. A mismatch, missing old metadata or unavailable identity needs
+an explicit default-no wizard confirmation or non-interactive `--force-id`.
+The override never bypasses signature, snapshot binding or key ownership checks.
+A distinct backup ID remains the recommended choice. Exact OS clones that also
+share a machine-id cannot be distinguished by this identity check.

@@ -44,6 +44,12 @@ else
     mount "${loop}p2" "$mnt"
     mount "${loop}p3" "$mnt/home"
 fi
+# Stable synthetic identities let the collision scenario share hostname/key
+# with plain while representing a different installed computer.
+printf '11111111111111111111111111111111\n' > "$mnt/etc/machine-id"
+if [[ $MODE == id-collision ]]; then
+    printf '22222222222222222222222222222222\n' > "$mnt/etc/machine-id"
+fi
 case "$MODE" in
     desktop)
         mkdir -p "$mnt/var/lib/nestegg/stick"
@@ -75,7 +81,7 @@ p=pathlib.Path(sys.argv[1]);s=p.read_text();s=s.replace('  echo "E2E-SOURCE-BOOT
 ''');p.write_text(s)
 PY
         ;;
-    plain|btrfs) ;;
+    plain|btrfs|id-collision) ;;
     luks-lvm)
         rm -f /work/encrypted.img
         truncate -s 8G /work/encrypted.img
