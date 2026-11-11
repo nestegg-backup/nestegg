@@ -319,6 +319,13 @@ pub struct SnapshotInfo {
     pub crypt_modes: Vec<(String, String)>,
 }
 
+fn parse_space_info(v: &Value) -> Result<(u64, Option<u64>)> {
+    let available = v["avail"]
+        .as_u64()
+        .context("PBS did not report space available to its backup user")?;
+    Ok((available, v["total"].as_u64().filter(|total| *total > 0)))
+}
+
 /// PBS itself defines a finished snapshot by the presence of its manifest.
 /// A failed upload can leave a newer unfinished directory; it must not hide
 /// the last completed snapshot's key, nor prevent the official client retry.
@@ -689,11 +696,14 @@ impl<'a> Client<'a> {
     }
 
     pub fn available_bytes(&self) -> Result<u64> {
+        Ok(self.space_info()?.0)
+    }
+
+    /// Space available to the backup user and the datastore's total size.
+    pub fn space_info(&self) -> Result<(u64, Option<u64>)> {
         let v: Value =
             serde_json::from_str(&self.output(&["status", "--output-format", "json"], false)?)?;
-        v["avail"]
-            .as_u64()
-            .context("PBS did not report space available to its backup user")
+        parse_space_info(&v)
     }
 
     /// Datastore usage `(used, total)`; `None` if the token may not see it.
@@ -1535,6 +1545,19 @@ pub fn parse_time(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_uses_backup_user_availability_and_optional_total() {
+        assert_eq!(
+            parse_space_info(&serde_json::json!({"avail": 25, "used": 60, "total": 100})).unwrap(),
+            (25, Some(100))
+        );
+        assert_eq!(
+            parse_space_info(&serde_json::json!({"avail": 0})).unwrap(),
+            (0, None)
+        );
+        assert!(parse_space_info(&serde_json::json!({"used": 10, "total": 100})).is_err());
+    }
 
     #[test]
     fn key_gate_uses_last_completed_snapshot_after_an_interrupted_upload() {

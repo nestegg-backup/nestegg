@@ -51,7 +51,7 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
   const successAt = success?.started_at ?? server?.latest ?? null;
   const lastSuccessText = successAt ? t.self.lastSuccessSentence(m(successAt)) : t.self.noSuccessYet;
   // Stick only and the stick is not plugged in: nothing starts by itself until it is.
-  const waitStick = stickOnly(s) && s.schedule.enabled && s.targets?.stick?.state === "stick_not_plugged_in";
+  const waitStick = stickOnly(s) && s.schedule.enabled && s.targets?.stick != null && stickView(s.targets.stick).plugged === false;
   // The token secret comes before the key and before the first backup (see setupGuide).
   if ((kind === "key_missing" || kind === "never") && setupGuide(s)?.current === "credentials") {
     return { kind, lead: t.self.credentialsLead, text: t.self.credentialsText };
@@ -252,6 +252,7 @@ export function stickRowOverride(s: Status, t: Messages, f: Formatter): string |
     case "full":
       return t.row.stickFull;
     case "damaged":
+    case "store_damaged":
     case "verify_failed":
     case "key_mismatch":
     case "unsupported":
@@ -377,6 +378,7 @@ const STICK_LEAD: Record<Exclude<StickKind, "ok" | "incomplete" | "overdue" | "f
   full: (t) => t.stick.full,
   damaged: (t) => t.stick.damaged,
   verify_failed: (t) => t.stick.verifyFailed,
+  store_damaged: (t) => t.stick.storeDamaged,
   key_mismatch: (t) => t.stick.keyMismatch,
   unsupported: (t) => t.stick.unsupported,
   unknown: (t) => t.stick.unknown,

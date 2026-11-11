@@ -872,6 +872,26 @@ fn stick_pipeline(
             }
         }
     }
+    // Publish the latest usage after retention or failure-only GC, rather
+    // than leaving the UI with the space measured before the upload.
+    if !crate::cancel::requested() && !rep.stick_missing() {
+        let usage = Client::local(
+            config,
+            SecretStore::new(&paths.credentials_dir),
+            session.pbs(),
+        )
+        .space_info();
+        match usage {
+            Ok((available, total)) => {
+                let mut state = rep.store.load_state()?;
+                state.available_bytes = Some(available);
+                state.total_bytes = total;
+                state.space_checked_at = Some(Utc::now());
+                rep.store.save_state(&state)?;
+            }
+            Err(e) => rep.warn(format!("could not refresh stick capacity: {e:#}")),
+        }
+    }
     // Safe-to-unplug means server stopped, writes flushed and filesystem
     // unmounted. Never emit it merely because the upload finished.
     session.close()?;
@@ -1250,9 +1270,11 @@ fn pipeline(
             );
             return Ok(());
         }
-        match client.available_bytes() {
-            Ok(available) => {
+        match client.space_info() {
+            Ok((available, total)) => {
                 state.available_bytes = Some(available);
+                state.total_bytes = total;
+                state.space_checked_at = Some(Utc::now());
                 rep.store.save_state(&state)?;
                 if available
                     < config

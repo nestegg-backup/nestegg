@@ -411,6 +411,9 @@ const en = {
   },
   reason: {
     stick_not_plugged_in: "stick not plugged in",
+    stick_already_mounted: "stick already mounted",
+    stick_ambiguous: "ambiguous stick UUID",
+    stick_busy: "stick already in use",
     stick_full: "stick full",
     filesystem_damaged: "stick file system damaged",
     stick_unsupported: "not possible on this computer",
@@ -431,6 +434,9 @@ const en = {
   explain: {
     stick_not_plugged_in:
       "The stick was not plugged in. That is not an error: as soon as it is plugged in and a backup is due, nestegg backs up by itself.",
+    stick_already_mounted: "Unmount the stick before nestegg uses it.",
+    stick_ambiguous: "Several devices have the same UUID. Disconnect the clone and try again.",
+    stick_busy: "Another stick operation is running. Wait until it has finished.",
     stick_full:
       "There is too little space on the stick. nestegg stopped and did not delete more older backups than the retention rules allow. A larger stick helps.",
     filesystem_damaged:
@@ -548,6 +554,7 @@ const en = {
       days >= 2 ? `Not backed up to the stick for ${days} days.` : `Not backed up to the stick for ${hours} hours.`,
     full: "The stick is full.",
     damaged: "The stick's file system is damaged.",
+    storeDamaged: "The monthly check found damaged data on the stick. The new backup is verified.",
     verifyFailed: "The check of the backup on the stick failed.",
     keyMismatch: "The stick holds a backup made with another key.",
     unsupported: "This computer cannot back up to the stick.",
@@ -562,7 +569,8 @@ const en = {
     safe: "Plugged in and not in use: safe to unplug.",
     keepIn: "Keep it plugged in until this says it is safe to unplug.",
     free: (size: string) => `${size} free`,
-    freeNote: "as of the last backup",
+    filled: (n: number) => `${n}% used`,
+    freeNote: "as of the last check",
     lastSuccess: (m: Moment) => `Last backed up ${at(m)}`,
     fullCheck: (day: string) => `fully checked on ${day}`,
     damagedSnapshots: (n: number) => `${n} ${plural(n, "backup", "backups")} on the stick reported as damaged`,
@@ -571,6 +579,9 @@ const en = {
     starting: "Starting …",
     runFailed: (msg: string) => `The backup to the stick could not be started. ${msg}`,
     waitPlug: "A backup happens as soon as the stick is plugged in and a backup is due.",
+    keyCopyTitle: "Create the stick's key copy",
+    keyCopyText: "This registered stick has no confirmed password-protected copy of the current key. Create it in the terminal and keep the password safe.",
+    passwordDueText: "The key copy on this stick is confirmed. After 180 days, check again that you can open it with your password. Backups continue.",
     passwordTitle: "Check the stick's password",
     passwordText:
       "The copy of the key on the stick is protected by a password. So that a forgotten password shows before you need it, nestegg asks for it every 180 days. If no copy is confirmed yet, make one with key-copy. Backups keep running meanwhile.",

@@ -28,6 +28,9 @@ export type RunErrorKind =
   | "stick_not_plugged_in"
   /** Too little space left on the stick for the PBS backup user; nothing beyond the retention rules was deleted. */
   | "stick_full"
+  | "stick_already_mounted"
+  | "stick_ambiguous"
+  | "stick_busy"
   /** The offline check of the stick's ext4 file system found damage; it needs an offline repair. */
   | "filesystem_damaged"
   /** This computer cannot start the stick's local backup server (kernel IPv6 support missing, no root helper). */
@@ -106,11 +109,18 @@ export interface TargetStatus {
   next_run?: string | null;
   /** Free space for the PBS backup user, as found at the last run of this target. */
   available_bytes?: number | null;
+  total_bytes?: number | null;
+  space_checked_at?: string | null;
+  last_checked_at?: string | null;
+  /** Live presence, independent of a previous run's outcome; null means unknown. */
+  plugged_in?: boolean | null;
   /** Last complete verification of the whole stick. */
   full_verified_at?: string | null;
   server_verify_failed?: string[];
   /** A registered stick has no password proof yet, or its 180-day password re-check is due (root-only CLI). */
   password_reminder: boolean;
+  /** Only media needing attention; absence means the proof is current. */
+  password_reminders?: Record<string, "key_copy_missing" | "password_check_due">;
 }
 
 export interface Status {
@@ -197,6 +207,7 @@ export interface ConfigView {
   overdue_after_hours?: number;
   /** "Overdue after" of the stick target; null or absent without a stick. */
   stick_overdue_after_hours?: number | null;
+  stick_data_uuids?: string[];
   /** `nestegg-backup.timer` is enabled. */
   automatic_backups?: boolean;
   /** Wake-on-LAN is configured and switched on. */
@@ -234,6 +245,7 @@ export interface SettingsChange {
 }
 
 export interface SettingsLimits {
+  stick_overdue_after_hours?: SettingsLimits["overdue_after_hours"] | null;
   interval_hours: { min: number; max: number };
   overdue_after_hours: {
     min: number;

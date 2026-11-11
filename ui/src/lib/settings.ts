@@ -54,10 +54,15 @@ export function overdueCap(interval: number, limits: SettingsLimits = DEFAULT_LI
 
 /**
  * The largest "overdue after" of the stick: the same rule as for the server, with the stick's own
- * value in the file as the floor (a larger value root set can only be lowered). The daemon does not
- * report it in `limits`, so it is computed from the server's `base` and `per_interval_extra`.
+ * value in the file as the floor. Prefer the stick's own daemon-supplied limits;
+ * older daemons fall back to the original server-cap rule.
  */
 export function stickOverdueCap(interval: number, stickFile: number | null | undefined, limits: SettingsLimits = DEFAULT_LIMITS): number {
+  const own = limits.stick_overdue_after_hours;
+  if (own) {
+    if (own.base === undefined || own.per_interval_extra === undefined) return own.max;
+    return Math.max(own.base, interval + own.per_interval_extra, own.file_minimum ?? 0);
+  }
   const od = limits.overdue_after_hours;
   return Math.max(od.base ?? OVERDUE_BASE_HOURS, interval + (od.per_interval_extra ?? OVERDUE_INTERVAL_EXTRA_HOURS), stickFile ?? 0);
 }
@@ -204,7 +209,7 @@ export function settingsProblem(
     if (!targets.stick) return "no stick target configured";
     const cap = stickOverdueCap(intervalAfter(raw, current), current.stick_overdue_after_hours, limits);
     const h = raw.stick_overdue_after_hours as number;
-    if (h === 0 || h > cap) return `stick_overdue_after_hours must be between 1 and ${cap}`;
+    if (h < (limits.stick_overdue_after_hours?.min ?? 1) || h > cap) return `stick_overdue_after_hours must be between 1 and ${cap}`;
     if (raw.remove_target === "stick") return "cannot change and remove the stick target together";
   }
   if (given("remove_target")) {

@@ -309,6 +309,10 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_bytes: Option<u64>,
     #[serde(default)]
+    pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub space_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub last_checked_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub stick_damaged: bool,
@@ -416,6 +420,10 @@ pub struct TargetState {
     #[serde(default)]
     pub available_bytes: Option<u64>,
     #[serde(default)]
+    pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub space_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub last_checked_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub stick_damaged: bool,
@@ -431,6 +439,8 @@ impl TargetState {
             server_verify_failed: s.server_verify_failed.clone(),
             full_verified_at: s.full_verified_at,
             available_bytes: s.available_bytes,
+            total_bytes: s.total_bytes,
+            space_checked_at: s.space_checked_at,
             last_checked_at: s.last_checked_at,
             stick_damaged: s.stick_damaged,
         }
@@ -444,6 +454,8 @@ impl TargetState {
         s.server_verify_failed = self.server_verify_failed.clone();
         s.full_verified_at = self.full_verified_at;
         s.available_bytes = self.available_bytes;
+        s.total_bytes = self.total_bytes;
+        s.space_checked_at = self.space_checked_at;
         s.last_checked_at = self.last_checked_at;
         s.stick_damaged = self.stick_damaged;
     }

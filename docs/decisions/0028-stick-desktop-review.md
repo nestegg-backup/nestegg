@@ -68,3 +68,13 @@ classifying a failure. Removal is `stick_not_plugged_in`, a cancellation is
 `cancelled`; neither counts towards the retry pause. Queries, group-key checks,
 pruning and verification honour cancellation. Failed uploads and `stick_full`
 may run GC alone, preserving every snapshot and the PBS atime cutoff.
+
+## UI contract
+
+The public OpenAPI contract adds independent live `plugged_in` presence,
+cached `available_bytes`/`total_bytes` with `space_checked_at`, registered
+`stick_data_uuids`, per-UUID `password_reminders`, and the stick's own overdue
+limits. Password reminders distinguish missing key-copy proof from the
+periodic password check. The original boolean and all legacy status fields
+remain. The UI prefers these fields and retains fallbacks for older daemons;
+the existing capacity line gains a percentage without changing the layout.

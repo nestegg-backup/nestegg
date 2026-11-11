@@ -40,10 +40,51 @@ pub struct TargetStatus {
     pub overdue_after_hours: u32,
     pub next_run: Option<DateTime<Utc>>,
     pub available_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub space_checked_at: Option<DateTime<Utc>>,
+    pub plugged_in: Option<bool>,
     pub last_checked_at: Option<DateTime<Utc>>,
     pub full_verified_at: Option<DateTime<Utc>>,
     pub server_verify_failed: Vec<String>,
     pub password_reminder: bool,
+    pub password_reminders: std::collections::BTreeMap<String, PasswordReminder>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PasswordReminder {
+    KeyCopyMissing,
+    PasswordCheckDue,
+}
+
+fn password_reminders(
+    state: &State,
+    config: &Config,
+    now: DateTime<Utc>,
+) -> std::collections::BTreeMap<String, PasswordReminder> {
+    config
+        .stick
+        .iter()
+        .flat_map(|s| &s.data_uuids)
+        .filter_map(|uuid| {
+            let reason = if !state.stick_key_exported(uuid) {
+                PasswordReminder::KeyCopyMissing
+            } else if state
+                .stick_media
+                .get(&uuid.to_ascii_lowercase())
+                .and_then(|m| m.password_checked_at)
+                .is_none_or(|last| {
+                    now - last >= chrono::Duration::days(180)
+                        || last > now + crate::state::future_tolerance()
+                })
+            {
+                PasswordReminder::PasswordCheckDue
+            } else {
+                return None;
+            };
+            Some((uuid.to_ascii_lowercase(), reason))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,20 +232,20 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
                 crate::state::config_stamp(&paths.config_file).as_deref(),
                 now,
             );
-            let password_reminder = target == crate::state::Target::Stick
-                && config.stick.as_ref().is_some_and(|stick| {
-                    stick.data_uuids.iter().any(|uuid| {
-                        !state.stick_key_exported(uuid)
-                            || state
-                                .stick_media
-                                .get(&uuid.to_ascii_lowercase())
-                                .and_then(|m| m.password_checked_at)
-                                .is_none_or(|last| {
-                                    now - last >= chrono::Duration::days(180)
-                                        || last > now + crate::state::future_tolerance()
-                                })
-                    })
-                });
+            let password_reminders = if target == crate::state::Target::Stick {
+                password_reminders(&state, config, now)
+            } else {
+                Default::default()
+            };
+            let plugged_in = (target == crate::state::Target::Stick).then(|| {
+                config
+                    .stick
+                    .as_ref()
+                    .expect("configured")
+                    .data_uuids
+                    .iter()
+                    .any(|uuid| crate::stick::target::present(uuid))
+            });
             targets.insert(
                 target,
                 TargetStatus {
@@ -217,10 +258,14 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
                     overdue_after_hours: threshold,
                     next_run: timer.then_some(retry.map(|r| r.max(due)).unwrap_or(due)),
                     available_bytes: view.available_bytes,
+                    total_bytes: view.total_bytes,
+                    space_checked_at: view.space_checked_at,
+                    plugged_in,
                     last_checked_at: view.last_checked_at,
                     full_verified_at: view.full_verified_at,
                     server_verify_failed: view.server_verify_failed,
-                    password_reminder,
+                    password_reminder: !password_reminders.is_empty(),
+                    password_reminders,
                 },
             );
         }
@@ -324,6 +369,7 @@ pub fn config_view(config: &Config, timer_enabled: bool) -> serde_json::Value {
         "encryption": config.backup.encryption,
         "overdue_after_hours": config.overdue_after_hours,
         "stick_overdue_after_hours": config.stick.as_ref().map(|s| s.overdue_after_hours),
+        "stick_data_uuids": config.stick.as_ref().map(|s| s.data_uuids.clone()).unwrap_or_default(),
         "automatic_backups": timer_enabled,
         "wake_on_lan": config.active_wake().is_some(),
         "wake_on_lan_configured": wake_configured,

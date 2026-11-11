@@ -346,6 +346,14 @@ pub fn limits_json(current: &Config) -> serde_json::Value {
             "per_interval_extra": OVERDUE_INTERVAL_EXTRA_HOURS,
             "file_minimum": current.overdue_after_hours,
         },
+        "stick_overdue_after_hours": current.stick.as_ref().map(|stick| serde_json::json!({
+            "min": 1,
+            "max": overdue_cap(interval, stick.overdue_after_hours),
+            "greater_than_interval": false,
+            "base": OVERDUE_API_MAX_HOURS,
+            "per_interval_extra": OVERDUE_INTERVAL_EXTRA_HOURS,
+            "file_minimum": stick.overdue_after_hours,
+        })),
         "excludes": { "max_items": MAX_EXCLUDES, "max_length": MAX_EXCLUDE_LEN },
     })
 }

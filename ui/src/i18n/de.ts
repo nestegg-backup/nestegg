@@ -410,6 +410,9 @@ const de = {
   },
   reason: {
     stick_not_plugged_in: "Stick nicht eingesteckt",
+    stick_already_mounted: "Stick bereits eingehängt",
+    stick_ambiguous: "Stick-UUID ist nicht eindeutig",
+    stick_busy: "Stick wird bereits benutzt",
     stick_full: "Stick voll",
     filesystem_damaged: "Dateisystem des Sticks beschädigt",
     stick_unsupported: "auf diesem PC nicht möglich",
@@ -430,6 +433,9 @@ const de = {
   explain: {
     stick_not_plugged_in:
       "Der Stick war nicht eingesteckt. Das ist kein Fehler: Sobald er eingesteckt ist und eine Sicherung fällig ist, sichert nestegg von selbst.",
+    stick_already_mounted: "Hänge den Stick aus, bevor nestegg ihn benutzt.",
+    stick_ambiguous: "Mehrere Laufwerke haben dieselbe UUID. Trenne die Kopie und versuche es erneut.",
+    stick_busy: "Eine andere Stick-Aktion läuft. Warte, bis sie beendet ist.",
     stick_full:
       "Auf dem Stick ist zu wenig Platz. nestegg hat abgebrochen und dabei keine älteren Sicherungen gelöscht, als die Aufbewahrungsregeln vorsehen. Abhilfe schafft ein größerer Stick.",
     filesystem_damaged:
@@ -551,6 +557,7 @@ const de = {
       days >= 2 ? `Seit ${days} Tagen nicht auf den Stick gesichert.` : `Seit ${hours} Stunden nicht auf den Stick gesichert.`,
     full: "Der Stick ist voll.",
     damaged: "Das Dateisystem des Sticks ist beschädigt.",
+    storeDamaged: "Die monatliche Kontrolle meldet beschädigte Daten auf dem Stick. Die neue Sicherung ist geprüft.",
     verifyFailed: "Die Kontrolle der Sicherung auf dem Stick ist fehlgeschlagen.",
     keyMismatch: "Auf dem Stick liegt eine Sicherung mit anderem Schlüssel.",
     unsupported: "Auf diesem PC lässt sich nicht auf den Stick sichern.",
@@ -565,7 +572,8 @@ const de = {
     safe: "Eingesteckt und nicht in Benutzung: Du kannst ihn abziehen.",
     keepIn: "Lass ihn eingesteckt, bis hier steht, dass du ihn abziehen kannst.",
     free: (size: string) => `${size} frei`,
-    freeNote: "Stand der letzten Sicherung",
+    filled: (n: number) => `${n} % belegt`,
+    freeNote: "Stand der letzten Prüfung",
     lastSuccess: (m: Moment) => `Zuletzt gesichert ${at(m)}`,
     fullCheck: (day: string) => `ganz geprüft am ${day}`,
     damagedSnapshots: (n: number) => `${n} ${plural(n, "Sicherung", "Sicherungen")} auf dem Stick als beschädigt gemeldet`,
@@ -574,6 +582,9 @@ const de = {
     starting: "Wird gestartet …",
     runFailed: (msg: string) => `Die Sicherung auf den Stick ließ sich nicht starten. ${msg}`,
     waitPlug: "Gesichert wird, sobald der Stick eingesteckt ist und eine Sicherung fällig ist.",
+    keyCopyTitle: "Schlüsselkopie auf dem Stick anlegen",
+    keyCopyText: "Auf diesem registrierten Stick ist noch keine passwortgeschützte Kopie des aktuellen Schlüssels bestätigt. Lege sie im Terminal an und bewahre das Passwort sicher auf.",
+    passwordDueText: "Die Schlüsselkopie auf diesem Stick ist bestätigt. Prüfe nach 180 Tagen erneut, ob du sie mit deinem Passwort öffnen kannst. Die Sicherungen laufen weiter.",
     passwordTitle: "Passwort des Sticks prüfen",
     passwordText:
       "Die Kopie des Schlüssels auf dem Stick ist mit einem Passwort geschützt. Damit ein vergessenes Passwort auffällt, bevor du es brauchst, fragt nestegg alle 180 Tage danach. Ist noch keine Kopie bestätigt, legst du sie mit key-copy an. Die Sicherungen laufen so lange weiter.",

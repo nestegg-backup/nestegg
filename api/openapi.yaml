@@ -550,11 +550,28 @@ components:
         consecutive_failures: { type: integer, minimum: 0 }
         overdue_after_hours: { type: integer, description: Stick default is 168 hours (7 days). }
         next_run: { type: [string, "null"], format: date-time }
-        available_bytes: { type: [integer, "null"], description: Free space as reported for the PBS backup user. }
+        plugged_in:
+          type: [boolean, "null"]
+          description: Current presence of any registered stick, independent of state/health/history. Null for PBS. Does not mount the medium or mean it is safe to unplug.
+        available_bytes: { type: [integer, "null"], description: Free space as reported for the PBS backup user; cached from space_checked_at. }
+        total_bytes: { type: [integer, "null"], description: Datastore filesystem capacity measured with available_bytes; null before first measurement. }
+        space_checked_at: { type: [string, "null"], format: date-time, description: Last successful capacity measurement (also refreshed after retention or failure-only GC). }
         last_checked_at: { type: [string, "null"], format: date-time, description: Last hourly stick presence check; absent media create no run record. }
         full_verified_at: { type: [string, "null"], format: date-time }
         server_verify_failed: { type: array, items: { type: string } }
-        password_reminder: { type: boolean, description: A registered stick has no password proof or needs its 180-day password re-check. Use the root-only CLI key-check action; the API never accepts passwords. }
+        password_reminder: { type: boolean, description: True when password_reminders is nonempty; retained for older clients. The API never accepts passwords. }
+        password_reminders:
+          type: object
+          description: |
+            Registered data UUID to reminder reason; absent UUID means no reminder.
+            key_copy_missing means no confirmed password-protected copy of the
+            current key on that medium (use root-only stick key-copy).
+            password_check_due means that copy exists but its 180-day password
+            check is due, missing, or has a future timestamp (use stick key-check).
+            The status is stored proof, not an inspection of files on an unplugged stick.
+          additionalProperties:
+            type: string
+            enum: [key_copy_missing, password_check_due]
     Status:
       type: object
       required: [machine, pbs, schedule, encryption, health]
@@ -788,6 +805,10 @@ components:
         encryption: { type: boolean }
         overdue_after_hours: { type: integer }
         stick_overdue_after_hours: { type: [integer, "null"] }
+        stick_data_uuids:
+          type: array
+          description: Registered data partition UUIDs in configuration order; empty without a stick target. Read-only, not secret.
+          items: { type: string, format: uuid }
         automatic_backups: { type: boolean, description: "`nestegg-backup.timer` is enabled." }
         wake_on_lan: { type: boolean, description: Wake-on-LAN is configured and switched on. }
         wake_on_lan_configured: { type: boolean, description: "A `[wake]` section with a MAC address exists; only then can `wake_on_lan` be switched on." }
@@ -881,6 +902,16 @@ components:
             base: { type: integer, description: "Base cap in hours (168)." }
             per_interval_extra: { type: integer, description: "Hours added on top of the interval (72)." }
             file_minimum: { type: integer, description: "A larger value already in the file; the cap is never below it." }
+        stick_overdue_after_hours:
+          type: [object, "null"]
+          description: Same cap calculation as overdue_after_hours, using the stick's own file_minimum. Null without a stick target. Minimum 1; need not exceed the backup interval.
+          properties:
+            min: { type: integer }
+            max: { type: integer }
+            greater_than_interval: { type: boolean }
+            base: { type: integer }
+            per_interval_extra: { type: integer }
+            file_minimum: { type: integer }
         excludes:
           type: object
           description: "`max_length` is a byte count (decision 0022)."

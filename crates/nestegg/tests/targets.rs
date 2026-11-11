@@ -461,3 +461,98 @@ fn monthly_verification_evidence_commits_only_with_successful_run() {
     assert!(state.stick_damaged);
     assert_eq!(state.stick_media[UUID].full_checked_at, Some(later));
 }
+
+#[test]
+fn status_and_config_expose_presence_capacity_password_reasons_and_own_limits() {
+    use nestegg::status::PasswordReminder;
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths(dir.path());
+    let second = "11234567-89ab-cdef-0123-456789abcdef";
+    let mut cfg = stick_config();
+    let stick = cfg.stick.as_mut().unwrap();
+    stick.data_uuids.push(second.into());
+    stick.overdue_after_hours = 300;
+    cfg.pbs = nestegg::config::example("pbs.example.com", "store", "backup@pbs!desktop").pbs;
+    let store = Store::new(&paths);
+    let mut state = State {
+        key_digest: Some("current".into()),
+        ..Default::default()
+    };
+    state.stick_media.entry(UUID.into()).or_default().key_digest = Some("current".into());
+    state.stick_media.get_mut(UUID).unwrap().password_checked_at =
+        Some(Utc::now() - Duration::days(181));
+    state.stick.available_bytes = Some(25);
+    state.stick.total_bytes = Some(100);
+    state.stick.space_checked_at = Some(Utc::now());
+    let mut full = finished(Target::Stick, RunState::Failed);
+    full.error = Some(RunError {
+        kind: ErrorKind::StickFull,
+        message: "fixture".into(),
+    });
+    state.stick.last_run = Some(full);
+    store.save_state(&state).unwrap();
+    let status = nestegg::status::build(&paths, Some(&cfg), true).unwrap();
+    let view = &status.targets[&Target::Stick];
+    assert_eq!(view.state, "stick_full");
+    assert_eq!(
+        view.plugged_in,
+        Some(false),
+        "presence must not be inferred from a full state"
+    );
+    assert_eq!(
+        (view.available_bytes, view.total_bytes),
+        (Some(25), Some(100))
+    );
+    assert!(view.space_checked_at.is_some());
+    assert!(view.password_reminder);
+    assert_eq!(
+        view.password_reminders[UUID],
+        PasswordReminder::PasswordCheckDue
+    );
+    assert_eq!(
+        view.password_reminders[second],
+        PasswordReminder::KeyCopyMissing
+    );
+    assert_eq!(status.targets[&Target::Pbs].plugged_in, None);
+    let json = serde_json::to_value(status).unwrap();
+    assert_eq!(
+        json["targets"]["stick"]["password_reminders"][UUID],
+        "password_check_due"
+    );
+    let config = nestegg::status::config_view(&cfg, true);
+    assert_eq!(
+        config["stick_data_uuids"],
+        serde_json::json!([UUID, second])
+    );
+    let limit = &config["limits"]["stick_overdue_after_hours"];
+    assert_eq!(limit["min"], 1);
+    assert_eq!(limit["max"], 300);
+    assert_eq!(limit["file_minimum"], 300);
+    assert_eq!(limit["greater_than_interval"], false);
+    assert_ne!(
+        limit["file_minimum"],
+        config["limits"]["overdue_after_hours"]["file_minimum"]
+    );
+    state.stick_media.get_mut(UUID).unwrap().password_checked_at = Some(Utc::now());
+    store.save_state(&state).unwrap();
+    assert!(
+        !nestegg::status::build(&paths, Some(&cfg), false)
+            .unwrap()
+            .targets[&Target::Stick]
+            .password_reminders
+            .contains_key(UUID)
+    );
+    state.key_digest = Some("replaced".into());
+    store.save_state(&state).unwrap();
+    assert_eq!(
+        nestegg::status::build(&paths, Some(&cfg), false)
+            .unwrap()
+            .targets[&Target::Stick]
+            .password_reminders[UUID],
+        PasswordReminder::KeyCopyMissing
+    );
+    cfg.stick = None;
+    let config = nestegg::status::config_view(&cfg, true);
+    assert_eq!(config["stick_data_uuids"], serde_json::json!([]));
+    assert!(config["limits"]["stick_overdue_after_hours"].is_null());
+}

@@ -17,10 +17,11 @@ import {
   stickKeyCheckCommand,
   stickOnly,
   stickView,
+  stickFillPercent,
   hasPlaceholder,
 } from "../src/lib/derive";
 import { createFormatter } from "../src/lib/format";
-import { settingsProblem } from "../src/lib/settings";
+import { settingsProblem, stickOverdueCap } from "../src/lib/settings";
 import { problemText } from "../src/lib/settingsForm";
 import { explainOf, runResultText, selfRowText, selfSummary, stickLine } from "../src/lib/text";
 import { app } from "../src/lib/store.svelte";
@@ -284,7 +285,7 @@ describe("mock: per-target endpoints like the daemon", () => {
   it("'back up now' with both: an absent stick is recorded as such, then the server backs up", () => {
     const t0 = Date.now();
     const w = new World("both_absent", "full", t0);
-    expect((w.handle("POST", "/runs", params, null, t0).body as Run).target).toBe("stick");
+    expect((w.handle("POST", "/targets/all/runs", params, null, t0).body as Run).target).toBe("stick");
     expect(st(w, t0 + 2_000).current_run?.target).toBe("pbs");
     expect(runsOf(w, "stick", t0 + 2_000)[0]!.state).toBe("stick_not_plugged_in");
     expect(st(w, t0 + 30_000).targets!.pbs!.last_run?.state).toBe("succeeded");
@@ -348,5 +349,46 @@ describe("store", () => {
     expect(paths).toContain("GET /targets/stick/runs");
     expect(paths).not.toContain("GET /targets/pbs/runs");
     expect(app.runs.value[0]?.target).toBe("stick");
+  });
+});
+
+describe("the daemon's detailed stick fields", () => {
+  it("uses live presence even when a previous run said full or absent", () => {
+    const full = target({ state: "stick_full", plugged_in: false });
+    expect(stickView(full).plugged).toBe(false);
+    expect(canBackUpToStick(stickView(full), false)).toBe(false);
+    expect(stickView(target({ state: "stick_not_plugged_in", plugged_in: true })).plugged).toBe(true);
+    expect(stickView(target({ plugged_in: null })).plugged).toBeNull();
+  });
+  it("computes fill only from a measured total and backup-user availability", () => {
+    expect(stickFillPercent(target({ available_bytes: 25, total_bytes: 100 }))).toBe(75);
+    expect(stickFillPercent(target({ available_bytes: 0, total_bytes: 100 }))).toBe(100);
+    expect(stickFillPercent(target({ available_bytes: 200, total_bytes: 100 }))).toBe(0);
+    expect(stickFillPercent(target())).toBeNull();
+    expect(stickFillPercent(target({ total_bytes: 0 }))).toBeNull();
+  });
+  it("selects registered UUIDs needing attention before any run and avoids retired media", () => {
+    const other = "11234567-89ab-cdef-0123-456789abcdef";
+    expect(knownStickUuid([], null, [STICK_UUID])).toBe(STICK_UUID);
+    expect(knownStickUuid([run()], target(), [other])).toBe(other);
+    expect(knownStickUuid([run()], target({ password_reminders: { [other]: "key_copy_missing" } }), [STICK_UUID, other])).toBe(other);
+    expect(knownStickUuid([run()], target(), [])).toBeNull();
+  });
+  it("uses the stick's own limits and trusts a daemon with a fixed cap", () => {
+    const limits = { interval_hours: { min: 1, max: 168 }, overdue_after_hours: { min: 2, max: 168 },
+      stick_overdue_after_hours: { min: 1, max: 96 }, excludes: { max_items: 200, max_length: 256 } };
+    expect(stickOverdueCap(168, 300, limits)).toBe(96);
+    expect(stickOverdueCap(168, 300, { ...limits, stick_overdue_after_hours: { min: 1, max: 400, base: 200, per_interval_extra: 100, file_minimum: 400 } })).toBe(400);
+  });
+  it("reports monthly damage while preserving the verified new backup", () => {
+    const ts = target({ state: "stick_damaged", server_verify_failed: ["host/other/2026-11-10T18:00:00Z"] });
+    expect(stickView(ts).kind).toBe("store_damaged");
+    expect(stickLine(ts, en, fen, now).lead).toBe(en.stick.storeDamaged);
+  });
+  it("keeps the legacy mock endpoints on PBS when both targets exist", () => {
+    const w = new World("both", "full");
+    const history = w.handle("GET", "/runs", params, null).body as { runs: Run[] };
+    expect(history.runs.every((r) => r.target !== "stick")).toBe(true);
+    expect((w.handle("POST", "/runs", params, null).body as Run).target).toBe("pbs");
   });
 });

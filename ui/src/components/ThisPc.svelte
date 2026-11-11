@@ -45,7 +45,7 @@
   const stickCurrent = $derived(status.current_run?.target === "stick" ? status.current_run : null);
   // Stick only: the main button backs up to the stick, and only while it is plugged in.
   const stickReady = $derived(!!stick && canBackUpToStick(stickView(stick), app.running));
-  const waitStick = $derived(onlyStick && stick?.state === "stick_not_plugged_in");
+  const waitStick = $derived(onlyStick && stick != null && stickView(stick).plugged === false);
 
   const server = $derived(serverBackups(app.snapshots));
   const summary = $derived(selfSummary(status, t, f, app.now, server));

@@ -23,6 +23,9 @@ const RUN_TRIGGERS: readonly string[] = ["timer", "manual", "cli", "plug"];
 const ERROR_KINDS: readonly string[] = [
   "stick_not_plugged_in",
   "stick_full",
+  "stick_already_mounted",
+  "stick_ambiguous",
+  "stick_busy",
   "filesystem_damaged",
   "stick_unsupported",
   "key_mismatch",
@@ -765,6 +768,7 @@ export type StickKind =
   | "full"
   | "damaged"
   | "verify_failed"
+  | "store_damaged"
   | "key_mismatch"
   | "unsupported"
   | "failing"
@@ -777,8 +781,8 @@ export type StickKind =
 export interface StickView {
   kind: StickKind;
   /**
-   * Whether a registered stick is plugged in, as far as `/status` tells: false for
-   * `stick_not_plugged_in`, null when the state does not say (`stick_full` hides it).
+   * Live registered-stick presence. Older daemons fall back to target state;
+   * an explicit null stays unknown.
    */
   plugged: boolean | null;
   /**
@@ -794,11 +798,13 @@ export interface StickView {
 export function stickView(ts: TargetStatus): StickView {
   const running = isActive(ts.current_run) ? ts.current_run! : null;
   const last = ts.last_run ?? null;
-  const plugged = running ? true : ts.state === "stick_not_plugged_in" ? false : ts.state === "stick_full" ? null : true;
+  const plugged = "plugged_in" in ts ? ts.plugged_in ?? null
+    : running ? true : ts.state === "stick_not_plugged_in" ? false : ts.state === "stick_full" ? null : true;
   const damaged = ts.server_verify_failed?.length ?? 0;
   const kind = ((): StickKind => {
     if (running || ts.health === "running") return "running";
     if (ts.state === "stick_full" || (last?.state === "failed" && last.error?.kind === "stick_full")) return "full";
+    if (ts.state === "stick_damaged") return "store_damaged";
     if (isUnknownRun(last)) return "unknown";
     if (last?.state === "failed" || ts.health === "failing") {
       switch (last?.state === "failed" ? knownErrorKind(last.error?.kind) : null) {
@@ -840,6 +846,7 @@ export function stickTone(kind: StickKind): Tone {
       return "running";
     case "full":
     case "damaged":
+    case "store_damaged":
     case "verify_failed":
     case "key_mismatch":
     case "unsupported":
@@ -866,11 +873,22 @@ export function canBackUpToStick(view: StickView, anyRunning: boolean): boolean 
 }
 
 /** The physical stick of the newest stick run that names one (for the commands that need `--uuid`). */
-export function knownStickUuid(runs: readonly Run[], ts: TargetStatus | null | undefined): string | null {
+export function knownStickUuid(runs: readonly Run[], ts: TargetStatus | null | undefined, registered?: readonly string[]): string | null {
+  const uuids = registered?.filter(isUuid).map((u) => u.toLowerCase());
+  const reminder = uuids?.find((u) => ts?.password_reminders?.[u]);
+  if (reminder) return reminder;
   for (const r of [ts?.current_run, ts?.last_run, ts?.last_success, ...runs]) {
-    if (r && runTarget(r) === "stick" && r.stick_uuid && isUuid(r.stick_uuid)) return r.stick_uuid.toLowerCase();
+    if (r && runTarget(r) === "stick" && r.stick_uuid && isUuid(r.stick_uuid)
+      && (!uuids || uuids.includes(r.stick_uuid.toLowerCase()))) return r.stick_uuid.toLowerCase();
   }
-  return null;
+  return uuids?.[0] ?? null;
+}
+
+/** Capacity is measured by the daemon, never inferred from uploaded bytes. */
+export function stickFillPercent(ts: TargetStatus): number | null {
+  const total = ts.total_bytes, free = ts.available_bytes;
+  if (total == null || free == null || !Number.isFinite(total) || !Number.isFinite(free) || total <= 0 || free < 0) return null;
+  return Math.round(Math.max(0, Math.min(1, 1 - free / total)) * 100);
 }
 
 export function isUuid(value: string): boolean {

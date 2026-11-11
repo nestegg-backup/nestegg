@@ -9,20 +9,21 @@
 
   /**
    * The stick's key copy needs its password re-check (or has no confirmed copy yet). Both happen
-   * in a terminal as root; the API never takes a password. The UUID of the stick is taken from the
-   * newest stick run that names it, otherwise the user enters it (it is not secret).
+   * in a terminal as root; the API never takes a password. Registered UUIDs and
+   * reminder reasons select the needed command; older daemons keep the manual fallback.
    */
   let { stick }: { stick: TargetStatus } = $props();
 
-  const known = $derived(knownStickUuid(app.runsOf("stick").value, stick));
+  const known = $derived(knownStickUuid(app.runsOf("stick").value, stick, app.config.value?.stick_data_uuids));
   let typed = $state("");
   const uuid = $derived(known ?? typed);
+  const reason = $derived(stick.password_reminders?.[uuid.toLowerCase()] ?? null);
   const bad = $derived(!known && typed.trim() !== "" && !isUuid(typed));
 </script>
 
 <section class="pw notice-box" aria-labelledby="h-stickpw">
-  <h2 id="h-stickpw"><Dot tone="warn" />{t.stick.passwordTitle}</h2>
-  <p>{t.stick.passwordText}</p>
+  <h2 id="h-stickpw"><Dot tone="warn" />{reason === "key_copy_missing" ? t.stick.keyCopyTitle : t.stick.passwordTitle}</h2>
+  <p>{reason === "key_copy_missing" ? t.stick.keyCopyText : reason === "password_check_due" ? t.stick.passwordDueText : t.stick.passwordText}</p>
   {#if !known}
     <div class="field">
       <label for="stick-uuid">{t.stick.uuidLabel}</label>
@@ -37,8 +38,8 @@
     <Cmd command={STICK_INFO_COMMAND} />
   {/if}
   <p class="lead-in">{t.stick.passwordCmd}</p>
-  <Cmd command={stickKeyCheckCommand(uuid)} missing={t.stick.fillUuid} />
-  <Cmd command={stickKeyCopyCommand(uuid)} missing={t.stick.fillUuid} />
+  {#if reason !== "key_copy_missing"}<Cmd command={stickKeyCheckCommand(uuid)} missing={t.stick.fillUuid} />{/if}
+  {#if reason !== "password_check_due"}<Cmd command={stickKeyCopyCommand(uuid)} missing={t.stick.fillUuid} />{/if}
 </section>
 
 <style>

@@ -111,36 +111,25 @@ is needed.
   The UI offers the button to every user of the page and shows the daemon's
   message for any other error.
 
-## 7. Backup stick (phase five of decision 0023)
+## 7. Stick target fields (implemented)
 
-Checked against `api/openapi.yaml` 0.4.0. The UI shows both targets, the
-per-target history, "Back up to stick now", the stick settings and target
-removal with what the contract has. These pieces are missing:
+The daemon and `api/openapi.yaml` now provide all requested fields. The UI uses:
 
-- **Restore from a plugged-in stick.** `/snapshots`, `/browse` and `/restores`
-  have no target. Without a server they answer `503 pbs_unreachable`. The UI
-  therefore offers no restore in stick-only setups and says so ("cannot restore
-  from the stick yet"); with both targets it restores from the server only.
-  Proposal: an optional `target=stick` query on the three endpoints (or
-  `/targets/stick/snapshots`), answered while a registered stick is plugged in,
-  `409 stick_not_plugged_in` otherwise.
-- **Plugged in, explicitly.** `TargetStatus.state` says `stick_not_plugged_in`,
-  but `stick_full` hides it, and a failing `attached()` probe (cloned UUIDs)
-  shows up as plain health. The UI reads "not `stick_not_plugged_in`" as
-  plugged in and shows nothing about it while the state is `stick_full`.
-  Proposal: `plugged_in: boolean | null` on the stick's `TargetStatus`.
-- **Fill level.** Only `available_bytes` (at the last run) exists, so the UI
-  shows free space "as of the last backup", not a percentage. Proposal:
-  `total_bytes` next to it, and the time it was measured.
-- **The stick's UUID.** `stick key-copy` and `key-check` need `--uuid`. The UI
-  takes it from the newest stick run's `stick_uuid`; before any stick run the
-  user has to type it (from `sudo nestegg stick info`). Proposal: the registered
-  data UUIDs in `GET /config` (not secret), and per UUID whether the password
-  proof is missing or only the 180-day re-check is due (`password_reminder`
-  is one flag for both, so the notice shows both commands).
-- **Stick limits.** `limits` has no entry for `stick_overdue_after_hours`; the
-  UI computes the cap from `overdue_after_hours.base`/`per_interval_extra` and
-  the stick's current value, like `settings::validate`.
+- `TargetStatus.plugged_in` for live presence, independent of a full/damaged
+  state or old history. Null means unknown; absent fields retain the legacy fallback.
+- `total_bytes` with `available_bytes` for the fill percentage in the existing
+  free-space line. `space_checked_at` identifies the cached measurement, also
+  refreshed after retention or failure-only GC.
+- `ConfigView.stick_data_uuids` for commands even before the first run.
+  `TargetStatus.password_reminders` maps each UUID needing attention to
+  `key_copy_missing` or `password_check_due`, selecting key-copy or key-check
+  and its explanation. The original boolean remains supported.
+- `limits.stick_overdue_after_hours` for the stick's own cap, minimum and
+  file value. Older daemons retain the original computed fallback.
+
+`state = stick_damaged` reports a failed monthly datastore check separately
+from the successful newly verified backup. Legacy GET/POST `/runs` select PBS
+when configured, otherwise the stick; explicit target endpoints select both.
 
 ## 8. Integration notes for the core side (not API)
 

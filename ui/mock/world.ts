@@ -934,6 +934,8 @@ export class World {
         full_verified_at: null,
         server_verify_failed: [...this.damagedPaths],
         password_reminder: false,
+        password_reminders: {},
+        plugged_in: null,
       };
     }
     const st = this.stick;
@@ -961,6 +963,10 @@ export class World {
         full_verified_at: st.fullVerifiedMs ? iso(st.fullVerifiedMs) : null,
         server_verify_failed: [...st.damagedPaths],
         password_reminder: this.faults.has("stick_password"),
+        password_reminders: this.faults.has("stick_password") ? { [STICK_UUID]: "password_check_due" } : {},
+        plugged_in: st.plugged,
+        total_bytes: 256e9,
+        space_checked_at: last?.started_at ?? null,
       };
     }
     return out;
@@ -1057,6 +1063,7 @@ export class World {
       encryption: this.encryptionOn(),
       overdue_after_hours: this.overdue(),
       stick_overdue_after_hours: this.stick ? this.stick.overdueHours : null,
+      stick_data_uuids: this.stick ? [STICK_UUID] : [],
       automatic_backups: this.timerOn(),
       wake_on_lan: this.wakeOn(),
       wake_on_lan_configured: this.wakeConfigured(),
@@ -1091,6 +1098,11 @@ export class World {
       },
     };
     limits.overdue_after_hours.max = overdueCap(this.intervalHours, limits);
+    limits.stick_overdue_after_hours = this.stick ? {
+      ...limits.overdue_after_hours, min: 1, greater_than_interval: false,
+      file_minimum: this.stick.overdueHours,
+      max: Math.max(OVERDUE_BASE_HOURS, this.intervalHours + OVERDUE_INTERVAL_EXTRA_HOURS, this.stick.overdueHours),
+    } : null;
     return limits;
   }
 
@@ -1242,8 +1254,9 @@ export class World {
       return err(500, "internal", "invalid configuration /etc/nestegg/config.toml; fix it in the terminal first: expected `=`");
     if (route === "GET /runs") {
       const limit = Math.min(500, Math.max(1, Number(query.get("limit") ?? 50) || 50));
-      // Like the daemon: every record, of both targets.
-      const list = [...(this.active ? [this.active.run] : []), ...this.allRuns()].slice(0, limit).map((r) => this.strip(r));
+      const target = this.pbsTarget ? "pbs" : "stick";
+      const list = [...(this.active ? [this.active.run] : []), ...this.allRuns()]
+        .filter((r) => (r.target ?? "pbs") === target).slice(0, limit).map((r) => this.strip(r));
       return { status: 200, body: { runs: list } };
     }
     if ((m = /^\/targets\/([^/]+)\/runs$/.exec(path)) && (method === "GET" || method === "POST")) {
@@ -1258,7 +1271,7 @@ export class World {
       return { status: 200, body: { runs: list } };
     }
     if (route === "POST /runs") {
-      const refused = this.startRun("all", now);
+      const refused = this.startRun(this.pbsTarget ? "pbs" : "stick", now);
       return refused ?? { status: 202, body: this.strip(this.active!.run) };
     }
     if (method === "GET" && (m = /^\/runs\/([^/]+)$/.exec(path))) {

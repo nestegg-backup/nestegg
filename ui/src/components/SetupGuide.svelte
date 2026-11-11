@@ -40,7 +40,7 @@
 
   // Stick only: the password-protected copy on the backup stick counts as the key proof (decision 0026).
   const onStick = $derived(stickOnly(status));
-  const knownUuid = $derived(onStick ? knownStickUuid(app.runs.value, status.targets?.stick) : null);
+  const knownUuid = $derived(onStick ? knownStickUuid(app.runs.value, status.targets?.stick, app.config.value?.stick_data_uuids) : null);
   let uuid = $state("");
   const stickUuid = $derived(knownUuid ?? uuid);
   const uuidBad = $derived(!knownUuid && uuid.trim() !== "" && !isUuid(uuid));
