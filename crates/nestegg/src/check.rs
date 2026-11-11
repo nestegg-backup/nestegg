@@ -194,7 +194,16 @@ fn run_items(paths: &Paths, options: &CheckOptions, tracker: &mut WakeTracker) -
         }
         let exported = Store::new(paths)
             .load_state()
-            .map(|s| s.key_exported())
+            .map(|s| {
+                s.key_exported()
+                    || (cfg.pbs.is_none()
+                        && cfg.stick.as_ref().is_some_and(|stick| {
+                            stick
+                                .data_uuids
+                                .iter()
+                                .any(|uuid| s.stick_key_exported(uuid))
+                        }))
+            })
             .unwrap_or(false);
         r.report(
             exported,
@@ -220,6 +229,16 @@ fn run_items(paths: &Paths, options: &CheckOptions, tracker: &mut WakeTracker) -
             ),
         );
     }
+    if cfg.stick.is_some() {
+        match crate::stick::target::attached(&cfg, None) {
+            Ok(Some(_)) => r.report(true, "stick", "registered stick attached".into()),
+            Ok(None) => r.not_checked("stick", "registered stick not plugged in"),
+            Err(e) => r.report(false, "stick", format!("{e:#}")),
+        }
+    }
+    let Some(pbs) = &cfg.pbs else {
+        return r.0;
+    };
     let mut reachable = crate::wake::is_reachable(&cfg, Duration::from_secs(5));
     let wake_on = cfg.active_wake().is_some();
     let mut wake_tried = false;
@@ -242,7 +261,7 @@ fn run_items(paths: &Paths, options: &CheckOptions, tracker: &mut WakeTracker) -
                 | Ok(crate::wake::Availability::Reachable)
         );
     }
-    let server = format!("{}:{}", cfg.pbs.server, cfg.pbs.port);
+    let server = format!("{}:{}", pbs.server, pbs.port);
     if reachable {
         r.report(true, REACHABLE_ITEM, server);
     } else if wake_tried {

@@ -150,6 +150,15 @@ check "check passes after the upgrade" on_client nestegg check
 check "a key confirmed before the upgrade stays confirmed" bash -c "docker exec $client nestegg key show | grep -Eq 'exported: +yes'"
 check "the exported key file still verifies after the upgrade" bash -c "docker exec $client nestegg key verify /root/key.json | grep -q 'opens the newest backup: yes'"
 
+echo "== target migration keeps the old PBS state and independent stick availability"
+check "legacy success is projected into the PBS target" on_client python3 -c 'import json,subprocess; s=json.loads(subprocess.check_output(["nestegg","status","--json"])); assert s["targets"]["pbs"]["last_success"]["id"]==s["last_success"]["id"]; assert "stick" not in s["targets"]'
+check "legacy history defaults to PBS" on_client python3 -c 'import json,subprocess; runs=json.loads(subprocess.check_output(["curl","-sf","--unix-socket","/run/nestegg/api.sock","http://localhost/api/v1/targets/pbs/runs"]))["runs"]; assert runs and all(r["target"]=="pbs" for r in runs)'
+on_client cp /etc/nestegg/config.toml /root/before-stick.toml
+on_client python3 -c 'open("/etc/nestegg/config.toml","a").write("\n[stick]\ndata_uuids = [\"01234567-89ab-cdef-0123-456789abcdef\"]\n")'
+check "absent newly registered stick exits as availability" exits_with 75 on_client nestegg backup --target stick
+check "stick availability cannot replace PBS success or failure counters" on_client python3 -c 'import json; s=json.load(open("/var/lib/nestegg/state.json")); assert s["last_success"]["target"]=="pbs" if "target" in s["last_success"] else True; assert s["stick"]["last_run"]["state"]=="stick_not_plugged_in"; assert not s["stick"].get("last_success"); assert s["stick"]["consecutive_failures"]==0'
+on_client cp /root/before-stick.toml /etc/nestegg/config.toml
+
 echo "== after the upgrade all lock files are 0600, the same files, closed to members"
 for lf in $lock_files; do
   b="$(basename "$lf")"

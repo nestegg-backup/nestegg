@@ -57,7 +57,7 @@ inside the daemon and write into home directories, `/tmp` and root-owned
 directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
 `crates/nestegg/tests/units.rs` enforces it.
 
-## Backup-stick preparation (phase one)
+## Backup-stick preparation and desktop target
 
 `stick create/update/info/add` runs as root, reusing the rescue disk guard.
 A private mount helper writes a GPT with BIOS/UEFI GRUB, two UUID-pinned live
@@ -73,7 +73,7 @@ configuration in private mount/PID/network/UTS namespaces. Only loopback exists;
 `client_command` joins only that network namespace. Token bytes remain in a
 memory descriptor; certificate and fixed token identity are generated inside
 the image. Stop/drop releases the private server. Root and kernel IPv6 socket
-support are prerequisites. Phase one does not hook this into the run pipeline.
+support are prerequisites. The desktop pipeline uses this handle for the stick target.
 
 ## Run pipeline
 
@@ -139,3 +139,28 @@ support are prerequisites. Phase one does not hook this into the run pipeline.
 | `ui/` | UI | Web UI source; build output `ui/dist/` is embedded into the binary. |
 | `packaging/` | core | systemd units, Debian packaging. |
 | `docs/` | both | Decisions, architecture, research. |
+
+
+## Multiple desktop targets
+
+`run::execute` holds the shared run lock across the selected targets. Each target
+runs the existing source/system-layout, inventory, encryption and read-back
+pipeline. The stick runs first; its device-bound plug-in unit waits behind an
+existing run and then rechecks the due/retry policy. Only a registered UUID can
+enter `stick::target::Session`, which creates private mounts, checks ext4 offline,
+starts the desktop-trusted PBS, and stops/flushes/unmounts before unplug approval.
+No code from the removable medium is executed.
+
+The network PBS retains the legacy `state.json` fields. Stick state is separate
+under `stick`; run records add `target` (absent means PBS). Per-medium password
+proof and monthly verification timestamps are keyed by UUID under `stick_media`.
+Both targets share the global encryption credential and its independent PBS
+export proof. The protected stick copy is additional proof only in stick-only
+setups. Notification event identities distinguish the targets.
+
+The additive API `Status.targets` exposes independent health, availability,
+history pointers, retry time, free space and password reminders.
+`GET /targets/{target}/runs` returns target history and
+`POST /targets/stick/runs` starts a manual stick backup. Existing top-level status
+fields remain available. See [0026](decisions/0026-desktop-stick-target.md) and the
+single API authority, `api/openapi.yaml`.

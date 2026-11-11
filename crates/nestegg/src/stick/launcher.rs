@@ -2,7 +2,7 @@
 //! a mounted ext4 data partition. Only its `nestegg/` directory is persistent.
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, Command, Stdio};
 use std::time::Duration;
@@ -139,13 +139,75 @@ impl Supervisor {
         }
     }
     fn stop(&mut self) -> Result<()> {
+        if self.worker.is_none() {
+            return Ok(());
+        }
+        // unshare's death kills its namespace PID 1 asynchronously. A pidfd
+        // lets us wait for that process to release mounts and its children,
+        // without ever signalling a possibly recycled PID.
+        let namespace_exit = self.namespace_exit_fd();
         self.control.take();
         if let Some(worker) = self.worker.take() {
             worker
                 .join()
                 .map_err(|_| anyhow::anyhow!("PBS supervisor panicked"))??;
         }
+        if let Some(exit) = namespace_exit? {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut poll = nix::libc::pollfd {
+                fd: exit.as_raw_fd(),
+                events: nix::libc::POLLIN,
+                revents: 0,
+            };
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    bail!("PBS namespace did not stop; stick is not safe to unplug");
+                }
+                // SAFETY: poll points to one live stack entry; the owned pidfd
+                // remains open throughout this bounded wait.
+                let ready = unsafe {
+                    nix::libc::poll(&mut poll, 1, remaining.as_millis().min(30_000) as i32)
+                };
+                if ready < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error).context("cannot wait for PBS namespace shutdown");
+                }
+                if ready > 0 && poll.revents & nix::libc::POLLIN != 0 {
+                    break;
+                }
+                if ready > 0 {
+                    bail!("PBS namespace shutdown descriptor failed");
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn namespace_exit_fd(&self) -> Result<Option<File>> {
+        let children = match fs::read_to_string(format!("/proc/{0}/task/{0}/children", self.id)) {
+            Ok(children) => children,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("cannot inspect PBS namespace process"),
+        };
+        let Some(pid) = children.split_whitespace().next() else {
+            return Ok(None);
+        };
+        let pid: i32 = pid.parse().context("invalid PBS namespace process ID")?;
+        // SAFETY: pidfd_open has no pointer arguments. A successful syscall
+        // returns a fresh CLOEXEC descriptor whose ownership is transferred.
+        let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(nix::libc::ESRCH) {
+                return Ok(None);
+            }
+            return Err(error).context("cannot track PBS namespace shutdown");
+        }
+        Ok(Some(unsafe { File::from_raw_fd(fd as i32) }))
     }
 }
 impl Drop for Supervisor {
@@ -372,6 +434,48 @@ impl LocalPbs {
             .env("PBS_REPOSITORY", self.repository());
         Ok(cmd)
     }
+    /// Run the official manager inside the trusted PBS root. Verification and
+    /// GC are synchronous CLI tasks; a successful spawn alone is no evidence.
+    pub fn maintenance(&self, args: &[&str]) -> Result<()> {
+        let runtime = self.runtime.as_ref().context("PBS is stopped")?;
+        let mut cmd = Command::new("nsenter");
+        cmd.arg(format!("--mount=/proc/{}/ns/mnt", self.supervisor.id))
+            .arg(format!("--net=/proc/{}/ns/net", self.supervisor.id))
+            .arg("--")
+            .arg("chroot")
+            .arg(runtime.path().join("ram/root"))
+            .arg("/usr/sbin/proxmox-backup-manager")
+            .args(args);
+        let mut log = tempfile::tempfile()?;
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log.try_clone()?)
+            .spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(12 * 3600);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                if status.success() {
+                    return Ok(());
+                }
+                let len = log.metadata()?.len();
+                log.seek(SeekFrom::Start(len.saturating_sub(4096)))?;
+                let mut tail = String::new();
+                std::io::Read::read_to_string(&mut log, &mut tail)?;
+                bail!(
+                    "PBS maintenance failed: {}",
+                    crate::rescue::printable_block(&tail)
+                );
+            }
+            if crate::cancel::requested() || std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("PBS maintenance cancelled or timed out");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     pub fn stop(mut self) -> Result<()> {
         self.teardown()
     }

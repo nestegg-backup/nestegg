@@ -1,0 +1,17 @@
+[Unit]
+Description=nestegg backup to registered stick %I
+BindsTo=dev-disk-by\x2duuid-%i.device
+After=dev-disk-by\x2duuid-%i.device
+OnSuccess=nestegg-notify.service
+OnFailure=nestegg-notify.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nestegg run --trigger plug --target stick --stick-uuid %I
+SuccessExitStatus=75
+TimeoutStartSec=12h
+TimeoutStopSec=30s
+KillMode=control-group
+Nice=10
+IOSchedulingClass=idle
+# Do not hide host sources: system.pxar needs the real desktop mounts.

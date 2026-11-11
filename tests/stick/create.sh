@@ -217,7 +217,7 @@ python3 "$here/confirm.py" "$bin" stick create "$stick" --test-image --image "$i
 grep -q '"active_slot": "a"' "$work/info-recreated.json"
 attach
 mount -o nodev,nosuid,noexec "${loop}p3" "$work/data"
-[[ -d $work/data/nestegg && ! -e $work/data/retained.txt && ! -e $work/data/nestegg/.chunks ]]
+[[ -d $work/data/nestegg && ! -e $work/data/retained.txt && ! -e $work/data/nestegg/store ]]
 dumpe2fs -h "${loop}p3" 2>/dev/null | grep -Eq '^Reserved block count:[[:space:]]+0$'
 umount "$work/data"
 detach

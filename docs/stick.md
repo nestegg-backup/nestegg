@@ -1,9 +1,11 @@
 # Prepare a backup stick
 
-Phase one of [decision 0023](decisions/0023-backup-stick.md) prepares and updates
-bootable media. Desktop backup scheduling and restoration **from this stick's
-local datastore are not available yet**. Booting it still gives the existing
-[rescue system](rescue.md), including restoration from a network PBS.
+Desktop backups to registered sticks are available. Preparing bootable media
+and the isolated PBS launcher implement phases one and two of
+[decision 0023](decisions/0023-backup-stick.md). Restoration from the stick's
+local datastore and the two-target graphical UI are later phases. Booting the
+stick currently still gives the existing [rescue system](rescue.md) for network
+PBS restores.
 
 Use an external USB SSD of at least 128 GB. Cheap flash sticks can be slow and
 wear out quickly. Keep another backup elsewhere: a stick beside the computer
@@ -71,11 +73,14 @@ boot/data UUIDs, active slot and live filesystem hash, without modifying the sti
 The stick's identifying files are parsed as data, never executed as root.
 
 Cloned data UUIDs on multiple devices are refused rather than resolved through
-an arbitrary by-UUID symlink. With exactly one registered disk attached, the disk argument can be omitted from
+an arbitrary by-UUID symlink, including for desktop backup and key-copy sessions.
+With exactly one registered disk attached, the disk argument can be omitted from
 `info`, `update` and `add`. With none or several attached, specify the whole disk.
-Unmount the partitions first. Registration alone does not enable backups in
-phase one. A registration-only configuration is accepted by the stick commands;
-the existing backup commands still require `[pbs]` until phase two adds targets.
+Unmount the partitions first. After registration, reconnect the medium so udev
+can start its backup service. Only registered UUIDs are used. A newly created
+stick-only configuration enables full-system backups; an existing configuration
+keeps its explicit backup settings. Complete the encryption-key proof before the
+first backup.
 
 ## Update
 
@@ -100,7 +105,7 @@ FAT filesystem (both slots share the same FAT metadata) or flash that loses alre
 power-loss and USB firmware behavior remain the hardware gate in phase six.
 Do not run a filesystem repair while the stick is mounted or in use by PBS.
 
-## Local PBS API for later phases
+## Local PBS launcher
 
 `nestegg::stick::launcher` supplies a privileged, reusable `LocalPbs` handle.
 Its caller mounts only a registered ext4 partition with `nodev,nosuid,noexec`,
@@ -113,19 +118,84 @@ an explicit error; the launcher does not alter host IPv6 or firewall settings.
 The helper uses private mount, PID, network and UTS namespaces, only loopback,
 a private character-device `/dev`, a tmpfs overlay, real tmpfs `/run`, and fresh
 configuration owned by the image's own `backup` user. Only the partition's
-`nestegg/` anchor is opened without following symlinks and bind-mounted by fd at `/mnt/stick/nestegg`. Certificates,
+`nestegg/` anchor is opened without following symlinks, cloned with `open_tree`
+and attached with `move_mount` at `/mnt/stick/nestegg`. Certificates,
 ACLs and secrets are recreated on every start; the fixed owner is
 `nestegg@pbs!stick`. The TLS fingerprint comes from the new `proxy.pem`. Token
 bytes reach the caller on a private readiness pipe and are kept in a CLOEXEC
 memory file descriptor. No token is placed in argv, environment values or logs.
 The returned client command joins **only** the network namespace; it can still
 read the desktop's source files. Keep the handle alive until all clients exit,
-then call `stop` (or drop it) to kill the private PID namespace and release mounts.
+then call `stop` (or drop it) to kill the private PID namespace, wait for its
+exit and release mounts. Startup waits for the API authentication keys and
+socket before starting the proxy.
 These namespaces isolate networking; trusted PBS code still runs with privilege.
 The data root and `nestegg/` must remain root-owned and not group/other-writable.
 PBS owns only `nestegg/store/`. Older prototype sticks with PBS-owned anchors or
 without payload manifests require explicit migration or recreation; this writer
 does not silently alter existing datastore ownership.
+
+## Back up from the desktop
+
+For a stick-only setup, register the medium, create the machine key, then make
+and prove its protected copy (replace the documentation UUID with `stick info`):
+
+```sh
+sudo nestegg key create
+sudo nestegg stick key-copy --uuid 01234567-89ab-cdef-0123-456789abcdef
+sudo systemctl enable --now nestegg.service nestegg-backup.timer nestegg-notify.timer
+sudo nestegg backup --target stick
+sudo nestegg status
+```
+
+The password is entered without echo. Use a strong password you can recall:
+at least 16 characters from three character classes, or five distinct words
+with at least 24 characters in total. Repeated characters alone do not qualify.
+An automated caller may supply `--password-fd` instead; passwords never go in
+arguments, the configuration, the journal or notification messages. The copy is
+scrypt-protected by the official client, read back from the medium, reopened and
+compared with the machine key. No unprotected key is written to the stick.
+
+For status and the UI without sudo, follow the group-membership step in
+[configuration and setup](configuration.md), then log in again.
+
+Keep a paper key separately. The copy can satisfy the export proof only when
+there is no PBS configured. A setup with both targets still needs the existing
+independent paper/export proof. The stick prompts for a password re-check after
+180 days; repeat it with:
+
+```sh
+sudo nestegg stick key-check --uuid 01234567-89ab-cdef-0123-456789abcdef
+```
+
+`backup --target pbs`, `--target stick` and `--target all` select the destination;
+the default is `all`. Both targets use the same machine key and sources. Full
+system mode includes `system.pxar` and `layout.json`. An incomplete backup stays
+incomplete on the stick as well. A group whose latest snapshot belongs to a
+different key is refused before upload or pruning; use a distinct backup ID for
+another machine with the same name. Its existing recovery key is not overwritten.
+
+The package's udev rule starts the device-bound service when a registered stick
+is plugged in and a backup is due. Unregistered drives are not mounted by
+nestegg. All partitions of a registered medium are hidden from the desktop
+automounter. The data mount is private and `nodev,nosuid,noexec,relatime`.
+The start notification says to keep the stick plugged in. **Wait for safe to
+unplug**: that message follows verification, retention, server shutdown, flushing
+and unmounting. A failed run never sends the success message.
+
+Before writing, the filesystem is checked offline without repairing it. After
+unclean removal, a filesystem error is reported separately from failed PBS
+verification. Unmount the medium and repair ext4 with `e2fsck` before reuse;
+never repair a mounted filesystem or an active datastore. PBS verification checks
+backup data and cannot repair ext4. Unplugging during a run can lose that run.
+
+Each new snapshot receives decrypted read-back and PBS verification. Once a
+month each physical medium receives a forced full datastore verification.
+Retention defaults to last 3, daily 7, weekly 4 and monthly 6 snapshots of this
+machine. GC keeps the atime safety check and a one-minute cutoff, so space from
+newly orphaned chunks is not reclaimed immediately. A full stick reports
+`stick_full`; nestegg does not silently delete more backups. See
+[configuration](configuration.md) for thresholds and retention overrides.
 
 ## Reproduce acceptance tests
 
@@ -134,6 +204,13 @@ cargo build --release
 cargo test --test stick_launcher --no-run
 packaging/rescue/build.sh target/release/nestegg target/nestegg-rescue-amd64.iso
 sudo tests/stick/create.sh target/release/nestegg target/nestegg-rescue-amd64.iso
+# Disposable trusted PBS fixture, without installing host packages:
+mkdir /tmp/stick-fixture
+tests/stick/spike/build-root.sh /tmp/stick-fixture
+sudo tests/stick/desktop.sh target/release/nestegg /tmp/stick-fixture/pbs.squashfs \
+  /tmp/stick-fixture/client/usr/bin/proxmox-backup-client
+sudo tests/stick/desktop-vm.sh target/release/nestegg target/nestegg-rescue-amd64.iso \
+  /tmp/stick-fixture/pbs.squashfs /tmp/stick-fixture/client/usr/bin/proxmox-backup-client
 ```
 
 The test allocates a sparse image and its own loop devices, creates and registers
@@ -180,3 +257,20 @@ whose anonymous mount number must resolve to its real backing device. All Btrfs
 members must have known local ancestry; degraded filesystems and unknown
 anonymous/network storage are refused. Known virtual-machine disks are trusted
 within the guest's storage boundary, not as proof of the hypervisor's hardware.
+
+The desktop test allocates its own image/loop, checks a stick-only encrypted
+backup, key proof, read-back, PBS verification, actual prune/GC reclamation after
+the atime cutoff, cloned-UUID refusal, full-stick reporting, key mismatch and
+injected device-mapper
+EIO during a run followed by offline repair. It cleans up its loops, namespaces,
+mounts and helpers. It uses synthetic source data, never the host's real files.
+The fixtures supply the fixed image cache and its checksum on private RAM
+storage; the VM live overlay is deliberately not trusted as code provenance.
+The EIO mapping exposes only one filesystem device, so it does not itself
+create an ambiguous UUID alias.
+The VM driver runs `hotplug-vm.sh` inside the disposable guest and checks real
+udev reconnection, device-bound systemd activation,
+automounter flags on both partitions, manual backup through the stick API and
+honest incomplete/layout handling on the live overlay. The phase-one test
+additionally checks BIOS/UEFI boot and interrupted updates.
+Neither proves physical flash endurance or real USB power-loss behavior.

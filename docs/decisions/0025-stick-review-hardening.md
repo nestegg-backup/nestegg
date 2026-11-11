@@ -109,7 +109,23 @@ must remain intact. This is a block-layer ordering test, not a physical USB
 controller failure or torn-sector simulation; that remains the hardware gate.
 
 
-## Verification result (2026-11-11)
+## Phase-two integration
+
+[0026](0026-desktop-stick-target.md) uses the same hardened launcher without an
+image argument. Desktop sessions cannot choose code through state-directory
+overrides: only `IMAGE_PATH` and its recorded checksum supply PBS code. The
+root-owned pinned `nestegg/` anchor contains `nestegg/store/`; desktop acceptance
+fixtures use this format and supply the fixed cache inside a private mount
+namespace (or the disposable guest). Desktop sessions also reject cloned UUIDs
+using the same complete block-device scan as the media commands.
+
+Registration preserves phase-two stick-only defaults while using the shared
+settings lock and owner/mode-preserving writer. The removed general stick byte
+writer is not restored: encrypted JSON key copies use the existing atomic file
+writer with mode 0600. API startup readiness and pidfd-based namespace shutdown
+waits from phase two remain in effect.
+
+## Phase-one verification result (2026-11-11)
 
 - `cargo test`: 493 passed; the two privileged launcher tests, normally ignored,
   also passed through the acceptance driver. All 16 stick unit tests passed as

@@ -1,4 +1,4 @@
-//! Root-only stick preparation; no backups are started in phase one.
+//! Stick preparation, registration and protected recovery-key commands.
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,29 @@ use crate::config::{Config, Paths, StickConfig};
 
 #[derive(Subcommand)]
 pub enum StickCmd {
+    /// Copy the machine key to a registered stick with a strong scrypt password.
+    KeyCopy {
+        #[arg(long)]
+        uuid: String,
+        #[arg(long)]
+        password_fd: Option<i32>,
+    },
+    /// Open the stick key copy again and renew the password reminder.
+    KeyCheck {
+        #[arg(long)]
+        uuid: String,
+        #[arg(long)]
+        password_fd: Option<i32>,
+    },
+    #[command(hide = true)]
+    Registered {
+        #[arg(long)]
+        uuid: Option<String>,
+        #[arg(long)]
+        parent: Option<PathBuf>,
+        #[arg(long)]
+        unit: bool,
+    },
     /// Erase a whole disk after typing its name; make a BIOS/UEFI backup stick.
     Create {
         disk: PathBuf,
@@ -58,6 +81,34 @@ pub enum StickCmd {
 }
 
 pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
+    let command = match command {
+        StickCmd::KeyCopy { uuid, password_fd } => {
+            return super::key::run(paths, &uuid, false, password_fd);
+        }
+        StickCmd::KeyCheck { uuid, password_fd } => {
+            return super::key::run(paths, &uuid, true, password_fd);
+        }
+        StickCmd::Registered { uuid, parent, unit } => {
+            return Ok(
+                if super::target::registered(paths, uuid.as_deref(), parent.as_deref()) {
+                    if unit {
+                        println!(
+                            "{}",
+                            uuid.context("--unit needs --uuid")?
+                                .to_ascii_lowercase()
+                                .replace('-', "\\x2d")
+                        );
+                    } else {
+                        println!("registered");
+                    }
+                    0
+                } else {
+                    1
+                },
+            );
+        }
+        command => command,
+    };
     if !nix::unistd::Uid::effective().is_root() {
         bail!("stick commands need root; run sudo nestegg stick …");
     }
@@ -81,6 +132,7 @@ pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
             sha256,
             test_image,
         } => ("add", disk, Some(image), sha256, test_image),
+        _ => unreachable!("handled above"),
     };
     // Serialize media operations and cache/registration updates on this desktop.
     fs::create_dir_all(&paths.runtime_dir)?;
@@ -139,6 +191,17 @@ fn registered_disk(paths: &Paths) -> Result<PathBuf> {
     let uuids: Vec<_> = uuids.iter().filter_map(|v| v.as_str()).collect();
     // Query every attached device; /dev/disk/by-uuid hides cloned UUIDs by
     // exposing just one arbitrarily selected symlink target.
+    let tree = registered_tree()?;
+    let mut disks = registered_candidates(&tree, &uuids)?;
+    disks.sort();
+    disks.dedup();
+    if disks.len() != 1 {
+        bail!("expected exactly one attached registered stick; specify its whole disk explicitly");
+    }
+    Ok(disks.remove(0))
+}
+
+pub(super) fn registered_tree() -> Result<serde_json::Value> {
     let mut tree: serde_json::Value =
         serde_json::from_str(&capture(Command::new("lsblk").args([
             "--json",
@@ -147,13 +210,7 @@ fn registered_disk(paths: &Paths) -> Result<PathBuf> {
             "PATH,TYPE,UUID,PKNAME",
         ]))?)?;
     refresh_partition_uuids(&mut tree["blockdevices"])?;
-    let mut disks = registered_candidates(&tree, &uuids)?;
-    disks.sort();
-    disks.dedup();
-    if disks.len() != 1 {
-        bail!("expected exactly one attached registered stick; specify its whole disk explicitly");
-    }
-    Ok(disks.remove(0))
+    Ok(tree)
 }
 
 fn refresh_partition_uuids(nodes: &mut serde_json::Value) -> Result<()> {
@@ -176,7 +233,10 @@ fn refresh_partition_uuids(nodes: &mut serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn registered_candidates(tree: &serde_json::Value, uuids: &[&str]) -> Result<Vec<PathBuf>> {
+pub(super) fn registered_candidates(
+    tree: &serde_json::Value,
+    uuids: &[&str],
+) -> Result<Vec<PathBuf>> {
     fn visit<'a>(items: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
         if let Some(items) = items.as_array() {
             for item in items {
@@ -215,8 +275,8 @@ fn registered_candidates(tree: &serde_json::Value, uuids: &[&str]) -> Result<Vec
     Ok(disks)
 }
 
-/// During phase one a registration-only document is valid for stick commands.
-/// The existing PBS pipeline still requires [pbs]; target support is phase two.
+/// Accept registration-only documents while preserving strict configuration parsing.
+/// Registration supplies full-system defaults for a new stick-only setup.
 fn registration_document(path: &Path) -> Result<toml_edit::DocumentMut> {
     let text = if path.exists() {
         fs::read_to_string(path)?
@@ -224,7 +284,7 @@ fn registration_document(path: &Path) -> Result<toml_edit::DocumentMut> {
         String::new()
     };
     let doc: toml_edit::DocumentMut = text.parse()?;
-    if doc.contains_key("pbs") {
+    if doc.contains_key("pbs") || doc.contains_key("backup") || doc.contains_key("backup_id") {
         Config::parse(&text)?;
     } else {
         #[derive(serde::Deserialize)]
@@ -261,6 +321,9 @@ fn register(path: &Path, uuid: &str) -> Result<()> {
         array.push(value.as_str());
     }
     doc["stick"]["data_uuids"] = toml_edit::value(array);
+    if !doc.contains_key("pbs") && !doc.contains_key("backup") {
+        doc["backup"]["system"] = toml_edit::value(true);
+    }
     if path.try_exists()? {
         crate::settings::write_atomically(path, &doc.to_string())
     } else {
@@ -286,6 +349,30 @@ mod tests {
         ]});
         assert!(registered_candidates(&tree, &["sample"]).is_err());
     }
+    #[test]
+    fn registration_preserves_permissions_and_refuses_config_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[pbs]\nserver='pbs.example.com'\ndatastore='backups'\nauth_id='backup@pbs!desktop'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        register(&path, "01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let before = fs::read(&path).unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(register(&link, "11111111-2222-3333-4444-555555555555").is_err());
+        assert!(link.is_symlink());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
     #[test]
     fn registration_preserves_pbs_and_comments_and_rejects_unknowns() {
         let d = tempfile::tempdir().unwrap();
@@ -331,5 +418,8 @@ mod tests {
         fs::write(&path, "").unwrap();
         register(&path, "01234567-89ab-cdef-0123-456789abcdef").unwrap();
         assert!(registration_document(&path).is_ok());
+        let config = Config::load(&path).unwrap();
+        assert!(config.backup.system);
+        assert!(config.pbs.is_none());
     }
 }

@@ -114,6 +114,23 @@ pub fn regular_uids() -> std::ops::RangeInclusive<u32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Event {
+    #[serde(rename = "stick_start")]
+    StickStart,
+    #[serde(rename = "stick_safe_to_unplug")]
+    StickSafeToUnplug,
+    #[serde(rename = "stick_failure")]
+    StickFailing,
+    #[serde(rename = "stick_overdue")]
+    StickOverdue,
+    #[serde(rename = "stick_full")]
+    StickFull,
+    #[serde(rename = "stick_incomplete")]
+    StickIncomplete,
+    #[serde(rename = "stick_damaged")]
+    StickDamaged,
+    #[serde(rename = "stick_password_reminder")]
+    StickPasswordReminder,
+
     Failing,
     Overdue,
     /// The backup timer is switched off while nestegg is configured (its own
@@ -146,6 +163,14 @@ impl Event {
             Event::Settings => "settings",
             Event::Outdated => "outdated",
             Event::Test => "test",
+            Event::StickStart => "stick_start",
+            Event::StickSafeToUnplug => "stick_safe_to_unplug",
+            Event::StickFailing => "stick_failure",
+            Event::StickOverdue => "stick_overdue",
+            Event::StickFull => "stick_full",
+            Event::StickIncomplete => "stick_incomplete",
+            Event::StickDamaged => "stick_damaged",
+            Event::StickPasswordReminder => "stick_password_reminder",
         }
     }
 
@@ -153,7 +178,11 @@ impl Event {
     pub fn urgent(self) -> bool {
         matches!(
             self,
-            Event::Failing
+            Event::StickFailing
+                | Event::StickOverdue
+                | Event::StickFull
+                | Event::StickDamaged
+                | Event::Failing
                 | Event::Overdue
                 | Event::AutomaticOff
                 | Event::Damaged
@@ -204,7 +233,10 @@ impl Condition {
     fn repeat_after(&self) -> Duration {
         match self.kind {
             // Switched off on purpose: a weekly reminder, not a daily nag.
-            Event::Incomplete | Event::AutomaticOff => Duration::days(7),
+            Event::Incomplete
+            | Event::StickIncomplete
+            | Event::StickPasswordReminder
+            | Event::AutomaticOff => Duration::days(7),
             _ => Duration::hours(24),
         }
     }
@@ -231,6 +263,77 @@ pub enum Evaluation {
 /// first check that saw it; a later change of the settings must not restart
 /// the wait).
 pub fn evaluate(
+    status: &Status,
+    timer_enabled: bool,
+    unbacked_since: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Evaluation {
+    if status.targets.is_empty() {
+        return evaluate_one(status, timer_enabled, unbacked_since, now);
+    }
+    if status.current_run.is_some() {
+        return Evaluation::Skip("a backup is running");
+    }
+    let mut conditions = Vec::new();
+    let mut settled = true;
+    for (target, view) in &status.targets {
+        let mut one = status.clone();
+        one.targets.clear();
+        one.health = view.health;
+        one.last_run = view.last_run.clone();
+        one.last_success = view.last_success.clone();
+        one.current_run = view.current_run.clone();
+        one.overdue_after_hours = view.overdue_after_hours;
+        one.server_verify_failed = view.server_verify_failed.clone();
+        if let Evaluation::Checked {
+            conditions: list,
+            settled: done,
+        } = evaluate_one(&one, timer_enabled, unbacked_since, now)
+        {
+            settled &= done;
+            for mut c in list {
+                if *target == crate::state::Target::Stick {
+                    c.kind = match c.kind {
+                        Event::Failing if view.state == "stick_full" => Event::StickFull,
+                        Event::Failing => Event::StickFailing,
+                        Event::Overdue => Event::StickOverdue,
+                        Event::Incomplete => Event::StickIncomplete,
+                        Event::Damaged => Event::StickDamaged,
+                        other => other,
+                    };
+                    if matches!(
+                        c.kind,
+                        Event::StickFailing
+                            | Event::StickOverdue
+                            | Event::StickFull
+                            | Event::StickIncomplete
+                            | Event::StickDamaged
+                    ) {
+                        c.key = format!("stick|{}", c.key);
+                    }
+                }
+                if !conditions
+                    .iter()
+                    .any(|old: &Condition| old.kind == c.kind && old.key == c.key)
+                {
+                    conditions.push(c);
+                }
+            }
+        }
+        if view.password_reminder {
+            conditions.push(Condition::new(
+                Event::StickPasswordReminder,
+                "stick-password".into(),
+            ));
+        }
+    }
+    Evaluation::Checked {
+        conditions,
+        settled,
+    }
+}
+
+fn evaluate_one(
     status: &Status,
     timer_enabled: bool,
     unbacked_since: Option<DateTime<Utc>>,
@@ -575,7 +678,7 @@ fn generic_body(lang: Lang, event: Event) -> Option<String> {
         ),
         // These carry no private path or name, so the generic version equals
         // the full one.
-        Event::Damaged | Event::Recovered | Event::Outdated | Event::Test => return None,
+        _ => return None,
     };
     Some(format!("{kind} {}", tell_admin(lang)))
 }
@@ -584,6 +687,47 @@ fn generic_body(lang: Lang, event: Event) -> Option<String> {
 /// `detail` chooses the full or the short "tell the admin" version
 /// (decision 0022). Use [`compose_settings`] for [`Event::Settings`].
 pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>, detail: Detail) -> Message {
+    let base = match event {
+        Event::StickFailing | Event::StickFull => Some(Event::Failing),
+        Event::StickOverdue => Some(Event::Overdue),
+        Event::StickIncomplete => Some(Event::Incomplete),
+        Event::StickDamaged => Some(Event::Damaged),
+        _ => None,
+    };
+    if let Some(base) = base {
+        let mut message = compose(lang, base, condition, detail);
+        message.event = event;
+        message.title = format!(
+            "{}: {}",
+            tr(lang, "Backup stick", "Sicherungsstick"),
+            message.title
+        );
+        return message;
+    }
+    if matches!(
+        event,
+        Event::StickStart | Event::StickSafeToUnplug | Event::StickPasswordReminder
+    ) {
+        let (en, de) = match event {
+            Event::StickStart => (
+                "Backup to stick started. Keep the stick plugged in.",
+                "Sicherung auf den Stick gestartet. Bitte angeschlossen lassen.",
+            ),
+            Event::StickSafeToUnplug => (
+                "Stick backup finished. Safe to unplug.",
+                "Sicherung auf den Stick beendet. Der Stick kann sicher abgezogen werden.",
+            ),
+            _ => (
+                "Check your stick key password again with nestegg stick key-check. Keep a paper key elsewhere.",
+                "Bitte das Schlüsselpasswort mit nestegg stick key-check erneut prüfen. Einen Papierschlüssel getrennt aufbewahren.",
+            ),
+        };
+        return Message {
+            event,
+            title: tr(lang, "Backup stick", "Sicherungsstick"),
+            body: tr(lang, en, de),
+        };
+    }
     let fallback = Condition::new(event, String::new());
     let c = condition.unwrap_or(&fallback);
     let (title, full_body) = match event {
@@ -797,6 +941,14 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>, detail: 
                  Bitte nestegg aktualisieren. Mehr dazu: \"nestegg ui\".",
             ),
         ),
+        Event::StickStart
+        | Event::StickSafeToUnplug
+        | Event::StickPasswordReminder
+        | Event::StickFailing
+        | Event::StickOverdue
+        | Event::StickFull
+        | Event::StickIncomplete
+        | Event::StickDamaged => unreachable!("handled above"),
         Event::Test => (
             tr(lang, "nestegg test message", "nestegg Testnachricht"),
             tr(
@@ -930,6 +1082,14 @@ fn pattern_list(lang: Lang, patterns: &[String]) -> String {
 fn reduction_phrase(lang: Lang, reduction: &crate::settings::Reduction) -> String {
     use crate::settings::Reduction;
     match reduction {
+        Reduction::TargetRemoved { target } => match lang {
+            Lang::En => format!("backup target {target} was removed"),
+            Lang::De => format!("Sicherungsziel {target} wurde entfernt"),
+        },
+        Reduction::StickOverdueRaised { from, to } => match lang {
+            Lang::En => format!("stick overdue threshold raised from {from} to {to} hours"),
+            Lang::De => format!("Stick-Warngrenze von {from} auf {to} Stunden erhöht"),
+        },
         Reduction::AutomaticBackupsOff => tr(
             lang,
             "automatic backups were switched off",
@@ -2160,6 +2320,37 @@ fn load_state(paths: &Paths) -> NotifyState {
             NotifyState::default()
         }
     }
+}
+
+pub enum StickEvent {
+    Start,
+    SafeToUnplug,
+}
+
+/// Lifecycle events use the same bounded desktop and hook channels as health
+/// messages. Hook/desktop failures are returned to the caller for its log.
+pub fn stick_event(config: &Config, event: StickEvent, _message: &str) -> Result<()> {
+    let event = match event {
+        StickEvent::Start => Event::StickStart,
+        StickEvent::SafeToUnplug => Event::StickSafeToUnplug,
+    };
+    let context = Context {
+        lang: system_lang(),
+        hostname: crate::config::hostname(),
+        last_success: None,
+    };
+    let mut channels = SystemChannels {
+        config: &config.notify,
+        context: &context,
+        runtime_root: runtime_root(),
+    };
+    for session in channels.sessions() {
+        let message = compose(context.lang, event, None, Detail::Full);
+        if let Err(e) = channels.send_desktop(&session, &message) {
+            eprintln!("stick notification failed: {e:#}");
+        }
+    }
+    channels.send_command(&compose(context.lang, event, None, Detail::Full))
 }
 
 pub fn run(paths: &Paths, options: &Options) -> Result<u8> {
@@ -4049,6 +4240,7 @@ mod tests {
         damaged: &[&str],
     ) -> Status {
         Status {
+            targets: Default::default(),
             machine: status::Machine {
                 hostname: "desktop".into(),
                 backup_id: "desktop".into(),

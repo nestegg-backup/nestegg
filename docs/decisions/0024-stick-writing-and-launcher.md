@@ -42,9 +42,12 @@
    path remains in `LauncherOptions`.
 6. `stick add` preserves the configuration document and records distinct ext4
    UUIDs under `[stick].data_uuids`. Existing `[pbs]` configurations remain valid;
-   unknown fields remain errors. During phase one only the stick commands accept
-   registration-only documents. General stick-only target handling and state are
-   phase two; no dummy PBS and no backup activation are introduced here.
+   unknown fields remain errors. Phase one accepted registration-only documents
+   without enabling backups. Phase two ([0026](0026-desktop-stick-target.md))
+   extends this with stick-only targets and full-system defaults on first
+   registration, preserving existing explicit backup settings. Registration and
+   settings share a lock and the owner/mode-preserving atomic writer; a new
+   configuration is root:nestegg 0640.
 7. Expose `stick::launcher::{LauncherOptions, LocalPbs, preflight}`. Startup runs
    the trusted embedded helper as root, with mount/PID/network/UTS namespaces,
    private devices, RAM overlay, fresh configuration and real tmpfs `/run`.
@@ -58,7 +61,9 @@
    and inherits the token as fd 9. A stable supervisor thread owns the helper
    process, so Linux parent-death signals cannot tie its lifetime to a
    short-lived thread that called `start`. The handle must outlive its clients; `stop`
-   kills and reaps the helper, and dropping it performs the same cleanup.
+   kills and reaps the helper, waits for namespace PID 1 to exit, and dropping
+   it performs the same cleanup. Startup waits for all API authentication keys
+   and the API socket before starting the proxy.
 8. Check AF_INET6 socket creation before privileged startup. A kernel without it
    is unsupported; never change host sysctls, boot options or firewall rules.
    Rootless operation remains unsupported, as demonstrated in phase zero.
@@ -68,12 +73,13 @@
 Acceptance uses disposable sparse files, owned loops, SeaBIOS and OVMF. It tests
 an interrupted write, not a physical flash-controller power failure. The data
 partition and existing encrypted snapshots must survive updates. New desktop
-backup scheduling, hotplug services, target state, key copies and local-datastore
-wizard flows are explicitly later phases. Decision 0023 remains proposed until
-the complete feature and its hardware gate pass. A release README claim is not
+backup scheduling, hotplug services, target state and key copies are covered
+by phase two (0026); local-datastore wizard flows remain later phases.
+Decision 0023 remains proposed until the complete feature and its hardware gate
+pass. A release README claim is not
 added merely because media preparation exists.
 
-## Acceptance result (2026-11-11)
+## Original phase-one acceptance result (2026-11-11, before 0025 hardening)
 
 The real CLI created/registered an 8 GiB disposable sparse image. The launcher
 completed encrypted backup/restore, restart with fresh certificate/token,

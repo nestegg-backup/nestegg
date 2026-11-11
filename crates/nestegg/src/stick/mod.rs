@@ -1,8 +1,10 @@
 //! Bootable removable media and an isolated, local PBS (decision 0023).
-//! Phase one provides media preparation and registration, not backup scheduling.
+//! Media preparation, registered desktop targets and protected recovery keys.
 pub mod cli;
+pub mod key;
 pub mod launcher;
 mod media;
+pub mod target;
 
 use std::fs::{self, File};
 use std::io::Read;

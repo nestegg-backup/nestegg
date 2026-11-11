@@ -1,6 +1,6 @@
 # 0023 – Backup stick: back up to, boot from and restore from one USB drive
 
-- Status: proposed (phase 0 decides whether the approach holds)
+- Status: proposed for release; phases 0–2 implemented, later phases and hardware gates remain
 - Date: 2026-11-11
 - Changes: 0002 (nestegg also runs a PBS, locally and only for the stick),
   0006 (a second kind of stick), 0019 point 4 (password-protected key copy
@@ -206,6 +206,14 @@ else is built. The feature is released only after phase 6.
 | 4 – Backup from the booted stick | Wizard choice "back up this computer": LUKS, LVM, read-only and copy-on-write mounts, layout and inventory from a mounted root, backup ID, key and clock questions. | VM tests: back up a powered-off VM (also one with LUKS + LVM, one killed mid-write, one without nestegg) from the stick, restore it onto an empty disk, it boots. |
 | 5 – UI and notifications | Two targets in status and history, "back up to stick now", fill level, stick overdue reminder, password reminder. | UI tests; checked in the browser. |
 | 6 – Real hardware | Documentation, a real desktop with a real USB SSD: back up, boot, restore onto a spare disk, back up from the booted stick. | Recorded in `docs/research/`; status of this decision → accepted. |
+
+## Implementation status
+
+Phase one is specified in [0024](0024-stick-writing-and-launcher.md), with the
+security and durability corrections in [0025](0025-stick-review-hardening.md).
+Desktop phase two in [0026](0026-desktop-stick-target.md) builds on that hardened
+format and launcher. These are incremental acceptance results, not release or
+physical-hardware acceptance.
 
 ## Consequences
 

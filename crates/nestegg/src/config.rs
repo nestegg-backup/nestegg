@@ -80,8 +80,9 @@ pub struct Config {
     /// Dashboard turns to "overdue" when the last success is older than this.
     #[serde(default = "default_overdue_hours")]
     pub overdue_after_hours: u32,
-    pub pbs: PbsConfig,
-    /// Registered removable datastores; backup scheduling is added separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pbs: Option<PbsConfig>,
+    /// Registered removable datastores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stick: Option<StickConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,10 +106,48 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct StickConfig {
     pub data_uuids: Vec<String>,
+    #[serde(default = "default_stick_overdue")]
+    pub overdue_after_hours: u32,
+    #[serde(default = "default_stick_free")]
+    pub minimum_free_bytes: u64,
+    #[serde(default)]
+    pub retention: StickRetention,
+}
+
+fn default_stick_overdue() -> u32 {
+    168
+}
+fn default_stick_free() -> u64 {
+    256 * 1024 * 1024
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct StickRetention {
+    pub keep_last: u32,
+    pub keep_daily: u32,
+    pub keep_weekly: u32,
+    pub keep_monthly: u32,
+}
+impl Default for StickRetention {
+    fn default() -> Self {
+        Self {
+            keep_last: 3,
+            keep_daily: 7,
+            keep_weekly: 4,
+            keep_monthly: 6,
+        }
+    }
 }
 
 impl StickConfig {
     pub fn validate(&self) -> Result<()> {
+        if self.overdue_after_hours == 0 {
+            bail!("stick.overdue_after_hours must be positive");
+        }
+        if self.retention.keep_last == 0 {
+            bail!("stick.retention.keep_last must be positive");
+        }
         let mut seen = std::collections::HashSet::new();
         for uuid in &self.data_uuids {
             if !crate::stick::valid_uuid(uuid) || !seen.insert(uuid.to_ascii_lowercase()) {
@@ -379,24 +418,35 @@ impl Config {
         if let Some(stick) = &self.stick {
             stick.validate()?;
         }
-        if self.pbs.server.trim().is_empty() {
-            bail!("pbs.server must not be empty");
+        if self.pbs.is_none() && self.stick.is_none() {
+            bail!("configure at least one target: [pbs] or [stick]");
         }
-        if self.pbs.server.contains(':') && !self.pbs.server.starts_with('[') {
-            bail!(
-                "pbs.server must not contain a port; use pbs.port (IPv6 addresses need [brackets])"
-            );
+        if self.pbs.is_none() && (self.wake.is_some() || self.overview.is_some()) {
+            bail!("wake and overview require [pbs]");
         }
-        if !is_valid_name(&self.pbs.datastore) {
-            bail!("pbs.datastore contains invalid characters");
+        if self.stick.is_some() && !self.backup.encryption {
+            bail!("stick backups require encryption");
         }
-        if let Some(ns) = &self.pbs.namespace
-            && (ns.is_empty() || ns.split('/').any(|part| !is_valid_name(part)))
-        {
-            bail!("pbs.namespace must be a slash-separated list of names");
-        }
-        if !self.pbs.auth_id.contains('@') {
-            bail!("pbs.auth_id must look like user@realm or user@realm!token");
+        if let Some(pbs) = &self.pbs {
+            if pbs.server.trim().is_empty() {
+                bail!("pbs.server must not be empty");
+            }
+            if pbs.server.contains(':') && !pbs.server.starts_with('[') {
+                bail!(
+                    "pbs.server must not contain a port; use pbs.port (IPv6 addresses need [brackets])"
+                );
+            }
+            if !is_valid_name(&pbs.datastore) {
+                bail!("pbs.datastore contains invalid characters");
+            }
+            if let Some(ns) = &pbs.namespace
+                && (ns.is_empty() || ns.split('/').any(|part| !is_valid_name(part)))
+            {
+                bail!("pbs.namespace must be a slash-separated list of names");
+            }
+            if !pbs.auth_id.contains('@') {
+                bail!("pbs.auth_id must look like user@realm or user@realm!token");
+            }
         }
         if let Some(id) = &self.backup_id
             && !is_valid_name(id)
@@ -455,6 +505,10 @@ impl Config {
         Ok(())
     }
 
+    pub fn remote_pbs(&self) -> Result<&PbsConfig> {
+        self.pbs.as_ref().context("no PBS target configured")
+    }
+
     /// The Wake-on-LAN settings if Wake-on-LAN is configured and switched on.
     pub fn active_wake(&self) -> Option<&WakeConfig> {
         self.wake.as_ref().filter(|w| w.enabled)
@@ -468,9 +522,12 @@ impl Config {
     /// Repository string for `proxmox-backup-client`
     /// (`[[auth_id@]server[:port]:]datastore`).
     pub fn repository(&self) -> String {
+        let Some(pbs) = &self.pbs else {
+            return String::new();
+        };
         format!(
             "{}@{}:{}:{}",
-            self.pbs.auth_id, self.pbs.server, self.pbs.port, self.pbs.datastore
+            pbs.auth_id, pbs.server, pbs.port, pbs.datastore
         )
     }
 }
@@ -517,14 +574,14 @@ pub fn example(server: &str, datastore: &str, auth_id: &str) -> Config {
     Config {
         backup_id: None,
         overdue_after_hours: default_overdue_hours(),
-        pbs: PbsConfig {
+        pbs: Some(PbsConfig {
             server: server.to_string(),
             port: default_pbs_port(),
             datastore: datastore.to_string(),
             namespace: None,
             auth_id: auth_id.to_string(),
             fingerprint: None,
-        },
+        }),
         stick: None,
         wake: None,
         backup: BackupConfig::default(),
@@ -548,7 +605,7 @@ auth_id = "backup@pbs!desktop"
     #[test]
     fn minimal_config_gets_defaults() {
         let c = Config::parse(MINIMAL).unwrap();
-        assert_eq!(c.pbs.port, 8007);
+        assert_eq!(c.pbs.as_ref().unwrap().port, 8007);
         assert!(c.backup.encryption);
         assert!(c.backup.inventory);
         assert_eq!(c.backup.sources.len(), 4);

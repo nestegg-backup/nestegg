@@ -43,10 +43,12 @@ sleeping backup server via Wake-on-LAN, keeps a package inventory for quick \
 rebuilds and offers a terminal interface and a local web interface."""
 section = "admin"
 priority = "optional"
-depends = "$auto, systemd"
+depends = "$auto, systemd, util-linux, e2fsprogs, iproute2, python3, openssl, udev"
 recommends = "proxmox-backup-client | proxmox-backup-client-static, libnotify-bin"
 maintainer-scripts = "../../packaging/debian/"
 assets = [
+    ["../../packaging/systemd/nestegg-stick-pbs@.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/udev/70-nestegg-stick.rules", "usr/lib/udev/rules.d/", "644"],
     ["target/release/nestegg", "usr/bin/", "755"],
     ["../../packaging/systemd/nestegg.service", "usr/lib/systemd/system/", "644"],
     ["../../packaging/systemd/nestegg-backup.service", "usr/lib/systemd/system/", "644"],
