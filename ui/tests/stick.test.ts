@@ -55,6 +55,7 @@ function target(over: Partial<TargetStatus> = {}): TargetStatus {
     overdue_after_hours: 168,
     available_bytes: 212e9,
     password_reminder: false,
+    in_use: null,
     ...over,
   };
 }

@@ -33,6 +33,101 @@ pub struct Session {
     pub mount: PathBuf,
     pbs: Option<LocalPbs>,
     _device_lock: nix::fcntl::Flock<File>,
+    _usage: UsageGuard,
+}
+
+/// Held from before opening the medium until PBS shutdown, flush and unmount.
+/// The kernel lock, rather than the saved text, makes crashed workers idle.
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Usage {
+    Backup,
+    Restore,
+}
+struct UsageGuard(nix::fcntl::Flock<File>);
+impl UsageGuard {
+    fn mark_unsafe(&mut self) {
+        use std::io::{Seek, Write};
+        // Retain a conservative refusal after cleanup fails, even once the
+        // worker exits. A later successful session or reboot clears it.
+        let _ = self.0.rewind().and_then(|_| self.0.write_all(b"unsafe"));
+    }
+    fn mark_safe(&mut self) -> Result<()> {
+        use std::io::{Seek, Write};
+        self.0.set_len(0)?;
+        self.0.rewind()?;
+        self.0.write_all(b"idle")?;
+        Ok(())
+    }
+    fn acquire(paths: &Paths, uuid: &str, usage: Usage) -> Result<Self> {
+        use std::io::{Read, Seek, Write};
+        let path = paths
+            .runtime_dir
+            .join("stick")
+            .join(format!("{}.usage", uuid.to_ascii_lowercase()));
+        let file = crate::state::open_private_lock(&path)?;
+        let mut guard = Self(
+            nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .map_err(|(_, e)| error(ErrorKind::StickBusy, format!("stick is in use: {e}")))?,
+        );
+        let mut previous = String::new();
+        guard.0.read_to_string(&mut previous)?;
+        if previous.starts_with("unsafe") {
+            return Ok(guard);
+        }
+        guard.0.set_len(0)?;
+        guard.0.rewind()?;
+        guard.0.write_all(match usage {
+            Usage::Backup => b"backup",
+            Usage::Restore => b"restore",
+        })?;
+        Ok(guard)
+    }
+}
+/// Read-only status probe; never mounts or starts a server. Unreadable or
+/// partially written usage is conservatively busy, never safe to unplug.
+pub fn in_use(paths: &Paths, uuid: &str) -> Option<Usage> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = paths
+        .runtime_dir
+        .join("stick")
+        .join(format!("{}.usage", uuid.to_ascii_lowercase()));
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(Usage::Restore),
+    };
+    match nix::fcntl::Flock::lock(
+        match file.try_clone() {
+            Ok(file) => file,
+            Err(_) => return Some(Usage::Restore),
+        },
+        nix::fcntl::FlockArg::LockSharedNonblock,
+    ) {
+        Ok(_probe) => {
+            let mut text = String::new();
+            match file.read_to_string(&mut text) {
+                Ok(_) if text.starts_with("unsafe") => Some(Usage::Restore),
+                Ok(_) => None,
+                Err(_) => Some(Usage::Restore),
+            }
+        }
+        Err((_, e)) if e == nix::errno::Errno::EWOULDBLOCK => {
+            let mut text = String::new();
+            let _ = file.read_to_string(&mut text);
+            Some(if text == "backup" {
+                Usage::Backup
+            } else {
+                Usage::Restore
+            })
+        }
+        Err(_) => Some(Usage::Restore),
+    }
 }
 
 pub fn attached(config: &Config, requested: Option<&str>) -> Result<Option<String>> {
@@ -53,9 +148,7 @@ pub fn attached(config: &Config, requested: Option<&str>) -> Result<Option<Strin
     let mut present = stick.data_uuids.iter().filter(|u| device(u).exists());
     let first = present.next().cloned();
     if present.next().is_some() {
-        bail!(
-            "several registered sticks are attached; select one with `nestegg run --target stick --stick-uuid <UUID> --force`"
-        );
+        bail!("several registered sticks are attached; select a stick UUID for this operation");
     }
     Ok(first.map(|v| v.to_ascii_lowercase()))
 }
@@ -101,10 +194,16 @@ fn classify_open_error(e: anyhow::Error, present: bool) -> RunError {
 
 impl Session {
     pub fn open(paths: &Paths, uuid: &str) -> std::result::Result<Self, RunError> {
-        Self::open_inner(paths, uuid)
+        Self::open_as(paths, uuid, Usage::Backup)
+    }
+    pub fn open_for_restore(paths: &Paths, uuid: &str) -> std::result::Result<Self, RunError> {
+        Self::open_as(paths, uuid, Usage::Restore)
+    }
+    fn open_as(paths: &Paths, uuid: &str, usage: Usage) -> std::result::Result<Self, RunError> {
+        Self::open_inner(paths, uuid, usage)
             .map_err(|e| classify_open_error(e, super::valid_uuid(uuid) && device(uuid).exists()))
     }
-    fn open_inner(paths: &Paths, uuid: &str) -> Result<Self> {
+    fn open_inner(paths: &Paths, uuid: &str, usage: Usage) -> Result<Self> {
         use std::os::unix::fs::FileTypeExt;
         anyhow::ensure!(super::valid_uuid(uuid), "invalid stick UUID");
         let base = paths.runtime_dir.join("stick");
@@ -117,6 +216,7 @@ impl Session {
                     format!("stick is already in use: {e}"),
                 )
             })?;
+        let usage = UsageGuard::acquire(paths, uuid, usage)?;
         // A by-UUID symlink hides cloned filesystems. Apply the media commands'
         // complete-device check before opening any registered desktop target.
         let tree = super::cli::registered_tree()?;
@@ -211,6 +311,7 @@ impl Session {
             mount,
             pbs: None,
             _device_lock: lock,
+            _usage: usage,
         })
     }
     pub fn start(&mut self, paths: &Paths) -> Result<()> {
@@ -231,7 +332,11 @@ impl Session {
         self.pbs.as_ref().expect("session started")
     }
     pub fn close(mut self) -> Result<()> {
-        self.shutdown()
+        let result = self.shutdown().and_then(|()| self._usage.mark_safe());
+        if result.is_err() {
+            self._usage.mark_unsafe();
+        }
+        result
     }
     fn shutdown(&mut self) -> Result<()> {
         if let Some(pbs) = self.pbs.take() {
@@ -263,6 +368,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if let Err(e) = self.shutdown() {
+            self._usage.mark_unsafe();
             eprintln!("stick cleanup failed: {e:#}");
         }
     }
@@ -323,6 +429,60 @@ pub fn registered(paths: &Paths, uuid: Option<&str>, parent: Option<&Path>) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn usage_is_per_medium_live_and_keeps_backups_out_until_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_dir: root.path().join("run"),
+            state_dir: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+            credentials_dir: root.path().join("credentials"),
+            systemctl: root.path().join("no-systemctl"),
+        };
+        let uuid = "01234567-89ab-cdef-0123-456789abcdef";
+        let other = "01234567-89ab-cdef-0123-456789abcdee";
+        fs::create_dir_all(paths.runtime_dir.join("stick")).unwrap();
+        let config =
+            Config::parse(&format!("[stick]\ndata_uuids = ['{uuid}', '{other}']")).unwrap();
+        assert_eq!(in_use(&paths, uuid), None);
+        for usage in [Usage::Backup, Usage::Restore] {
+            let run_lock = crate::run::RunLock::try_acquire(&paths).unwrap().unwrap();
+            let guard = UsageGuard::acquire(&paths, uuid, usage).unwrap();
+            assert!(crate::run::RunLock::try_acquire(&paths).unwrap().is_none());
+            let status = crate::status::build(&paths, Some(&config), false).unwrap();
+            let stick = &status.targets[&crate::state::Target::Stick];
+            assert_eq!(stick.in_use, Some(usage));
+            assert_eq!(stick.sticks[uuid].in_use, Some(usage));
+            assert_eq!(in_use(&paths, &uuid.to_ascii_uppercase()), Some(usage));
+            assert_eq!(stick.sticks[other].in_use, None);
+            assert!(stick.plugged_in_uuids.is_empty());
+            drop(guard);
+            assert_eq!(in_use(&paths, uuid), None, "stale text must not mean busy");
+            drop(run_lock);
+            assert!(crate::run::RunLock::try_acquire(&paths).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn failed_cleanup_does_not_become_safe_when_the_worker_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let mut paths = Paths::from_env();
+        paths.runtime_dir = root.path().into();
+        fs::create_dir(root.path().join("stick")).unwrap();
+        let uuid = "01234567-89ab-cdef-0123-456789abcdef";
+        let mut guard = UsageGuard::acquire(&paths, uuid, Usage::Restore).unwrap();
+        guard.mark_unsafe();
+        drop(guard);
+        assert_eq!(in_use(&paths, uuid), Some(Usage::Restore));
+        let mut guard = UsageGuard::acquire(&paths, uuid, Usage::Restore).unwrap();
+        drop(guard);
+        assert_eq!(in_use(&paths, uuid), Some(Usage::Restore));
+        guard = UsageGuard::acquire(&paths, uuid, Usage::Restore).unwrap();
+        guard.mark_safe().unwrap();
+        drop(guard);
+        assert_eq!(in_use(&paths, uuid), None);
+    }
+
     #[test]
     fn read_only_fsck_must_be_clean_even_when_its_exit_code_is_zero() {
         assert!(filesystem_healthy(

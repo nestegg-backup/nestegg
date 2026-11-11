@@ -39,6 +39,7 @@ export class ApiFailure extends Error {
     readonly status: number,
     readonly code: string | null,
     message: string,
+    readonly reason: string | null = null,
   ) {
     super(message);
   }
@@ -75,22 +76,37 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     let code: string | null = null;
     let message = res.statusText;
+    let reason: string | null = null;
     const text = await res.text().catch(() => "");
     try {
-      const body = JSON.parse(text) as { code?: unknown; message?: unknown };
+      const body = JSON.parse(text) as { code?: unknown; message?: unknown; reason?: unknown };
+      if (typeof body.reason === "string") reason = body.reason;
       if (typeof body.code === "string") code = body.code;
       if (typeof body.message === "string") message = body.message;
     } catch {
       if (text.trim()) message = text.trim();
     }
-    throw new ApiFailure(kindOf(res.status, code), res.status, code, message);
+    throw new ApiFailure(kindOf(res.status, code), res.status, code, message, reason);
   }
   return (await res.json()) as T;
 }
 
 const q = (s: string) => encodeURIComponent(s);
 /** The server is the default target: requests for it stay as older daemons know them. */
-const sourceQuery = (source: Target, sep: "?" | "&") => (source === "stick" ? `${sep}target=stick` : "");
+const sourceQuery = (source: Target, sep: "?" | "&", uuid?: string | null) => (source === "stick" ? `${sep}target=stick${uuid ? `&stick_uuid=${q(uuid)}` : ""}` : "");
+
+interface SourceEcho { target?: Target; stick_uuid?: string | null }
+/** Old PBS responses remain usable; stick data always needs a source echo. */
+export function verifySource<T extends SourceEcho>(value: T, source: Target, uuid?: string | null): T {
+  if ((value.target != null && value.target !== source)
+    || (source === "stick" && (value.target !== "stick" || typeof value.stick_uuid !== "string" || !value.stick_uuid || (uuid && value.stick_uuid.toLowerCase() !== uuid.toLowerCase())))) {
+    throw new ApiFailure("not_implemented", 0, "source_mismatch", "The daemon did not confirm the requested restore source. Update nestegg.");
+  }
+  return value;
+}
+async function snapshotSource(source: Target = "pbs", uuid?: string | null) {
+  return verifySource(await request<SourceEcho & { snapshots: Snapshot[] }>(`snapshots${sourceQuery(source, "?", uuid)}`), source, uuid);
+}
 
 export const api = {
   health: () => request<HealthInfo>("health"),
@@ -112,15 +128,15 @@ export const api = {
   /** Runs the checks of `nestegg check`; without `wake` a sleeping PBS is reported as not checked; with `wake` it is woken first (can take minutes). */
   checkPbs: (wake: boolean) => request<PbsCheckResult>(`pbs/check${wake ? "?wake=true" : ""}`, { method: "POST" }),
   /** Snapshots on the server, or with `stick` on the plugged-in stick (503 `stick_unavailable` when it cannot be opened). */
-  snapshots: (source: Target = "pbs") =>
-    request<{ snapshots: Snapshot[] }>(`snapshots${sourceQuery(source, "?")}`).then((r) => r.snapshots),
-  browse: (time: string, archive: string, path: string, source: Target = "pbs") =>
-    request<{ entries: DirEntry[] }>(
-      `snapshots/${q(time)}/browse?archive=${q(archive)}&path=${q(path)}${sourceQuery(source, "&")}`,
-    ).then((r) => r.entries),
-  startRestore: (body: RestoreRequest) =>
-    request<Restore>("restores", { method: "POST", body: JSON.stringify(body) }),
-  restore: (id: string) => request<Restore>(`restores/${q(id)}`),
+  snapshotSource,
+  snapshots: (source: Target = "pbs", uuid?: string | null) => snapshotSource(source, uuid).then((r) => r.snapshots),
+  browse: async (time: string, archive: string, path: string, source: Target = "pbs", uuid?: string | null) =>
+    verifySource(await request<SourceEcho & { entries: DirEntry[] }>(
+      `snapshots/${q(time)}/browse?archive=${q(archive)}&path=${q(path)}${sourceQuery(source, "&", uuid)}`,
+    ), source, uuid).entries,
+  startRestore: async (body: RestoreRequest) =>
+    verifySource(await request<Restore>("restores", { method: "POST", body: JSON.stringify(body) }), body.target ?? "pbs", body.stick_uuid),
+  restore: async (id: string, source: Target = "pbs", uuid?: string | null) => verifySource(await request<Restore>(`restores/${q(id)}`), source, uuid),
   config: () => request<ConfigView>("config"),
   /**
    * Change settings (only the given fields); resolves to the new configuration.

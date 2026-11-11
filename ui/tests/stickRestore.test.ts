@@ -29,6 +29,7 @@ function serve(w: World) {
 afterEach(() => {
   vi.unstubAllGlobals();
   restore.reset();
+  restore.setStick(null);
   restore.setSource("pbs");
 });
 
@@ -196,6 +197,7 @@ describe("the stick row while a restore reads from it", () => {
     overdue_after_hours: 168,
     password_reminder: false,
     plugged_in: true,
+    in_use: null,
   };
 
   it("never says it can be unplugged while this page restores from it", () => {
@@ -203,5 +205,91 @@ describe("the stick row while a restore reads from it", () => {
     const busy = stickLine(ts, de, f, now, true);
     expect(busy.view.safeToUnplug).toBe(false);
     expect(busy.plug).toBe(de.stick.keepIn);
+  });
+});
+
+// A reachable PBS is the dangerous old-daemon case: a successful response must
+// still be refused unless it confirms the stick source and selected UUID.
+describe("source echoes and several media", () => {
+  it("refuses an old daemon's successful PBS response", async () => {
+    serve(new World("both", "today"));
+    restore.setSource("stick");
+    await restore.loadStickSnapshots();
+    expect(restore.stickSnaps.state).toBe("error");
+    expect(restore.stickSnaps.list).toEqual([]);
+    expect(stickNotSupported(restore.stickSnaps.error)).toBe(true);
+  });
+
+  it("pins the resolved UUID and includes it in browse and restore requests", async () => {
+    const w = new World("both", "full");
+    w.faults.add("stick_multiple");
+    const urls = serve(w);
+    await expect(api.snapshots("stick")).rejects.toMatchObject({ reason: "ambiguous" });
+    const uuid = "01234567-89ab-cdef-0123-456789abcdee";
+    restore.setSource("stick");
+    restore.setStick(uuid);
+    await restore.loadStickSnapshots();
+    const snapshot = restore.stickSnaps.list[0]!;
+    restore.pick(snapshot.time);
+    await restore.prepare(snapshot, null);
+    expect(urls.some((u) => u.includes(`/browse?`) && u.endsWith(`&stick_uuid=${uuid}`))).toBe(true);
+    restore.selection = [sel("home.pxar", "/alice")];
+    restore.fullPath = "/home/alice/chosen-stick";
+    expect(await restore.start(null)).toBe(true);
+    expect(restore.job).toMatchObject({ target: "stick", stick_uuid: uuid });
+    const status = w.status();
+    expect(status.targets?.stick?.plugged_in_uuids).toHaveLength(2);
+    expect(status.targets?.stick?.sticks?.[uuid]?.in_use).toBe("restore");
+    expect(status.targets?.stick?.sticks?.["01234567-89ab-cdef-0123-456789abcdef"]?.in_use).toBeNull();
+    expect(stickLine(status.targets!.stick!, de, createFormatter("de", "de-DE", "Europe/Berlin"), new Date()).view.safeToUnplug).toBe(false);
+  });
+
+  it("refuses a different source or stick on list, browse, job creation and polling", async () => {
+    const uuid = "01234567-89ab-cdef-0123-456789abcdef";
+    vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ target: "stick", stick_uuid: "01234567-89ab-cdef-0123-456789abcdee", snapshots: [], entries: [], id: "r", state: "running" })));
+    await expect(api.snapshots("stick", uuid)).rejects.toMatchObject({ code: "source_mismatch" });
+    await expect(api.browse("t", "home.pxar", "/", "stick", uuid)).rejects.toMatchObject({ code: "source_mismatch" });
+    await expect(api.startRestore(restoreRequest([sel("home.pxar", "/")], "t", "/x", "stick", uuid))).rejects.toMatchObject({ code: "source_mismatch" });
+    await expect(api.restore("r", "stick", uuid)).rejects.toMatchObject({ code: "source_mismatch" });
+    await expect(api.snapshots("pbs")).rejects.toMatchObject({ code: "source_mismatch" });
+  });
+
+  it("does not replace a new medium's list with a late response", async () => {
+    let finish!: (r: Response) => void;
+    vi.stubGlobal("fetch", () => new Promise<Response>((resolve) => { finish = resolve; }));
+    restore.setSource("stick");
+    const loading = restore.loadStickSnapshots();
+    restore.setStick("01234567-89ab-cdef-0123-456789abcdee");
+    finish(new Response(JSON.stringify({ target: "stick", stick_uuid: "01234567-89ab-cdef-0123-456789abcdef", snapshots: [{ time: "old" }] })));
+    await loading;
+    expect(restore.stickSnaps.state).toBe("idle");
+    expect(restore.stickSnaps.list).toEqual([]);
+    expect(restore.snapshotTime).toBeNull();
+  });
+});
+
+
+describe("safe removal requires live usage information", () => {
+  it("suppresses safe removal in every tab, including browse and unknown old status", () => {
+    const w = new World("stick_only", "full");
+    const ts = w.status().targets!.stick!;
+    const f = createFormatter("de", "de-DE", "Europe/Berlin");
+    expect(stickLine({ ...ts, in_use: "restore" }, de, f, new Date()).plug).toBe(de.stick.keepIn);
+    expect(stickLine({ ...ts, in_use: undefined }, de, f, new Date()).view.safeToUnplug).toBe(false);
+    expect(stickLine({ ...ts, in_use: null, sticks: { test: { plugged_in: true, in_use: "restore" } } }, de, f, new Date()).plug).toBe(de.stick.keepIn);
+  });
+});
+
+describe("translated stick reasons", () => {
+  it("uses a distinct explanation for known reasons and a generic fallback for newer ones", async () => {
+    const { stickProblemText } = await import("../src/lib/text");
+    const { default: en } = await import("../src/i18n/en");
+    for (const messages of [de, en]) {
+      for (const [reason, text] of Object.entries(messages.restore.stickReasons)) {
+        expect(stickProblemText({ reason }, messages)).toBe(text);
+        expect(text).not.toBe(messages.restore.stickUnavailable);
+      }
+      expect(stickProblemText({ reason: "newer_reason" }, messages)).toBe(messages.restore.stickUnavailable);
+    }
   });
 });

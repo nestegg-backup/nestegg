@@ -114,6 +114,9 @@ export interface TargetStatus {
   last_checked_at?: string | null;
   /** Live presence, independent of a previous run's outcome; null means unknown. */
   plugged_in?: boolean | null;
+  plugged_in_uuids?: string[];
+  in_use?: "backup" | "restore" | null;
+  sticks?: Record<string, { plugged_in: boolean; in_use: "backup" | "restore" | null }>;
   /** Last complete verification of the whole stick. */
   full_verified_at?: string | null;
   server_verify_failed?: string[];
@@ -188,6 +191,8 @@ export interface RestoreRequest {
 }
 
 export interface Restore {
+  target?: Target;
+  stick_uuid?: string | null;
   id: string;
   state: "running" | "succeeded" | "failed";
   target_dir?: string;

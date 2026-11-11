@@ -3,6 +3,7 @@
   import { archiveFolder, displayPath, folderNameFor, folderProblem, restore, selectedArchives } from "../../lib/restore.svelte";
   import { href, router } from "../../lib/router.svelte";
   import { isInventoryArchive, stickView } from "../../lib/derive";
+  import { stickProblemText } from "../../lib/text";
   import { f, t } from "../../lib/locale";
 
   const fromStick = $derived(restore.source === "stick");
@@ -37,7 +38,7 @@
       ? restore.startError.exists
         ? t.restore.targetExists
         : restore.startError.stick
-          ? t.restore.startStick(restore.startError.message)
+          ? stickProblemText(restore.stickProblem, t)
           : restore.startError.notImplemented
             ? t.errors.notImplemented
             : t.restore.startFailed(restore.startError.message)

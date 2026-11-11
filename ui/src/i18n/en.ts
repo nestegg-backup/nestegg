@@ -809,6 +809,15 @@ const en = {
     loadingStick: "Opening the stick and reading its backups. This takes a moment …",
     noSnapshotsStick: "This stick has no backup of this computer yet.",
     stickAbsent: "The backup stick is not plugged in. Plug it in and nestegg shows its backups here.",
+    chooseStick: "Choose stick",
+    stickReasons: {
+      not_plugged_in: "The selected stick is not plugged in. Plug it in and try again.",
+      ambiguous: "Several sticks are plugged in. Choose the stick to restore from.",
+      busy: "A backup or restore is using the stick. Try again afterwards.",
+      snapshot_not_on_stick: "This backup is not on the selected stick. Choose the matching stick.",
+      unreadable: "The stick cannot be read. Check the stick before trying again.",
+      unsupported: "This system does not support restoring from the stick yet.",
+    },
     stickUnavailable: "The backup stick could not be opened. Is it plugged in? Then try again.",
     stickNotSupported: "This version of nestegg cannot restore files from the stick yet. Update nestegg.",
     stickGoneBrowse:

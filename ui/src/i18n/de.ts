@@ -816,6 +816,15 @@ const de = {
     loadingStick: "Der Stick wird geöffnet und seine Stände gelesen. Das dauert einen Moment …",
     noSnapshotsStick: "Auf diesem Stick gibt es noch keinen Stand dieses PCs.",
     stickAbsent: "Der Backup-Stick ist nicht eingesteckt. Steck ihn ein, dann zeigt nestegg hier seine Stände.",
+    chooseStick: "Stick auswählen",
+    stickReasons: {
+      not_plugged_in: "Der gewählte Stick ist nicht eingesteckt. Stecke ihn ein und versuche es erneut.",
+      ambiguous: "Mehrere Sticks sind eingesteckt. Wähle den Stick für die Wiederherstellung.",
+      busy: "Ein Backup oder eine Wiederherstellung verwendet den Stick. Versuche es danach erneut.",
+      snapshot_not_on_stick: "Dieses Backup ist nicht auf dem gewählten Stick. Wähle den passenden Stick.",
+      unreadable: "Der Stick kann nicht gelesen werden. Prüfe den Stick, bevor du es erneut versuchst.",
+      unsupported: "Dieses System unterstützt die Wiederherstellung vom Stick noch nicht.",
+    },
     stickUnavailable: "Der Backup-Stick ließ sich nicht öffnen. Ist er eingesteckt? Dann versuch es noch einmal.",
     stickNotSupported: "Diese nestegg-Version kann Dateien noch nicht vom Stick wiederherstellen. Aktualisiere nestegg.",
     stickGoneBrowse:

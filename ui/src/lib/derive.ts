@@ -787,7 +787,7 @@ export interface StickView {
   plugged: boolean | null;
   /**
    * The last stick backup ended successfully, so the daemon had stopped its server, flushed and
-   * unmounted the stick ("safe to unplug"), and no stick run has started since.
+   * unmounted the stick, no run has started since, and live usage explicitly says idle.
    */
   safeToUnplug: boolean;
   running: Run | null;
@@ -834,7 +834,7 @@ export function stickView(ts: TargetStatus): StickView {
   return {
     kind,
     plugged,
-    safeToUnplug: !running && plugged === true && last?.state === "succeeded",
+    safeToUnplug: !running && ts.in_use === null && !Object.values(ts.sticks ?? {}).some((s) => s.in_use) && plugged === true && last?.state === "succeeded",
     running,
     damaged,
   };

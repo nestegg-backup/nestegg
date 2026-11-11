@@ -6,6 +6,7 @@
   import { restore } from "../../lib/restore.svelte";
   import { href } from "../../lib/router.svelte";
   import { allDamaged, isDamaged, stickView } from "../../lib/derive";
+  import { stickProblemText } from "../../lib/text";
   import { f, t } from "../../lib/locale";
 
   const fromStick = $derived(restore.source === "stick");
@@ -22,7 +23,7 @@
   const everyDamaged = $derived(allDamaged(restore.snaps(app.snapshots).list, failed));
   // The stick went away (the status says so) or the last request to it failed.
   const stickNote = $derived(
-    !fromStick ? null : plugged === false ? t.restore.stickGoneBrowse : restore.stickProblem ? t.restore.stickFailedBrowse : null,
+    !fromStick ? null : plugged === false ? t.restore.stickGoneBrowse : restore.stickProblem ? stickProblemText(restore.stickProblem, t) : null,
   );
   const total = $derived(restore.totalSize());
   const n = $derived(restore.selection.length);

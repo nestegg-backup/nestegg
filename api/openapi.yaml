@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: nestegg local API
-  version: 0.4.0
+  version: 0.5.0
   summary: Local control API of the nestegg daemon.
   description: |
     Served by `nestegg daemon` on the Unix socket `/run/nestegg/api.sock`
@@ -319,13 +319,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [snapshots]
+                required: [target, stick_uuid, snapshots]
                 properties:
+                  target: { type: string, enum: [pbs, stick], description: Actual source; clients must reject a mismatching or missing stick echo. }
+                  stick_uuid: { type: [string, "null"], format: uuid, description: Resolved physical stick; null for PBS. }
                   snapshots:
                     type: array
                     items: { $ref: "#/components/schemas/Snapshot" }
         "503":
-          description: PBS not reachable.
+          description: PBS not reachable, or stick unavailable (reason explains why).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -361,8 +363,10 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entries]
+                required: [target, stick_uuid, entries]
                 properties:
+                  target: { type: string, enum: [pbs, stick], description: Actual source; clients must reject a mismatching or missing stick echo. }
+                  stick_uuid: { type: [string, "null"], format: uuid, description: Resolved physical stick; null for PBS. }
                   entries:
                     type: array
                     items: { $ref: "#/components/schemas/DirEntry" }
@@ -547,12 +551,23 @@ components:
           description: Stable identifier.
           enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, already_checking, not_found, pbs_unreachable, stick_unavailable, not_implemented, bad_request, forbidden, internal]
         message: { type: string, description: Human-readable English text. }
+        reason:
+          oneOf: [{ $ref: "#/components/schemas/StickUnavailableReason" }, { type: "null" }]
+          description: Always set for 503 stick_unavailable; null or absent for other errors.
+    StickUnavailableReason:
+      type: string
+      enum: [not_plugged_in, ambiguous, busy, snapshot_not_on_stick, unreadable, unsupported]
+    StickUsage:
+      type: [string, "null"]
+      enum: [backup, restore, null]
+      description: Restore includes listing, validation and browsing while the worker holds the stick. Usage lasts through PBS shutdown, flush and unmount.
+
     Health:
       type: object
       required: [version, api_version]
       properties:
         version: { type: string, examples: ["0.1.0"] }
-        api_version: { type: string, examples: ["1"] }
+        api_version: { type: string, examples: ["2"], description: Version 2 adds source echoes and live per-stick usage; old clients remain supported. }
     TargetStatus:
       type: object
       required: [health, state, consecutive_failures, overdue_after_hours, password_reminder]
@@ -574,6 +589,21 @@ components:
         plugged_in:
           type: [boolean, "null"]
           description: Current presence of any registered stick, independent of state/health/history. Null for PBS. Does not mount the medium or mean it is safe to unplug.
+        plugged_in_uuids:
+          type: array
+          items: { type: string, format: uuid }
+          description: Currently present registered sticks; empty for PBS.
+        in_use:
+          $ref: "#/components/schemas/StickUsage"
+        sticks:
+          type: object
+          description: Every registered UUID with live usage, even if unplugged during use. Empty for PBS. Never infer safe removal from backup history alone.
+          additionalProperties:
+            type: object
+            required: [plugged_in, in_use]
+            properties:
+              plugged_in: { type: boolean }
+              in_use: { $ref: "#/components/schemas/StickUsage" }
         available_bytes: { type: [integer, "null"], description: Free space as reported for the PBS backup user; cached from space_checked_at. }
         total_bytes: { type: [integer, "null"], description: Datastore filesystem capacity measured with available_bytes; null before first measurement. }
         space_checked_at: { type: [string, "null"], format: date-time, description: Last successful capacity measurement (also refreshed after retention or failure-only GC). }
@@ -803,8 +833,10 @@ components:
         target_dir: { type: string, examples: ["/home/alice/nestegg-restore-2026-11-08"] }
     Restore:
       type: object
-      required: [id, state]
+      required: [id, state, target, stick_uuid]
       properties:
+        target: { type: string, enum: [pbs, stick] }
+        stick_uuid: { type: [string, "null"], format: uuid, description: Resolved and pinned during validation; null for PBS. }
         id: { type: string }
         state: { type: string, enum: [running, succeeded, failed] }
         target_dir: { type: string }

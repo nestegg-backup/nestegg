@@ -122,6 +122,7 @@ export const FAULTS = [
   "stick_password",
   "stick_pulled",
   "stick_busy",
+  "stick_multiple",
 ] as const;
 export type Fault = (typeof FAULTS)[number];
 
@@ -137,6 +138,7 @@ const DAY = 24 * HOUR;
 const GB = 1_000_000_000;
 
 /** The documentation UUID of docs/stick.md; never a real medium. */
+export const SECOND_STICK_UUID = "01234567-89ab-cdef-0123-456789abcdee";
 export const STICK_UUID = "01234567-89ab-cdef-0123-456789abcdef";
 
 const iso = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
@@ -1006,6 +1008,14 @@ export class World {
         password_reminder: this.faults.has("stick_password"),
         password_reminders: this.faults.has("stick_password") ? { [STICK_UUID]: "password_check_due" } : {},
         plugged_in: this.stickIn(),
+        ...(this.flavor !== "today" ? {
+          plugged_in_uuids: this.stickIn() ? this.faults.has("stick_multiple") ? [STICK_UUID, SECOND_STICK_UUID] : [STICK_UUID] : [],
+          in_use: [...this.restores.values()].some((j) => j.stick && j.restore.state === "running") ? "restore" as const : running ? "backup" as const : null,
+          sticks: Object.fromEntries((this.faults.has("stick_multiple") ? [STICK_UUID, SECOND_STICK_UUID] : [STICK_UUID]).map((uuid) => [uuid, {
+            plugged_in: this.stickIn(),
+            in_use: [...this.restores.values()].some((j) => j.stick && j.restore.stick_uuid === uuid && j.restore.state === "running") ? "restore" : running ? "backup" : null,
+          }])),
+        } : {}),
         total_bytes: 256e9,
         space_checked_at: last?.started_at ?? null,
       };
@@ -1280,7 +1290,7 @@ export class World {
 
     const route = `${method} ${path}`;
     let m: RegExpExecArray | null;
-    if (route === "GET /health") return { status: 200, body: { version: "0.1.0", api_version: "1" } };
+    if (route === "GET /health") return { status: 200, body: { version: "0.1.0", api_version: today ? "1" : "2" } };
     if (route === "GET /status") {
       const st = this.status(now);
       if (this.faults.has("no_run_details")) {
@@ -1436,29 +1446,36 @@ export class World {
     if (fromStick && !today && (route === "GET /snapshots" || route === "POST /restores" || /^GET \/snapshots\/[^/]+\/browse$/.test(route))) {
       const slow = (r: Reply, ms: number): Reply => ({ ...r, delayMs: ms });
       if (!this.configured) return notConfigured();
-      if (!this.stick) return err(503, "stick_unavailable", "no stick target is configured");
-      if (!this.stickIn()) return slow(err(503, "stick_unavailable", "registered stick not plugged in"), 600);
-      if (this.faults.has("stick_busy")) return slow(err(503, "stick_unavailable", "e2fsck -f -n on the stick's data partition did not finish: device or resource busy"), 1_500);
+      const unavailable = (reason: string, message: string): Reply => ({ status: 503, body: { code: "stick_unavailable", reason, message } });
+      const uuid = query.get("stick_uuid") ?? (body as Partial<RestoreRequest> | null)?.stick_uuid;
+      const selected = uuid ?? STICK_UUID;
+      if (uuid && ![STICK_UUID, ...(this.faults.has("stick_multiple") ? [SECOND_STICK_UUID] : [])].includes(uuid)) return err(400, "bad_request", "stick UUID is not registered");
+      if (!uuid && this.faults.has("stick_multiple")) return unavailable("ambiguous", "choose a stick to restore from");
+      const echo = { target: "stick" as const, stick_uuid: selected };
+      if (!this.stick) return unavailable("unsupported", "no stick target is configured");
+      if (!this.stickIn()) return slow(unavailable("not_plugged_in", "registered stick not plugged in"), 600);
+      if (this.faults.has("stick_busy")) return slow(unavailable("unreadable", "the stick filesystem could not be read"), 1_500);
       if (this.active || [...this.restores.values()].some((j) => j.restore.state === "running"))
-        return err(503, "stick_unavailable", "a backup or stick restore is running");
+        return unavailable("busy", "a backup or stick restore is running");
       const list = this.stickSnapshots();
-      if (route === "GET /snapshots") return slow({ status: 200, body: { snapshots: list } }, 1_800);
+      if (route === "GET /snapshots") return slow({ status: 200, body: { ...echo, snapshots: list } }, 1_800);
       if (method === "GET") {
         const time = decodeURIComponent(/^\/snapshots\/([^/]+)\/browse$/.exec(path)![1]!);
-        if (!list.some((s) => s.time === time)) return err(503, "stick_unavailable", `snapshot ${time} not found on this stick`);
+        if (!list.some((s) => s.time === time)) return unavailable("snapshot_not_on_stick", `snapshot ${time} not found on this stick`);
         const entries = browseTree(query.get("archive") ?? "", query.get("path") ?? "/");
         if (!entries) return err(404, "not_found", "no such directory");
-        return slow({ status: 200, body: { entries } }, 700);
+        return slow({ status: 200, body: { ...echo, entries } }, 700);
       }
       const req = body as Partial<RestoreRequest>;
       const many = Array.isArray(req.archives) && req.archives.length > 0;
       if (!req.snapshot_time || !req.target_dir || (!many && (!req.archive || !Array.isArray(req.paths))))
         return err(400, "bad_request", "snapshot_time, archive (or archives), paths and target_dir are required");
-      if (!list.some((s) => s.time === req.snapshot_time)) return err(503, "stick_unavailable", `snapshot ${req.snapshot_time} not found on this stick`);
+      if (!list.some((s) => s.time === req.snapshot_time)) return unavailable("snapshot_not_on_stick", `snapshot ${req.snapshot_time} not found on this stick`);
       if (EXISTING_TARGETS.includes(req.target_dir.replace(/\/$/, "")))
         return err(409, "target_exists", `target directory ${req.target_dir} already exists`);
       const id = `restore-${this.restores.size + 1}`;
       const restore: Restore = {
+        ...echo,
         id,
         state: "running",
         target_dir: req.target_dir,
@@ -1476,7 +1493,7 @@ export class World {
       if (!this.configured) return notConfigured();
       // Like the daemon: without [pbs] the reachability probe fails.
       if (this.reachable === false || !this.pbsTarget) return err(503, "pbs_unreachable", "PBS is not reachable");
-      return { status: 200, body: { snapshots: this.snapshots } };
+      return { status: 200, body: { ...(today ? {} : { target: "pbs", stick_uuid: null }), snapshots: this.snapshots } };
     }
     if (method === "GET" && (m = /^\/snapshots\/([^/]+)\/browse$/.exec(path))) {
       if (today) return err(501, "not_implemented", "planned for v0.2");
@@ -1485,7 +1502,7 @@ export class World {
       if (!this.snapshots.some((s) => s.time === time)) return err(404, "not_found", "unknown snapshot");
       const entries = browseTree(query.get("archive") ?? "", query.get("path") ?? "/");
       if (!entries) return err(404, "not_found", "no such directory");
-      return { status: 200, body: { entries } };
+      return { status: 200, body: { target: "pbs", stick_uuid: null, entries } };
     }
     if (route === "POST /restores") {
       if (today) return err(501, "not_implemented", "planned for v0.2");
@@ -1501,6 +1518,8 @@ export class World {
       const id = `restore-${this.restores.size + 1}`;
       const totalBytes = (many ? req.archives!.length : 1) * 3.2 * GB;
       const restore: Restore = {
+        target: "pbs",
+        stick_uuid: null,
         id,
         state: "running",
         target_dir: req.target_dir,

@@ -43,11 +43,20 @@ pub struct TargetStatus {
     pub total_bytes: Option<u64>,
     pub space_checked_at: Option<DateTime<Utc>>,
     pub plugged_in: Option<bool>,
+    pub plugged_in_uuids: Vec<String>,
+    pub in_use: Option<crate::stick::target::Usage>,
+    pub sticks: std::collections::BTreeMap<String, StickStatus>,
     pub last_checked_at: Option<DateTime<Utc>>,
     pub full_verified_at: Option<DateTime<Utc>>,
     pub server_verify_failed: Vec<String>,
     pub password_reminder: bool,
     pub password_reminders: std::collections::BTreeMap<String, PasswordReminder>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StickStatus {
+    pub plugged_in: bool,
+    pub in_use: Option<crate::stick::target::Usage>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -246,6 +255,32 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
                     .iter()
                     .any(|uuid| crate::stick::target::present(uuid))
             });
+            let sticks: std::collections::BTreeMap<_, _> = config
+                .stick
+                .as_ref()
+                .filter(|_| target == crate::state::Target::Stick)
+                .map(|stick| {
+                    stick
+                        .data_uuids
+                        .iter()
+                        .map(|uuid| {
+                            (
+                                uuid.to_ascii_lowercase(),
+                                StickStatus {
+                                    plugged_in: crate::stick::target::present(uuid),
+                                    in_use: crate::stick::target::in_use(paths, uuid),
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let plugged_in_uuids = sticks
+                .iter()
+                .filter(|(_, s)| s.plugged_in)
+                .map(|(u, _)| u.clone())
+                .collect();
+            let in_use = sticks.values().find_map(|s| s.in_use);
             targets.insert(
                 target,
                 TargetStatus {
@@ -261,6 +296,9 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
                     total_bytes: view.total_bytes,
                     space_checked_at: view.space_checked_at,
                     plugged_in,
+                    plugged_in_uuids,
+                    in_use,
+                    sticks,
                     last_checked_at: view.last_checked_at,
                     full_verified_at: view.full_verified_at,
                     server_verify_failed: view.server_verify_failed,

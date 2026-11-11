@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -50,6 +50,39 @@ pub struct Request {
     /// Filled by the daemon from the Unix socket peer, never from HTTP input.
     pub uid: u32,
     pub action: Action,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableReason {
+    #[error("registered stick not plugged in")]
+    NotPluggedIn,
+    #[error(
+        "several registered sticks are attached; choose a stick in the restore source selector"
+    )]
+    Ambiguous,
+    #[error("a backup or stick restore is running; try again afterwards")]
+    Busy,
+    #[error("this snapshot is not on the selected stick")]
+    SnapshotNotOnStick,
+    #[error("the stick cannot be read")]
+    Unreadable,
+    #[error("stick restores are not supported on this system")]
+    Unsupported,
+}
+fn unavailable_reason(e: &anyhow::Error) -> UnavailableReason {
+    if let Some(reason) = e.downcast_ref::<UnavailableReason>() {
+        return *reason;
+    }
+    match e.downcast_ref::<crate::state::RunError>().map(|e| e.kind) {
+        Some(crate::state::ErrorKind::StickNotPluggedIn) => UnavailableReason::NotPluggedIn,
+        Some(crate::state::ErrorKind::StickAmbiguous) => UnavailableReason::Ambiguous,
+        Some(crate::state::ErrorKind::StickBusy | crate::state::ErrorKind::StickAlreadyMounted) => {
+            UnavailableReason::Busy
+        }
+        Some(crate::state::ErrorKind::StickUnsupported) => UnavailableReason::Unsupported,
+        _ => UnavailableReason::Unreadable,
+    }
 }
 
 fn invalid(message: impl Into<String>) -> anyhow::Error {
@@ -181,18 +214,60 @@ fn validate(
 pub fn execute(paths: &Paths, request: Request) -> Result<Value> {
     ensure!(
         nix::unistd::Uid::effective().is_root(),
-        "stick API worker requires root"
+        UnavailableReason::Unsupported
     );
     let mut config = Config::load(&paths.config_file)?;
     config.backup.encryption = true;
+    let registered = config
+        .stick
+        .as_ref()
+        .ok_or(UnavailableReason::Unsupported)?;
+    if let Some(uuid) = &request.uuid {
+        ensure!(
+            crate::stick::valid_uuid(uuid)
+                && registered
+                    .data_uuids
+                    .iter()
+                    .any(|u| u.eq_ignore_ascii_case(uuid)),
+            invalid("stick UUID is not registered")
+        );
+    } else {
+        ensure!(
+            registered
+                .data_uuids
+                .iter()
+                .filter(|u| crate::stick::target::present(u))
+                .count()
+                <= 1,
+            UnavailableReason::Ambiguous
+        );
+    }
     let uuid = crate::stick::target::attached(&config, request.uuid.as_deref())?
-        .context("registered stick not plugged in")?;
-    let _lock =
-        crate::run::RunLock::try_acquire(paths)?.context("a backup or stick restore is running")?;
+        .ok_or(UnavailableReason::NotPluggedIn)?;
+    let _lock = crate::run::RunLock::try_acquire(paths)?.ok_or(UnavailableReason::Busy)?;
+    crate::stick::launcher::preflight()
+        .map_err(|e| anyhow::Error::new(UnavailableReason::Unsupported).context(e))?;
     crate::stick::target::isolate_mounts()?;
-    let mut session = crate::stick::target::Session::open(paths, &uuid)
-        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let mut session = crate::stick::target::Session::open_for_restore(paths, &uuid)?;
     session.start(paths)?;
+    if let Action::Browse { time, .. }
+    | Action::Validate { time, .. }
+    | Action::Restore { time, .. } = &request.action
+    {
+        let wanted = snapshot(&config, time)?;
+        let client = Client::local(
+            &config,
+            SecretStore::new(&paths.credentials_dir),
+            session.pbs(),
+        );
+        ensure!(
+            client
+                .list_snapshots(&config.effective_backup_id())?
+                .iter()
+                .any(|s| s.snapshot == wanted),
+            UnavailableReason::SnapshotNotOnStick
+        );
+    }
     let requester = if request.uid == 0 {
         Requester::Root { sudo: None }
     } else {
@@ -207,7 +282,7 @@ pub fn execute(paths: &Paths, request: Request) -> Result<Value> {
         SecretStore::new(&paths.credentials_dir),
         session.pbs(),
     );
-    let result = match request.action {
+    let mut result = match request.action {
         Action::List => {
             json!({ "snapshots": client.list_snapshots(&config.effective_backup_id())? })
         }
@@ -305,6 +380,8 @@ pub fn execute(paths: &Paths, request: Request) -> Result<Value> {
         }
     };
     session.close()?;
+    result["target"] = json!("stick");
+    result["stick_uuid"] = json!(uuid);
     Ok(result)
 }
 
@@ -327,7 +404,7 @@ pub fn run() -> Result<u8> {
                 Some(RestoreError::TargetExists(_)) => "target_exists",
                 None => "stick_unavailable",
             };
-            json!({ "error": { "code": code, "message": super::printable_block(&format!("{e:#}")) } })
+            json!({ "error": { "code": code, "reason": (code == "stick_unavailable").then(|| unavailable_reason(&e)), "message": super::printable_block(&format!("{e:#}")) } })
         }
     };
     serde_json::to_writer(std::io::stdout().lock(), &envelope)?;
@@ -338,6 +415,55 @@ pub fn run() -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_reasons_are_stable_and_preserve_typed_causes() {
+        for (kind, expected) in [
+            (
+                crate::state::ErrorKind::StickNotPluggedIn,
+                UnavailableReason::NotPluggedIn,
+            ),
+            (crate::state::ErrorKind::StickBusy, UnavailableReason::Busy),
+            (
+                crate::state::ErrorKind::StickAlreadyMounted,
+                UnavailableReason::Busy,
+            ),
+            (
+                crate::state::ErrorKind::StickAmbiguous,
+                UnavailableReason::Ambiguous,
+            ),
+            (
+                crate::state::ErrorKind::StickUnsupported,
+                UnavailableReason::Unsupported,
+            ),
+            (
+                crate::state::ErrorKind::FilesystemDamaged,
+                UnavailableReason::Unreadable,
+            ),
+        ] {
+            let error = anyhow::Error::new(crate::stick::target::error(kind, "fixture"))
+                .context("opening stick");
+            assert_eq!(unavailable_reason(&error), expected);
+        }
+        for reason in [
+            UnavailableReason::NotPluggedIn,
+            UnavailableReason::Ambiguous,
+            UnavailableReason::Busy,
+            UnavailableReason::SnapshotNotOnStick,
+            UnavailableReason::Unreadable,
+            UnavailableReason::Unsupported,
+        ] {
+            assert_eq!(
+                unavailable_reason(&anyhow::Error::new(reason).context("fixture")),
+                reason
+            );
+            assert_eq!(
+                serde_json::from_value::<UnavailableReason>(serde_json::to_value(reason).unwrap())
+                    .unwrap(),
+                reason
+            );
+        }
+    }
+
     #[test]
     fn worker_protocol_refuses_foreign_paths_and_invalid_archive_names() {
         assert!(serde_json::from_value::<Request>(json!({"uid": 0, "uuid": null, "image": "/media/foreign.squashfs", "action": {"operation":"list"}})).is_err());

@@ -5,6 +5,7 @@
   import { restore, stickNotSupported } from "../../lib/restore.svelte";
   import { href } from "../../lib/router.svelte";
   import { allDamaged, hasPbs, hasStick, isDamaged, restorableArchives, stickView } from "../../lib/derive";
+  import { stickProblemText } from "../../lib/text";
   import { f, t } from "../../lib/locale";
   import type { Snapshot, Status } from "../../lib/types";
 
@@ -16,6 +17,13 @@
   const fromStick = $derived(restore.source === "stick");
   const stickTs = $derived(status.targets?.stick ?? null);
   const plugged = $derived(stickTs ? stickView(stickTs).plugged : null);
+  const uuids = $derived(stickTs?.plugged_in_uuids ?? []);
+  const needsStick = $derived(fromStick && uuids.length > 1 && !uuids.includes(restore.stickUuid ?? ""));
+  $effect.pre(() => {
+    if (!fromStick || !stickTs?.plugged_in_uuids) return;
+    const selected = uuids.length === 1 ? uuids[0]! : uuids.includes(restore.stickUuid ?? "") ? restore.stickUuid : null;
+    untrack(() => restore.setStick(selected));
+  });
   const absent = $derived(fromStick && plugged === false);
   const snaps = $derived(restore.snaps(app.snapshots));
   const list = $derived(snaps.list);
@@ -43,13 +51,13 @@
   // that is what step 2 shows first, and it tells whether browsing works at all.
   // The stick is opened only when it is the source and not known to be missing.
   $effect(() => {
-    if (fromStick && plugged !== false && restore.stickSnaps.state === "idle") untrack(() => void restore.loadStickSnapshots());
+    if (fromStick && !needsStick && plugged !== false && restore.stickSnaps.state === "idle") untrack(() => void restore.loadStickSnapshots());
   });
 
   async function retryStick() {
     // The status says whether the stick is plugged in; it is asked only every half minute.
     await app.poll();
-    void restore.loadStickSnapshots(true);
+    if (!needsStick) void restore.loadStickSnapshots(true);
   }
 
   $effect(() => {
@@ -94,7 +102,23 @@
   </fieldset>
 {/if}
 
-{#if absent}
+{#if fromStick && uuids.length > 1}
+  <fieldset class="choice-group">
+    <legend class="sec-title">{t.restore.chooseStick}</legend>
+    <div class="box choices">
+      {#each uuids as uuid (uuid)}
+        <label class="choice where">
+          <input type="radio" name="stick" value={uuid} checked={restore.stickUuid === uuid} onchange={() => restore.setStick(uuid)} />
+          <span>{uuid}</span>
+        </label>
+      {/each}
+    </div>
+  </fieldset>
+{/if}
+
+{#if needsStick}
+  <p class="lead-text gap" role="status">{t.restore.stickReasons.ambiguous}</p>
+{:else if absent}
   <p class="lead-text gap" role="status">{t.restore.stickAbsent}</p>
   <div class="actions"><button class="btn" type="button" onclick={retryStick}>{t.app.retry}</button></div>
 {:else if snaps.state === "loading" || snaps.state === "idle"}
@@ -103,7 +127,7 @@
   {#if stickNotSupported(snaps.error)}
     <p class="lead-text gap">{t.restore.stickNotSupported}</p>
   {:else}
-    <p class="lead-text gap">{snaps.error?.kind === "stick_unavailable" ? t.restore.stickUnavailable : t.errors.genericText}</p>
+    <p class="lead-text gap">{snaps.error?.kind === "stick_unavailable" ? stickProblemText(snaps.error, t) : t.errors.genericText}</p>
     {#if snaps.error?.message}<p class="hint">{t.errors.detail(snaps.error.message)}</p>{/if}
     <div class="actions"><button class="btn primary" type="button" onclick={retryStick}>{t.app.retry}</button></div>
   {/if}

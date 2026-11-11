@@ -24,7 +24,7 @@ use crate::secrets::SecretStore;
 use crate::state::{Run, Store, Trigger, is_valid_run_id};
 
 pub const GROUP: &str = "nestegg";
-pub const API_VERSION: &str = "1";
+pub const API_VERSION: &str = "2";
 
 #[derive(Clone)]
 struct App {
@@ -182,6 +182,8 @@ fn requester(peer: &PeerInfo) -> ApiResult<crate::restore::Requester> {
 
 #[derive(Clone, serde::Serialize)]
 struct RestoreJob {
+    target: crate::state::Target,
+    stick_uuid: Option<String>,
     #[serde(skip)]
     owner: u32,
     id: String,
@@ -203,6 +205,7 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    reason: Option<crate::rescue::desktop_api::UnavailableReason>,
 }
 
 impl ApiError {
@@ -211,6 +214,7 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            reason: None,
         }
     }
 
@@ -223,7 +227,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
             self.status,
-            Json(json!({ "code": self.code, "message": self.message })),
+            Json(json!({ "code": self.code, "message": self.message, "reason": self.reason })),
         )
             .into_response()
     }
@@ -604,13 +608,20 @@ fn stick_rpc(
             Some("target_exists") => (StatusCode::CONFLICT, "target_exists"),
             _ => (StatusCode::SERVICE_UNAVAILABLE, "stick_unavailable"),
         };
-        return Err(ApiError::new(
+        let mut failure = ApiError::new(
             status,
             code,
             error["message"]
                 .as_str()
                 .unwrap_or("stick operation failed"),
-        ));
+        );
+        if code == "stick_unavailable" {
+            failure.reason = Some(
+                serde_json::from_value(error["reason"].clone())
+                    .unwrap_or(crate::rescue::desktop_api::UnavailableReason::Unreadable),
+            );
+        }
+        return Err(failure);
     }
     envelope
         .get("result")
@@ -646,7 +657,9 @@ async fn list_snapshots(
             let client =
                 crate::client::Client::new(&config, SecretStore::new(&app.paths.credentials_dir));
             let snapshots = client.list_snapshots(&config.effective_backup_id())?;
-            Ok(Ok(json!({ "snapshots": snapshots })))
+            Ok(Ok(
+                json!({ "target": "pbs", "stick_uuid": null, "snapshots": snapshots }),
+            ))
         },
     )
     .await
@@ -1099,7 +1112,9 @@ async fn browse(
         })
         .await
         .map_err(ApiError::internal)??;
-    Ok(Json(json!({ "entries": entries })))
+    Ok(Json(
+        json!({ "target": "pbs", "stick_uuid": null, "entries": entries }),
+    ))
 }
 
 type ArchivePaths = crate::rescue::desktop_api::Selection;
@@ -1156,7 +1171,7 @@ async fn start_restore(
     .await?;
     let snapshot = snapshot_of(&config, &body.snapshot_time)?;
     let stick = body.source.is_stick()?;
-    let stick_uuid = body.source.stick_uuid;
+    let mut stick_uuid = body.source.stick_uuid;
     let restore_time = body.snapshot_time.clone();
     // Validate archives and paths; unprivileged users are limited to their
     // own home directory, as recorded in the snapshot.
@@ -1182,6 +1197,13 @@ async fn start_restore(
         })
         .await
         .map_err(ApiError::internal)??;
+        // Pin the resolved medium across validation and the asynchronous job.
+        stick_uuid = Some(
+            value["stick_uuid"]
+                .as_str()
+                .ok_or_else(|| ApiError::internal("missing worker stick UUID"))?
+                .to_owned(),
+        );
         let selections: Vec<ArchivePaths> =
             serde_json::from_value(value["selections"].clone()).map_err(ApiError::internal)?;
         (selections, config, snapshot, requester)
@@ -1259,6 +1281,12 @@ async fn start_restore(
         rand::random::<u64>()
     );
     let job = RestoreJob {
+        target: if stick {
+            crate::state::Target::Stick
+        } else {
+            crate::state::Target::Pbs
+        },
+        stick_uuid: stick_uuid.clone(),
         owner,
         id: id.clone(),
         state: "running",

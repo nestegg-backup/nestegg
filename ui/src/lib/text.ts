@@ -427,7 +427,7 @@ export function stickLine(ts: TargetStatus, t: Messages, f: Formatter, now: Date
             ? t.explain.stick_full
             : null;
   const plug =
-    view.kind === "running" || (inUse && view.plugged !== false)
+    view.kind === "running" || ((inUse || ts.in_use || Object.values(ts.sticks ?? {}).some((s) => s.in_use)) && view.plugged !== false)
       ? t.stick.keepIn
       : view.plugged === false
         ? view.kind === "overdue" || view.kind === "never"
@@ -439,4 +439,11 @@ export function stickLine(ts: TargetStatus, t: Messages, f: Formatter, now: Date
             ? t.stick.plugged
             : null;
   return { view, lead, why, plug };
+}
+
+/** Stable stick reasons are translated; unknown reasons keep the generic fallback. */
+export function stickProblemText(error: { reason: string | null } | null, t: Messages): string {
+  const reasons = t.restore.stickReasons;
+  return error?.reason && Object.hasOwn(reasons, error.reason)
+    ? reasons[error.reason as keyof typeof reasons] : t.restore.stickUnavailable;
 }
