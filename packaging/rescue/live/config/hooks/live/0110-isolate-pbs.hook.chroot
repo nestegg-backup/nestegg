@@ -1,0 +1,9 @@
+#!/bin/sh
+# The rescue wizard launches PBS privately; no server may start on the live LAN.
+set -eu
+for unit in proxmox-backup.service proxmox-backup-proxy.service proxmox-backup-banner.service proxmox-backup-daily-update.service proxmox-backup-daily-update.timer ssh.service ssh.socket sshd.service exim4.service postfix.service sendmail.service; do
+    systemctl mask --force "$unit"
+done
+# The server package adds an enterprise source during installation. This live
+# system uses only the explicitly configured no-subscription repository.
+rm -f /etc/apt/sources.list.d/pbs-enterprise.sources /etc/apt/sources.list.d/pbs-enterprise.list

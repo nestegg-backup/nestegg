@@ -33,6 +33,9 @@ What it does:
   server
 - a rescue stick (bootable ISO) that restores the whole computer onto an
   empty disk: partitions, files, boot loader ([docs/rescue.md](docs/rescue.md))
+- creating and updating BIOS/UEFI rescue media with a separate data partition,
+  preserving its contents across live-system updates; desktop backups to that
+  partition are still in development ([docs/stick.md](docs/stick.md))
 
 See [docs/roadmap.md](docs/roadmap.md), [docs/architecture.md](docs/architecture.md)
 and the [decision records](docs/decisions/).

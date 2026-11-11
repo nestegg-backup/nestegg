@@ -100,6 +100,9 @@ enum Cmd {
         #[command(subcommand)]
         command: Option<nestegg::rescue::cli::RescueCmd>,
     },
+    /// Create, update or register a bootable backup stick (root).
+    #[command(subcommand)]
+    Stick(nestegg::stick::cli::StickCmd),
     /// Show the configuration.
     Config {
         /// Print an example configuration instead.
@@ -305,6 +308,7 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
         }) => set_password(paths, allow_plain, overview),
         Cmd::Key(k) => key(paths, k),
         Cmd::Check { wake } => check(paths, wake),
+        Cmd::Stick(command) => nestegg::stick::cli::run(command, paths),
         Cmd::Rescue { command } => nestegg::rescue::cli::run(command),
         Cmd::Backup => backup_now(paths),
         Cmd::Status { json } => status(paths, json),

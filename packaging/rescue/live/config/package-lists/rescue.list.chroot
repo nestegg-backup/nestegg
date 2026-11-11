@@ -38,3 +38,5 @@ firmware-iwlwifi
 firmware-atheros
 firmware-intel-sound
 proxmox-backup-client-static
+proxmox-backup-server
+curl

@@ -1,0 +1,2 @@
+# Same pinned archive key as the official client repository.
+deb http://download.proxmox.com/debian/pbs trixie pbs-no-subscription

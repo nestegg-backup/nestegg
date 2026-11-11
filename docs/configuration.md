@@ -697,3 +697,20 @@ Because
 backups are normal PBS snapshots, they can also be restored with plain
 `proxmox-backup-client` (with the exported key) or through the PBS web UI
 (unencrypted backups only).
+
+## Registered backup sticks (preparation only)
+
+`sudo nestegg stick add /dev/sdX --image nestegg-rescue-amd64.iso` preserves
+existing settings and adds the ext4 data UUID under:
+
+```toml
+[stick]
+data_uuids = ["01234567-89ab-cdef-0123-456789abcdef"]
+```
+
+UUIDs must be distinct and have ext4 UUID syntax; unknown keys are rejected,
+including inside `[stick]`. Existing `[pbs]`-only files require no migration.
+Phase one only prepares/registers media; it does not automatically back up to
+these drives. A file with just `[stick]` is accepted by the stick commands;
+the existing backup pipeline still requires `[pbs]`. Per-target settings and
+stick-only backups arrive in phase two. See [stick preparation](stick.md).

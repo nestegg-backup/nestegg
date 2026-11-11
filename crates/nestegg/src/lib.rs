@@ -22,6 +22,7 @@ pub mod settings;
 pub mod staging;
 pub mod state;
 pub mod status;
+pub mod stick;
 pub mod ui;
 pub mod verify;
 pub mod wake;

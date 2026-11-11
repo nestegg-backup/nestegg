@@ -81,6 +81,9 @@ pub struct Config {
     #[serde(default = "default_overdue_hours")]
     pub overdue_after_hours: u32,
     pub pbs: PbsConfig,
+    /// Registered removable datastores; backup scheduling is added separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stick: Option<StickConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<WakeConfig>,
     #[serde(default)]
@@ -96,6 +99,27 @@ pub struct Config {
     /// cannot change it, because `command` runs as root.
     #[serde(default, skip_serializing_if = "NotifyConfig::is_default")]
     pub notify: NotifyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StickConfig {
+    pub data_uuids: Vec<String>,
+}
+
+impl StickConfig {
+    pub fn validate(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for uuid in &self.data_uuids {
+            if !crate::stick::valid_uuid(uuid) || !seen.insert(uuid.to_ascii_lowercase()) {
+                bail!("stick.data_uuids must contain distinct ext4 UUIDs");
+            }
+        }
+        if self.data_uuids.is_empty() {
+            bail!("stick.data_uuids must not be empty");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -352,6 +376,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(stick) = &self.stick {
+            stick.validate()?;
+        }
         if self.pbs.server.trim().is_empty() {
             bail!("pbs.server must not be empty");
         }
@@ -498,6 +525,7 @@ pub fn example(server: &str, datastore: &str, auth_id: &str) -> Config {
             auth_id: auth_id.to_string(),
             fingerprint: None,
         },
+        stick: None,
         wake: None,
         backup: BackupConfig::default(),
         schedule: ScheduleConfig::default(),
@@ -542,6 +570,30 @@ auth_id = "backup@pbs!desktop"
     fn rejects_unknown_fields() {
         let text = format!("{MINIMAL}\npassword = \"x\"\n");
         assert!(Config::parse(&text).is_err());
+    }
+
+    #[test]
+    fn stick_registration_is_optional_strict_and_validated() {
+        assert!(Config::parse(MINIMAL).unwrap().stick.is_none());
+        let good =
+            format!("{MINIMAL}\n[stick]\ndata_uuids=['01234567-89ab-cdef-0123-456789abcdef']\n");
+        assert_eq!(
+            Config::parse(&good)
+                .unwrap()
+                .stick
+                .unwrap()
+                .data_uuids
+                .len(),
+            1
+        );
+        for bad in [
+            "data_uuids=[]",
+            "data_uuids=['../disk']",
+            "data_uuids=['01234567-89ab-cdef-0123-456789abcdef','01234567-89AB-CDEF-0123-456789ABCDEF']",
+            "data_uuids=['01234567-89ab-cdef-0123-456789abcdef']\nimage='/media/stick/untrusted.squashfs'",
+        ] {
+            assert!(Config::parse(&format!("{MINIMAL}\n[stick]\n{bad}\n")).is_err());
+        }
     }
 
     #[test]
