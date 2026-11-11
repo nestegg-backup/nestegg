@@ -12,13 +12,21 @@ chmod 0700 /etc/proxmox-backup
 "$lib/proxmox-backup-api" 3>&- &
 api=$!
 trap 'kill "$api" "${proxy:-}" 2>/dev/null || true; wait || true' EXIT
+api_ready=0
 for ((i=0;i<120;i++)); do
-  [[ -s /etc/proxmox-backup/proxy.pem && -s /etc/proxmox-backup/proxy.key ]] && break
+  # The API creates its certificate BEFORE its authentication and CSRF keys.
+  # The proxy reads all of them at startup; a fixed sleep races slow hosts.
+  if [[ -s /etc/proxmox-backup/proxy.pem && -s /etc/proxmox-backup/proxy.key &&
+        -s /etc/proxmox-backup/authkey.pub && -s /etc/proxmox-backup/authkey.key &&
+        -s /etc/proxmox-backup/csrf.key ]] &&
+     { : <>/dev/tcp/127.0.0.1/82; } 2>/dev/null; then
+    api_ready=1
+    break
+  fi
   kill -0 "$api"
   sleep .5
 done
-[[ -s /etc/proxmox-backup/proxy.key ]]
-sleep 1
+[[ $api_ready == 1 ]]
 setpriv --reuid=backup --regid=backup --init-groups "$lib/proxmox-backup-proxy" 3>&- &
 proxy=$!
 proxmox-backup-manager user create nestegg@pbs
