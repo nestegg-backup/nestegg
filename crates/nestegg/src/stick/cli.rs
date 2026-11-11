@@ -16,9 +16,12 @@ pub enum StickCmd {
     /// Erase a whole disk after typing its name; make a BIOS/UEFI backup stick.
     Create {
         disk: PathBuf,
-        /// Trusted release ISO with an adjacent .sha256 file.
+        /// Root-owned local release ISO; checksum is integrity, not authenticity.
         #[arg(long)]
         image: PathBuf,
+        /// SHA-256 obtained independently (takes precedence over adjacent .sha256).
+        #[arg(long)]
+        sha256: Option<String>,
         /// Test harness only: disk is a disposable regular image file.
         #[arg(long, hide = true)]
         test_image: bool,
@@ -29,6 +32,9 @@ pub enum StickCmd {
         disk: Option<PathBuf>,
         #[arg(long)]
         image: PathBuf,
+        /// SHA-256 obtained independently (takes precedence over adjacent .sha256).
+        #[arg(long)]
+        sha256: Option<String>,
         #[arg(long, hide = true)]
         test_image: bool,
     },
@@ -43,6 +49,9 @@ pub enum StickCmd {
         disk: Option<PathBuf>,
         #[arg(long)]
         image: PathBuf,
+        /// SHA-256 obtained independently (takes precedence over adjacent .sha256).
+        #[arg(long)]
+        sha256: Option<String>,
         #[arg(long, hide = true)]
         test_image: bool,
     },
@@ -52,23 +61,26 @@ pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
     if !nix::unistd::Uid::effective().is_root() {
         bail!("stick commands need root; run sudo nestegg stick …");
     }
-    let (action, disk, image, test_image) = match command {
+    let (action, disk, image, sha256, test_image) = match command {
         StickCmd::Create {
             disk,
             image,
+            sha256,
             test_image,
-        } => ("create", Some(disk), Some(image), test_image),
+        } => ("create", Some(disk), Some(image), sha256, test_image),
         StickCmd::Update {
             disk,
             image,
+            sha256,
             test_image,
-        } => ("update", disk, Some(image), test_image),
-        StickCmd::Info { disk, test_image } => ("info", disk, None, test_image),
+        } => ("update", disk, Some(image), sha256, test_image),
+        StickCmd::Info { disk, test_image } => ("info", disk, None, None, test_image),
         StickCmd::Add {
             disk,
             image,
+            sha256,
             test_image,
-        } => ("add", disk, Some(image), test_image),
+        } => ("add", disk, Some(image), sha256, test_image),
     };
     // Serialize media operations and cache/registration updates on this desktop.
     fs::create_dir_all(&paths.runtime_dir)?;
@@ -85,6 +97,7 @@ pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
         Some(d) => d,
         None => registered_disk(paths)?,
     };
+    let _signals = media::SignalGuard::install()?;
     let owned = if test_image {
         Some(OwnedLoop::open(&disk)?)
     } else {
@@ -92,8 +105,11 @@ pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
     };
     let target = owned.as_ref().map(OwnedLoop::path).unwrap_or(&disk);
     let disk = media::inspect(target, owned.is_some())?;
-    let image = image.as_deref().map(VerifiedImage::open).transpose()?;
     let cache = paths.state_dir.join("stick");
+    let image = image
+        .as_deref()
+        .map(|p| VerifiedImage::open(p, sha256.as_deref(), &cache))
+        .transpose()?;
     if image.is_some() {
         private_dir(&cache)?;
     }
@@ -104,6 +120,7 @@ pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
     if action == "add" {
         let _ = registration_document(&paths.config_file)?;
     }
+    media::check_interrupted()?;
     let info = media::operate(action, &disk, image.as_ref(), &cache)?;
     if action == "add" {
         register(&paths.config_file, &info.data_uuid)?;

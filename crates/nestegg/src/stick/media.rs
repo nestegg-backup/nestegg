@@ -1,7 +1,7 @@
 //! Privileged media operations. Shell code is embedded in the trusted binary,
 //! never loaded from the medium. All mounts are private to the helper.
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::Read;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::{PartitionPlan, capture, digest, valid_uuid};
+use super::{PartitionPlan, capture, digest, private_dir, trusted_file, valid_sha256, valid_uuid};
 use crate::rescue::{Disk, guard};
 
 pub(super) struct VerifiedImage {
@@ -18,27 +18,46 @@ pub(super) struct VerifiedImage {
     pub size: u64,
 }
 impl VerifiedImage {
-    pub fn open(iso: &Path) -> Result<Self> {
-        let checksum = fs::read_to_string(format!("{}.sha256", iso.display())).context(
-            "release ISO needs its adjacent .sha256 file; obtain both from a trusted release",
-        )?;
-        let expected = checksum
-            .split_whitespace()
-            .next()
-            .context("empty ISO checksum")?;
-        if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+    pub fn open(iso: &Path, pinned: Option<&str>, cache: &Path) -> Result<Self> {
+        trusted_file(iso)?;
+        let expected = if let Some(pin) = pinned {
+            pin.to_owned()
+        } else {
+            let mut checksum_path = iso.as_os_str().to_os_string();
+            checksum_path.push(".sha256");
+            let checksum_path = PathBuf::from(checksum_path);
+            trusted_file(&checksum_path).context("adjacent .sha256 must be a trusted root-owned local file; alternatively supply --sha256")?;
+            let checksum = fs::read_to_string(checksum_path)?;
+            checksum
+                .split_whitespace()
+                .next()
+                .context("empty ISO checksum")?
+                .to_owned()
+        };
+        if !valid_sha256(&expected) {
             bail!("invalid ISO checksum");
         }
-        let dir = tempfile::Builder::new().prefix("nestegg-iso-").tempdir()?;
+        private_dir(cache)?;
+        super::local_storage(cache)?;
+        let dir = tempfile::Builder::new().prefix("iso-").tempdir_in(cache)?;
         let path = dir.path().join("verified.iso");
         // Verify the private copy that will be mounted, closing a source-file
         // substitution race between hashing and privileged use.
         let mut input = File::open(iso)?;
         let mut output = File::create(&path)?;
-        io::copy(&mut input, &mut output)?;
+        use std::io::Write;
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            check_interrupted()?;
+            let n = input.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            output.write_all(&buffer[..n])?;
+        }
         output.sync_all()?;
         let actual = digest(&path)?;
-        if !actual.eq_ignore_ascii_case(expected) {
+        if !actual.eq_ignore_ascii_case(&expected) {
             bail!("ISO SHA-256 mismatch; nothing on the target disk was changed");
         }
         let size = output.metadata()?.len();
@@ -168,11 +187,60 @@ pub(super) fn confirm(disk: &Disk) -> Result<()> {
         } else {
             "Disk is not empty; also type ERASE followed by the disk name"
         };
-        if crate::rescue::ask(prompt, None)? != *phrase {
+        if ask_confirmation(prompt)? != *phrase {
             bail!("confirmation did not match; nothing changed");
         }
     }
     Ok(())
+}
+
+/// Do not let stdio's read_line retry EINTR indefinitely after the early signal
+/// guard is installed. Poll stdin so Ctrl-C also unwinds the verified ISO while
+/// the user is thinking at either destructive-confirmation prompt.
+fn ask_confirmation(prompt: &str) -> Result<String> {
+    use std::io::Write;
+    let input = std::io::stdin();
+    loop {
+        check_interrupted()?;
+        eprint!("{prompt}: ");
+        std::io::stderr().flush()?;
+        let mut line = Vec::new();
+        loop {
+            check_interrupted()?;
+            let mut poll = nix::libc::pollfd {
+                fd: 0,
+                events: nix::libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid stack-allocated pollfd, with a bounded timeout.
+            let ready = unsafe { nix::libc::poll(&mut poll, 1, 100) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            if ready == 0 {
+                continue;
+            }
+            let mut byte = [0];
+            match nix::unistd::read(&input, &mut byte) {
+                Ok(0) => bail!("input closed"),
+                Ok(_) if byte[0] == b'\n' => break,
+                Ok(_) => line.push(byte[0]),
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            if line.len() > 4096 {
+                bail!("confirmation input too long");
+            }
+        }
+        let line = String::from_utf8(line)?;
+        if !line.trim().is_empty() {
+            return Ok(line.trim().to_owned());
+        }
+    }
 }
 
 fn confirmation_phrases(disk: &Disk) -> Vec<String> {
@@ -296,7 +364,7 @@ pub(super) fn operate(
             Ok(())
         });
     }
-    let _signals = SignalGuard::install()?;
+    check_interrupted()?;
     let mut child = cmd.spawn()?;
     let mut output = child.stdout.take().context("missing helper output")?;
     let status = loop {
@@ -350,13 +418,20 @@ fn lock_device(path: &str) -> Result<nix::fcntl::Flock<File>> {
     }
 }
 
+pub(super) fn check_interrupted() -> Result<()> {
+    if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        bail!("stick operation interrupted");
+    }
+    Ok(())
+}
+
 static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 extern "C" fn interrupted(_: i32) {
     INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
-struct SignalGuard(Vec<(nix::sys::signal::Signal, nix::sys::signal::SigAction)>);
+pub(super) struct SignalGuard(Vec<(nix::sys::signal::Signal, nix::sys::signal::SigAction)>);
 impl SignalGuard {
-    fn install() -> Result<Self> {
+    pub(super) fn install() -> Result<Self> {
         use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
         INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
         let action = SigAction::new(
@@ -436,7 +511,35 @@ mod tests {
     }
 
     #[test]
+    fn pinned_checksum_precedes_sidecar_and_private_copy_is_removed() {
+        if !nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let iso = d.path().join("release.iso");
+        fs::write(&iso, b"test release").unwrap();
+        let cache = d.path().join("cache");
+        let pin = digest(&iso).unwrap();
+        fs::write(d.path().join("release.iso.sha256"), "invalid").unwrap();
+        let verified = VerifiedImage::open(&iso, Some(&pin), &cache).unwrap();
+        let copy = verified.path.clone();
+        assert!(copy.starts_with(&cache));
+        assert_eq!(digest(&copy).unwrap(), pin);
+        drop(verified);
+        assert!(!copy.exists());
+        assert!(VerifiedImage::open(&iso, None, &cache).is_err());
+        fs::set_permissions(&iso, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(VerifiedImage::open(&iso, Some(&pin), &cache).is_err());
+        fs::set_permissions(&iso, fs::Permissions::from_mode(0o644)).unwrap();
+        nix::unistd::chown(&iso, Some(nix::unistd::Uid::from_raw(65534)), None).unwrap();
+        assert!(VerifiedImage::open(&iso, Some(&pin), &cache).is_err());
+    }
+    #[test]
     fn checksum_failure_precedes_disk_operations() {
+        if !nix::unistd::Uid::effective().is_root() {
+            return;
+        }
         let d = tempfile::tempdir().unwrap();
         let iso = d.path().join("bad.iso");
         fs::write(&iso, b"not a release").unwrap();
@@ -446,7 +549,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            VerifiedImage::open(&iso)
+            VerifiedImage::open(&iso, None, &d.path().join("cache"))
                 .err()
                 .unwrap()
                 .to_string()

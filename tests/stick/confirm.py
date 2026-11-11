@@ -3,11 +3,14 @@
 import os
 import re
 import select
+import signal
 import subprocess
 import sys
 import time
 
-child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+interrupt = len(sys.argv) > 1 and sys.argv[1] == "--interrupt"
+arguments = sys.argv[2:] if interrupt else sys.argv[1:]
+child = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT)
 output = b""
 confirmed = False
@@ -31,6 +34,11 @@ try:
             if not matches:
                 raise RuntimeError("refusing to confirm anything except an owned loop")
             name = matches[-1].rsplit(b"/", 1)[-1]
+            if interrupt:
+                child.send_signal(signal.SIGINT)
+                confirmed = True
+                deadline = time.monotonic() + 10
+                continue
             child.stdin.write(name + b"\n")
             child.stdin.flush()
             confirmed = True

@@ -21,3 +21,15 @@ The daemon's original mutex cannot coordinate a CLI process; both settings
 updates and registration now hold the same stable sidecar flock over the entire
 read/modify/write, including settings rollback. Never lock the replaced config
 inode itself.
+
+## Release inputs and temporary copies (review findings 6 and 8)
+
+Require regular, root-owned ISO/checksum files with protected path components,
+on fixed local storage. Reject FAT, optical filesystems, loop devices, USB and
+removable block ancestors, including non-removable-looking partitions whose
+parent is removable. A supplied `--sha256` pin takes precedence and does not
+read the adjacent checksum. A sidecar alone detects damage, not authenticity:
+an attacker able to replace both inputs can supply any privileged code.
+Copy into the root-only desktop cache, not `$TMPDIR`. Install signal handling
+before opening the owned loop or copying the ISO; interruptible copying unwinds
+the temporary directory before loop detachment. SIGKILL cannot run cleanup.
