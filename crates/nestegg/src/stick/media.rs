@@ -52,7 +52,19 @@ impl VerifiedImage {
 
 /// Reuse 0010's content classifier and live-use guard. Loop devices are accepted
 /// only inside the image-file test path, after this process allocated that loop.
-pub(super) fn inspect(path: &Path, owned_loop: bool) -> Result<Disk> {
+pub(super) struct InspectedDisk {
+    disk: Disk,
+    identity: serde_json::Value,
+    owned_loop: bool,
+}
+impl std::ops::Deref for InspectedDisk {
+    type Target = Disk;
+    fn deref(&self) -> &Disk {
+        &self.disk
+    }
+}
+
+pub(super) fn inspect(path: &Path, owned_loop: bool) -> Result<InspectedDisk> {
     let path = fs::canonicalize(path)?;
     if !fs::metadata(&path)?.file_type().is_block_device() {
         bail!("target must be a whole block disk");
@@ -63,12 +75,14 @@ pub(super) fn inspect(path: &Path, owned_loop: bool) -> Result<Disk> {
                 "-J",
                 "-b",
                 "-o",
-                "NAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,RO,MOUNTPOINTS,FSTYPE,UUID,PARTUUID,LABEL",
+                "NAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,RO,MOUNTPOINTS,FSTYPE,UUID,PARTUUID,LABEL,WWN,PTUUID,START",
             ])
             .arg(&path),
     )?;
     let mut tree: serde_json::Value = serde_json::from_str(&text)?;
     let first = &mut tree["blockdevices"][0];
+    probe_content(first)?;
+    let identity = first.clone();
     // The shared parser deliberately excludes loops from rescue target lists.
     // For a loop we own, map only its display identity through that parser;
     // the returned content and children remain the real probed values.
@@ -84,7 +98,49 @@ pub(super) fn inspect(path: &Path, owned_loop: bool) -> Result<Disk> {
         disk.path = path.to_string_lossy().into_owned();
     }
     ensure_free(&disk)?;
-    Ok(disk)
+    Ok(InspectedDisk {
+        disk,
+        identity,
+        owned_loop,
+    })
+}
+
+/// Probe signatures directly: lsblk's udev properties can change from stale to
+/// current just after attaching a partitioned loop or hotplugging a disk.
+fn probe_content(node: &mut serde_json::Value) -> Result<()> {
+    let path = node["path"].as_str().context("missing block path")?;
+    let out = Command::new("blkid")
+        .args(["-p", "-o", "export", "--"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .env("LC_ALL", "C")
+        .output()?;
+    if !out.status.success() && out.status.code() != Some(2) {
+        bail!("cannot safely probe block content");
+    }
+    let text = String::from_utf8(out.stdout)?;
+    let properties: std::collections::BTreeMap<_, _> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    for (key, property) in [
+        ("fstype", "TYPE"),
+        ("uuid", "UUID"),
+        ("partuuid", "PART_ENTRY_UUID"),
+        ("label", "LABEL"),
+        ("ptuuid", "PTUUID"),
+    ] {
+        node[key] = properties.get(property).copied().unwrap_or_default().into();
+    }
+    // Include partition count/geometry and any additional signature fields.
+    node["probe"] = serde_json::to_value(&properties)?;
+    if let Some(children) = node["children"].as_array_mut() {
+        for child in children.iter_mut() {
+            probe_content(child)?;
+        }
+        children.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    }
+    Ok(())
 }
 
 pub(super) fn ensure_free(disk: &Disk) -> Result<()> {
@@ -188,7 +244,7 @@ impl Info {
 
 pub(super) fn operate(
     action: &str,
-    disk: &Disk,
+    disk: &InspectedDisk,
     image: Option<&VerifiedImage>,
     cache: &Path,
 ) -> Result<Info> {
@@ -197,7 +253,8 @@ pub(super) fn operate(
     let _device_lock = lock_device(&disk.path)?;
     // Fail closed immediately before the helper starts, after confirmation and
     // ISO verification, including mounts/holders that appeared in the meantime.
-    ensure_free(disk)?;
+    let current = inspect(Path::new(&disk.path), disk.owned_loop)?;
+    same_identity(&disk.identity, &current.identity)?;
     let plan = image
         .map(|i| PartitionPlan::new(disk.size_bytes, i.size))
         .transpose()?;
@@ -269,6 +326,15 @@ pub(super) fn operate(
     Ok(info)
 }
 
+fn same_identity(confirmed: &serde_json::Value, current: &serde_json::Value) -> Result<()> {
+    if confirmed != current {
+        bail!(
+            "target disk identity or content changed after inspection/confirmation; nothing changed"
+        );
+    }
+    Ok(())
+}
+
 fn lock_device(path: &str) -> Result<nix::fcntl::Flock<File>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut file = File::open(path)?;
@@ -318,6 +384,20 @@ impl Drop for SignalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refuses_every_changed_disk_identity_component() {
+        let confirmed = serde_json::json!({
+            "size": 8589934592_u64, "model": "external disk", "serial": "sample",
+            "wwn": "sample-wwn", "ptuuid": "sample-table",
+            "children": [{"path":"/dev/sdx1", "size":1024, "uuid":"sample-fs"}]
+        });
+        same_identity(&confirmed, &confirmed).unwrap();
+        for field in ["size", "model", "serial", "wwn", "ptuuid", "children"] {
+            let mut changed = confirmed.clone();
+            changed[field] = serde_json::Value::Null;
+            assert!(same_identity(&confirmed, &changed).is_err(), "{field}");
+        }
+    }
     #[test]
     fn rejects_busy_target_without_running_writer() {
         let d = Disk {
