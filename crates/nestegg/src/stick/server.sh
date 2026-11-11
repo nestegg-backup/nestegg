@@ -29,6 +29,18 @@ done
 [[ $api_ready == 1 ]]
 setpriv --reuid=backup --regid=backup --init-groups "$lib/proxmox-backup-proxy" 3>&- &
 proxy=$!
+# Manager/debug maintenance talks to the HTTPS proxy. Starting it is not
+# readiness: even datastore creation can otherwise race the listening socket.
+proxy_ready=0
+for ((i=0;i<120;i++)); do
+  if curl -skf https://127.0.0.1:8007/api2/json/ping >/dev/null; then
+    proxy_ready=1
+    break
+  fi
+  kill -0 "$api" "$proxy"
+  sleep .5
+done
+[[ $proxy_ready == 1 ]]
 proxmox-backup-manager user create nestegg@pbs
 (umask 077; proxmox-backup-manager user generate-token nestegg@pbs stick > /run/token.json)
 secret=$(sed -n 's/.*"value": *"\([^"]*\)".*/\1/p' /run/token.json)

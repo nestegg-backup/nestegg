@@ -405,3 +405,59 @@ async fn legacy_history_uses_pbs_when_configured_otherwise_stick() {
         );
     }
 }
+
+#[test]
+fn monthly_verification_evidence_commits_only_with_successful_run() {
+    use nestegg::state::FullVerification;
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths(dir.path());
+    let store = Store::for_target(&paths, Target::Stick);
+    let checked_at = Utc::now() - Duration::seconds(10);
+    let mut run = finished(Target::Stick, RunState::Failed);
+    run.stick_uuid = Some(UUID.into());
+    let evidence = FullVerification {
+        checked_at,
+        succeeded: true,
+    };
+    store
+        .record_finished_with_maintenance(&run, 20, None, Some(evidence))
+        .unwrap();
+    let state = store.load_state().unwrap();
+    assert!(state.full_verified_at.is_none());
+    assert!(!state.stick_media.contains_key(UUID));
+    run.finish(RunState::Succeeded, Utc::now());
+    store
+        .record_finished_with_maintenance(&run, 20, None, Some(evidence))
+        .unwrap();
+    let state = store.load_state().unwrap();
+    assert_eq!(state.full_verified_at, Some(checked_at));
+    assert_eq!(state.stick_media[UUID].full_checked_at, Some(checked_at));
+    assert!(!state.stick_damaged);
+    let later = checked_at + Duration::seconds(1);
+    store
+        .record_finished_with_maintenance(
+            &run,
+            20,
+            None,
+            Some(FullVerification {
+                checked_at: later,
+                succeeded: false,
+            }),
+        )
+        .unwrap();
+    let state = store.load_state().unwrap();
+    assert!(state.stick_damaged);
+    assert_eq!(state.full_verified_at, Some(checked_at));
+    assert_eq!(state.stick_media[UUID].full_checked_at, Some(later));
+    assert!(!nestegg::stick::target::full_verify_due(
+        state.stick_media[UUID].full_checked_at,
+        Utc::now()
+    ));
+    run.finish(RunState::Cancelled, Utc::now());
+    store
+        .record_finished_with_maintenance(&run, 20, None, Some(evidence))
+        .unwrap();
+    let state = store.load_state().unwrap();
+    assert!(state.stick_damaged);
+    assert_eq!(state.stick_media[UUID].full_checked_at, Some(later));
+}

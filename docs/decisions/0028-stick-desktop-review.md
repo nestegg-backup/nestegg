@@ -44,3 +44,27 @@ opportunity to retry.
 
 Legacy GET and POST `/runs` describe PBS when configured, otherwise the sole
 stick target. Explicit `/targets/all/runs` remains the way to request both.
+
+## Verification, interruption and recovery of space
+
+The new snapshot is verified independently through the official
+`proxmox-backup-debug api create /admin/datastore/stick/verify` interface,
+scoped by backup type, ID and time. It authenticates against the ephemeral
+local PBS and waits for the worker; the manager CLI cannot select a snapshot.
+Inherited `PROXMOX_DEBUG_API_CODE` is removed so the caller cannot switch it
+into the direct-code mode that lacks worker initialization. See [the upstream CLI implementation](https://github.com/proxmox/proxmox-backup/blob/master/src/bin/proxmox_backup_debug/api.rs).
+
+Only the monthly pass verifies the entire datastore. Its failure reports
+`stick_damaged` and all failed snapshots in `server_verify_failed`, including
+other machines. It does not invalidate the verified new snapshot or prevent
+this machine's retention and GC. A completed monthly attempt is remembered
+separately from the most recent successful full verification, so unrelated
+damage does not repeat a complete scan on every backup. Both timestamps are
+committed with a successful final run record, after cleanup; interrupted or
+failed runs preserve the preceding evidence.
+
+Every stick failure path checks cancellation and physical presence before
+classifying a failure. Removal is `stick_not_plugged_in`, a cancellation is
+`cancelled`; neither counts towards the retry pause. Queries, group-key checks,
+pruning and verification honour cancellation. Failed uploads and `stick_full`
+may run GC alone, preserving every snapshot and the PBS atime cutoff.

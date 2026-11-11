@@ -6,6 +6,7 @@ trap 'status=$?; if (( status != 0 )); then echo "FAILED guest line $LINENO"; ca
 cp /mnt/fixture/nestegg /usr/bin/nestegg
 cp /mnt/fixture/nestegg /usr/local/bin/nestegg
 cp /mnt/fixture/nestegg-stick-pbs@.service /etc/systemd/system/
+cp /mnt/fixture/nestegg-backup.service /etc/systemd/system/
 cp /mnt/fixture/70-nestegg-stick.rules /etc/udev/rules.d/
 mkdir -p /etc/nestegg/credentials /var/lib/nestegg/stick /srv/stick-test /run/nestegg
 chmod 0700 /etc/nestegg/credentials
@@ -83,6 +84,24 @@ s=json.load(open('/var/lib/nestegg/state.json'))
 assert s['stick']['last_success']['verified']
 assert s.get('last_success') is None
 PY
+# Exercise the actual hourly unit with its shipped privilege sandbox. Age
+# only the disposable target's success so the timer performs a real backup.
+python3 - <<'PYTIMER'
+import json
+p='/var/lib/nestegg/state.json'
+s=json.load(open(p)); s['stick']['last_success']['finished_at']='2000-01-01T00:00:00Z'
+with open(p,'w') as f: json.dump(s,f)
+PYTIMER
+systemctl start nestegg-backup.service
+[[ $(systemctl show -p NoNewPrivileges --value nestegg-backup.service) == yes ]]
+python3 - <<'PYTIMER'
+import json,os
+s=json.load(open('/var/lib/nestegg/state.json'))
+r=s['stick']['last_run']
+assert r['trigger']=='timer' and r['state']=='succeeded' and r['verified'],r
+assert not os.path.exists('/var/lib/nestegg/current.json')
+PYTIMER
+printf 'VM-%s\n' TIMER-SANDBOX-PASS
 # The live overlay cannot be recreated by the bare-metal restore. Requesting
 # system mode must therefore preserve layout.json and report incomplete,
 # rather than silently claim a complete system backup.
@@ -126,4 +145,77 @@ PY
 losetup -d "$loop"
 udevadm settle
 if systemctl is-active --quiet "$unit"; then exit 1; fi
+# Unlike loop detach (which is lazy while mounted), removing this owned
+# virtual SCSI device makes the kernel revoke a disk in the middle of upload.
+disk=$(lsblk -dnpo PATH,SERIAL | awk '$2 == "nestegg-test" {print $1}')
+[[ -b $disk && $(lsblk -dnro SERIAL "$disk") == nestegg-test ]]
+printf 'label: gpt\n,,L\n' | sfdisk "$disk" >/run/scsi-partition.log 2>&1
+partprobe "$disk"; udevadm settle
+part=${disk}1
+mkfs.ext4 -q -m 0 "$part"
+uuid=$(blkid -p -s UUID -o value "$part")
+mount "$part" /run/prepare; mkdir /run/prepare/nestegg; umount /run/prepare
+sed -i -E "s/data_uuids = .*/data_uuids = [\"$uuid\"]/; s/system = true/system = false/" /etc/nestegg/config.toml
+sed -i '/system = false/a rate_limit = "64KiB"' /etc/nestegg/config.toml
+nestegg stick key-copy --uuid "$uuid" --password-fd 7 7</run/password >/run/scsi-key-copy.log 2>&1
+head -c 67108864 /dev/urandom >/srv/stick-test/random
+python3 - <<'PYUNPLUG'
+import json
+p='/var/lib/nestegg/state.json'; s=json.load(open(p))
+s['stick']['last_success']=None
+with open(p,'w') as f: json.dump(s,f)
+PYUNPLUG
+# A deliberately stubborn fixture process remains in the device-bound cgroup
+# after SIGTERM, proving systemd's final SIGKILL cleanup as well as graceful
+# run-state recording. It cannot escape this disposable VM or its unit.
+cat >>/usr/local/bin/stick-events <<'STUBBORN'
+if [ "$NESTEGG_EVENT" = stick_start ] && [ -f /run/start-stubborn ]; then
+    nohup /bin/bash -c 'trap "" TERM INT; echo $$ >/run/stubborn.pid; while :; do sleep 1; done' >/run/stubborn.log 2>&1 </dev/null &
+fi
+STUBBORN
+touch /run/start-stubborn
+unit=$(systemd-escape --template=nestegg-stick-pbs@.service "$uuid")
+mkdir -p "/etc/systemd/system/$unit.d"
+printf '[Service]\nTimeoutStopSec=10s\n' >"/etc/systemd/system/$unit.d/test.conf"
+systemctl daemon-reload
+systemctl start --no-block "$unit"
+for _ in {1..240}; do
+    if [[ -s /run/stubborn.pid && -f /var/lib/nestegg/current.json ]] && python3 - <<'PYUNPLUG'
+import json,pathlib,sys
+r=json.load(open('/var/lib/nestegg/current.json'))
+log=pathlib.Path('/var/lib/nestegg/runs')/(r['id']+'.log')
+sys.exit(0 if r['state']=='uploading' and log.exists() and 'Starting backup:' in log.read_text() else 1)
+PYUNPLUG
+    then break; fi
+    sleep .5
+done
+[[ -s /run/stubborn.pid ]]
+stubborn=$(cat /run/stubborn.pid)
+kill -0 "$stubborn"
+cp /var/lib/nestegg/current.json /run/unplug-current.json
+# This is the synthetic disk identified by its QEMU serial above, never a
+# system disk or a real device on the host.
+echo 1 >"/sys/class/block/${disk##*/}/device/delete"
+udevadm settle
+for _ in {1..120}; do
+    state=$(systemctl show -p ActiveState --value "$unit")
+    [[ $state == inactive || $state == failed ]] && break
+    sleep .5
+done
+journalctl -u "$unit" --no-pager >/run/unplug-unit.log
+[[ $(systemctl show -p Result --value "$unit") == timeout ]]
+if kill -0 "$stubborn" 2>/dev/null; then exit 1; fi
+python3 - <<'PYUNPLUG'
+import json,os
+s=json.load(open('/var/lib/nestegg/state.json'))
+r=s['stick']['last_run']; requested=json.load(open('/run/unplug-current.json'))
+assert r['id']==requested['id'],(r,requested)
+assert r['state']=='stick_not_plugged_in' and r['error']['kind']=='stick_not_plugged_in',r
+assert s['stick']['consecutive_failures']==0,s['stick']
+assert not os.path.exists('/var/lib/nestegg/current.json')
+assert not os.path.exists('/run/nestegg/run.pid')
+PYUNPLUG
+if pgrep -f '^/usr/lib/.*/proxmox-backup-(proxy|api)' >/dev/null; then exit 1; fi
+if find /run/nestegg/stick/pbs -maxdepth 1 -type d -name 'pbs-*' | grep -q .; then exit 1; fi
+printf 'VM-%s\n' UNPLUG-TERM-KILL-PASS
 printf 'VM-%s\n' HOTPLUG-PASS

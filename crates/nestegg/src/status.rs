@@ -178,6 +178,8 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
                     .is_some_and(|e| e.kind == crate::state::ErrorKind::StickFull)
                 {
                     condition = "stick_full".into();
+                } else if view.stick_damaged || !view.server_verify_failed.is_empty() {
+                    condition = "stick_damaged".into();
                 } else if matches!(crate::stick::target::attached(config, None), Ok(None)) {
                     condition = "stick_not_plugged_in".into();
                 }

@@ -437,6 +437,31 @@ impl LocalPbs {
     /// Run the official manager inside the trusted PBS root. Verification and
     /// GC are synchronous CLI tasks; a successful spawn alone is no evidence.
     pub fn maintenance(&self, args: &[&str]) -> Result<()> {
+        self.maintenance_program("/usr/sbin/proxmox-backup-manager", args)
+    }
+
+    /// The official debug CLI exposes the snapshot-scoped verify API and
+    /// waits for its worker. The manager's verify command only accepts a store.
+    pub fn verify_snapshot(&self, backup_id: &str, backup_time: i64) -> Result<()> {
+        self.maintenance_program(
+            "/usr/sbin/proxmox-backup-debug",
+            &[
+                "api",
+                "create",
+                "/admin/datastore/stick/verify",
+                "--backup-type",
+                "host",
+                "--backup-id",
+                backup_id,
+                "--backup-time",
+                &backup_time.to_string(),
+                "--ignore-verified",
+                "false",
+            ],
+        )
+    }
+
+    fn maintenance_program(&self, program: &str, args: &[&str]) -> Result<()> {
         let runtime = self.runtime.as_ref().context("PBS is stopped")?;
         let mut cmd = Command::new("nsenter");
         cmd.arg(format!("--mount=/proc/{}/ns/mnt", self.supervisor.id))
@@ -444,8 +469,12 @@ impl LocalPbs {
             .arg("--")
             .arg("chroot")
             .arg(runtime.path().join("ram/root"))
-            .arg("/usr/sbin/proxmox-backup-manager")
-            .args(args);
+            .arg(program)
+            .args(args)
+            // The official CLI authenticates against the ephemeral local
+            // server and waits for its task; never let the caller switch it
+            // into direct API-code mode (which lacks worker initialization).
+            .env_remove("PROXMOX_DEBUG_API_CODE");
         let mut log = tempfile::tempfile()?;
         let mut child = cmd
             .stdin(Stdio::null())

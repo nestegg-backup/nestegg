@@ -196,6 +196,16 @@ fn isolated_pbs_backup_restore_and_restart() {
     ])))
     .unwrap();
     assert_eq!(value.as_array().unwrap().len(), 1);
+    first.verify_snapshot("stick-test", epoch as i64).unwrap();
+    let mut list = first.client_command(&client).unwrap();
+    let verified: serde_json::Value = serde_json::from_str(&run(list.args([
+        "snapshot",
+        "list",
+        "--output-format",
+        "json",
+    ])))
+    .unwrap();
+    assert_eq!(verified[0]["verification"]["state"], "ok");
     first.stop().unwrap();
     use std::os::unix::fs::MetadataExt;
     let anchor = fs::metadata(options.data_mount.join("nestegg")).unwrap();

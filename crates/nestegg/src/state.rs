@@ -164,6 +164,9 @@ impl RunError {
     /// secret that cannot be decrypted: that becomes
     /// [`ErrorKind::CredentialsUnreadable`] with a message naming the fix.
     pub fn from_error(e: &anyhow::Error, fallback: ErrorKind) -> RunError {
+        if let Some(known) = e.downcast_ref::<RunError>() {
+            return known.clone();
+        }
         match crate::secrets::find_unreadable(e) {
             Some(unreadable) => RunError {
                 kind: ErrorKind::CredentialsUnreadable,
@@ -308,6 +311,8 @@ pub struct State {
     #[serde(default)]
     pub last_checked_at: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub stick_damaged: bool,
+    #[serde(default)]
     pub last_run: Option<Run>,
     #[serde(default)]
     pub last_success: Option<Run>,
@@ -362,9 +367,19 @@ pub struct State {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct StickMediaState {
+    #[serde(default)]
+    pub full_checked_at: Option<DateTime<Utc>>,
     pub key_digest: Option<String>,
     pub password_checked_at: Option<DateTime<Utc>>,
     pub full_verified_at: Option<DateTime<Utc>>,
+}
+
+/// Evidence held in memory until the complete stick run succeeds, including
+/// retention, GC, server teardown, flush and unmount.
+#[derive(Debug, Clone, Copy)]
+pub struct FullVerification {
+    pub checked_at: DateTime<Utc>,
+    pub succeeded: bool,
 }
 
 impl State {
@@ -402,6 +417,8 @@ pub struct TargetState {
     pub available_bytes: Option<u64>,
     #[serde(default)]
     pub last_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub stick_damaged: bool,
 }
 impl TargetState {
     fn from_state(s: &State) -> Self {
@@ -415,6 +432,7 @@ impl TargetState {
             full_verified_at: s.full_verified_at,
             available_bytes: s.available_bytes,
             last_checked_at: s.last_checked_at,
+            stick_damaged: s.stick_damaged,
         }
     }
     fn apply(&self, s: &mut State) {
@@ -427,6 +445,7 @@ impl TargetState {
         s.full_verified_at = self.full_verified_at;
         s.available_bytes = self.available_bytes;
         s.last_checked_at = self.last_checked_at;
+        s.stick_damaged = self.stick_damaged;
     }
 }
 
@@ -805,7 +824,17 @@ impl Store {
         keep: usize,
         config_stamp: Option<String>,
     ) -> Result<()> {
-        self.record_finished(run, keep)?;
+        self.record_finished_with_maintenance(run, keep, config_stamp, None)
+    }
+
+    pub fn record_finished_with_maintenance(
+        &self,
+        run: &Run,
+        keep: usize,
+        config_stamp: Option<String>,
+        full: Option<FullVerification>,
+    ) -> Result<()> {
+        self.record_finished_inner(run, keep, full)?;
         // A transient failure (server unavailable during the read-back) does
         // not pause the retries, so it does not tie the pause to the config.
         if run.state == RunState::Failed && !run.transient {
@@ -831,6 +860,15 @@ impl Store {
 
     /// Persist a finished run, update `state.json` and prune old records.
     pub fn record_finished(&self, run: &Run, keep: usize) -> Result<()> {
+        self.record_finished_inner(run, keep, None)
+    }
+
+    fn record_finished_inner(
+        &self,
+        run: &Run,
+        keep: usize,
+        full: Option<FullVerification>,
+    ) -> Result<()> {
         let dir = self.paths.runs_dir();
         fs::create_dir_all(&dir)?;
         write_json_atomic(&dir.join(format!("{}.json", run.id)), run)?;
@@ -840,6 +878,18 @@ impl Store {
             RunState::Succeeded => {
                 state.last_success = Some(run.clone());
                 state.consecutive_failures = 0;
+                if self.target == Target::Stick
+                    && let Some(full) = full
+                    && let Some(uuid) = &run.stick_uuid
+                {
+                    let medium = state.stick_media.entry(uuid.clone()).or_default();
+                    medium.full_checked_at = Some(full.checked_at);
+                    if full.succeeded {
+                        medium.full_verified_at = Some(full.checked_at);
+                        state.full_verified_at = Some(full.checked_at);
+                    }
+                    state.stick_damaged = !full.succeeded;
+                }
             }
             // A transient failure (server unavailable during the read-back,
             // decision 0015) is treated like `pbs_unreachable`: it neither

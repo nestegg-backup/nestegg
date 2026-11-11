@@ -148,6 +148,98 @@ umount "$work/data"
 # than the two complete unique generations. The manager log also states removal.
 (( after < before * 3 / 2 ))
 echo 'PASS prune policy and actual unique-chunk space reclamation after the safety cutoff'
+# A corrupt snapshot of another machine must not prevent this machine's new
+# snapshot, retention, GC, or success. Use the real client for both groups.
+mount -o nodev,nosuid,noexec "$part" "$work/data"
+find "$work/data/nestegg/store/.chunks" -type f -size +1M -printf '%P\n' | sort >"$work/chunks-before"
+umount "$work/data"
+sed -i 's/backup_id = "desktop"/backup_id = "other"/' "$NESTEGG_CONFIG"
+head -c 16777216 /dev/urandom >"$work/source/random"
+"$bin" backup --target stick >"$work/other-group.log" 2>&1
+sed -i 's/backup_id = "other"/backup_id = "desktop"/' "$NESTEGG_CONFIG"
+mount -o nodev,nosuid,noexec "$part" "$work/data"
+find "$work/data/nestegg/store/.chunks" -type f -size +1M -printf '%P\n' | sort >"$work/chunks-after"
+foreign=$(comm -13 "$work/chunks-before" "$work/chunks-after" | head -1)
+[[ -n $foreign ]]
+cp -a "$work/data/nestegg/store/.chunks/$foreign" "$work/foreign-chunk"
+python3 - "$work/data/nestegg/store/.chunks/$foreign" <<'PYDAMAGE'
+import sys
+with open(sys.argv[1],'r+b') as f:
+    f.seek(-1,2); byte=f.read(1); f.seek(-1,2); f.write(bytes([byte[0]^1]))
+PYDAMAGE
+umount "$work/data"
+python3 - "$work/state/state.json" "$uuid" <<'PYDAMAGE'
+import json,sys
+p=sys.argv[1]; s=json.load(open(p)); m=s['stick_media'][sys.argv[2]]
+m['full_checked_at']=None; m['full_verified_at']=None
+with open(p,'w') as f: json.dump(s,f)
+PYDAMAGE
+head -c 16777216 /dev/urandom >"$work/source/random"
+"$bin" backup --target stick >"$work/foreign-damaged.log" 2>&1
+python3 - "$work/state/state.json" "$uuid" <<'PYDAMAGE'
+import json,sys
+s=json.load(open(sys.argv[1])); v=s['stick']; m=s['stick_media'][sys.argv[2]]
+assert v['last_run']['state']=='succeeded' and v['last_run']['verified'],v
+assert v['stick_damaged'] and any(p.startswith('host/other/') for p in v['server_verify_failed']),v
+assert m['full_checked_at'] and not m['full_verified_at'],m
+PYDAMAGE
+"$bin" backup --target stick >"$work/foreign-no-rescan.log" 2>&1
+if grep -q 'monthly PBS verification' "$work/foreign-no-rescan.log"; then exit 1; fi
+mount -o nodev,nosuid,noexec "$part" "$work/data"
+[[ $(find "$work/data/nestegg/store/host/desktop" -mindepth 1 -maxdepth 1 -type d | wc -l) == 1 ]]
+cp -a "$work/foreign-chunk" "$work/data/nestegg/store/.chunks/$foreign"
+umount "$work/data"
+python3 - "$work/state/state.json" "$uuid" <<'PYDAMAGE'
+import json,sys
+p=sys.argv[1]; s=json.load(open(p)); s['stick_media'][sys.argv[2]]['full_checked_at']=None
+with open(p,'w') as f: json.dump(s,f)
+PYDAMAGE
+"$bin" backup --target stick >"$work/foreign-recovered.log" 2>&1
+python3 - "$work/state/state.json" <<'PYDAMAGE'
+import json,sys
+v=json.load(open(sys.argv[1]))['stick']; assert not v['stick_damaged'] and not v['server_verify_failed'],v
+PYDAMAGE
+echo 'PASS foreign snapshot damage reported without blocking success, retention or GC; monthly retry bounded'
+# Interrupt only the official upload, leaving real orphan chunks. A later
+# full-stick attempt must reclaim them with GC alone, without a success or prune.
+mount -o nodev,nosuid,noexec "$part" "$work/data"
+find "$work/data/nestegg/store/.chunks" -type f -size +1M -printf '%P\n' | sort >"$work/pre-failed-upload"
+umount "$work/data"
+cat >"$work/failing-client" <<EOF
+#!/bin/bash
+if [[ \$1 == backup ]]; then
+    "$client_bin" "\$@" &
+    pid=\$!
+    sleep 3
+    kill -KILL "\$pid" 2>/dev/null || true
+    wait "\$pid" 2>/dev/null || true
+    exit 1
+fi
+exec "$client_bin" "\$@"
+EOF
+chmod 0700 "$work/failing-client"
+head -c 67108864 /dev/urandom >"$work/source/random"
+sed -i '/system = false/a rate_limit = "4MiB"' "$NESTEGG_CONFIG"
+if NESTEGG_PBS_CLIENT="$work/failing-client" "$bin" backup --target stick >"$work/failed-upload.log" 2>&1; then exit 1; fi
+grep -q 'reclaiming orphaned chunks.*no prune' "$work/failed-upload.log"
+sed -i '/rate_limit =/d' "$NESTEGG_CONFIG"
+mount -o nodev,nosuid,noexec "$part" "$work/data"
+find "$work/data/nestegg/store/.chunks" -type f -size +1M -printf '%P\n' | sort >"$work/post-failed-upload"
+comm -13 "$work/pre-failed-upload" "$work/post-failed-upload" >"$work/orphan-chunks"
+[[ -s $work/orphan-chunks ]]
+retained=$(find "$work/data/nestegg/store/host" -name index.json.blob | wc -l)
+umount "$work/data"
+sleep 70
+sed -i 's/minimum_free_bytes = 1048576/minimum_free_bytes = 9223372036854775807/' "$NESTEGG_CONFIG"
+if "$bin" backup --target stick >"$work/full-gc.log" 2>&1; then exit 1; fi
+grep -q 'reclaiming orphaned chunks.*no prune' "$work/full-gc.log"
+mount -o nodev,nosuid,noexec "$part" "$work/data"
+[[ $(find "$work/data/nestegg/store/host" -name index.json.blob | wc -l) == "$retained" ]]
+while IFS= read -r orphan; do [[ ! -e $work/data/nestegg/store/.chunks/$orphan ]]; done <"$work/orphan-chunks"
+umount "$work/data"
+sed -i 's/minimum_free_bytes = 9223372036854775807/minimum_free_bytes = 1048576/' "$NESTEGG_CONFIG"
+"$bin" backup --target stick >"$work/after-failed-upload.log" 2>&1
+echo 'PASS orphan chunks from failed upload reclaimed by full-stick GC alone, without pruning snapshots'
 # Damage backup data without damaging ext4, proving this is PBS verification
 # failure rather than the filesystem-health gate. Restore the exact fixture
 # chunk afterwards; never invent or repair PBS data in product code.
@@ -164,7 +256,7 @@ PY
 umount "$work/data"
 python3 - "$work/state/state.json" "$uuid" <<'PY'
 import json,sys
-p=sys.argv[1]; s=json.load(open(p)); s['stick_media'][sys.argv[2]]['full_verified_at']=None
+p=sys.argv[1]; s=json.load(open(p)); s['stick_media'][sys.argv[2]]['full_verified_at']=None; s['stick_media'][sys.argv[2]]['full_checked_at']=None
 with open(p,'w') as f: json.dump(s,f)
 PY
 if "$bin" backup --target stick >"$work/pbs-damaged.log" 2>&1; then exit 1; fi
@@ -193,7 +285,8 @@ grep -q 'stick_full' "$work/full-notify.log"
 mount -o nodev,nosuid,noexec "$part" "$work/data"
 rm "$work/data/full-fixture"
 umount "$work/data"
-echo 'PASS stick full has its own state and notification'
+grep -q 'reclaiming orphaned chunks.*no prune' "$work/full.log"
+echo 'PASS stick full has its own state, notification and GC without prune'
 # Another machine with the same ID has a valid proof of its own key; it still
 # must be refused before upload/prune and must preserve the first snapshot.
 cp "$work/credentials/encryption-key" "$work/original-key"

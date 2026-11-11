@@ -661,9 +661,12 @@ impl<'a> Client<'a> {
             self.add_namespace(&mut cmd);
         }
         fds.apply(&mut cmd);
-        let output = cmd.output().context("cannot run proxmox-backup-client")?;
+        let output = run_capturing(&mut cmd, Some(std::time::Duration::from_secs(12 * 3600)))?;
+        if output.stopped != Stopped::No {
+            bail!("client query cancelled or timed out");
+        }
         if !output.status.success() {
-            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+            return Err(bounded_failure(&output.stderr));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
@@ -926,15 +929,28 @@ impl<'a> Client<'a> {
         backup_id: &str,
         timeout: std::time::Duration,
     ) -> Result<Vec<SnapshotInfo>> {
+        self.list_snapshot_scope_bounded(Some(backup_id), timeout)
+    }
+
+    pub fn list_all_snapshots_bounded(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<SnapshotInfo>> {
+        self.list_snapshot_scope_bounded(None, timeout)
+    }
+
+    fn list_snapshot_scope_bounded(
+        &self,
+        backup_id: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<SnapshotInfo>> {
         let mut fds = FdPassing::new();
         let mut cmd = self.command(&mut fds)?;
-        cmd.args([
-            "snapshot",
-            "list",
-            &format!("host/{backup_id}"),
-            "--output-format",
-            "json",
-        ]);
+        cmd.args(["snapshot", "list"]);
+        if let Some(id) = backup_id {
+            cmd.arg(format!("host/{id}"));
+        }
+        cmd.args(["--output-format", "json"]);
         self.add_namespace(&mut cmd);
         fds.apply(&mut cmd);
         let cap = run_capturing(&mut cmd, Some(timeout))?;

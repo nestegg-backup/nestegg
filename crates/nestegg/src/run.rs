@@ -347,6 +347,8 @@ struct Reporter<'a> {
     log: File,
     /// Written by the daemon before it cancels the run: who asked.
     cancel_note: PathBuf,
+    full_verification: Option<crate::state::FullVerification>,
+    reclaim_after_failure: bool,
 }
 
 /// File in which the daemon records who cancelled run `run_id`.
@@ -400,7 +402,7 @@ impl Reporter<'_> {
 
     /// Finish as cancelled if a cancel was requested. Returns true then.
     fn cancelled(&mut self) -> bool {
-        if crate::cancel::requested() && !self.run.state.is_finished() {
+        if !self.run.state.is_finished() && (crate::cancel::requested() || self.stick_missing()) {
             self.fail(
                 RunState::Cancelled,
                 RunError {
@@ -413,7 +415,26 @@ impl Reporter<'_> {
         false
     }
 
-    fn fail(&mut self, state: RunState, mut error: RunError) {
+    fn stick_missing(&self) -> bool {
+        self.run.target == Target::Stick
+            && self
+                .run
+                .stick_uuid
+                .as_deref()
+                .is_some_and(|uuid| !crate::stick::target::present(uuid))
+    }
+
+    fn fail(&mut self, state: RunState, error: RunError) {
+        let (state, mut error) = if self.run.target == Target::Stick {
+            stick_failure(
+                state,
+                error,
+                self.stick_missing(),
+                crate::cancel::requested(),
+            )
+        } else {
+            (state, error)
+        };
         if error.kind == ErrorKind::Cancelled
             && let Some(who) = read_cancel_note(&self.cancel_note)
         {
@@ -422,6 +443,33 @@ impl Reporter<'_> {
         self.line(&format!("error: {}", error.message));
         self.run.error = Some(error);
         self.run.finish(state, Utc::now());
+    }
+}
+
+fn stick_failure(
+    state: RunState,
+    error: RunError,
+    missing: bool,
+    cancelled: bool,
+) -> (RunState, RunError) {
+    if missing || error.kind == ErrorKind::StickNotPluggedIn {
+        (
+            RunState::StickNotPluggedIn,
+            crate::stick::target::error(
+                ErrorKind::StickNotPluggedIn,
+                format!("stick not plugged in; {}", error.message),
+            ),
+        )
+    } else if cancelled {
+        (
+            RunState::Cancelled,
+            crate::stick::target::error(
+                ErrorKind::Cancelled,
+                format!("the stick backup was cancelled; {}", error.message),
+            ),
+        )
+    } else {
+        (state, error)
     }
 }
 
@@ -583,6 +631,8 @@ fn execute_target(
         run,
         log,
         cancel_note: cancel_note.clone(),
+        full_verification: None,
+        reclaim_after_failure: false,
     };
     rep.phase(
         RunState::Starting,
@@ -627,21 +677,20 @@ fn execute_target(
         );
     }
     if target == Target::Stick
-        && rep.run.state != RunState::Succeeded
-        && let Some(uuid) = &rep.run.stick_uuid
+        && rep.run.state == RunState::Succeeded
+        && (crate::cancel::requested() || rep.stick_missing())
     {
-        let mut state = store.load_state()?;
-        state
-            .stick_media
-            .entry(uuid.clone())
-            .or_default()
-            .full_verified_at = None;
-        state.full_verified_at = None;
-        store.save_state(&state)?;
+        rep.fail(
+            RunState::Cancelled,
+            crate::stick::target::error(
+                ErrorKind::Cancelled,
+                "interrupted before completing stick cleanup",
+            ),
+        );
     }
     let final_state = rep.run.state;
     rep.line(&format!("run finished: {:?}", final_state));
-    store.record_finished_with_config(&rep.run, keep, config_stamp)?;
+    store.record_finished_with_maintenance(&rep.run, keep, config_stamp, rep.full_verification)?;
     // The run is finished and recorded. Tidying up must not turn its result
     // into an error: if `current.json` cannot be removed now (its lock is
     // held past the time limit), it is left behind, counts as stale after a
@@ -802,6 +851,27 @@ fn stick_pipeline(
         rep.warn(format!("stick start notification failed: {e:#}"));
     }
     let result = pipeline(paths, config, rep, Some(session.pbs()));
+    if rep.reclaim_after_failure
+        && rep.run.state == RunState::Failed
+        && !crate::cancel::requested()
+        && !rep.stick_missing()
+    {
+        // Failed uploads can leave unreferenced chunks. GC alone may reclaim
+        // them after PBS's atime cutoff; never prune as a response to failure.
+        rep.line("reclaiming orphaned chunks after failed upload/full stick (no prune)");
+        if let Err(e) = session
+            .pbs()
+            .maintenance(&["garbage-collection", "start", "stick"])
+        {
+            rep.warn(format!("garbage collection after failure failed: {e:#}"));
+            if crate::cancel::requested() || rep.stick_missing() {
+                rep.fail(
+                    RunState::Failed,
+                    RunError::from_error(&e, ErrorKind::Internal),
+                );
+            }
+        }
+    }
     // Safe-to-unplug means server stopped, writes flushed and filesystem
     // unmounted. Never emit it merely because the upload finished.
     session.close()?;
@@ -1191,6 +1261,7 @@ fn pipeline(
                         .context("missing stick configuration")?
                         .minimum_free_bytes
                 {
+                    rep.reclaim_after_failure = true;
                     rep.fail(RunState::Failed, crate::stick::target::error(ErrorKind::StickFull, "stick full: insufficient space available to the PBS user; retention policy was kept"));
                     return Ok(());
                 }
@@ -1205,6 +1276,7 @@ fn pipeline(
         }
     }
     let mut log = rep.log.try_clone().context("cannot duplicate log handle")?;
+    rep.reclaim_after_failure = local.is_some();
     let outcome = client.backup(&spec, &mut log, &mut |stats| {
         // Live progress for the dashboard after each finished archive.
         rep.run.processed_bytes =
@@ -1231,6 +1303,7 @@ fn pipeline(
             return Ok(());
         }
     };
+    rep.reclaim_after_failure = false;
     rep.run.snapshot = Some(snapshot.clone());
     rep.run.archives = archives
         .iter()
@@ -1341,33 +1414,36 @@ fn pipeline(
             return Ok(());
         }
     }
-    // Verified: a cancel request that arrives now comes too late.
+    // Remote backups are complete after read-back. Stick backups still need
+    // server verification and maintenance, all of which remain cancellable.
     record_server_verification(rep, &client, &backup_id);
 
     if let Some(pbs) = local {
+        if rep.cancelled() {
+            return Ok(());
+        }
         let uuid = rep.run.stick_uuid.clone().context("stick UUID missing")?;
-        let mut state = rep.store.load_state()?;
+        let state = rep.store.load_state()?;
         let full_due = crate::stick::target::full_verify_due(
             state
                 .stick_media
                 .get(&uuid)
-                .and_then(|m| m.full_verified_at),
+                .and_then(|m| m.full_checked_at.or(m.full_verified_at)),
             Utc::now(),
         );
-        rep.phase(RunState::Finishing, "verifying stick snapshots with PBS");
-        // A normal pass verifies all unverified snapshots (including the new
-        // one). Once a month force a pass over the entire physical datastore.
-        if let Err(e) = pbs.maintenance(&[
-            "verify",
-            "stick",
-            "--ignore-verified",
-            if full_due { "false" } else { "true" },
-        ]) {
+        rep.phase(
+            RunState::Finishing,
+            "verifying the new stick snapshot with PBS",
+        );
+        if let Err(e) = pbs.verify_snapshot(&backup_id, backup_time) {
             record_server_verification(rep, &client, &backup_id);
             rep.fail(
                 RunState::Failed,
                 RunError::from_error(&e, ErrorKind::VerificationFailed),
             );
+            return Ok(());
+        }
+        if rep.cancelled() {
             return Ok(());
         }
         record_server_verification(rep, &client, &backup_id);
@@ -1386,19 +1462,33 @@ fn pipeline(
             );
             return Ok(());
         }
-        state = rep.store.load_state()?;
         if full_due {
-            let at = Utc::now();
-            state.full_verified_at = Some(at);
-            state.stick_media.entry(uuid).or_default().full_verified_at = Some(at);
-            rep.store.save_state(&state)?;
+            rep.phase(
+                RunState::Finishing,
+                "monthly PBS verification of the complete stick",
+            );
+            let checked = pbs.maintenance(&["verify", "stick", "--ignore-verified", "false"]);
+            if rep.cancelled() {
+                return Ok(());
+            }
+            rep.full_verification = Some(crate::state::FullVerification {
+                checked_at: Utc::now(),
+                succeeded: checked.is_ok(),
+            });
+            if let Err(e) = checked {
+                rep.warn(format!("stick damaged: monthly datastore verification failed; the new snapshot is verified and this machine's retention continues: {e:#}"));
+            }
+            record_server_verification(rep, &client, &backup_id);
         }
         rep.phase(
             RunState::Finishing,
             "applying stick retention and garbage collection",
         );
-        // Prove ownership again immediately before any destructive maintenance.
+        // Prove ownership again immediately before destructive maintenance.
         client.check_group_key(&backup_id)?;
+        if rep.cancelled() {
+            return Ok(());
+        }
         client.prune_stick(
             &backup_id,
             &config
@@ -1407,7 +1497,14 @@ fn pipeline(
                 .context("missing stick configuration")?
                 .retention,
         )?;
+        if rep.cancelled() {
+            return Ok(());
+        }
         pbs.maintenance(&["garbage-collection", "start", "stick"])?;
+        if rep.cancelled() {
+            return Ok(());
+        }
+        record_server_verification(rep, &client, &backup_id);
     }
 
     // 7. Notes on the snapshot, readable by the read-only overview.
@@ -1418,6 +1515,9 @@ fn pipeline(
         client.set_notes_bounded(&snapshot, &notes, crate::client::readback_list_timeout())
     {
         rep.warn(format!("could not write snapshot notes: {e:#}"));
+    }
+    if local.is_some() && rep.cancelled() {
+        return Ok(());
     }
     rep.run.finish(RunState::Succeeded, Utc::now());
     Ok(())
@@ -1497,16 +1597,19 @@ fn note_readback(rep: &mut Reporter<'_>, outcome: &crate::verify::Outcome) -> u3
 /// Store the snapshots of this machine that the server's own verification
 /// marked as failed (`State::server_verify_failed`).
 fn record_server_verification(rep: &mut Reporter<'_>, client: &Client, backup_id: &str) {
-    let failed =
-        match client.list_snapshots_bounded(backup_id, crate::client::readback_list_timeout()) {
-            Ok(list) => crate::verify::failed_snapshots(&list),
-            Err(e) => {
-                rep.warn(format!(
-                    "could not read the server's verification state: {e:#}"
-                ));
-                return;
-            }
-        };
+    let failed = match if rep.run.target == Target::Stick {
+        client.list_all_snapshots_bounded(crate::client::readback_list_timeout())
+    } else {
+        client.list_snapshots_bounded(backup_id, crate::client::readback_list_timeout())
+    } {
+        Ok(list) => crate::verify::failed_snapshots(&list),
+        Err(e) => {
+            rep.warn(format!(
+                "could not read the server's verification state: {e:#}"
+            ));
+            return;
+        }
+    };
     if !failed.is_empty() {
         rep.line(&format!(
             "the server's verification marked {} snapshot(s) as failed: {}",
@@ -1625,6 +1728,39 @@ pub fn parse_report(notes: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_stick_step_preserves_cancellation_and_device_loss() {
+        for (step, fallback) in [
+            ("new snapshot verify", ErrorKind::VerificationFailed),
+            ("monthly verify", ErrorKind::VerificationFailed),
+            ("prune", ErrorKind::Internal),
+            ("GC", ErrorKind::Internal),
+            ("group key", ErrorKind::KeyMismatch),
+            ("PBS startup", ErrorKind::Internal),
+            ("flush/unmount", ErrorKind::Internal),
+        ] {
+            let error = crate::stick::target::error(fallback, step);
+            assert_eq!(
+                stick_failure(RunState::Failed, error.clone(), false, false),
+                (RunState::Failed, error.clone())
+            );
+            let (state, cancelled) = stick_failure(RunState::Failed, error.clone(), false, true);
+            assert_eq!(
+                (state, cancelled.kind),
+                (RunState::Cancelled, ErrorKind::Cancelled),
+                "{step}"
+            );
+            for cancel in [false, true] {
+                let (state, missing) = stick_failure(RunState::Failed, error.clone(), true, cancel);
+                assert_eq!(
+                    (state, missing.kind),
+                    (RunState::StickNotPluggedIn, ErrorKind::StickNotPluggedIn),
+                    "{step}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn plug_respects_due_time_but_bypasses_failure_pause() {

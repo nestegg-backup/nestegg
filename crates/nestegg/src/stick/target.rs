@@ -60,6 +60,10 @@ pub fn attached(config: &Config, requested: Option<&str>) -> Result<Option<Strin
     Ok(first.map(|v| v.to_ascii_lowercase()))
 }
 
+pub fn present(uuid: &str) -> bool {
+    super::valid_uuid(uuid) && device(uuid).exists()
+}
+
 fn device(uuid: &str) -> PathBuf {
     PathBuf::from(format!("/dev/disk/by-uuid/{}", uuid.to_ascii_lowercase()))
 }

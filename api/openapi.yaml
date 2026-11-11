@@ -540,7 +540,7 @@ components:
         state:
           type: string
           description: Availability or target-specific state alongside independently computed health.
-          enum: [ok, running, overdue, failing, incomplete, never, unconfigured, stick_full, stick_not_plugged_in]
+          enum: [ok, running, overdue, failing, incomplete, never, unconfigured, stick_full, stick_not_plugged_in, stick_damaged]
         last_run:
           oneOf: [{ $ref: "#/components/schemas/Run" }, { type: "null" }]
         last_success:

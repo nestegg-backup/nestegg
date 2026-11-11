@@ -34,20 +34,24 @@ cp "$image" "$work/share/pbs.squashfs"
 cp "$client" "$work/share/client"
 cp "$here/hotplug-vm.sh" "$work/share/"
 cp "$here/../../packaging/systemd/nestegg-stick-pbs@.service" "$work/share/"
+cp "$here/../../packaging/systemd/nestegg-backup.service" "$work/share/"
 cp "$here/../../packaging/udev/70-nestegg-stick.rules" "$work/share/"
 cat >"$work/steps" <<'STEPS'
 expect root@.*# 240
 send mkdir -p /mnt/fixture; mount -t 9p -o trans=virtio,ro fixture /mnt/fixture; touch /run/nestegg-disposable-vm; bash -x /mnt/fixture/hotplug-vm.sh >/run/hotplug.log 2>&1; result=$?; cat /run/hotplug.log; printf 'VM-FINISHED-%s\n' "$result"
-expect VM-FINISHED-[0-9] 300
+expect VM-FINISHED-[0-9] 600
 send poweroff -f
 STEPS
+truncate -s 3G "$work/hotplug.raw"
 qemu-system-x86_64 -enable-kvm -cpu host -m 4096 -smp 2 -display none -monitor none -nic none \
     -kernel "$work/kernel" -initrd "$work/initrd" \
     -append 'boot=live components hostname=desktop.example.com locales=en_US.UTF-8 console=ttyS0,115200n8' \
+    -device virtio-scsi-pci,id=scsi0 -drive "file=$work/hotplug.raw,format=raw,if=none,id=hotstick" \
+    -device scsi-hd,drive=hotstick,bus=scsi0.0,serial=nestegg-test \
     -cdrom "$iso" -virtfs "local,path=$work/share,mount_tag=fixture,security_model=none,readonly=on" \
     -serial "unix:$work/console.sock,server=on,wait=on" >"$work/qemu.log" 2>&1 &
 pid=$!
-timeout 600 python3 "$here/../rescue/console.py" "$work/console.sock" "$work/console.log" "$work/steps"
+timeout 900 python3 "$here/../rescue/console.py" "$work/console.sock" "$work/console.log" "$work/steps"
 wait "$pid"; pid=
 grep -q 'VM-FINISHED-0' "$work/console.log"
 grep -q 'VM-HOTPLUG-PASS' "$work/console.log"
