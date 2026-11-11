@@ -98,6 +98,9 @@ export type Flavor = "full" | "today";
  * - `long_overdue`: an administrator set "overdue after" to 744 hours in the file: above the API's
  *   limit of 168, so the settings page can only lower it (`limits` reports 744 as the maximum)
  * - `stick_password`: the stick's key copy is due for its password re-check (`password_reminder`)
+ * - `stick_pulled`: the stick is pulled out (also at runtime: `POST /__mock/fault?stick_pulled=1|0`);
+ *   stick requests answer 503 `stick_unavailable` and a running restore from it fails
+ * - `stick_busy`: opening the stick fails although it is plugged in (503 `stick_unavailable`)
  */
 export const FAULTS = [
   "down",
@@ -117,6 +120,8 @@ export const FAULTS = [
   "unknown_stored",
   "long_overdue",
   "stick_password",
+  "stick_pulled",
+  "stick_busy",
 ] as const;
 export type Fault = (typeof FAULTS)[number];
 
@@ -181,6 +186,8 @@ interface RestoreJob {
   restore: Restore;
   startedMs: number;
   totalBytes: number;
+  /** From the stick: no progress until the end, and it fails when the stick is pulled out. */
+  stick?: boolean;
 }
 
 const fmtClock = (ms: number) => new Date(ms).toTimeString().slice(0, 8);
@@ -736,7 +743,7 @@ export class World {
 
   /** How a run to the stick ends in this scenario. */
   private stickOutcome(): ActiveRun["outcome"] {
-    if (!this.stick?.plugged) return "absent";
+    if (!this.stickIn()) return "absent";
     return this.scenario === "stick_full" ? "stick_full" : "succeeded";
   }
 
@@ -766,11 +773,45 @@ export class World {
     return null;
   }
 
+  /** A registered stick is plugged in right now. */
+  stickIn(): boolean {
+    return !!this.stick?.plugged && !this.faults.has("stick_pulled");
+  }
+
+  /** Snapshots on the stick, made by its successful runs (`GET /snapshots?target=stick`). */
+  stickSnapshots(): Snapshot[] {
+    return (this.stick?.runs ?? [])
+      .filter((r) => r.state === "succeeded" && r.snapshot)
+      .map((r) => ({
+        time: r.started_at,
+        snapshot: r.snapshot!,
+        size_bytes: 412 * GB,
+        archives: [...ARCHIVES.map((a) => `${a.name}.didx`), "inventory.pxar.didx", "index.json.blob"],
+        encrypted: true,
+        verified: this.stick!.damagedPaths.includes(r.snapshot!) ? "failed" : "ok",
+        protected: false,
+        comment: null,
+      }));
+  }
+
   /** Advance the simulated run to the current time. */
   tick(now = Date.now()) {
     for (const job of this.restores.values()) {
       if (job.restore.state !== "running") continue;
       const el = now - job.startedMs;
+      if (job.stick) {
+        // Like the stick worker: the bytes are reported once everything is copied.
+        if (!this.stickIn()) {
+          job.restore.state = "failed";
+          job.restore.finished_at = iso(now);
+          job.restore.error = "reading the stick failed: the device disappeared (stick removed?); nothing was moved into the target folder";
+        } else if (el > 8_000) {
+          job.restore.state = "succeeded";
+          job.restore.finished_at = iso(now);
+          job.restore.restored_bytes = Math.round(job.totalBytes);
+        }
+        continue;
+      }
       job.restore.restored_bytes = Math.round(Math.min(1, el / 4_000) * job.totalBytes);
       if (el > 4_000) {
         job.restore.state = "succeeded";
@@ -947,7 +988,7 @@ export class World {
         ? health
         : last?.state === "failed" && last.error?.kind === "stick_full"
           ? "stick_full"
-          : !st.plugged
+          : !this.stickIn()
             ? "stick_not_plugged_in"
             : health;
       out.stick = {
@@ -964,7 +1005,7 @@ export class World {
         server_verify_failed: [...st.damagedPaths],
         password_reminder: this.faults.has("stick_password"),
         password_reminders: this.faults.has("stick_password") ? { [STICK_UUID]: "password_check_due" } : {},
-        plugged_in: st.plugged,
+        plugged_in: this.stickIn(),
         total_bytes: 256e9,
         space_checked_at: last?.started_at ?? null,
       };
@@ -1389,6 +1430,47 @@ export class World {
       checks.push(item("backup timer enabled", this.timerOn() ? "passed" : "failed", "nestegg-backup.timer"));
       const body: PbsCheckResult = { checked_at: checkedAt, checks };
       return { status: 200, body, delayMs };
+    }
+    // Restoring from the stick (`target=stick`). A daemon from before that (`today`) ignores the parameter.
+    const fromStick = query.get("target") === "stick" || (body as Partial<RestoreRequest> | null)?.target === "stick";
+    if (fromStick && !today && (route === "GET /snapshots" || route === "POST /restores" || /^GET \/snapshots\/[^/]+\/browse$/.test(route))) {
+      const slow = (r: Reply, ms: number): Reply => ({ ...r, delayMs: ms });
+      if (!this.configured) return notConfigured();
+      if (!this.stick) return err(503, "stick_unavailable", "no stick target is configured");
+      if (!this.stickIn()) return slow(err(503, "stick_unavailable", "registered stick not plugged in"), 600);
+      if (this.faults.has("stick_busy")) return slow(err(503, "stick_unavailable", "e2fsck -f -n on the stick's data partition did not finish: device or resource busy"), 1_500);
+      if (this.active || [...this.restores.values()].some((j) => j.restore.state === "running"))
+        return err(503, "stick_unavailable", "a backup or stick restore is running");
+      const list = this.stickSnapshots();
+      if (route === "GET /snapshots") return slow({ status: 200, body: { snapshots: list } }, 1_800);
+      if (method === "GET") {
+        const time = decodeURIComponent(/^\/snapshots\/([^/]+)\/browse$/.exec(path)![1]!);
+        if (!list.some((s) => s.time === time)) return err(503, "stick_unavailable", `snapshot ${time} not found on this stick`);
+        const entries = browseTree(query.get("archive") ?? "", query.get("path") ?? "/");
+        if (!entries) return err(404, "not_found", "no such directory");
+        return slow({ status: 200, body: { entries } }, 700);
+      }
+      const req = body as Partial<RestoreRequest>;
+      const many = Array.isArray(req.archives) && req.archives.length > 0;
+      if (!req.snapshot_time || !req.target_dir || (!many && (!req.archive || !Array.isArray(req.paths))))
+        return err(400, "bad_request", "snapshot_time, archive (or archives), paths and target_dir are required");
+      if (!list.some((s) => s.time === req.snapshot_time)) return err(503, "stick_unavailable", `snapshot ${req.snapshot_time} not found on this stick`);
+      if (EXISTING_TARGETS.includes(req.target_dir.replace(/\/$/, "")))
+        return err(409, "target_exists", `target directory ${req.target_dir} already exists`);
+      const id = `restore-${this.restores.size + 1}`;
+      const restore: Restore = {
+        id,
+        state: "running",
+        target_dir: req.target_dir,
+        started_at: iso(now),
+        finished_at: null,
+        error: null,
+        restored_bytes: 0,
+        total_bytes: null,
+        warnings: [],
+      };
+      this.restores.set(id, { restore, startedMs: now, totalBytes: (many ? req.archives!.length : 1) * 1.7 * GB, stick: true });
+      return slow({ status: 202, body: restore }, 1_500);
     }
     if (route === "GET /snapshots") {
       if (!this.configured) return notConfigured();

@@ -592,8 +592,6 @@ const en = {
     uuidInvalid: "That does not look like a UUID (8-4-4-4-12 characters from 0–9 and a–f).",
     fillUuid: "Enter the UUID of the stick first.",
     noServer: "This computer backs up to a backup stick only. No backup server is set up.",
-    restoreMissing: "This interface cannot restore files from the stick yet.",
-    factRestore: "Restore",
     factBackupId: "Name of the backups",
     verifiedYes: "Read back from the stick and checked after writing",
     colWritten: "Written",
@@ -804,6 +802,29 @@ const en = {
     backTo: (name: string) => `Back to ${name}`,
     tryAgain: "Back to the target folder",
     startFailed: (msg: string) => `The restore could not be started. ${msg}`,
+    // Restoring from the backup stick (the source is chosen only when there is a server as well).
+    sourceTitle: "Restore from",
+    stickIn: "plugged in",
+    stickOut: "not plugged in",
+    loadingStick: "Opening the stick and reading its backups. This takes a moment …",
+    noSnapshotsStick: "This stick has no backup of this computer yet.",
+    stickAbsent: "The backup stick is not plugged in. Plug it in and nestegg shows its backups here.",
+    stickUnavailable: "The backup stick could not be opened. Is it plugged in? Then try again.",
+    stickNotSupported: "This version of nestegg cannot restore files from the stick yet. Update nestegg.",
+    stickGoneBrowse:
+      "The backup stick is no longer plugged in. Plug it in again and the folders can be opened again. What you have selected stays selected.",
+    stickFailedBrowse: "The backup stick could not be read just now. Is it still plugged in? Then open the folder again.",
+    damagedSnapshotStick:
+      "This backup is marked as damaged on the stick. Files from it may not be restorable completely. Better pick another one.",
+    damagedAllStick:
+      "All backups are marked as damaged on the stick, this one too. Files from it may not be restorable completely. You can try anyway.",
+    sumSource: "Source",
+    startNeedsStick: "Plug in the backup stick to bring the files back.",
+    startStick: (msg: string) => `The backup stick could not be opened, nothing was restored. Is it plugged in? ${msg}`,
+    runningStick: "Bringing the files back from the stick.",
+    runningStickText:
+      "Keep the stick plugged in until this page says “Done”. The stick only reports how much was restored at the end.",
+    failedStickGone: "The backup stick is no longer plugged in.",
   },
 } satisfies Messages;
 

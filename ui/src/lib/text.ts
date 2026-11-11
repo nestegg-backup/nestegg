@@ -386,9 +386,13 @@ const STICK_LEAD: Record<Exclude<StickKind, "ok" | "incomplete" | "overdue" | "f
   never: (t) => t.stick.never,
 };
 
-/** What the stick row says about the stick target. */
-export function stickLine(ts: TargetStatus, t: Messages, f: Formatter, now: Date): StickLine {
-  const view = stickView(ts);
+/**
+ * What the stick row says about the stick target. `inUse`: this page is restoring files from the
+ * stick; the status does not know that, so it must not say the stick can be unplugged.
+ */
+export function stickLine(ts: TargetStatus, t: Messages, f: Formatter, now: Date, inUse = false): StickLine {
+  const seen = stickView(ts);
+  const view = inUse ? { ...seen, safeToUnplug: false } : seen;
   const m = (iso: string) => f.moment(iso, now);
   const last = ts.last_run ?? null;
   const success = ts.last_success ?? null;
@@ -423,7 +427,7 @@ export function stickLine(ts: TargetStatus, t: Messages, f: Formatter, now: Date
             ? t.explain.stick_full
             : null;
   const plug =
-    view.kind === "running"
+    view.kind === "running" || (inUse && view.plugged !== false)
       ? t.stick.keepIn
       : view.plugged === false
         ? view.kind === "overdue" || view.kind === "never"

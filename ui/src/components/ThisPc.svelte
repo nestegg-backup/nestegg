@@ -71,9 +71,10 @@
     summary.kind !== "unconfigured" && summary.kind !== "key_missing" && summary.kind !== "running" && (!onlyStick || stickReady),
   );
   // Based on the snapshots on the server, not on the local history (empty after a reinstall).
-  // Without a server there is nothing to restore through this page (no API for the stick yet).
   const offer = $derived(pbs ? restoreOffer(summary.kind, app.snapshots) : "none");
-  const canRestore = $derived(offer === "show");
+  // With a stick the flow offers it as a source as well; what it holds is only known once it is
+  // plugged in and opened, so the entry stays (the flow says when the stick is missing or empty).
+  const canRestore = $derived(offer === "show" || (!!stick && summary.kind !== "unconfigured"));
   const startError = $derived(onlyStick ? app.stickStartError : app.startError);
   const sources = $derived((app.config.value?.sources ?? []).filter((s) => s.archive !== "inventory.pxar"));
   const latest = $derived(app.snapshots.state === "ok" ? (app.snapshots.list[0] ?? null) : null);
@@ -227,10 +228,6 @@
             {sources.map((s) => s.path).join(", ")} {t.self.factSourcesExtra}
           {/if}
         </dd>
-        {#if !pbs}
-          <dt>{t.stick.factRestore}</dt>
-          <dd class="muted">{t.stick.restoreMissing}</dd>
-        {/if}
         {#if pbs && app.snapshots.state !== "idle"}
           <dt>{t.self.factOnServer}</dt>
           <dd>

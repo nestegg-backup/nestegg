@@ -29,6 +29,7 @@ export type FailureKind =
   | "not_found" // 404
   | "conflict" // 409
   | "pbs_unreachable" // 503
+  | "stick_unavailable" // 503 `stick_unavailable`: the stick could not be opened (not plugged in, busy, unreadable)
   | "bad_request" // 400
   | "other";
 
@@ -46,6 +47,7 @@ export class ApiFailure extends Error {
 function kindOf(status: number, code: string | null): FailureKind {
   if (status === 401) return "unauthorized";
   if (status === 501 || code === "not_implemented") return "not_implemented";
+  if (code === "stick_unavailable") return "stick_unavailable";
   if (status === 503 || code === "pbs_unreachable") return "pbs_unreachable";
   if (status === 502) return "daemon";
   if (status === 404) return "not_found";
@@ -87,6 +89,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 const q = (s: string) => encodeURIComponent(s);
+/** The server is the default target: requests for it stay as older daemons know them. */
+const sourceQuery = (source: Target, sep: "?" | "&") => (source === "stick" ? `${sep}target=stick` : "");
 
 export const api = {
   health: () => request<HealthInfo>("health"),
@@ -107,11 +111,13 @@ export const api = {
   pbs: () => request<PbsInfo>("pbs"),
   /** Runs the checks of `nestegg check`; without `wake` a sleeping PBS is reported as not checked; with `wake` it is woken first (can take minutes). */
   checkPbs: (wake: boolean) => request<PbsCheckResult>(`pbs/check${wake ? "?wake=true" : ""}`, { method: "POST" }),
-  snapshots: () => request<{ snapshots: Snapshot[] }>("snapshots").then((r) => r.snapshots),
-  browse: (time: string, archive: string, path: string) =>
-    request<{ entries: DirEntry[] }>(`snapshots/${q(time)}/browse?archive=${q(archive)}&path=${q(path)}`).then(
-      (r) => r.entries,
-    ),
+  /** Snapshots on the server, or with `stick` on the plugged-in stick (503 `stick_unavailable` when it cannot be opened). */
+  snapshots: (source: Target = "pbs") =>
+    request<{ snapshots: Snapshot[] }>(`snapshots${sourceQuery(source, "?")}`).then((r) => r.snapshots),
+  browse: (time: string, archive: string, path: string, source: Target = "pbs") =>
+    request<{ entries: DirEntry[] }>(
+      `snapshots/${q(time)}/browse?archive=${q(archive)}&path=${q(path)}${sourceQuery(source, "&")}`,
+    ).then((r) => r.entries),
   startRestore: (body: RestoreRequest) =>
     request<Restore>("restores", { method: "POST", body: JSON.stringify(body) }),
   restore: (id: string) => request<Restore>(`restores/${q(id)}`),

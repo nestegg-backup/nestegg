@@ -595,8 +595,6 @@ const de = {
     uuidInvalid: "Das sieht nicht wie eine UUID aus (8-4-4-4-12 Zeichen aus 0–9 und a–f).",
     fillUuid: "Erst die UUID des Sticks eintragen.",
     noServer: "Dieser PC sichert nur auf einen Backup-Stick. Ein Backup-Server ist nicht eingerichtet.",
-    restoreMissing: "Dateien vom Stick wiederherstellen kann diese Oberfläche noch nicht.",
-    factRestore: "Wiederherstellen",
     factBackupId: "Name der Sicherungen",
     verifiedYes: "Nach dem Schreiben vom Stick zurückgelesen und geprüft",
     colWritten: "Geschrieben",
@@ -811,6 +809,29 @@ const de = {
     backTo: (name: string) => `Zurück zu ${name}`,
     tryAgain: "Zurück zum Zielordner",
     startFailed: (msg: string) => `Das Wiederherstellen ließ sich nicht starten. ${msg}`,
+    // Restoring from the backup stick (the source is chosen only when there is a server as well).
+    sourceTitle: "Wiederherstellen von",
+    stickIn: "eingesteckt",
+    stickOut: "nicht eingesteckt",
+    loadingStick: "Der Stick wird geöffnet und seine Stände gelesen. Das dauert einen Moment …",
+    noSnapshotsStick: "Auf diesem Stick gibt es noch keinen Stand dieses PCs.",
+    stickAbsent: "Der Backup-Stick ist nicht eingesteckt. Steck ihn ein, dann zeigt nestegg hier seine Stände.",
+    stickUnavailable: "Der Backup-Stick ließ sich nicht öffnen. Ist er eingesteckt? Dann versuch es noch einmal.",
+    stickNotSupported: "Diese nestegg-Version kann Dateien noch nicht vom Stick wiederherstellen. Aktualisiere nestegg.",
+    stickGoneBrowse:
+      "Der Backup-Stick ist nicht mehr eingesteckt. Steck ihn wieder ein, dann lassen sich die Ordner wieder öffnen. Was du schon ausgewählt hast, bleibt ausgewählt.",
+    stickFailedBrowse: "Der Backup-Stick ließ sich gerade nicht lesen. Ist er noch eingesteckt? Öffne den Ordner dann noch einmal.",
+    damagedSnapshotStick:
+      "Dieser Stand ist auf dem Stick als beschädigt markiert. Dateien daraus lassen sich vielleicht nicht vollständig zurückholen. Nimm lieber einen anderen Stand.",
+    damagedAllStick:
+      "Alle Stände sind auf dem Stick als beschädigt markiert, auch dieser. Dateien daraus lassen sich vielleicht nicht vollständig zurückholen. Du kannst es trotzdem versuchen.",
+    sumSource: "Quelle",
+    startNeedsStick: "Steck den Backup-Stick ein, um die Dateien zurückzuholen.",
+    startStick: (msg: string) => `Der Backup-Stick ließ sich nicht öffnen, es wurde nichts wiederhergestellt. Ist er eingesteckt? ${msg}`,
+    runningStick: "Dateien werden vom Stick zurückgeholt.",
+    runningStickText:
+      "Lass den Stick eingesteckt, bis hier „Fertig“ steht. Wie viel schon zurückgeholt ist, meldet der Stick erst am Ende.",
+    failedStickGone: "Der Backup-Stick ist nicht mehr eingesteckt.",
   },
 };
 

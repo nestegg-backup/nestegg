@@ -2,10 +2,15 @@
   import { app } from "../../lib/store.svelte";
   import { archiveFolder, displayPath, folderNameFor, folderProblem, restore, selectedArchives } from "../../lib/restore.svelte";
   import { href, router } from "../../lib/router.svelte";
-  import { isInventoryArchive } from "../../lib/derive";
+  import { isInventoryArchive, stickView } from "../../lib/derive";
   import { f, t } from "../../lib/locale";
 
-  const snap = $derived(restore.snapshot(app.snapshots.list));
+  const fromStick = $derived(restore.source === "stick");
+  const snap = $derived(restore.snapshot(restore.snaps(app.snapshots).list));
+  const stickTs = $derived(app.status?.targets?.stick ?? null);
+  // Known to be missing: starting would only fail. Unknown presence is left to the daemon.
+  const stickAbsent = $derived(fromStick && !!stickTs && stickView(stickTs).plugged === false);
+  const showSource = $derived(!!stickTs);
   // Without the proposed `session` endpoint the UI does not know the user's home folder.
   const home = $derived(app.session ? app.session.home : null);
   const fullPath = $derived(!home);
@@ -31,9 +36,11 @@
     restore.startError
       ? restore.startError.exists
         ? t.restore.targetExists
-        : restore.startError.notImplemented
-          ? t.errors.notImplemented
-          : t.restore.startFailed(restore.startError.message)
+        : restore.startError.stick
+          ? t.restore.startStick(restore.startError.message)
+          : restore.startError.notImplemented
+            ? t.errors.notImplemented
+            : t.restore.startFailed(restore.startError.message)
       : null,
   );
   const total = $derived(restore.totalSize());
@@ -44,7 +51,7 @@
   }
 
   async function start() {
-    if (problem) return;
+    if (problem || stickAbsent) return;
     if (await restore.start(home)) router.go({ view: "restore", step: "done" });
   }
 </script>
@@ -89,6 +96,7 @@
   <section class="summary" aria-labelledby="h-sum">
     <h2 class="sec-title" id="h-sum">{t.restore.summary}</h2>
     <dl class="box sum">
+      {#if showSource}<div><dt>{t.restore.sumSource}</dt><dd>{fromStick ? t.stick.name : t.stick.server}</dd></div>{/if}
       <div><dt>{t.restore.sumSnapshot}</dt><dd>{f.dayLongYear(snap.time)}, {f.time(snap.time)}</dd></div>
       <div>
         <dt>{t.restore.sumSelection}</dt>
@@ -111,9 +119,10 @@
     </dl>
   </section>
 
+  {#if stickAbsent}<p class="hint bad" role="status">{t.restore.startNeedsStick}</p>{/if}
   <div class="selbar">
     <a class="linkbtn" href={href({ view: "restore", step: "2" })}>{t.restore.changeSelection}</a>
-    <button class="btn primary" type="button" disabled={!!problem || restore.starting || app.offline} onclick={start}>
+    <button class="btn primary" type="button" disabled={!!problem || restore.starting || app.offline || stickAbsent} onclick={start}>
       {restore.starting ? t.restore.starting : t.restore.start}
     </button>
   </div>

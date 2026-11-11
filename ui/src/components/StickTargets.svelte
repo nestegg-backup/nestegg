@@ -1,6 +1,7 @@
 <script lang="ts">
   import Dot from "./Dot.svelte";
   import { app } from "../lib/store.svelte";
+  import { restore } from "../lib/restore.svelte";
   import { href } from "../lib/router.svelte";
   import { reveal } from "../lib/reveal";
   import { canBackUpToStick, hasPbs, selfKind, selfTone, serverBackups, stickOnly, stickTone, stickFillPercent } from "../lib/derive";
@@ -15,7 +16,7 @@
    */
   let { status, stick }: { status: Status; stick: TargetStatus } = $props();
 
-  const line = $derived(stickLine(stick, t, f, app.now));
+  const line = $derived(stickLine(stick, t, f, app.now, restore.usingStick));
   const tone = $derived(stickTone(line.view.kind));
   const server = $derived(hasPbs(status));
   // The legacy fields say "running" for a run to either target: the server line uses the server's own state.

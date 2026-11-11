@@ -3,7 +3,7 @@
 What the UI still needs from `api/openapi.yaml` and the daemon, written by the
 UI side. The core side decides and updates the contract. Every item says what
 the UI does today without it. Checked against `api/openapi.yaml` (version
-0.3.0); items that were requested earlier and are in the contract by now are
+0.4.0); items that were requested earlier and are in the contract by now are
 listed at the end.
 
 ## 1. Search inside a snapshot
@@ -131,7 +131,43 @@ The daemon and `api/openapi.yaml` now provide all requested fields. The UI uses:
 from the successful newly verified backup. Legacy GET/POST `/runs` select PBS
 when configured, otherwise the stick; explicit target endpoints select both.
 
-## 8. Integration notes for the core side (not API)
+## 8. Restoring from the stick (open points)
+
+The UI restores from the stick with `target=stick` (see the README). These
+points are missing or unclear; each says what the UI does without it.
+
+- **An older daemon ignores `target=stick`.** A daemon from before stick
+  restores answers `GET /snapshots?target=stick` with the server's snapshots
+  when the server is reachable; the UI cannot tell and would list them as the
+  stick's. Without a server it answers `503 pbs_unreachable` (or `501` for
+  browse), which the UI reads as "this version cannot restore from the stick
+  yet". Proposal: echo the source in the answers (`{ target: "stick",
+  stick_uuid, snapshots }`, the same in `browse` and in `Restore`), or raise
+  `api_version` in `/health`.
+- **Several sticks at once.** `plugged_in` says only "some registered stick".
+  The UI never sends `stick_uuid`, so with two registered sticks plugged in it
+  can only show the daemon's refusal, whose text points to `nestegg run
+  --target stick --stick-uuid`, which does not fit a restore. Proposal: `TargetStatus.plugged_in_uuids`
+  (registered data UUIDs that are present now); the UI would then offer the
+  choice and send `stick_uuid`.
+- **Why the stick is unavailable.** Every stick worker error is `503
+  stick_unavailable` with an English message (not plugged in, a backup or
+  restore holds the lock, snapshot not on this stick, unreadable). The UI says
+  "could not be opened, is it plugged in?" and shows the message. Proposal: a
+  stable `reason` next to the code (`not_plugged_in`, `ambiguous`, `busy`,
+  `not_found`, `unreadable`), so the UI can say "a backup is running, try
+  again afterwards" or "this backup is not on the stick that is plugged in".
+- **The stick in use by a restore.** `/status` does not say that a restore
+  reads from the stick. The tab that started it never says "safe to unplug"
+  while it runs; another tab, or the same tab after a reload, would (it only
+  sees the last successful stick run). Proposal: `TargetStatus.in_use:
+  "backup" | "restore" | null`, or the running restore in `/status`.
+- **Progress from the stick (optional).** `restored_bytes` comes only at the
+  end; the UI shows the elapsed time and no bar. A running byte count would let
+  it show how much is done (still without a percentage while `total_bytes` is
+  null).
+
+## 9. Integration notes for the core side (not API)
 
 - **Websockets through `--dev-proxy`:** the forwarding in `nestegg ui` does
   not pass websocket upgrades on, so Vite's live reload would not work
@@ -174,5 +210,11 @@ All of these are in `api/openapi.yaml` and the UI uses them:
   setup guide uses them to show the steps after `nestegg init`; null or absent
   means unknown and never counts as missing).
 
-Not used by the UI: `MachinesResponse.complete` (the list simply shows who is
+- Restoring from the stick: `target=stick` on `GET /snapshots` and
+  `/snapshots/{time}/browse` and in the body of `POST /restores`, `503
+  stick_unavailable`, `TargetStatus.plugged_in` (the source choice and "not
+  plugged in" in the restore flow). Open points: section 8.
+
+Not used by the UI: `RestoreRequest.stick_uuid` (see section 8),
+`MachinesResponse.complete` (the list simply shows who is
 visible), `PbsInfo.overview_configured` and `SessionInfo.uid` / `root`.

@@ -176,6 +176,10 @@ export interface DirEntry {
 
 /** Either `archive` (+ `paths`) or `archives` (takes precedence; each goes into its own subfolder). */
 export interface RestoreRequest {
+  /** Where the files come from; absent means the server (the default, understood by every daemon). */
+  target?: Target;
+  /** One of several registered sticks plugged in at the same time; omitted when exactly one is plugged in. */
+  stick_uuid?: string;
   snapshot_time: string;
   archive?: string;
   paths?: string[];
@@ -190,9 +194,9 @@ export interface Restore {
   started_at?: string;
   finished_at?: string | null;
   error?: string | null;
-  /** Bytes restored so far (staging copy). */
+  /** Bytes restored so far (staging copy). From the stick only known at completion. */
   restored_bytes?: number;
-  /** Expected total when whole archives are restored. */
+  /** Expected total when whole archives are restored; always null from the stick. */
   total_bytes?: number | null;
   warnings?: string[];
 }
