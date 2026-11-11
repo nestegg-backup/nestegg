@@ -166,6 +166,55 @@ fn read_protected(path: &Path) -> Result<Secret> {
     Ok(Secret::new(bytes))
 }
 
+/// Open only a scrypt-protected copy. Plaintext exists in private RAM scratch
+/// and is removed on every return path, including a wrong password.
+pub fn open_copy(path: &Path, password: &Secret, scratch: &Path) -> Result<Secret> {
+    secrets::create_private_dir(scratch)?;
+    let work = tempfile::Builder::new()
+        .prefix("open-key-")
+        .tempdir_in(scratch)?;
+    let plain = work.path().join("key.json");
+    let encrypted = read_protected(path)?;
+    secrets::write_private_file(&plain, encrypted.as_bytes())?;
+    change(&plain, password, "none")?;
+    let key = Secret::new(fs::read(&plain)?);
+    crate::keyproof::KeyMaterial::from_copy(key.as_bytes())?;
+    Ok(key)
+}
+
+/// Create a protected recovery copy and independently reopen the bytes from
+/// the medium. Existing copies must be opened and match before replacement.
+pub fn save_copy(path: &Path, key: &Secret, password: &Secret, scratch: &Path) -> Result<()> {
+    anyhow::ensure!(
+        strong_password(password.as_bytes()),
+        "use 16 characters from three classes or five distinct words totalling 24 characters"
+    );
+    if fs::symlink_metadata(path).is_ok() {
+        let previous = open_copy(path, password, scratch)?;
+        anyhow::ensure!(
+            crate::keyproof::KeyMaterial::from_copy(previous.as_bytes())?
+                == crate::keyproof::KeyMaterial::from_copy(key.as_bytes())?,
+            "existing recovery copy belongs to another key"
+        );
+    }
+    secrets::create_private_dir(scratch)?;
+    let work = tempfile::Builder::new()
+        .prefix("protect-key-")
+        .tempdir_in(scratch)?;
+    let plain = work.path().join("key.json");
+    secrets::write_private_file(&plain, key.as_bytes())?;
+    change(&plain, password, "scrypt")?;
+    let protected = read_protected(&plain)?;
+    crate::settings::write_file_atomic(path, std::str::from_utf8(protected.as_bytes())?, 0o600)?;
+    let reopened = open_copy(path, password, scratch)?;
+    anyhow::ensure!(
+        crate::keyproof::KeyMaterial::from_copy(reopened.as_bytes())?
+            == crate::keyproof::KeyMaterial::from_copy(key.as_bytes())?,
+        "recovery copy read-back differs"
+    );
+    Ok(())
+}
+
 pub fn run(paths: &Paths, uuid: &str, check_only: bool, password_fd: Option<i32>) -> Result<u8> {
     anyhow::ensure!(
         nix::unistd::Uid::effective().is_root(),

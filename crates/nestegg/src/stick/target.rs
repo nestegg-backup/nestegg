@@ -220,6 +220,13 @@ impl Session {
         })?);
         Ok(())
     }
+    pub(crate) fn start_live(&mut self, paths: &Paths) -> Result<()> {
+        self.pbs = Some(LocalPbs::start_live(&LauncherOptions {
+            data_mount: self.mount.clone(),
+            runtime_dir: paths.runtime_dir.join("stick/pbs"),
+        })?);
+        Ok(())
+    }
     pub fn pbs(&self) -> &LocalPbs {
         self.pbs.as_ref().expect("session started")
     }

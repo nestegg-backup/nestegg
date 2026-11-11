@@ -235,6 +235,17 @@ impl LocalPbs {
         {
             bail!("desktop PBS cache SHA-256 mismatch; reinstall from a trusted release ISO");
         }
+        Self::start_image(options, image)
+    }
+
+    /// Only the image already running under live-boot is trusted here. The
+    /// desktop entry point above deliberately retains its fixed-cache policy.
+    pub(crate) fn start_live(options: &LauncherOptions) -> Result<Self> {
+        preflight()?;
+        Self::start_image(options, crate::rescue::source::boot_image()?)
+    }
+
+    fn start_image(options: &LauncherOptions, image: File) -> Result<Self> {
         private_dir(&options.runtime_dir)?;
         trusted_path(&options.data_mount)?;
         let data_root = open_directory(&options.data_mount)?;

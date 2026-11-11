@@ -23,6 +23,7 @@ efibootmgr
 grub-efi-amd64-bin
 grub-pc-bin
 grub-common
+grub2-common
 kbd
 console-setup
 keyboard-configuration

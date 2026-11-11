@@ -176,7 +176,7 @@ docker run --rm -e KEY_MODE="$key_mode" -v "$work:/work" debian:trixie bash -euo
   apt-get update -qq && apt-get install -y -qq dosfstools mtools >/dev/null
   mkfs.vfat -C /work/media.img 16384 >/dev/null
   mcopy -i /work/media.img /work/nestegg-rescue.toml ::nestegg-rescue.toml
-  mcopy -i /work/media.img /work/password /work/luks ::/
+  mcopy -i /work/media.img /work/password /work/luks /work/nestegg ::/
   mmd -i /work/media.img ::x ::x/y ::x/y/z
   mcopy -i /work/media.img /work/settings-otherfp.toml ::x/nestegg-rescue.toml
   mcopy -i /work/media.img /work/nestegg-key.json /work/wrong-paperkey.txt ::x/y/z/
@@ -287,6 +287,10 @@ if [[ "${WIZARD:-1}" == 1 ]]; then
     echo 'expect root@nestegg-rescue[^#]*# 600'
     echo 'send mkdir -p /media/t && mount -o ro /dev/vdb /media/t; echo MOUNT-EXIT=$?'
     echo 'expect MOUNT-EXIT=0 60'
+    # Always exercise the supplied binary in both VMs. The ISO supplies the
+    # immutable OS/PBS fixture; it may have been built before a code-only fix.
+    echo 'send install -m 0755 /media/t/nestegg /usr/local/bin/nestegg; echo BINARY-EXIT=$?'
+    echo 'expect BINARY-EXIT=0 60'
     echo '# A wrong key for the non-interactive restore, WITH permission to erase:'
     echo '# it must be refused before the disk is touched.'
     marked WRONGKEY nestegg rescue restore "$restore_args" --snapshot "$real_snap" --keyfile /media/t/x/y/z/wrong-paperkey.txt
@@ -409,6 +413,10 @@ else
     echo 'expect root@nestegg-rescue[^#]*# 600'
     echo 'send mkdir -p /media/t && mount -o ro /dev/vdb /media/t; echo MOUNT-EXIT=$?'
     echo 'expect MOUNT-EXIT=0 60'
+    # Always exercise the supplied binary in both VMs. The ISO supplies the
+    # immutable OS/PBS fixture; it may have been built before a code-only fix.
+    echo 'send install -m 0755 /media/t/nestegg /usr/local/bin/nestegg; echo BINARY-EXIT=$?'
+    echo 'expect BINARY-EXIT=0 60'
     echo '# The newest backup is the unencrypted decoy: refused, disk untouched.'
     marked DECOY nestegg rescue restore "$restore_args"
     echo '# The same for the backup that is only signed with the key.'

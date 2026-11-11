@@ -35,6 +35,32 @@ render_cfg() {
 # nestegg-generation=$generation
 # nestegg-kernel=$kernel
 # nestegg-initrd=$initrd
+function nestegg_boot_$slot {
+  if [ -z "\$nestegg_selected" ]; then
+    set default=nestegg-$slot
+    set nestegg_selected=1
+  fi
+  menuentry 'nestegg rescue (slot $slot)' --id=nestegg-$slot {
+    search --no-floppy --fs-uuid --set=root $boot_uuid
+    linux /live/$slot/$kernel boot=live components live-media=/dev/disk/by-uuid/$boot_uuid live-media-path=/live/$slot hostname=nestegg-rescue locales=en_US.UTF-8 console=tty0 console=ttyS0,115200n8
+    initrd /live/$slot/$initrd
+  }
+}
+if hashsum --hash sha256 --check /live/$slot/payload.sha256; then
+  set nestegg_${slot}_generation=$generation
+fi
+CFG
+}
+# Recognition only: never rewrite a committed legacy slot in place. Its old
+# parser could add a menu entry while loading; new entries select by stable ID
+# so an update still boots the newly committed generation first.
+render_cfg_legacy() {
+    local slot=$1 generation=$2 kernel=$3 initrd=$4
+    cat <<CFG
+# nestegg-slot=$slot
+# nestegg-generation=$generation
+# nestegg-kernel=$kernel
+# nestegg-initrd=$initrd
 if hashsum --hash sha256 --check /live/$slot/payload.sha256; then
 function nestegg_boot_$slot {
   menuentry 'nestegg rescue (slot $slot)' {
@@ -136,7 +162,8 @@ else
         candidate_kernel=$(sed -n 's/^# nestegg-kernel=//p' "$cfg")
         candidate_initrd=$(sed -n 's/^# nestegg-initrd=//p' "$cfg")
         [[ $candidate_kernel =~ ^vmlinuz[a-zA-Z0-9._+-]*$ && $candidate_initrd =~ ^initrd[a-zA-Z0-9._+-]*$ ]] || continue
-        cmp -s "$cfg" <(render_cfg "$candidate" "$candidate_generation" "$candidate_kernel" "$candidate_initrd") || continue
+        if ! cmp -s "$cfg" <(render_cfg "$candidate" "$candidate_generation" "$candidate_kernel" "$candidate_initrd") &&
+           ! cmp -s "$cfg" <(render_cfg_legacy "$candidate" "$candidate_generation" "$candidate_kernel" "$candidate_initrd"); then continue; fi
         payload=$work/esp/live/$candidate
         [[ -f $payload/payload.sha256 && $(stat -c %s "$payload/payload.sha256") -le 1024 ]] || continue
         # Validate exact names before passing this untrusted list to sha256sum.

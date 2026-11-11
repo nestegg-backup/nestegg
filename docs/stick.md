@@ -1,11 +1,10 @@
 # Prepare a backup stick
 
-Desktop backups to registered sticks are available. Preparing bootable media
-and the isolated PBS launcher implement phases one and two of
-[decision 0023](decisions/0023-backup-stick.md). Restoration from the stick's
-local datastore and the two-target graphical UI are later phases. Booting the
-stick currently still gives the existing [rescue system](rescue.md) for network
-PBS restores.
+Registered sticks support desktop backups, restoring from their own datastore,
+and read-only backups of a computer booted from the stick (phases one through
+four of [decision 0023](decisions/0023-backup-stick.md)). The graphical UI work
+and physical-hardware acceptance remain separate phases. The existing
+[rescue system](rescue.md) also continues to restore from a network PBS.
 
 Use an external USB SSD of at least 128 GB. Cheap flash sticks can be slow and
 wear out quickly. Keep another backup elsewhere: a stick beside the computer
@@ -274,3 +273,19 @@ automounter flags on both partitions, manual backup through the stick API and
 honest incomplete/layout handling on the live overlay. The phase-one test
 additionally checks BIOS/UEFI boot and interrupted updates.
 Neither proves physical flash endurance or real USB power-loss behavior.
+
+## Restore and backup while booted from the stick
+
+Boot the stick and run `nestegg rescue`. **Restore this computer** offers
+**Backups on this stick**, with a password for the protected key copy or the
+paper-key fallback. No network, token or certificate question is involved.
+**Back up this computer** reads a powered-off Debian-family GRUB installation,
+including ordinary LUKS/linear LVM, without writing its disks. It asks for the
+computer identity, key and UTC time; dirty journal recovery stays in RAM.
+See [rescue.md](rescue.md) for supported layouts and automation commands.
+
+On the desktop, the file-restore API accepts `target=stick` (and optionally
+`stick_uuid`) for listing/browsing snapshots and in the restore request body.
+It uses this computer's configured key and the desktop's trusted PBS image.
+Non-root users retain their home-directory restriction. The UI integration is
+separate; see [api/openapi.yaml](../api/openapi.yaml) for the contract.

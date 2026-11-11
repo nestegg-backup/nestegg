@@ -19,6 +19,8 @@ on:
       - "crates/nestegg/src/keyproof.rs"
       - "packaging/rescue/**"
       - "tests/rescue/**"
+      - "tests/stick/**"
+      - "crates/nestegg/src/stick/**"
       # tests/rescue/run.sh starts the PBS with these.
       - "tests/e2e/lib.sh"
       - "tests/e2e/pbs.Dockerfile"
@@ -53,6 +55,7 @@ jobs:
           path: |
             target/release/nestegg
             target/nestegg-rescue-amd64.iso
+            target/nestegg-rescue-amd64.iso.sha256
 
   test:
     needs: iso
@@ -104,3 +107,25 @@ jobs:
         with:
           name: rescue-logs-${{ matrix.variant }}-wizard${{ matrix.wizard }}
           path: rescue-logs/
+
+  stick-rescue:
+    needs: iso
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rescue-iso
+          path: rescue-iso
+      - name: Install VM tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf gdisk e2fsprogs dosfstools squashfs-tools
+      - name: Stick restore and read-only offline backup matrix
+        run: |
+          chmod +x rescue-iso/release/nestegg
+          sudo env KEEP_LOGS="${{ runner.temp }}/stick-rescue-logs" tests/stick/rescue.sh rescue-iso/release/nestegg rescue-iso/nestegg-rescue-amd64.iso
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: stick-rescue-logs
+          path: ${{ runner.temp }}/stick-rescue-logs/
