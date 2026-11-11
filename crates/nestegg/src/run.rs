@@ -677,7 +677,10 @@ fn execute_target(
         );
     }
     if target == Target::Stick
-        && rep.run.state == RunState::Succeeded
+        && !matches!(
+            rep.run.state,
+            RunState::Cancelled | RunState::StickNotPluggedIn
+        )
         && (crate::cancel::requested() || rep.stick_missing())
     {
         rep.fail(

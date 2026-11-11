@@ -100,6 +100,10 @@ s=json.load(open('/var/lib/nestegg/state.json'))
 r=s['stick']['last_run']
 assert r['trigger']=='timer' and r['state']=='succeeded' and r['verified'],r
 assert not os.path.exists('/var/lib/nestegg/current.json')
+import subprocess
+view=json.loads(subprocess.check_output(['nestegg','status','--json']))['targets']['stick']
+assert view['plugged_in'] is True,view
+assert view['total_bytes'] > view['available_bytes'] >= 0 and view['space_checked_at'],view
 PYTIMER
 printf 'VM-%s\n' TIMER-SANDBOX-PASS
 # The live overlay cannot be recreated by the bare-metal restore. Requesting
@@ -116,6 +120,13 @@ class LocalApi(http.client.HTTPConnection):
         self.sock=socket.socket(socket.AF_UNIX)
         self.sock.connect('/run/nestegg/api.sock')
 connection=LocalApi('localhost', timeout=10)
+connection.request('GET','/api/v1/config')
+response=connection.getresponse()
+assert response.status==200,response.read().decode()
+import json
+config=json.loads(response.read())
+assert len(config['stick_data_uuids'])==1,config
+assert config['limits']['stick_overdue_after_hours']['min']==1,config
 connection.request('POST','/api/v1/targets/stick/runs')
 response=connection.getresponse()
 assert response.status==202, response.read().decode()

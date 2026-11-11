@@ -108,6 +108,8 @@ r=s['stick']['last_success']
 assert r['target']=='stick' and r['verified'] and not r['incomplete'], r
 assert s.get('last_success') is None, 'stick must not overwrite legacy PBS state'
 assert s['stick']['full_verified_at']
+assert s['stick']['total_bytes'] > s['stick']['available_bytes'] >= 0
+assert s['stick']['space_checked_at']
 assert s['stick_media'][r['stick_uuid']]['password_checked_at']
 assert not s.get('key_exported_digest'), 'stick-only proof must not confirm the independent PBS proof'
 PY
@@ -117,6 +119,21 @@ echo 'PASS stick-only key copy, encrypted backup, read-back, PBS verify and clea
 "$bin" run --trigger plug --target stick >"$work/not-due.log" 2>&1
 grep -q 'not due yet' "$work/not-due.log"
 echo 'PASS recent stick backup is not repeated on plug-in'
+# A mounted device and a busy per-device lock are different from filesystem
+# damage; both are refused without ever starting PBS or changing the medium.
+mount -o nodev,nosuid,noexec "$part" "$work/data"
+if "$bin" backup --target stick >"$work/already-mounted.log" 2>&1; then exit 1; fi
+python3 - "$work/state/state.json" <<'PYOPEN'
+import json,sys
+assert json.load(open(sys.argv[1]))['stick']['last_run']['error']['kind']=='stick_already_mounted'
+PYOPEN
+umount "$work/data"
+if flock -x "$work/runtime/stick/$uuid.lock" "$bin" backup --target stick >"$work/lock-busy.log" 2>&1; then exit 1; fi
+python3 - "$work/state/state.json" <<'PYOPEN'
+import json,sys
+assert json.load(open(sys.argv[1]))['stick']['last_run']['error']['kind']=='stick_busy'
+PYOPEN
+echo 'PASS mounted and lock-busy media retain distinct error kinds'
 # The by-UUID link still points to the original medium. A second attached
 # filesystem with the same UUID must nevertheless stop desktop sessions.
 cp --reflink=auto --sparse=always "$work/stick.img" "$work/clone.img"
@@ -125,6 +142,11 @@ partprobe "$clone_loop"
 for _ in {1..50}; do [[ -b ${clone_loop}p1 ]] && break; sleep .1; done
 if "$bin" stick key-check --uuid "$uuid" --password-fd 7 7<"$work/password" >"$work/cloned-uuid.log" 2>&1; then exit 1; fi
 grep -q 'cloned data UUID' "$work/cloned-uuid.log"
+if "$bin" backup --target stick >"$work/cloned-run.log" 2>&1; then exit 1; fi
+python3 - "$work/state/state.json" <<'PYOPEN'
+import json,sys
+assert json.load(open(sys.argv[1]))['stick']['last_run']['error']['kind']=='stick_ambiguous'
+PYOPEN
 losetup -d "$clone_loop"; clone_loop=
 rm "$work/clone.img"
 echo 'PASS desktop sessions refuse cloned UUIDs despite an unambiguous by-UUID symlink'
@@ -236,6 +258,7 @@ grep -q 'reclaiming orphaned chunks.*no prune' "$work/full-gc.log"
 mount -o nodev,nosuid,noexec "$part" "$work/data"
 [[ $(find "$work/data/nestegg/store/host" -name index.json.blob | wc -l) == "$retained" ]]
 while IFS= read -r orphan; do [[ ! -e $work/data/nestegg/store/.chunks/$orphan ]]; done <"$work/orphan-chunks"
+find "$work/data/nestegg/store/.chunks" -type f -size +1M -printf '%P\n' | sort >"$work/before-own-snapshot"
 umount "$work/data"
 sed -i 's/minimum_free_bytes = 9223372036854775807/minimum_free_bytes = 1048576/' "$NESTEGG_CONFIG"
 "$bin" backup --target stick >"$work/after-failed-upload.log" 2>&1
@@ -244,8 +267,9 @@ echo 'PASS orphan chunks from failed upload reclaimed by full-stick GC alone, wi
 # failure rather than the filesystem-health gate. Restore the exact fixture
 # chunk afterwards; never invent or repair PBS data in product code.
 mount -o nodev,nosuid,noexec "$part" "$work/data"
-chunk=$(find "$work/data/nestegg/store/.chunks" -type f -size +1M -print -quit)
-[[ -n $chunk ]]
+find "$work/data/nestegg/store/.chunks" -type f -size +1M -printf '%P\n' | sort >"$work/after-own-snapshot"
+chunk="$work/data/nestegg/store/.chunks/$(comm -13 "$work/before-own-snapshot" "$work/after-own-snapshot" | head -1)"
+[[ -f $chunk ]]
 chunk_relative=${chunk#"$work/data/"}
 cp -a "$chunk" "$work/original-chunk"
 python3 - "$chunk" <<'PY'
@@ -336,6 +360,10 @@ PY
     kill -0 "$backup_pid"
     sleep .5
 done
+# Inspect the actual run namespace, not a string in the implementation.
+options=$(nsenter --mount="/proc/$backup_pid/ns/mnt" findmnt -rn -o OPTIONS "$work/runtime/stick/data-$uuid")
+[[ ,$options, == *,errors=remount-ro,* ]]
+[[ ,$options, == *,nodev,* && ,$options, == *,nosuid,* && ,$options, == *,noexec,* ]]
 sleep 2
 dmsetup suspend --noflush "$mapper"
 echo "0 $sectors error" | dmsetup load "$mapper"

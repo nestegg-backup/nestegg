@@ -95,6 +95,16 @@ old_run="$(on_client nestegg history --json | sed -n 's/.*"id": "\([^"]*\)".*/\1
 old_snapshot="$(on_client nestegg history --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
 check "old run recorded" test -n "$old_run"
 check "old run has a snapshot" test -n "$old_snapshot"
+# Accept both historical baselines: early packages have only the local run
+# record, while the phase-two baseline already writes per-snapshot metadata.
+# Capture the old capability before upgrade, then prove it is preserved.
+snapshot_metadata() {
+  docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$pbs" \
+    proxmox-backup-client snapshot files "$1" --ns desktops \
+      --repository admin@pbs@127.0.0.1:store1 --output-format json \
+    | python3 -c 'import json,sys; print(int(any(f["filename"]=="nestegg-meta.conf.blob" for f in json.load(sys.stdin))))'
+}
+old_metadata="$(snapshot_metadata "$old_snapshot")"
 sums_before="$(config_sums)"
 run_record_before="$(on_client sha256sum "/var/lib/nestegg/runs/$old_run.json")"
 pid_before="$(daemon_pid)"
@@ -191,9 +201,9 @@ user_browse_names() {
     "http://localhost/api/v1/snapshots/${1##*/}/browse?archive=home.pxar&path=/" \
     | grep -o '"name":"[^"]*"' | sort -u | tr -d '\n'
 }
-check "pre-upgrade snapshot has no metadata blob" bash -c "! docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot files '$old_snapshot' --ns desktops --repository admin@pbs@127.0.0.1:store1 | grep -q nestegg-meta"
+check "pre-upgrade snapshot metadata availability is preserved" test "$(snapshot_metadata "$old_snapshot")" == "$old_metadata"
 check "post-upgrade snapshot has the metadata blob" bash -c "docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot files '$new_snapshot' --ns desktops --repository admin@pbs@127.0.0.1:store1 | grep -q nestegg-meta.conf.blob"
-check "user browses the pre-upgrade snapshot (local run record)" test "$(user_browse_names "$old_snapshot")" == '"name":"alice"'
+check "user browses the pre-upgrade snapshot (local record or metadata)" test "$(user_browse_names "$old_snapshot")" == '"name":"alice"'
 check "user browses the post-upgrade snapshot (metadata blob)" test "$(user_browse_names "$new_snapshot")" == '"name":"alice"'
 
 echo "== apt remove keeps configuration, credentials and state"

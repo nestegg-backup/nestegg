@@ -78,3 +78,33 @@ limits. Password reminders distinguish missing key-copy proof from the
 periodic password check. The original boolean and all legacy status fields
 remain. The UI prefers these fields and retains fallbacks for older daemons;
 the existing capacity line gains a percentage without changing the layout.
+
+## Acceptance result (2026-11-11)
+
+- `cargo test`: 523 passed; three privileged tests are opt-in. The incoming
+  mount propagation test was also run explicitly as root and passed.
+- Clippy over all targets with warnings denied, format check, release build,
+  privacy tree scan: passed.
+- `tests/stick/desktop.sh`: passed on an owned loop/device-mapper medium,
+  including mounted/busy/cloned-UUID errors, actual safe mount options,
+  foreign snapshot corruption without retention starvation, new-snapshot
+  corruption, GC-only reclamation of actual failed-upload orphan chunks,
+  full media, key mismatch, injected I/O failure, offline repair and recovery.
+- `tests/stick/hotplug-vm.sh` through `desktop-vm.sh`: passed with real udev,
+  the shipped timer sandbox, live presence/capacity/config fields, and a
+  device-bound upload stopped by virtual SCSI removal. The run ended as
+  `stick_not_plugged_in`; a deliberately stubborn child exercised systemd's
+  SIGTERM-to-SIGKILL escalation. No PBS process, current run or runtime leaked.
+- End-to-end, packaged systemd and upgrade suites: 193, 155 and 97 checks
+  passed. The upgrade used the actual `290c429` baseline. Its pre-existing
+  snapshot metadata is preserved; the harness also supports older baselines
+  without that metadata instead of assuming that all old packages lack it.
+- `npm ci`, UI build, Svelte/TypeScript check and all 347 UI tests passed.
+  Desktop/mobile browser inspection confirmed the percentage, distinct key
+  copy/check notices, full-but-absent media and monthly damage wording, with
+  no document overflow. A monthly damage notice never calls a verified new
+  backup failed.
+
+The local PBS proxy must answer its ping before manager/debug commands are
+issued; merely spawning it raced the listening socket during acceptance.
+Physical USB hardware remains the separate phase-six gate from decision 0023.
