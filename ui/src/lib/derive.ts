@@ -2,7 +2,7 @@
 // No strings here except stable ids; texts live in ../i18n.
 
 import { daysBetween, shiftDayKey, type Formatter } from "./format";
-import type { ConfigView, Machine, Run, RunErrorKind, RunState, RunTrigger, Status } from "./types";
+import type { ConfigView, Machine, Run, RunErrorKind, RunState, RunTrigger, Status, Target, TargetStatus } from "./types";
 
 export const ACTIVE_STATES = ["starting", "waking_pbs", "inventory", "uploading", "finishing"] as const;
 
@@ -18,9 +18,14 @@ export function isActive(run: Pick<Run, "state"> | null | undefined): boolean {
 // for a known value (cancelled, succeeded, internal error, ...). Every lookup over a state, trigger
 // or error kind goes through these three functions.
 
-const RUN_STATES: readonly string[] = [...ACTIVE_STATES, "succeeded", "failed", "pbs_unreachable", "cancelled"];
-const RUN_TRIGGERS: readonly string[] = ["timer", "manual", "cli"];
+const RUN_STATES: readonly string[] = [...ACTIVE_STATES, "succeeded", "failed", "pbs_unreachable", "stick_not_plugged_in", "cancelled"];
+const RUN_TRIGGERS: readonly string[] = ["timer", "manual", "cli", "plug"];
 const ERROR_KINDS: readonly string[] = [
+  "stick_not_plugged_in",
+  "stick_full",
+  "filesystem_damaged",
+  "stick_unsupported",
+  "key_mismatch",
   "pbs_unreachable",
   "authentication",
   "source_missing",
@@ -172,7 +177,7 @@ export function runEvents(
         out.push({ at: r.started_at, kind: "unknown" });
         break;
       default:
-        // cancelled: no mark (as before); a running state is drawn from `current` below
+        // cancelled and "stick not plugged in": no mark; a running state is drawn from `current` below
         break;
     }
   }
@@ -289,10 +294,11 @@ export function historyRows(runs: Run[], f: Formatter): RunRow[] {
   for (const run of runs) {
     if (isActive(run)) continue;
     const prev = rows[rows.length - 1];
+    // The same for a stick that was not plugged in: the timer looks for it every hour.
     if (
       prev &&
-      run.state === "pbs_unreachable" &&
-      prev.run.state === "pbs_unreachable" &&
+      (run.state === "pbs_unreachable" || run.state === "stick_not_plugged_in") &&
+      prev.run.state === run.state &&
       f.dayKey(prev.run.started_at) === f.dayKey(run.started_at)
     ) {
       prev.count++;
@@ -371,6 +377,8 @@ export function runStep(state: Run["state"]): number {
  * happen anywhere.
  */
 export function serverContact(run: Run): "reached" | "not_reached" | "unknown" {
+  // A run to the stick says nothing about the backup server.
+  if (run.target === "stick") return "unknown";
   const state = runState(run);
   if (state === "succeeded") return "reached";
   if (state === "pbs_unreachable") return "not_reached";
@@ -553,7 +561,8 @@ export type Blocked = "unconfigured" | "credentials" | "credentials_unreadable" 
 
 export function backupBlocked(s: Status): Blocked | null {
   if (s.health === "unconfigured") return "unconfigured";
-  if (s.pbs.credentials_stored === false) return "credentials";
+  // Without a backup server there is no token secret to store (stick-only setups).
+  if (hasPbs(s) && s.pbs.credentials_stored === false) return "credentials";
   // The stored secrets exist, but cannot be decrypted (new mainboard): every run fails the same way
   // until they are stored again. A backup that is running now shows that it got further.
   if (s.last_run?.state === "failed" && s.last_run.error?.kind === "credentials_unreadable" && !isActive(s.current_run))
@@ -590,7 +599,7 @@ export function setupGuide(s: Status): Guide | null {
 
   const open: Record<Exclude<GuideStep, "automatic">, boolean> = {
     connect: unconfigured,
-    credentials: !unconfigured && s.pbs.credentials_stored === false,
+    credentials: !unconfigured && hasPbs(s) && s.pbs.credentials_stored === false,
     key_create: !unconfigured && noKey,
     key_store: !unconfigured && encrypted && !noKey && s.encryption.key_exported === false,
     first_backup: s.health === "never",
@@ -598,7 +607,7 @@ export function setupGuide(s: Status): Guide | null {
   const anyOther = Object.values(open).some(Boolean);
   const automatic = !unconfigured && s.schedule.enabled === false && (anyOther || !s.last_success);
 
-  const steps: GuideStep[] = ["connect", "credentials"];
+  const steps: GuideStep[] = unconfigured || hasPbs(s) ? ["connect", "credentials"] : [];
   if (encrypted) steps.push("key_create", "key_store");
   steps.push("automatic");
   // A backup that exists already makes "first backup" meaningless.
@@ -720,3 +729,165 @@ export const SET_PASSWORD_COMMAND = "sudo nestegg credentials set-password";
 export const CHECK_COMMAND = "sudo nestegg check";
 export const KEY_CREATE_COMMAND = "sudo nestegg key create";
 export const ENABLE_TIMERS_COMMAND = "sudo systemctl enable --now nestegg-backup.timer nestegg-notify.timer";
+
+// ---------------------------------------------------------------- targets: backup server and stick
+
+/**
+ * A backup server is configured. Older daemons send no `targets` (they only know the server); an
+ * unconfigured daemon sends an empty object. Only a setup whose sole target is the stick has none.
+ */
+export function hasPbs(s: Status): boolean {
+  return !s.targets || !!s.targets.pbs || !s.targets.stick;
+}
+
+export function hasStick(s: Status): boolean {
+  return !!s.targets?.stick;
+}
+
+/** The stick is the only target: there is no server, no snapshot list and no restore through the server. */
+export function stickOnly(s: Status): boolean {
+  return hasStick(s) && !s.targets?.pbs;
+}
+
+/** The target the legacy fields of `/status` describe: the server when there is one, otherwise the stick. */
+export function primaryTarget(s: Status): Target {
+  return hasPbs(s) ? "pbs" : "stick";
+}
+
+/** The target of a run; records of older versions have none and belong to the server. */
+export function runTarget(run: Pick<Run, "target">): Target {
+  return run.target === "stick" ? "stick" : "pbs";
+}
+
+/** What the stick row says, in priority order. */
+export type StickKind =
+  | "running"
+  | "full"
+  | "damaged"
+  | "verify_failed"
+  | "key_mismatch"
+  | "unsupported"
+  | "failing"
+  | "unknown"
+  | "overdue"
+  | "incomplete"
+  | "never"
+  | "ok";
+
+export interface StickView {
+  kind: StickKind;
+  /**
+   * Whether a registered stick is plugged in, as far as `/status` tells: false for
+   * `stick_not_plugged_in`, null when the state does not say (`stick_full` hides it).
+   */
+  plugged: boolean | null;
+  /**
+   * The last stick backup ended successfully, so the daemon had stopped its server, flushed and
+   * unmounted the stick ("safe to unplug"), and no stick run has started since.
+   */
+  safeToUnplug: boolean;
+  running: Run | null;
+  /** Snapshots on the stick that its own verification marked as damaged. */
+  damaged: number;
+}
+
+export function stickView(ts: TargetStatus): StickView {
+  const running = isActive(ts.current_run) ? ts.current_run! : null;
+  const last = ts.last_run ?? null;
+  const plugged = running ? true : ts.state === "stick_not_plugged_in" ? false : ts.state === "stick_full" ? null : true;
+  const damaged = ts.server_verify_failed?.length ?? 0;
+  const kind = ((): StickKind => {
+    if (running || ts.health === "running") return "running";
+    if (ts.state === "stick_full" || (last?.state === "failed" && last.error?.kind === "stick_full")) return "full";
+    if (isUnknownRun(last)) return "unknown";
+    if (last?.state === "failed" || ts.health === "failing") {
+      switch (last?.state === "failed" ? knownErrorKind(last.error?.kind) : null) {
+        case "filesystem_damaged":
+          return "damaged";
+        case "verification_failed":
+          return "verify_failed";
+        case "key_mismatch":
+          return "key_mismatch";
+        case "stick_unsupported":
+          return "unsupported";
+        default:
+          return "failing";
+      }
+    }
+    switch (ts.health) {
+      case "overdue":
+        return "overdue";
+      case "incomplete":
+        return "incomplete";
+      case "never":
+        return "never";
+      default:
+        return "ok";
+    }
+  })();
+  return {
+    kind,
+    plugged,
+    safeToUnplug: !running && plugged === true && last?.state === "succeeded",
+    running,
+    damaged,
+  };
+}
+
+export function stickTone(kind: StickKind): Tone {
+  switch (kind) {
+    case "running":
+      return "running";
+    case "full":
+    case "damaged":
+    case "verify_failed":
+    case "key_mismatch":
+    case "unsupported":
+    case "failing":
+      return "bad";
+    case "unknown":
+    case "overdue":
+    case "incomplete":
+      return "warn";
+    case "ok":
+      return "ok";
+    default:
+      return "neutral";
+  }
+}
+
+/**
+ * "Back up to stick now" is offered only when a registered stick is plugged in and no backup runs
+ * (the run lock is shared by both targets). A full stick is offered too: whether space was freed
+ * meanwhile only shows by trying.
+ */
+export function canBackUpToStick(view: StickView, anyRunning: boolean): boolean {
+  return !anyRunning && view.plugged !== false && view.kind !== "running";
+}
+
+/** The physical stick of the newest stick run that names one (for the commands that need `--uuid`). */
+export function knownStickUuid(runs: readonly Run[], ts: TargetStatus | null | undefined): string | null {
+  for (const r of [ts?.current_run, ts?.last_run, ts?.last_success, ...runs]) {
+    if (r && runTarget(r) === "stick" && r.stick_uuid && isUuid(r.stick_uuid)) return r.stick_uuid.toLowerCase();
+  }
+  return null;
+}
+
+export function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
+}
+
+const uuidOption = (uuid: string) => `--uuid=${isUuid(uuid) ? uuid.trim().toLowerCase() : "<UUID>"}`;
+
+/** Shows the UUID of the one registered stick that is plugged in. */
+export const STICK_INFO_COMMAND = "sudo nestegg stick info";
+
+/** Makes the password-protected key copy on the stick (stick-only setups: counts as the key proof). */
+export function stickKeyCopyCommand(uuid: string): string {
+  return `sudo nestegg stick key-copy ${uuidOption(uuid)}`;
+}
+
+/** Opens the stick's key copy with the password again and renews the 180-day reminder. */
+export function stickKeyCheckCommand(uuid: string): string {
+  return `sudo nestegg stick key-check ${uuidOption(uuid)}`;
+}

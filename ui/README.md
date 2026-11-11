@@ -56,6 +56,22 @@ local API described in [`../api/openapi.yaml`](../api/openapi.yaml).
   areas (several `archives` go into one subfolder each), restore into a new
   directory with progress in bytes (`/snapshots/{time}/browse`,
   `/restores`).
+- **Backup stick (decisions 0023, 0026):** with a stick target the page of
+  this PC lists the destinations (server and stick, one row each): the
+  stick's state from `status.targets.stick` (backing up, not plugged in,
+  "safe to unplug" only after a successful stick run, full, file system
+  damaged, check failed, other key, not possible on this computer such as
+  missing IPv6, overdue after its own threshold), free space as of the last
+  run, the last full check, and "Back up to stick now" (`POST
+  /targets/stick/runs`) only while a registered stick is plugged in and no
+  backup runs. The history and the 14 days switch between the targets
+  (`/targets/{target}/runs`); hourly "not plugged in" records of a day are
+  folded. The password reminder shows `stick key-check`/`key-copy`. Stick-only
+  setups have no server row, no other computers, no token-secret step and no
+  restore (the API has none for the stick yet); the key guide offers the
+  password-protected copy on the stick. Settings: "overdue after" per target
+  and removing one of two targets after a confirmation (decision 0022
+  reports both). Missing API pieces: `API-REQUESTS.md`, section 7.
 - **Overview of several machines:** same UI, a list fed by a read-only PBS
   connection (`/machines`).
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { app } from "../lib/store.svelte";
-  import { runStep, runTrigger } from "../lib/derive";
+  import { runStep, runTarget, runTrigger } from "../lib/derive";
   import { f, t } from "../lib/locale";
   import type { Run } from "../lib/types";
 
@@ -8,10 +8,11 @@
   let { run, wakeOnLan, stale = false }: { run: Run; wakeOnLan: boolean; stale?: boolean } = $props();
 
   const now = $derived(runStep(run.state));
+  const stick = $derived(runTarget(run) === "stick");
   /** A terminal start counts as "by hand". */
   const how = $derived.by(() => {
     const trigger = runTrigger(run);
-    return trigger === "timer" ? "timer" : trigger === "unknown" ? "unknown" : "manual";
+    return trigger === "timer" ? "timer" : trigger === "unknown" ? "unknown" : trigger === "plug" ? "plug" : "manual";
   });
   const elapsed = $derived(Math.max(0, (app.now.getTime() - new Date(run.started_at).getTime()) / 1000));
 
@@ -22,7 +23,17 @@
       : null,
   );
 
-  const steps = $derived([
+  const stickSteps = $derived([
+    { title: t.stick.stepCheck, sub: now === 0 ? t.stick.stepCheckNow : "" },
+    { title: t.self.stepInventory, sub: now === 1 ? t.self.stepInventorySub : "" },
+    {
+      title: t.stick.stepUpload,
+      sub: now >= 2 && run.uploaded_bytes ? t.stick.written(f.size(run.uploaded_bytes)) : now === 2 ? t.self.stepUploadCheck : "",
+    },
+    { title: t.stick.stepFinish, sub: now === 3 ? t.stick.stepFinishSub : "" },
+  ]);
+
+  const serverSteps = $derived([
     {
       title: wakeOnLan ? t.self.stepWake : t.self.stepReach,
       sub:
@@ -48,10 +59,18 @@
     },
     { title: t.self.stepFinish, sub: now === 3 ? t.self.stepFinishSub : "" },
   ]);
+  const steps = $derived(stick ? stickSteps : serverSteps);
+  const since = $derived(
+    stale
+      ? t.conn.runUnknown
+      : how === "plug"
+        ? t.stick.runningSincePlug(f.duration(elapsed))
+        : t.self.runningSince(f.duration(elapsed), how),
+  );
 </script>
 
-<h2 class="lead"><span class="pulse" aria-hidden="true"></span>{t.self.runningLead}</h2>
-<p class="lead-text">{t.self.runningText}</p>
+<h2 class="lead"><span class="pulse" aria-hidden="true"></span>{stick ? t.stick.runningLead : t.self.runningLead}</h2>
+<p class="lead-text">{stick ? t.stick.runningText : t.self.runningText}</p>
 <ol class="steps">
   {#each steps as s, i (i)}
     <li class="step" class:done={i < now} class:now={i === now} aria-current={i === now ? "step" : undefined}>
@@ -67,7 +86,7 @@
     </li>
   {/each}
 </ol>
-<p class="hint">{stale ? t.conn.runUnknown : t.self.runningSince(f.duration(elapsed), how)}</p>
+<p class="hint">{since}</p>
 
 <style>
   .pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--accent-text); flex: none; transform: translateY(-2px); animation: pulse 1.6s ease-in-out infinite; }

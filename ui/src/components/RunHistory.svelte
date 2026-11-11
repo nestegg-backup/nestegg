@@ -8,8 +8,8 @@
 <script lang="ts">
   import Dot from "./Dot.svelte";
   import { api } from "../lib/api";
-  import { errorKind, isIncomplete, otherWarnings, runTone, type RunRow } from "../lib/derive";
-  import { runResultText } from "../lib/text";
+  import { isIncomplete, otherWarnings, runTone, type RunRow } from "../lib/derive";
+  import { explainOf, runResultText } from "../lib/text";
   import { f, t } from "../lib/locale";
 
   /**
@@ -24,7 +24,8 @@
     remote = false,
     emptyText,
     damaged = new Set<string>(),
-  }: { rows: RunRow[]; loaded: boolean; remote?: boolean; emptyText?: string; damaged?: ReadonlySet<string> } = $props();
+    written = false,
+  }: { rows: RunRow[]; loaded: boolean; remote?: boolean; emptyText?: string; damaged?: ReadonlySet<string>; written?: boolean } = $props();
 
   const LIMIT = 8;
   let showAll = $state(false);
@@ -77,7 +78,7 @@
         <th scope="col">{t.runs.colStart}</th>
         <th scope="col">{t.runs.colResult}</th>
         {#if !remote}<th scope="col" class="c-dur">{t.runs.colDuration}</th>{/if}
-        <th scope="col" class="r">{#if remote}<span class="sr">{t.runs.showLog}</span>{:else}{t.runs.colUploaded}{/if}</th>
+        <th scope="col" class="r">{#if remote}<span class="sr">{t.runs.showLog}</span>{:else}{written ? t.stick.colWritten : t.runs.colUploaded}{/if}</th>
       </tr>
     </thead>
     <tbody>
@@ -126,8 +127,8 @@
               {:else}
                 <p class="explain">{r.error?.message ?? t.runs.logEmpty}</p>
               {/if}
-              {#if errorKind(r)}
-                <p class="explain">{t.explain[errorKind(r)!]}</p>
+              {#if explainOf(r, t)}
+                <p class="explain">{explainOf(r, t)}</p>
               {/if}
             </div></td>
           </tr>

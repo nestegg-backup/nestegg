@@ -6,6 +6,7 @@
   import { href, type Route } from "../lib/router.svelte";
   import {
     dayStrip,
+    hasPbs,
     machineKind,
     machineName,
     machineSnapshotEvents,
@@ -15,10 +16,12 @@
     selfTone,
     serverBackups,
     sortMachines,
+    stickTone,
+    stickView,
     type DayCell,
     type Tone,
   } from "../lib/derive";
-  import { machineRowText, selfRowText, serverRow } from "../lib/text";
+  import { machineRowText, selfRowText, serverRow, stickRowOverride } from "../lib/text";
   import { f, t } from "../lib/locale";
 
   let { route }: { route: Route } = $props();
@@ -30,6 +33,15 @@
     app.machines && status ? sortMachines(app.machines.machines, status.machine.backup_id, app.now, overdueHours) : [],
   );
   const server = $derived(app.reach ? serverRow(app.reach, t, f, app.now) : null);
+  // Stick only: no server row, and no other computers (they are read from the server).
+  const pbs = $derived(!status || hasPbs(status));
+  // The line names the stick when the server is fine and the stick is not; the dot follows it.
+  const selfTon = $derived.by((): Tone | null => {
+    if (!status) return null;
+    const stick = status.targets?.stick;
+    if (stick && stickRowOverride(status, t, f)) return stickTone(stickView(stick).kind);
+    return selfTone(selfKind(status));
+  });
   // This PC: the same days as the boxes on its page, only once the history is loaded.
   const selfCells = $derived(
     status && status.health !== "unconfigured" && app.runs.state === "ok"
@@ -63,12 +75,12 @@
       href({ view: "self" }),
       selfSelected,
       status.machine.hostname,
-      selfTone(selfKind(status)),
+      selfTon,
       selfRowText(status, t, f, app.now, serverBackups(app.snapshots)),
       selfCells,
     )}
 
-    {#if others.length}
+    {#if pbs && others.length}
       <h2 class="grp">{t.nav.others}</h2>
       {#each others as m (m.backup_id)}
         {@render row(
@@ -83,7 +95,7 @@
       <p class="note">{t.nav.othersNote}</p>
     {/if}
     <!-- Before the setup the daemon cannot read the server (no configuration): nothing to report. -->
-    {#if app.machinesError && status.health !== "unconfigured"}
+    {#if pbs && app.machinesError && status.health !== "unconfigured"}
       {#if !others.length}<h2 class="grp">{t.nav.others}</h2>{/if}
       <p class="note">
         {t.load.othersFailed}
@@ -92,14 +104,16 @@
     {/if}
 
     <div class="end">
-      {@render row(
-        href({ view: "server" }),
-        route.view === "server",
-        t.nav.server,
-        server?.tone ?? null,
-        server?.text ?? null,
-        null,
-      )}
+      {#if pbs}
+        {@render row(
+          href({ view: "server" }),
+          route.view === "server",
+          t.nav.server,
+          server?.tone ?? null,
+          server?.text ?? null,
+          null,
+        )}
+      {/if}
       {@render row(href({ view: "settings" }), route.view === "settings", t.nav.settings, null, null, null)}
     </div>
   {:else}

@@ -129,6 +129,11 @@ const en = {
         : m.rel === "yesterday"
           ? `Backed up yesterday ${m.time}`
           : `Backed up ${dayMonth} ${m.time}`,
+    stickRunning: "Backing up to the stick",
+    stickFull: "Stick full",
+    stickFailing: "Backup to the stick failed",
+    stickOverdue: (day: string) => `Stick overdue, last ${day}`,
+    stickNever: "Not backed up to the stick yet",
     serverReachable: (time: string) => `Reachable, checked at ${time}`,
     serverReachableDay: (day: string) => `Reachable, checked on ${day}`,
     serverUnreachable: (time: string) => `Not reachable, checked at ${time}`,
@@ -316,7 +321,7 @@ const en = {
     keyCreateImport:
       "If you already have a key from before, for example after a reinstall, do not create a new one but bring the old one back: sudo nestegg key import <key file>. Otherwise the older backups cannot be opened.",
     keyStoreWhy:
-      "Without this key nobody can open the backups, not even you if the computer breaks. That is why a copy must be kept outside this computer. A copy that only lies on this computer does not count, nor does one inside a folder that is backed up, even on an external disk. There are two ways; one is enough. Backups only start once you have confirmed the copy.",
+      "Without this key nobody can open the backups, not even you if the computer breaks. That is why a copy must be kept outside this computer. A copy that only lies on this computer does not count, nor does one inside a folder that is backed up, even on an external disk. There are several ways; one is enough. Backups only start once you have confirmed the copy.",
     usbTitle: "On a USB stick",
     usbText:
       "Write the key to a USB stick and keep the stick somewhere other than the computer. Enter where the stick is mounted, usually below /media.",
@@ -344,6 +349,12 @@ const en = {
     codeHint: "Not secret. Eight characters from 0–9 and A–F, with or without hyphen.",
     codeInvalid: "That does not look like a check code (eight characters from 0–9 and A–F).",
     fillCode: "Enter the check code first.",
+    stickCopyTitle: "On the backup stick, with a password",
+    stickCopyText:
+      "nestegg puts a copy of the key, protected by your password, on the plugged-in backup stick and opens it again as a test. You type the password in the terminal: at least 16 characters from three kinds of characters, or five different words with at least 24 characters together. Choose one you can remember.",
+    stickCopyPaper: "Also keep a paper key away from the stick: if the stick is lost, it is the only way back.",
+    firstBackupStick:
+      "Everything is ready. Plug in the backup stick: if a backup is due, it starts by itself. You can also start it above with “Back up to stick now”. The first time, everything is written, which can take a long time.",
     firstBackupText:
       "Everything is ready. Click “Back up now” above. The first time, everything is uploaded, which can take a long time. You can close the page meanwhile.",
   },
@@ -372,6 +383,9 @@ const en = {
     failed: (reason: string) => `Failed: ${reason}`,
     pbs: "Server not reachable",
     pbsTimes: (n: number) => `Server not reachable, ${n} attempts`,
+    stickAbsent: "Stick not plugged in",
+    stickAbsentTimes: (n: number) => `Stick not plugged in, looked ${n} times`,
+    succeededPlug: "Backed up, started when plugged in",
     cancelled: "Cancelled",
     unknown: "Not understood, please update nestegg",
     succeededOtherStart: "Backed up, started in an unknown way",
@@ -396,6 +410,11 @@ const en = {
     emptyHere: "No backup from this installation yet. The earlier ones are on the server.",
   },
   reason: {
+    stick_not_plugged_in: "stick not plugged in",
+    stick_full: "stick full",
+    filesystem_damaged: "stick file system damaged",
+    stick_unsupported: "not possible on this computer",
+    key_mismatch: "a backup with another key is there",
     pbs_unreachable: "server not reachable",
     authentication: "access denied",
     source_missing: "folder missing",
@@ -410,6 +429,16 @@ const en = {
     unknown: "unknown error",
   },
   explain: {
+    stick_not_plugged_in:
+      "The stick was not plugged in. That is not an error: as soon as it is plugged in and a backup is due, nestegg backs up by itself.",
+    stick_full:
+      "There is too little space on the stick. nestegg stopped and did not delete more older backups than the retention rules allow. A larger stick helps.",
+    filesystem_damaged:
+      "The check before writing found damage in the stick's file system, for example because it was pulled out during a backup. nestegg only writes to it again once it is repaired. It can only be repaired while the stick is not mounted: by an administrator with e2fsck in a terminal.",
+    stick_unsupported:
+      "This computer cannot start the backup service for the stick. Most often the kernel's IPv6 support is switched off (ipv6.disable=1). nestegg needs it even for the connection inside the computer and does not change this setting itself.",
+    key_mismatch:
+      "The target holds a backup under this computer's name that was made with a different key, for example by another computer with the same name. nestegg wrote nothing and deleted nothing. To fix it, an administrator gives this computer its own backup ID in a terminal.",
     pbs_unreachable:
       "The backup server did not answer. This computer did nothing wrong.",
     authentication:
@@ -505,11 +534,77 @@ const en = {
           : "Check finished, everything is fine.",
     checkFailed: (msg: string) => `The check could not be run. ${msg}`,
   },
+  stick: {
+    title: "Backup destinations",
+    server: "Backup server",
+    name: "Backup stick",
+    toServer: "To the backup server",
+    running: "Backing up to the stick right now.",
+    ok: (m: Moment) => `Backed up to the stick ${at(m)}.`,
+    okUndated: "Backed up to the stick.",
+    incomplete: (m: Moment) => `Backed up to the stick ${at(m)}, but incomplete.`,
+    never: "No backup on the stick yet.",
+    overdue: (days: number, hours: number) =>
+      days >= 2 ? `Not backed up to the stick for ${days} days.` : `Not backed up to the stick for ${hours} hours.`,
+    full: "The stick is full.",
+    damaged: "The stick's file system is damaged.",
+    verifyFailed: "The check of the backup on the stick failed.",
+    keyMismatch: "The stick holds a backup made with another key.",
+    unsupported: "This computer cannot back up to the stick.",
+    failing: (m: Moment) => `The backup to the stick ${at(m)} failed.`,
+    failingUndated: "The last backup to the stick failed.",
+    unknown: "This version of nestegg does not understand the stick's last entry. Update nestegg.",
+    verifyText:
+      "After writing, nestegg checks the new backup on the stick. This check found an error, so the backup does not count as done. It can be a sign that the stick is wearing out. Try again; if it happens again, use another stick.",
+    absent: "Not plugged in.",
+    plugToBackUp: "Plug it in and nestegg backs up as soon as a backup is due.",
+    plugged: "Plugged in.",
+    safe: "Plugged in and not in use: safe to unplug.",
+    keepIn: "Keep it plugged in until this says it is safe to unplug.",
+    free: (size: string) => `${size} free`,
+    freeNote: "as of the last backup",
+    lastSuccess: (m: Moment) => `Last backed up ${at(m)}`,
+    fullCheck: (day: string) => `fully checked on ${day}`,
+    damagedSnapshots: (n: number) => `${n} ${plural(n, "backup", "backups")} on the stick reported as damaged`,
+    overdueAfter: (h: number) => `overdue after ${h % 24 === 0 ? `${h / 24} ${plural(h / 24, "day", "days")}` : `${h} hours`}`,
+    runNow: "Back up to stick now",
+    starting: "Starting …",
+    runFailed: (msg: string) => `The backup to the stick could not be started. ${msg}`,
+    waitPlug: "A backup happens as soon as the stick is plugged in and a backup is due.",
+    passwordTitle: "Check the stick's password",
+    passwordText:
+      "The copy of the key on the stick is protected by a password. So that a forgotten password shows before you need it, nestegg asks for it every 180 days. If no copy is confirmed yet, make one with key-copy. Backups keep running meanwhile.",
+    passwordCmd: "With the stick plugged in, in a terminal:",
+    uuidLabel: "UUID of the stick",
+    uuidHint: "Shown by sudo nestegg stick info when exactly one registered stick is plugged in.",
+    uuidInvalid: "That does not look like a UUID (8-4-4-4-12 characters from 0–9 and a–f).",
+    fillUuid: "Enter the UUID of the stick first.",
+    noServer: "This computer backs up to a backup stick only. No backup server is set up.",
+    restoreMissing: "This interface cannot restore files from the stick yet.",
+    factRestore: "Restore",
+    factBackupId: "Name of the backups",
+    verifiedYes: "Read back from the stick and checked after writing",
+    colWritten: "Written",
+    retention: "Retention on the stick",
+    retentionText: "The last 3, plus 7 daily, 4 weekly and 6 monthly",
+    fixedOnly: "Encryption",
+    okServerOnly: "Everything is fine on the backup server, but not on the backup stick, see below.",
+    history: "History of",
+    stepCheck: "Check and mount the stick",
+    stepCheckNow: "Checking the file system, starting the backup service for the stick.",
+    stepUpload: "Write changed files to the stick",
+    written: (size: string) => `${size} written`,
+    stepFinish: "Check, clean up, unmount",
+    stepFinishSub: "The new backup is checked, old ones are cleaned up by the rules, then the stick is unmounted.",
+    runningLead: "Backup to the stick in progress.",
+    runningText: "Keep the stick plugged in until this page says it is safe to unplug. You can close the page.",
+    runningSincePlug: (dur: string) => `Started when plugged in, running for ${dur}`,
+  },
   settings: {
     title: "Settings",
     intro: "Changes are saved immediately and apply from the next backup.",
     reported:
-      "Changes that reduce the protection are reported to everyone who uses this computer: automatic backups switched off, a new exclude, a longer rhythm or a longer time before “overdue”, Wake-on-LAN switched off.",
+      "Changes that reduce the protection are reported to everyone who uses this computer: automatic backups switched off, a new exclude, a longer rhythm or a longer time before “overdue”, Wake-on-LAN switched off, a removed backup destination.",
     introReadOnly:
       "This nestegg version only shows the settings. Change them in a terminal in the file /etc/nestegg/config.toml (sudoedit /etc/nestegg/config.toml).",
     offline: "Nothing can be changed without a connection to the nestegg service.",
@@ -573,9 +668,29 @@ const en = {
     sumExcludeAdded: (pattern: string) => `${pattern} is left out from now on`,
     sumExcludeRemoved: (pattern: string) => `${pattern} is backed up again`,
     sumWol: (on: boolean) => `Wake-on-LAN ${on ? "switched on" : "switched off"}`,
+    overdueServer: "Server: report overdue after",
+    overdueStick: "Stick: report overdue after",
+    overdueStickHint:
+      "The stick is not always plugged in, so the default is 7 days (168 hours). Saved when you leave the field or press Enter.",
+    sumStickOverdue: (hours: number) => `Stick overdue after ${hours} hours`,
+    targetsHint: "Where this computer backs up to. Adding one is only possible in a terminal with administrator rights.",
+    onlyTarget: "The only destination. It cannot be removed.",
+    removeTarget: "Remove …",
+    removeTargetLabel: (name: string) => `Remove ${name} as a backup destination`,
+    removeAskPbs:
+      "Remove the backup server as a destination? From then on backups only go to the stick. The server settings are deleted from the setup; only an administrator can add it again in a terminal. The change is reported to everyone who uses this computer.",
+    removeAskStick:
+      "Remove the backup stick as a destination? From then on backups only go to the backup server, and nestegg no longer uses the stick when it is plugged in. The backups on the stick stay as they are. Only an administrator can add it again in a terminal. The change is reported to everyone who uses this computer.",
+    removeConfirm: "Remove",
+    removeKeep: "Keep",
+    sumRemoved: (name: string) => `${name} removed as a backup destination`,
     overdueRaised: (hours: number) => `Raised to ${hours} hours because it must be longer than the rhythm.`,
     problem: {
       wholeNumber: "Please enter a whole number of hours.",
+      stickOverdueRange: (max: number) =>
+        `Allowed are 1 to ${max} hours. Only an administrator can set a longer time in /etc/nestegg/config.toml.`,
+      noStick: "No backup stick is set up for this computer.",
+      lastTarget: "The last backup destination cannot be removed.",
       intervalRange: (min: number, max: number) => `The rhythm must be between ${min} and ${max} hours.`,
       overdueRange: (min: number, max: number) => `Allowed are ${min} to ${max} hours.`,
       overdueCapped: (min: number, max: number, current: number | null) =>

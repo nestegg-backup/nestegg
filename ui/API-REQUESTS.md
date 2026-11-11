@@ -111,7 +111,38 @@ is needed.
   The UI offers the button to every user of the page and shows the daemon's
   message for any other error.
 
-## 7. Integration notes for the core side (not API)
+## 7. Backup stick (phase five of decision 0023)
+
+Checked against `api/openapi.yaml` 0.4.0. The UI shows both targets, the
+per-target history, "Back up to stick now", the stick settings and target
+removal with what the contract has. These pieces are missing:
+
+- **Restore from a plugged-in stick.** `/snapshots`, `/browse` and `/restores`
+  have no target. Without a server they answer `503 pbs_unreachable`. The UI
+  therefore offers no restore in stick-only setups and says so ("cannot restore
+  from the stick yet"); with both targets it restores from the server only.
+  Proposal: an optional `target=stick` query on the three endpoints (or
+  `/targets/stick/snapshots`), answered while a registered stick is plugged in,
+  `409 stick_not_plugged_in` otherwise.
+- **Plugged in, explicitly.** `TargetStatus.state` says `stick_not_plugged_in`,
+  but `stick_full` hides it, and a failing `attached()` probe (cloned UUIDs)
+  shows up as plain health. The UI reads "not `stick_not_plugged_in`" as
+  plugged in and shows nothing about it while the state is `stick_full`.
+  Proposal: `plugged_in: boolean | null` on the stick's `TargetStatus`.
+- **Fill level.** Only `available_bytes` (at the last run) exists, so the UI
+  shows free space "as of the last backup", not a percentage. Proposal:
+  `total_bytes` next to it, and the time it was measured.
+- **The stick's UUID.** `stick key-copy` and `key-check` need `--uuid`. The UI
+  takes it from the newest stick run's `stick_uuid`; before any stick run the
+  user has to type it (from `sudo nestegg stick info`). Proposal: the registered
+  data UUIDs in `GET /config` (not secret), and per UUID whether the password
+  proof is missing or only the 180-day re-check is due (`password_reminder`
+  is one flag for both, so the notice shows both commands).
+- **Stick limits.** `limits` has no entry for `stick_overdue_after_hours`; the
+  UI computes the cap from `overdue_after_hours.base`/`per_interval_extra` and
+  the stick's current value, like `settings::validate`.
+
+## 8. Integration notes for the core side (not API)
 
 - **Websockets through `--dev-proxy`:** the forwarding in `nestegg ui` does
   not pass websocket upgrades on, so Vite's live reload would not work

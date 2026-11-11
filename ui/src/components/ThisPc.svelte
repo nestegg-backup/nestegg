@@ -7,33 +7,74 @@
   import RunHistory from "./RunHistory.svelte";
   import RunProgress from "./RunProgress.svelte";
   import SetupGuide from "./SetupGuide.svelte";
+  import StickNotice from "./StickNotice.svelte";
+  import StickTargets from "./StickTargets.svelte";
   import { app } from "../lib/store.svelte";
   import { href } from "../lib/router.svelte";
   import { reveal } from "../lib/reveal";
-  import { backupBlocked, damagedSnapshots, damagedTimes, historyRows, restoreOffer, scheduleHours, selfStrip, selfTone, serverBackups, setupGuide } from "../lib/derive";
+  import {
+    backupBlocked,
+    canBackUpToStick,
+    damagedSnapshots,
+    damagedTimes,
+    hasPbs,
+    historyRows,
+    restoreOffer,
+    scheduleHours,
+    selfStrip,
+    selfTone,
+    serverBackups,
+    setupGuide,
+    stickOnly,
+    stickView,
+  } from "../lib/derive";
   import { selfSummary } from "../lib/text";
   import { f, t } from "../lib/locale";
-  import type { Status } from "../lib/types";
+  import type { Status, Target } from "../lib/types";
 
   let { status }: { status: Status } = $props();
+
+  const pbs = $derived(hasPbs(status));
+  const stick = $derived(status.targets?.stick ?? null);
+  const onlyStick = $derived(stickOnly(status));
+  // With both targets the history shows one of them; the server's first.
+  let picked = $state<Target>("pbs");
+  const shownTarget = $derived<Target>(onlyStick ? "stick" : stick && picked === "stick" ? "stick" : "pbs");
+  const both = $derived(pbs && !!stick);
+  const shownRuns = $derived(both && shownTarget === "stick" ? app.stickRuns : app.runs);
+  const stickCurrent = $derived(status.current_run?.target === "stick" ? status.current_run : null);
+  // Stick only: the main button backs up to the stick, and only while it is plugged in.
+  const stickReady = $derived(!!stick && canBackUpToStick(stickView(stick), app.running));
+  const waitStick = $derived(onlyStick && stick?.state === "stick_not_plugged_in");
 
   const server = $derived(serverBackups(app.snapshots));
   const summary = $derived(selfSummary(status, t, f, app.now, server));
   const tone = $derived(selfTone(summary.kind));
-  const cells = $derived(selfStrip(app.runs.value, status.current_run, app.snapshots.list, app.now, f, status.server_verify_failed ?? []));
+  // The stick's backups are not in the server's snapshot list, and "damaged on the server" does not fit them.
+  const cells = $derived(
+    shownTarget === "stick"
+      ? selfStrip(shownRuns.value, stickCurrent, [], app.now, f)
+      : selfStrip(app.runs.value, stickCurrent ? null : status.current_run, app.snapshots.list, app.now, f, status.server_verify_failed ?? []),
+  );
   const guide = $derived(setupGuide(status));
   const incompleteReasons = $derived(summary.kind === "incomplete" ? (status.last_success?.incomplete ?? []) : []);
   const damaged = $derived(damagedTimes(status.server_verify_failed, app.snapshots.list));
   // Snapshot paths marked as damaged: the history rows say the same as the strip.
-  const damagedPaths = $derived(damagedSnapshots(app.snapshots.list, status.server_verify_failed ?? []));
+  const damagedPaths = $derived(
+    shownTarget === "stick" ? new Set<string>() : damagedSnapshots(app.snapshots.list, status.server_verify_failed ?? []),
+  );
   const hours = $derived(scheduleHours(app.config.value, status));
   const verified = $derived(status.last_success?.verified === true);
-  const rows = $derived(historyRows(app.runs.value, f));
+  const rows = $derived(historyRows(shownRuns.value, f));
   const running = $derived(summary.kind === "running" && !!status.current_run);
-  const canRun = $derived(summary.kind !== "unconfigured" && summary.kind !== "key_missing" && summary.kind !== "running");
+  const canRun = $derived(
+    summary.kind !== "unconfigured" && summary.kind !== "key_missing" && summary.kind !== "running" && (!onlyStick || stickReady),
+  );
   // Based on the snapshots on the server, not on the local history (empty after a reinstall).
-  const offer = $derived(restoreOffer(summary.kind, app.snapshots));
+  // Without a server there is nothing to restore through this page (no API for the stick yet).
+  const offer = $derived(pbs ? restoreOffer(summary.kind, app.snapshots) : "none");
   const canRestore = $derived(offer === "show");
+  const startError = $derived(onlyStick ? app.stickStartError : app.startError);
   const sources = $derived((app.config.value?.sources ?? []).filter((s) => s.archive !== "inventory.pxar"));
   const latest = $derived(app.snapshots.state === "ok" ? (app.snapshots.list[0] ?? null) : null);
   const next = $derived(status.schedule.next_run ?? null);
@@ -54,7 +95,7 @@
   $effect(() => {
     // What the server holds decides about restoring, also without any local history.
     // Needs the PBS, so only asked once per page load.
-    if (status.health !== "unconfigured") untrack(() => void app.loadSnapshots());
+    if (status.health !== "unconfigured" && pbs) untrack(() => void app.loadSnapshots());
   });
 </script>
 
@@ -77,9 +118,13 @@
       {/if}
     </div>
     {#if running}<CancelRun />{/if}
-    {#if app.startError}
-      <p class="hint" class:bad={app.startError.kind !== "conflict"} role="status" use:reveal>
-        {app.startError.kind === "conflict" ? t.self.runConflict : t.self.runStartFailed(app.startError.message)}
+    {#if startError}
+      <p class="hint" class:bad={startError.kind !== "conflict"} role="status" use:reveal>
+        {startError.kind === "conflict"
+          ? t.self.runConflict
+          : onlyStick
+            ? t.stick.runFailed(startError.message)
+            : t.self.runStartFailed(startError.message)}
       </p>
     {/if}
   </div>
@@ -94,7 +139,11 @@
           role={app.offline ? "link" : undefined}>{t.self.restore}</a
         >
       {/if}
-      {#if canRun}
+      {#if canRun && onlyStick}
+        <button class="btn primary" type="button" disabled={app.stickStarting || app.offline} onclick={() => app.startStickRun()}>
+          {app.stickStarting ? t.stick.starting : t.stick.runNow}
+        </button>
+      {:else if canRun}
         <button class="btn primary" type="button" disabled={app.starting || app.offline} onclick={() => app.startRun()}>
           {app.starting ? t.self.starting : t.self.runNow}
         </button>
@@ -104,7 +153,11 @@
 </div>
 
 {#if guide}
-  <SetupGuide {guide} />
+  <SetupGuide {guide} {status} />
+{/if}
+
+{#if stick?.password_reminder && summary.kind !== "unconfigured"}
+  <StickNotice {stick} />
 {/if}
 
 {#if incompleteReasons.length}
@@ -128,19 +181,29 @@
   </section>
 {/if}
 
+{#if stick && summary.kind !== "unconfigured"}
+  <StickTargets {status} {stick} />
+{/if}
+
 {#if summary.kind !== "unconfigured"}
   <div class="cols">
     <section aria-label={t.strip.title}>
-      {#if app.runs.state === "error"}
+      {#if both}
+        <div class="pick" role="group" aria-label={t.stick.history}>
+          <button class="btn small" type="button" aria-pressed={shownTarget === "pbs"} onclick={() => (picked = "pbs")}>{t.stick.server}</button>
+          <button class="btn small" type="button" aria-pressed={shownTarget === "stick"} onclick={() => (picked = "stick")}>{t.stick.name}</button>
+        </div>
+      {/if}
+      {#if shownRuns.state === "error"}
         <!-- Never draw 14 empty days for a history that could not be loaded. -->
         <h2 class="sec-title">{t.strip.title}</h2>
         <LoadError text={t.load.runsFailed} onretry={() => app.loadRuns()} />
-      {:else if app.runs.state === "loading"}
+      {:else if shownRuns.state === "loading"}
         <h2 class="sec-title">{t.strip.title}</h2>
         <p class="empty" role="status">{t.app.loading}</p>
       {:else}
         <DayStrip {cells} />
-        <RunHistory {rows} loaded damaged={damagedPaths} emptyText={server?.count ? t.runs.emptyHere : undefined} />
+        <RunHistory {rows} loaded damaged={damagedPaths} written={shownTarget === "stick"} emptyText={shownTarget === "pbs" && server?.count ? t.runs.emptyHere : undefined} />
       {/if}
     </section>
 
@@ -151,7 +214,7 @@
           <dt>{t.self.factOs}</dt>
           <dd>{status.machine.os}</dd>
         {/if}
-        <dt>{t.self.factBackupId}</dt>
+        <dt>{onlyStick ? t.stick.factBackupId : t.self.factBackupId}</dt>
         <dd><code>{status.machine.backup_id}</code></dd>
         <dt>{t.self.factSources}</dt>
         <dd>
@@ -164,7 +227,11 @@
             {sources.map((s) => s.path).join(", ")} {t.self.factSourcesExtra}
           {/if}
         </dd>
-        {#if app.snapshots.state !== "idle"}
+        {#if !pbs}
+          <dt>{t.stick.factRestore}</dt>
+          <dd class="muted">{t.stick.restoreMissing}</dd>
+        {/if}
+        {#if pbs && app.snapshots.state !== "idle"}
           <dt>{t.self.factOnServer}</dt>
           <dd>
             {#if latest}
@@ -196,6 +263,8 @@
             <a class="linkbtn" href={href({ view: "settings" })}>{t.self.nextOffLink}</a>
           {:else if running}
             {t.self.runningLead}
+          {:else if waitStick}
+            {t.stick.waitPlug}
           {:else if next}
             {new Date(next) <= app.now ? t.self.nextDue : t.self.nextAt(f.moment(next, app.now))}
           {:else}
@@ -204,7 +273,7 @@
         </dd>
         {#if verified}
           <dt>{t.self.factVerified}</dt>
-          <dd>{t.self.verifiedYes}</dd>
+          <dd>{onlyStick ? t.stick.verifiedYes : t.self.verifiedYes}</dd>
         {/if}
         <dt>{t.self.factEncryption}</dt>
         <dd>
@@ -223,6 +292,8 @@
 
 <style>
   .warn-text { color: var(--warn); }
+  .pick { display: flex; gap: 6px; margin-bottom: 14px; }
+  .pick .btn[aria-pressed="true"] { background: var(--sel); border-color: var(--field-border); }
   .reasons, .damaged { margin-top: 22px; max-width: 720px; padding: 14px 16px 16px; }
   .reasons h2, .damaged h2 { font-size: var(--fs-m); font-weight: 600; display: flex; align-items: center; gap: 10px; }
   .reasons ul, .damaged ul { margin-top: 8px; padding-left: 18px; list-style: disc; }

@@ -19,6 +19,7 @@ import type {
   SettingsChange,
   Snapshot,
   Status,
+  Target,
 } from "./types";
 
 export type FailureKind =
@@ -92,7 +93,15 @@ export const api = {
   status: () => request<Status>("status"),
   runs: (limit = 200) => request<{ runs: Run[] }>(`runs?limit=${limit}`).then((r) => r.runs),
   run: (id: string) => request<RunDetail>(`runs/${q(id)}`),
+  /** All configured targets (the stick first, then the backup server). */
   startRun: () => request<Run>("runs", { method: "POST" }),
+  /** Up to 200 runs of one target, newest first, including the active run. Older records without a target belong to the server. */
+  targetRuns: (target: Target) => request<{ runs: Run[] }>(`targets/${target}/runs`).then((r) => r.runs),
+  /**
+   * Back up to this target only. 202 means started: the run then shows up as `current_run`; a stick
+   * that is not plugged in ends that run as `stick_not_plugged_in`. 409: a backup is already running.
+   */
+  startTargetRun: (target: Target) => request<Run>(`targets/${target}/runs`, { method: "POST" }),
   /** Ask the daemon to stop a running backup. Rejects with kind `conflict` (`cannot_cancel`: still starting, or already over) or `not_found` (unknown run; older daemons also answered 404 for the former). */
   cancelRun: (id: string) => request<{ cancelling?: boolean }>(`runs/${q(id)}/cancel`, { method: "POST" }),
   pbs: () => request<PbsInfo>("pbs"),
