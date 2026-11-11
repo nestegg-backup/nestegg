@@ -125,3 +125,16 @@ ext4 and Btrfs, not a complete XFS or ext2/3 restore cycle.
 
 - [Kernel dm-snapshot documentation](https://www.kernel.org/doc/html/latest/admin-guide/device-mapper/snapshot.html)
 - [LVM activation and metadata-read-only configuration](https://gitlab.com/lvmteam/lvm2/-/blob/main/conf/example.conf.in)
+
+## Offline review hardening
+
+All ext2/3/4 source mounts, including the RAM journal replay mount, explicitly
+use `errors=continue`. The mount is already read-only, so remount-ro cannot add
+protection; overriding the source superblock's `errors=panic` avoids a live-kernel
+panic. The writeable RAM snapshot alone receives journal replay.
+
+The phase-two integration audit also checked the shared Python key helper
+(`/usr/bin/python3 -I`, root working directory and cleared PYTHON variables) and
+`BootMedium::open`'s shared recursively slave mount namespace. Both fixes are
+already reused by the offline flow. Cancellation handling is checked separately
+alongside verification and retention; offline sessions have no daemon retry state.

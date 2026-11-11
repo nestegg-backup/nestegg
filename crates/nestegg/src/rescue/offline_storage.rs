@@ -15,12 +15,22 @@ use crate::stick::capture;
 
 pub fn readonly_options(fstype: &str) -> Result<&'static str> {
     match fstype {
-        "ext2" => Ok("ro,nodev,nosuid,noexec"),
-        "ext3" | "ext4" => Ok("ro,noload,nodev,nosuid,noexec"),
+        "ext2" => Ok("ro,errors=continue,nodev,nosuid,noexec"),
+        "ext3" | "ext4" => Ok("ro,noload,errors=continue,nodev,nosuid,noexec"),
         "xfs" => Ok("ro,norecovery,nodev,nosuid,noexec"),
         "btrfs" => Ok("ro,rescue=nologreplay,nodev,nosuid,noexec"),
         "vfat" => Ok("ro,nodev,nosuid,noexec"),
         _ => bail!("unsupported offline filesystem: {fstype}"),
+    }
+}
+
+// A read-only mount cannot become any more read-only. Override even a
+// superblock errors=panic policy while replaying into the private RAM COW.
+fn replay_options(fstype: &str) -> &'static str {
+    if matches!(fstype, "ext2" | "ext3" | "ext4") {
+        "ro,errors=continue,nodev,nosuid,noexec"
+    } else {
+        "ro,nodev,nosuid,noexec"
     }
 }
 
@@ -549,7 +559,7 @@ impl Sources {
         fs::create_dir(&probe)?;
         capture(
             Command::new("mount")
-                .args(["-t", kind, "-o", "ro,nodev,nosuid,noexec"])
+                .args(["-t", kind, "-o", replay_options(kind)])
                 .arg(format!("/dev/mapper/{name}"))
                 .arg(&probe),
         )?;
@@ -895,6 +905,26 @@ fn lvm_config(vg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ext_source_mounts_override_superblock_panic_policy() {
+        for kind in ["ext2", "ext3", "ext4"] {
+            assert!(
+                readonly_options(kind)
+                    .unwrap()
+                    .split(',')
+                    .any(|o| o == "errors=continue")
+            );
+            assert!(
+                replay_options(kind)
+                    .split(',')
+                    .any(|o| o == "errors=continue")
+            );
+            assert!(!replay_options(kind).contains("noload"));
+        }
+        assert!(!replay_options("xfs").contains("errors="));
+        assert!(!replay_options("btrfs").contains("errors="));
+    }
+
     #[test]
     fn btrfs_scope_includes_database_siblings_and_keeps_snapshots_empty() {
         let root = BlockDev {
