@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 
 use super::media::{self, OwnedLoop, VerifiedImage};
-use super::{atomic_write, capture, private_dir};
+use super::{capture, private_dir};
 use crate::config::{Config, Paths, StickConfig};
 
 #[derive(Subcommand)]
@@ -182,12 +182,34 @@ fn register(path: &Path, uuid: &str) -> Result<()> {
     }
     doc["stick"]["data_uuids"] = toml_edit::value(array);
     fs::create_dir_all(path.parent().context("config parent missing")?)?;
-    atomic_write(path, doc.to_string().as_bytes())
+    let text = doc.to_string();
+    if path.exists() {
+        crate::settings::write_atomically(path, &text)
+    } else {
+        crate::settings::write_file_atomic(path, &text, 0o600)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn registration_preserves_permissions_and_refuses_config_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[pbs]\nserver='pbs.example.com'\ndatastore='backups'\nauth_id='backup@pbs!desktop'\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        register(&path, "01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+        let before = fs::read(&path).unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(register(&link, "11111111-2222-3333-4444-555555555555").is_err());
+        assert!(link.is_symlink());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
     #[test]
     fn registration_preserves_pbs_and_comments_and_rejects_unknowns() {
         let d = tempfile::tempdir().unwrap();
