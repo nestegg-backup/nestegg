@@ -37,11 +37,25 @@ def main():
     query = urlencode({'target': 'stick', 'archive': 'system.pxar', 'path': '/home/alice'})
     status, value = request('GET', '/snapshots/' + timestamp + '/browse?' + query)
     assert status == 200 and value['entries'], (status, value)
+    query = urlencode({'target': 'stick', 'archive': 'system.pxar', 'path': '/home/bob'})
+    status, value = request('GET', '/snapshots/' + timestamp + '/browse?' + query)
+    assert status == 403, (status, value)
     body = {'target': 'stick', 'snapshot_time': timestamp, 'archive': 'system.pxar',
             'paths': ['/etc/shadow'], 'target_dir': '/home/alice/refused-system-files'}
     status, value = request('POST', '/restores', body)
     assert status == 403, (status, value)
     assert not Path(body['target_dir']).exists()
+    body['paths'] = ['/home/bob/private.txt']
+    body['target_dir'] = '/home/alice/refused-other-user'
+    status, value = request('POST', '/restores', body)
+    assert status == 403, (status, value)
+    assert not Path(body['target_dir']).exists()
+    body['paths'] = ['/home/alice/notes.txt']
+    for outside in ['/home/bob/refused-target', '/tmp/refused-outside-home']:
+        body['target_dir'] = outside
+        status, value = request('POST', '/restores', body)
+        assert status == 403, (status, value)
+    assert not Path('/tmp/refused-outside-home').exists()
     body['paths'] = ['/home/alice/notes.txt']
     body['target_dir'] = '/home/alice/restored-stick-files'
     status, value = request('POST', '/restores', body)
@@ -55,7 +69,7 @@ def main():
     assert value['state'] == 'succeeded', value
     files = list(Path(body['target_dir']).rglob('notes.txt'))
     assert len(files) == 1 and files[0].read_text() == 'hello from alice\n', files
-    print('PASS desktop stick API: list, scoped browse, refused system files, own-file restore')
+    print('PASS desktop stick API: list, scoped browse, refused system/other-user files and outside-home targets, own-file restore')
 
 
 if __name__ == '__main__':

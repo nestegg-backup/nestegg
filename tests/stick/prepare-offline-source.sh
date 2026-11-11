@@ -52,6 +52,10 @@ if [[ $MODE == id-collision ]]; then
 fi
 case "$MODE" in
     desktop)
+        chroot "$mnt" useradd -m -s /bin/bash bob
+        printf 'second user private file\n' > "$mnt/home/bob/private.txt"
+        chroot "$mnt" chown -R bob:bob /home/bob
+        chmod 0700 "$mnt/home/bob"
         mkdir -p "$mnt/var/lib/nestegg/stick"
         cp /work/pbs.squashfs "$mnt/var/lib/nestegg/stick/pbs.squashfs"
         sha256sum "$mnt/var/lib/nestegg/stick/pbs.squashfs" | cut -d' ' -f1 > "$mnt/var/lib/nestegg/stick/pbs.squashfs.sha256"
