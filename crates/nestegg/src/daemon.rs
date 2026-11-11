@@ -314,7 +314,11 @@ async fn list_runs(
         if let Some(current) = crate::run::active_run(&app.paths)? {
             runs.push(current);
         }
-        runs.extend(store.list_runs(limit)?);
+        runs.extend(store.list_runs(usize::MAX)?);
+        let target = Config::load(&app.paths.config_file)
+            .map(|c| legacy_target(&c))
+            .unwrap_or(crate::state::TargetSelection::Pbs);
+        runs.retain(|r| target.includes(r.target));
         runs.truncate(limit);
         Ok(runs)
     })
@@ -361,7 +365,17 @@ fn log_tail(path: &Path, lines: usize) -> Vec<String> {
 }
 
 async fn start_run(AxState(app): AxState<App>) -> ApiResult<(StatusCode, Json<Run>)> {
-    start_selected_run(app, crate::state::TargetSelection::All).await
+    let paths = app.paths.clone();
+    let target = blocking(move || Ok(legacy_target(&Config::load(&paths.config_file)?))).await?;
+    start_selected_run(app, target).await
+}
+
+fn legacy_target(config: &Config) -> crate::state::TargetSelection {
+    if config.pbs.is_some() {
+        crate::state::TargetSelection::Pbs
+    } else {
+        crate::state::TargetSelection::Stick
+    }
 }
 
 fn selection(value: &str) -> ApiResult<crate::state::TargetSelection> {
@@ -1782,6 +1796,17 @@ mod tests {
             system_mode: false,
             incomplete: vec![],
         }
+    }
+
+    #[test]
+    fn legacy_start_selects_one_compatible_target() {
+        let mut cfg = crate::config::example("pbs.example.com", "store", "backup@pbs!desktop");
+        cfg.stick = Config::parse("[stick]\ndata_uuids=['01234567-89ab-cdef-0123-456789abcdef']")
+            .unwrap()
+            .stick;
+        assert_eq!(legacy_target(&cfg), crate::state::TargetSelection::Pbs);
+        cfg.pbs = None;
+        assert_eq!(legacy_target(&cfg), crate::state::TargetSelection::Stick);
     }
 
     #[test]

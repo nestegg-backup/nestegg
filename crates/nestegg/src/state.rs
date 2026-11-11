@@ -306,6 +306,8 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_bytes: Option<u64>,
     #[serde(default)]
+    pub last_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub last_run: Option<Run>,
     #[serde(default)]
     pub last_success: Option<Run>,
@@ -398,6 +400,8 @@ pub struct TargetState {
     pub full_verified_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub available_bytes: Option<u64>,
+    #[serde(default)]
+    pub last_checked_at: Option<DateTime<Utc>>,
 }
 impl TargetState {
     fn from_state(s: &State) -> Self {
@@ -410,6 +414,7 @@ impl TargetState {
             server_verify_failed: s.server_verify_failed.clone(),
             full_verified_at: s.full_verified_at,
             available_bytes: s.available_bytes,
+            last_checked_at: s.last_checked_at,
         }
     }
     fn apply(&self, s: &mut State) {
@@ -421,6 +426,7 @@ impl TargetState {
         s.server_verify_failed = self.server_verify_failed.clone();
         s.full_verified_at = self.full_verified_at;
         s.available_bytes = self.available_bytes;
+        s.last_checked_at = self.last_checked_at;
     }
 }
 

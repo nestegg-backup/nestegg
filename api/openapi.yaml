@@ -58,6 +58,10 @@ paths:
     get:
       operationId: listRuns
       summary: Run history, newest first.
+      description: |
+        Legacy target view: PBS runs only when a PBS is configured, otherwise
+        stick runs only. Includes that target's current run. Use
+        /targets/{target}/runs for explicit target selection or combined history.
       parameters:
         - name: limit
           in: query
@@ -77,6 +81,11 @@ paths:
     post:
       operationId: startRun
       summary: Start a backup now.
+      description: |
+        No body. Legacy target view: starts PBS only when a PBS is configured
+        (even with a stick attached); a stick-only configuration starts the
+        stick. The returned run belongs to that target. To start both targets,
+        explicitly POST /targets/all/runs (stick first).
       responses:
         "202":
           description: Accepted; the run is starting.
@@ -542,6 +551,7 @@ components:
         overdue_after_hours: { type: integer, description: Stick default is 168 hours (7 days). }
         next_run: { type: [string, "null"], format: date-time }
         available_bytes: { type: [integer, "null"], description: Free space as reported for the PBS backup user. }
+        last_checked_at: { type: [string, "null"], format: date-time, description: Last hourly stick presence check; absent media create no run record. }
         full_verified_at: { type: [string, "null"], format: date-time }
         server_verify_failed: { type: array, items: { type: string } }
         password_reminder: { type: boolean, description: A registered stick has no password proof or needs its 180-day password re-check. Use the root-only CLI key-check action; the API never accepts passwords. }

@@ -33,3 +33,14 @@ Unit tests exercise isolated imports and error classification. A privileged
 temporary-tmpfs test proves incoming mount propagation and the absence of
 outgoing propagation. Desktop and device-bound VM acceptance cover the real
 mount, filesystem check and backup pipeline.
+
+## Presence probes and compatibility
+
+An hourly timer tick records `last_checked_at` before probing for media. An
+absent stick does not create a run, rotate history, or alter retry evidence.
+Manual absent-stick attempts remain visible. Plug-in events respect the backup
+interval but bypass the growing retry pause: reattachment is a deliberate
+opportunity to retry.
+
+Legacy GET and POST `/runs` describe PBS when configured, otherwise the sole
+stick target. Explicit `/targets/all/runs` remains the way to request both.

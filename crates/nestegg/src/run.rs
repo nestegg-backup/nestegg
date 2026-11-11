@@ -523,7 +523,23 @@ fn execute_target(
 ) -> Result<RunExit> {
     crate::cancel::install_handler();
     let store = Store::for_target(paths, target);
-    let state = store.load_state()?;
+    let mut state = store.load_state()?;
+
+    // An hourly presence probe is not a backup attempt. In particular it must
+    // not evict real runs or reset failure/last-success evidence.
+    if target == Target::Stick && options.trigger == Trigger::Timer {
+        state.last_checked_at = Some(Utc::now());
+        store.save_state(&state)?;
+        if let Ok(cfg) = config
+            && matches!(
+                crate::stick::target::attached(cfg, options.stick_uuid.as_deref()),
+                Ok(None)
+            )
+        {
+            eprintln!("stick not plugged in; presence checked without starting a run");
+            return Ok(RunExit::NotDue);
+        }
+    }
 
     if let Some(reason) = timer_skip(config, &state, config_stamp.as_deref(), options) {
         eprintln!("{reason}");
@@ -665,8 +681,9 @@ fn timer_skip(
     }
     // After failures in a row the timer pauses longer and longer; manual
     // runs and a changed configuration are not held back.
-    if let Some(not_before) =
-        crate::state::retry_not_before(state, cfg.schedule.interval_hours, config_stamp, now)
+    if options.trigger == Trigger::Timer
+        && let Some(not_before) =
+            crate::state::retry_not_before(state, cfg.schedule.interval_hours, config_stamp, now)
         && now < not_before
     {
         return Some(format!(
@@ -1608,6 +1625,38 @@ pub fn parse_report(notes: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plug_respects_due_time_but_bypasses_failure_pause() {
+        let cfg = crate::config::example("pbs.example.com", "store", "backup@pbs!desktop");
+        let mut run = Run::new(Trigger::Timer, Utc::now());
+        run.finish(RunState::Failed, Utc::now());
+        let mut state = crate::state::State {
+            last_run: Some(run),
+            consecutive_failures: 3,
+            failed_config: Some("same".into()),
+            ..Default::default()
+        };
+        let mut options = RunOptions {
+            target: TargetSelection::Stick,
+            stick_uuid: None,
+            trigger: Trigger::Timer,
+            run_id: None,
+            force: false,
+        };
+        let cfg = Ok(cfg);
+        assert!(timer_skip(&cfg, &state, Some("same"), &options).is_some());
+        options.trigger = Trigger::Plug;
+        assert!(timer_skip(&cfg, &state, Some("same"), &options).is_none());
+        let mut success = Run::new(Trigger::Plug, Utc::now());
+        success.finish(RunState::Succeeded, Utc::now());
+        state.last_success = Some(success);
+        assert!(
+            timer_skip(&cfg, &state, Some("same"), &options)
+                .unwrap()
+                .contains("not due yet")
+        );
+    }
 
     #[test]
     fn exit_codes() {

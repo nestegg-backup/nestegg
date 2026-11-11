@@ -332,3 +332,76 @@ async fn target_history_filters_legacy_and_new_runs() {
     assert_eq!(json["runs"].as_array().unwrap().len(), 1);
     assert_eq!(json["runs"][0]["target"], "stick");
 }
+
+#[test]
+fn absent_timer_checks_preserve_real_history_and_retry_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths(dir.path());
+    std::fs::write(&paths.config_file, stick_config().to_toml().unwrap()).unwrap();
+    let store = Store::for_target(&paths, Target::Stick);
+    let failed = finished(Target::Stick, RunState::Failed);
+    store.record_finished(&failed, 1).unwrap();
+    let before = store.load_state().unwrap();
+    let options = nestegg::run::RunOptions {
+        target: nestegg::state::TargetSelection::Stick,
+        stick_uuid: None,
+        trigger: Trigger::Timer,
+        run_id: None,
+        force: false,
+    };
+    for _ in 0..25 {
+        assert_eq!(
+            nestegg::run::execute(&paths, &options).unwrap(),
+            nestegg::run::RunExit::NotDue
+        );
+    }
+    let after = store.load_state().unwrap();
+    assert_eq!(after.last_run, before.last_run);
+    assert_eq!(after.last_success, before.last_success);
+    assert_eq!(after.consecutive_failures, 1);
+    assert!(after.last_checked_at.is_some());
+    let runs = store.list_runs(50).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].id, failed.id);
+    assert!(!paths.current_run_file().exists());
+}
+
+#[tokio::test]
+async fn legacy_history_uses_pbs_when_configured_otherwise_stick() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    for with_pbs in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut cfg = stick_config();
+        if with_pbs {
+            cfg.pbs =
+                nestegg::config::example("pbs.example.com", "store", "backup@pbs!desktop").pbs;
+        }
+        std::fs::write(&paths.config_file, cfg.to_toml().unwrap()).unwrap();
+        for target in [Target::Stick, Target::Pbs] {
+            Store::for_target(&paths, target)
+                .record_finished(&finished(target, RunState::Succeeded), 20)
+                .unwrap();
+        }
+        let response = nestegg::daemon::router(paths)
+            .oneshot(
+                Request::get("/api/v1/runs?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["runs"][0]["target"],
+            if with_pbs { "pbs" } else { "stick" }
+        );
+    }
+}
