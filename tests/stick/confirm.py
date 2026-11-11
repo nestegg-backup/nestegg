@@ -9,7 +9,8 @@ import sys
 import time
 
 interrupt = len(sys.argv) > 1 and sys.argv[1] == "--interrupt"
-arguments = sys.argv[2:] if interrupt else sys.argv[1:]
+resize = len(sys.argv) > 1 and sys.argv[1] == "--resize-confirmed"
+arguments = sys.argv[2:] if interrupt or resize else sys.argv[1:]
 child = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT)
 output = b""
@@ -39,6 +40,22 @@ try:
                 confirmed = True
                 deadline = time.monotonic() + 10
                 continue
+            if resize:
+                # Change identity without releasing/reusing the global loop
+                # number: only resize this CLI's verified disposable backing.
+                if (arguments[1:3] != ["stick", "create"] or
+                        "--test-image" not in arguments):
+                    raise RuntimeError("resize test requires CLI-owned test image")
+                target = os.path.realpath(arguments[3])
+                device = matches[-1].decode()
+                backing = subprocess.check_output(
+                    ["losetup", "--noheadings", "--output", "BACK-FILE", device],
+                    text=True).strip()
+                if (os.path.realpath(backing) != target or
+                        not os.path.isfile(target) or os.stat(target).st_size != 8 << 30):
+                    raise RuntimeError("refusing to resize another backing file")
+                os.truncate(target, 4 << 30)
+                subprocess.run(["losetup", "--set-capacity", device], check=True)
             child.stdin.write(name + b"\n")
             child.stdin.flush()
             confirmed = True

@@ -18,16 +18,20 @@ if [[ ${NESTEGG_STICK_PRIVATE_MOUNTS:-0} != 1 ]]; then
     exec unshare --mount --propagation private env NESTEGG_STICK_PRIVATE_MOUNTS=1 "$0" "$@"
 fi
 work=$(mktemp -d /tmp/nestegg-stick-test.XXXXXX)
-loop=; qemu_pid=; update_pid=
+loop=; clone_loop=; holder=; qemu_pid=; update_pid=
 cleanup() {
     local status=$? failed=0 point
     trap - EXIT; trap '' INT TERM
     set +e
     if [[ -n $update_pid ]]; then kill -TERM "$update_pid" 2>/dev/null; wait "$update_pid" 2>/dev/null; fi
     if [[ -n $qemu_pid ]]; then kill "$qemu_pid" 2>/dev/null; wait "$qemu_pid" 2>/dev/null; fi
-    for point in data esp iso root; do
+    [[ -z $holder ]] || dmsetup remove "$holder" || failed=1
+    for point in data esp iso root guard; do
         if mountpoint -q "$work/$point"; then umount "$work/$point" || failed=1; fi
     done
+    [[ -z $clone_loop ]] || losetup -d "$clone_loop" || failed=1
+    umount /var/lib/nestegg 2>/dev/null || true
+    umount /var/lib 2>/dev/null || true
     if [[ -n $loop && $failed == 0 ]]; then losetup -d "$loop" || failed=1; fi
     if [[ -n ${KEEP_LOGS:-} ]]; then
         mkdir -p "$KEEP_LOGS" || failed=1
@@ -45,12 +49,42 @@ trap 'echo "ERROR: stick acceptance failed at line $LINENO" >&2' ERR
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir -p "$work/"{data,esp,iso,root,state,runtime,home}
+mkdir -p "$work/"{data,esp,iso,root,state,runtime,home,guard,tools}
+# All fixed cache paths and NSS fixtures exist only in this mount namespace.
+mount -t tmpfs -o mode=0755 tmpfs /var/lib
+mkdir /var/lib/nestegg
+mount --bind "$work/state" /var/lib/nestegg
+cp /etc/group "$work/group"
+if ! getent group nestegg >/dev/null; then printf 'nestegg:x:59000:\n' >> "$work/group"; fi
+mount --bind "$work/group" /etc/group
+# Copy release inputs into root-owned protected storage; user-owned downloads
+# deliberately fail the privileged CLI's new provenance guard.
+cp --reflink=auto "$iso" "$work/release.iso"
+cp "$iso.sha256" "$work/release.iso.sha256"
+chmod 0600 "$work/release.iso" "$work/release.iso.sha256"
+iso=$work/release.iso
 chmod 0700 "$work/runtime"
 export NESTEGG_CONFIG="$work/config.toml" NESTEGG_STATE_DIR="$work/state" NESTEGG_RUNTIME_DIR="$work/runtime" HOME="$work/home"
 # Root-owned private scratch directory; no physical media are ever accepted.
 stick=$work/stick.img
 truncate -s 8G "$stick"
+truncate -s 16G "$work/slow.iso"
+"$bin" stick create "$stick" --test-image --image "$work/slow.iso" --sha256 "$(printf '%064d' 0)" > "$work/interrupted-iso.log" 2>&1 &
+update_pid=$!
+for ((i=0;i<2000;i++)); do
+    compgen -G "$work/state/stick/iso-*/verified.iso" >/dev/null && break
+    kill -0 "$update_pid"; sleep .005
+done
+compgen -G "$work/state/stick/iso-*/verified.iso" >/dev/null
+kill -STOP "$update_pid"; kill -INT "$update_pid"; kill -CONT "$update_pid"
+if wait "$update_pid"; then echo 'ERROR: interrupted ISO copy succeeded' >&2; exit 1; fi
+update_pid=
+if compgen -G "$work/state/stick/iso-*" >/dev/null; then echo 'ERROR: interrupted ISO copy retained' >&2; exit 1; fi
+rm "$work/slow.iso"
+# Ctrl-C at the confirmation prompt must also unwind the verified ISO copy.
+if python3 "$here/confirm.py" --interrupt "$bin" stick create "$stick" --test-image --image "$iso" > "$work/interrupted-confirm.log" 2>&1; then exit 1; fi
+grep -q 'stick operation interrupted' "$work/interrupted-confirm.log"
+if compgen -G "$work/state/stick/iso-*" >/dev/null; then echo 'ERROR: confirmation retained ISO copy' >&2; exit 1; fi
 # The Rust test mode allocates its own loop and still applies the real disk guard.
 python3 "$here/confirm.py" "$bin" stick create "$stick" --test-image --image "$iso" >"$work/create.log" 2>&1
 "$bin" stick info "$stick" --test-image >"$work/info-a.json"
@@ -58,6 +92,7 @@ grep -q '"active_slot": "a"' "$work/info-a.json"
 "$bin" stick add "$stick" --test-image --image "$iso" >"$work/add.log" 2>&1
 grep -q data_uuids "$NESTEGG_CONFIG"
 [[ -s $work/state/stick/pbs.squashfs ]]
+[[ $(stat -c '%a:%U:%G' "$NESTEGG_CONFIG") == 640:root:nestegg ]]
 # Data UUID and partition layout must remain byte-for-byte stable after updates.
 attach() { loop=$(losetup --find --show --partscan "$stick"); }
 detach() { losetup -d "$loop"; loop=; }
@@ -67,10 +102,10 @@ mount -o nodev,nosuid,noexec "${loop}p3" "$work/data"
 printf 'data survives both updates\n' >"$work/data/retained.txt"
 # Extract only the official client from the desktop-trusted image for host tests.
 unsquashfs -no-progress -d "$work/client" "$work/state/stick/pbs.squashfs" usr/bin/proxmox-backup-client >"$work/extract.log" 2>&1
-export NESTEGG_STICK_IMAGE="$work/state/stick/pbs.squashfs" NESTEGG_STICK_DATA="$work/data" NESTEGG_STICK_CLIENT="$work/client/usr/bin/proxmox-backup-client" NESTEGG_STICK_RUNTIME="$work/runtime"
+export NESTEGG_STICK_DATA="$work/data" NESTEGG_STICK_CLIENT="$work/client/usr/bin/proxmox-backup-client" NESTEGG_STICK_RUNTIME="$work/runtime"
 "$probe" --ignored --nocapture >"$work/launcher.log" 2>&1
 # An actual encrypted PBS datastore now exists on the partition.
-[[ -d $work/data/nestegg/.chunks && -d $work/data/nestegg/host/stick-test ]]
+[[ -d $work/data/nestegg/store/.chunks && -d $work/data/nestegg/store/host/stick-test ]]
 find "$work/data/nestegg" -type f -print0 | sort -z | xargs -0 sha256sum | sed "s#$work/data/##g" >"$work/snapshots-before"
 umount "$work/data"
 detach
@@ -102,13 +137,43 @@ both() {
     boot "$label-uefi" "$active" -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd -drive "if=pflash,format=raw,file=$work/vars.fd"
 }
 both created a
-"$bin" stick update "$stick" --test-image --image "$iso" >"$work/update.log" 2>&1
+# Observe actual fsync barriers in the real helper; do not replace their work.
+cat > "$work/tools/sync" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+for path in "$@"; do
+    [[ $path != -* ]] || { echo 'syncfs/option is forbidden' >&2; exit 1; }
+    if [[ $path == */esp/live/b/* ]]; then
+        dir=${path%/*}
+        printf '%s %s %s\n' "${path##*/}" "$([[ -f $dir/boot.cfg ]] && echo cfg || echo no-cfg)" "$([[ -f $dir/commit.sha256 ]] && echo commit || echo no-commit)" >> "$NESTEGG_TEST_SYNC_LOG"
+    fi
+done
+exec /usr/bin/sync "$@"
+WRAPPER
+chmod +x "$work/tools/sync"
+PATH="$work/tools:$PATH" NESTEGG_TEST_SYNC_LOG="$work/sync-order" "$bin" stick update "$stick" --test-image --image "$iso" >"$work/update.log" 2>&1
+python3 - "$work/sync-order" <<'CHECK'
+import sys
+rows = [line.split() for line in open(sys.argv[1])]
+for payload in ('filesystem.squashfs', 'payload.sha256'):
+    assert [payload, 'no-cfg', 'no-commit'] in rows, rows
+cfg = rows.index(['boot.cfg', 'cfg', 'no-commit'])
+commit = rows.index(['commit.sha256', 'cfg', 'commit'])
+assert cfg < commit
+CHECK
+# Check coreutils really calls fsync, including for directories.
+strace -o "$work/fsync.log" -e fsync,fdatasync,syncfs /usr/bin/sync "$work" "$work/release.iso"
+[[ $(grep -c '^fsync(.*= 0$' "$work/fsync.log") == 2 ]]
+if grep -q '^syncfs(' "$work/fsync.log"; then echo 'ERROR: syncfs used instead of fsync' >&2; exit 1; fi
+rm "$work/tools/sync"
 "$bin" stick info "$stick" --test-image >"$work/info-b.json"
 grep -q '"active_slot": "b"' "$work/info-b.json"
 both updated b
+# shellcheck source=tests/stick/adversarial.sh
+source "$here/adversarial.sh"
 # Stop the REAL update helper after copying HALF of the inactive squashfs. PATH
 # interposes only that copy; all earlier checks and the update itself are real.
-mkdir "$work/tools"
+# tools directory was created with the private fixture
 cat >"$work/tools/cp" <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail

@@ -136,22 +136,83 @@ fn registered_disk(paths: &Paths) -> Result<PathBuf> {
         .and_then(|s| s.get("data_uuids"))
         .and_then(|v| v.as_array())
         .context("no registered stick; specify its whole disk explicitly")?;
-    let mut disks = Vec::new();
-    for uuid in uuids.iter().filter_map(|v| v.as_str()) {
-        let part = PathBuf::from(format!("/dev/disk/by-uuid/{}", uuid.to_ascii_lowercase()));
-        if part.exists() {
-            let parent = capture(Command::new("lsblk").args(["-n", "-o", "PKNAME"]).arg(part))?;
-            if !parent.is_empty() && !parent.contains('\n') {
-                disks.push(PathBuf::from(format!("/dev/{parent}")));
-            }
-        }
-    }
+    let uuids: Vec<_> = uuids.iter().filter_map(|v| v.as_str()).collect();
+    // Query every attached device; /dev/disk/by-uuid hides cloned UUIDs by
+    // exposing just one arbitrarily selected symlink target.
+    let mut tree: serde_json::Value =
+        serde_json::from_str(&capture(Command::new("lsblk").args([
+            "--json",
+            "--paths",
+            "-o",
+            "PATH,TYPE,UUID,PKNAME",
+        ]))?)?;
+    refresh_partition_uuids(&mut tree["blockdevices"])?;
+    let mut disks = registered_candidates(&tree, &uuids)?;
     disks.sort();
     disks.dedup();
     if disks.len() != 1 {
         bail!("expected exactly one attached registered stick; specify its whole disk explicitly");
     }
     Ok(disks.remove(0))
+}
+
+fn refresh_partition_uuids(nodes: &mut serde_json::Value) -> Result<()> {
+    if let Some(nodes) = nodes.as_array_mut() {
+        for node in nodes {
+            if node["type"] == "part" {
+                let path = node["path"].as_str().context("partition path missing")?;
+                let out = Command::new("blkid")
+                    .args(["-p", "-s", "UUID", "-o", "value", "--"])
+                    .arg(path)
+                    .output()?;
+                if !out.status.success() && out.status.code() != Some(2) {
+                    bail!("cannot probe registered partition UUID");
+                }
+                node["uuid"] = String::from_utf8(out.stdout)?.trim().into();
+            }
+            refresh_partition_uuids(&mut node["children"])?;
+        }
+    }
+    Ok(())
+}
+
+fn registered_candidates(tree: &serde_json::Value, uuids: &[&str]) -> Result<Vec<PathBuf>> {
+    fn visit<'a>(items: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+        if let Some(items) = items.as_array() {
+            for item in items {
+                out.push(item);
+                visit(&item["children"], out);
+            }
+        }
+    }
+    let mut items = Vec::new();
+    visit(&tree["blockdevices"], &mut items);
+    let mut disks = Vec::new();
+    for uuid in uuids {
+        let mut matches: Vec<_> = items
+            .iter()
+            .filter(|d| {
+                d["uuid"]
+                    .as_str()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(uuid))
+            })
+            .collect();
+        matches.sort_by_key(|d| d["path"].as_str());
+        matches.dedup_by_key(|d| d["path"].as_str());
+        if matches.len() > 1 {
+            bail!("cloned data UUID on multiple devices; refusing ambiguous registered stick");
+        }
+        if let Some(d) = matches.first() {
+            let parent = d["pkname"]
+                .as_str()
+                .context("registered UUID is not a partition")?;
+            if !parent.starts_with("/dev/") {
+                bail!("invalid registered partition parent");
+            }
+            disks.push(PathBuf::from(parent));
+        }
+    }
+    Ok(disks)
 }
 
 /// During phase one a registration-only document is valid for stick commands.
@@ -217,6 +278,14 @@ fn register(path: &Path, uuid: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cloned_uuid_does_not_select_an_arbitrary_symlink() {
+        let tree = serde_json::json!({"blockdevices":[
+            {"path":"/dev/sdx1", "pkname":"/dev/sdx", "uuid":"sample"},
+            {"path":"/dev/sdy1", "pkname":"/dev/sdy", "uuid":"sample"}
+        ]});
+        assert!(registered_candidates(&tree, &["sample"]).is_err());
+    }
     #[test]
     fn registration_preserves_pbs_and_comments_and_rejects_unknowns() {
         let d = tempfile::tempdir().unwrap();
