@@ -124,7 +124,7 @@ EOF
         {
             common_steps
             cat <<'EOF'
-send lvs --reportformat json --devices /dev/vdb -o vg_name,lv_name,segtype,lv_attr; blockdev --setro /dev/vdb; vgchange -ay --monitor n --devices /dev/vdb --config 'global { metadata_read_only=1 } activation { read_only_volume_list=["nestegg-pending-fixture"] monitoring=0 } backup { backup=0 archive=0 }' nestegg-pending-fixture; dmsetup table; sleep 5; vgchange -an --devices /dev/vdb --config 'global { metadata_read_only=1 } backup { backup=0 archive=0 }' nestegg-pending-fixture; blockdev --setrw /dev/vdb; echo UNSAFE-REPRO-DONE
+send uname -r; lvm version; lvs -a --segments --reportformat json --devices /dev/vdb -o vg_name,lv_name,segtype,lv_attr,lv_role; lvs --reportformat json --devices /dev/vdb -o vg_name,lv_name,segtype,lv_attr; blockdev --setro /dev/vdb; vgchange -ay --monitor n --devices /dev/vdb --config 'global { metadata_read_only=1 } activation { read_only_volume_list=["nestegg-pending-fixture"] monitoring=0 } backup { backup=0 archive=0 }' nestegg-pending-fixture; dmsetup table; sleep 5; vgchange -an --devices /dev/vdb --config 'global { metadata_read_only=1 } backup { backup=0 archive=0 }' nestegg-pending-fixture; blockdev --setrw /dev/vdb; echo UNSAFE-REPRO-DONE
 expect UNSAFE-REPRO-DONE 120
 send poweroff -f
 EOF
