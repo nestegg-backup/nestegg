@@ -1641,13 +1641,14 @@ pub struct Outcome {
 
 /// Validate and apply a change: rewrite the configuration file, then switch
 /// the timer. If the timer cannot be switched, the old file is put back, so
-/// a failed request changes nothing. The caller serialises calls.
+/// a failed request changes nothing. A file lock also serialises CLI registration.
 pub fn update(
     config_file: &Path,
     patch: &SettingsPatch,
     timer: &dyn Timer,
     identity: Option<PeerIdentity>,
 ) -> Result<Outcome, SettingsError> {
+    let _config_lock = config_lock(config_file)?;
     let old_text = fs::read_to_string(config_file)
         .with_context(|| format!("cannot read configuration {}", config_file.display()))?;
     let current = Config::parse(&old_text).with_context(|| {
@@ -1801,6 +1802,25 @@ fn describe(old: &Config, new: &Config) -> Vec<String> {
     changes
 }
 
+/// Cross-process lock held over the complete configuration read/modify/write.
+/// Keep the sidecar inode stable across atomic configuration replacements.
+pub(crate) fn config_lock(path: &Path) -> Result<nix::fcntl::Flock<fs::File>> {
+    let name = path
+        .file_name()
+        .context("config name missing")?
+        .to_string_lossy();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path.with_file_name(format!(".{name}.lock")))?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| anyhow!("cannot lock configuration: {e}"))
+}
+
 /// Write `text` to `path` atomically with a fixed `mode`: a new temporary file
 /// (exclusive, no symlinks) is created with the final mode from the start,
 /// written, synced and renamed over any old file, and the directory is synced.
@@ -1809,6 +1829,15 @@ fn describe(old: &Config, new: &Config) -> Vec<String> {
 /// create the configuration this way with no window at a looser mode and no
 /// symlink following (decision 0022, item 14).
 pub fn write_file_atomic(path: &Path, text: &str, mode: u32) -> Result<()> {
+    write_file_atomic_owned(path, text, mode, None)
+}
+
+pub(crate) fn write_file_atomic_owned(
+    path: &Path,
+    text: &str,
+    mode: u32,
+    owner: Option<(nix::unistd::Uid, nix::unistd::Gid)>,
+) -> Result<()> {
     if let Ok(meta) = fs::symlink_metadata(path)
         && meta.file_type().is_symlink()
     {
@@ -1831,6 +1860,9 @@ pub fn write_file_atomic(path: &Path, text: &str, mode: u32) -> Result<()> {
             .custom_flags(nix::libc::O_NOFOLLOW)
             .open(&tmp)
             .with_context(|| format!("cannot create {}", tmp.display()))?;
+        if let Some((uid, gid)) = owner {
+            nix::unistd::fchown(&file, Some(uid), Some(gid))?;
+        }
         file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
@@ -3859,6 +3891,25 @@ interval_hours = 24
     }
 
     #[test]
+    fn configuration_lock_coordinates_independent_processes() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("config.toml");
+        let lock = config_lock(&path).unwrap();
+        let try_lock = || {
+            Command::new("flock")
+                .args(["--nonblock", "--exclusive"])
+                .arg(path.with_file_name(".config.toml.lock"))
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(!try_lock());
+        drop(lock);
+        assert!(try_lock());
+    }
+
+    #[test]
     fn update_writes_atomically_and_keeps_mode() {
         let (dir, path) = config_file(COMMENTED, 0o640);
         let timer = FakeTimer::new(true, false);
@@ -3887,11 +3938,12 @@ interval_hours = 24
                 .contains("interval_hours = 12")
         );
         // No temporary files left behind.
-        let names: Vec<_> = fs::read_dir(dir.path())
+        let mut names: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(names, ["config.toml"]);
+        names.sort();
+        assert_eq!(names, [".config.toml.lock", "config.toml"]);
         // The same request again changes nothing and does not call systemctl.
         let again = update(
             &path,

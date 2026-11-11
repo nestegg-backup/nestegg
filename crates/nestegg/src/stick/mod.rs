@@ -5,7 +5,7 @@ pub mod launcher;
 mod media;
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -106,18 +106,8 @@ pub(crate) fn digest(path: &Path) -> Result<String> {
     Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("missing parent")?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
 /// A trusted input is a regular root-owned file, with no writable or symbolic
-/// components. A mounted stick can never be selected as the desktop image.
+/// components. Storage provenance is checked separately by trusted_file().
 pub(crate) fn trusted_path(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     if !path.is_absolute() {

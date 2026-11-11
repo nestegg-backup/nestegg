@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 
 use super::media::{self, OwnedLoop, VerifiedImage};
-use super::{atomic_write, capture, private_dir};
+use super::{capture, private_dir};
 use crate::config::{Config, Paths, StickConfig};
 
 #[derive(Subcommand)]
@@ -162,6 +162,8 @@ fn registration_document(path: &Path) -> Result<toml_edit::DocumentMut> {
     Ok(doc)
 }
 fn register(path: &Path, uuid: &str) -> Result<()> {
+    fs::create_dir_all(path.parent().context("config parent missing")?)?;
+    let _lock = crate::settings::config_lock(path)?;
     let mut doc = registration_document(path)?;
     let mut values: Vec<String> = doc
         .get("stick")
@@ -181,8 +183,18 @@ fn register(path: &Path, uuid: &str) -> Result<()> {
         array.push(value.as_str());
     }
     doc["stick"]["data_uuids"] = toml_edit::value(array);
-    fs::create_dir_all(path.parent().context("config parent missing")?)?;
-    atomic_write(path, doc.to_string().as_bytes())
+    if path.try_exists()? {
+        crate::settings::write_atomically(path, &doc.to_string())
+    } else {
+        let group = nix::unistd::Group::from_name("nestegg")?
+            .context("nestegg group missing; install the nestegg package before registering")?;
+        crate::settings::write_file_atomic_owned(
+            path,
+            &doc.to_string(),
+            0o640,
+            Some((nix::unistd::Uid::from_raw(0), group.gid)),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -194,8 +206,16 @@ mod tests {
         let path = d.path().join("config.toml");
         let old = "# keep this\n[pbs]\nserver='pbs.example.com'\ndatastore='backups'\nauth_id='backup@pbs!desktop'\n";
         fs::write(&path, old).unwrap();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let before = fs::metadata(&path).unwrap();
         register(&path, "01234567-89ab-cdef-0123-456789abcdef").unwrap();
         register(&path, "01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(
+            (before.uid(), before.gid(), before.mode()),
+            (after.uid(), after.gid(), after.mode())
+        );
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("# keep this"));
         assert_eq!(
@@ -222,6 +242,7 @@ mod tests {
     fn registration_only_document() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("config.toml");
+        fs::write(&path, "").unwrap();
         register(&path, "01234567-89ab-cdef-0123-456789abcdef").unwrap();
         assert!(registration_document(&path).is_ok());
     }

@@ -2602,11 +2602,12 @@ fn daemon_changes_settings() {
     assert_eq!(view["excludes"], serde_json::json!(["**/.cache"]));
     assert_eq!(view["wake_on_lan"], true);
     assert_eq!(view["automatic_backups"], false);
-    let leftovers: Vec<_> = fs::read_dir(env.root().join("etc"))
+    let mut leftovers: Vec<_> = fs::read_dir(env.root().join("etc"))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
-    assert_eq!(leftovers, ["config.toml"]);
+    leftovers.sort();
+    assert_eq!(leftovers, [".config.toml.lock", "config.toml"]);
 }
 
 #[test]
