@@ -691,7 +691,7 @@ components:
         kind:
           type: string
           description: "`verification_failed`: the upload finished, but reading the snapshot back from the server failed or did not match. `already_running`: the run did not start because another backup run held the run lock (state `cancelled`). `internal` also covers a run lock that could not be taken although no backup was running (the message names the holders). `unknown`: a kind written by a newer version this one does not recognise (forward compatibility)."
-          enum: [stick_not_plugged_in, stick_full, filesystem_damaged, stick_unsupported, key_mismatch, pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, credentials_unreadable, verification_failed, cancelled, internal, unknown]
+          enum: [stick_not_plugged_in, stick_full, stick_already_mounted, stick_ambiguous, stick_busy, filesystem_damaged, stick_unsupported, key_mismatch, pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, credentials_unreadable, verification_failed, cancelled, internal, unknown]
         message: { type: string }
     RunDetail:
       allOf:

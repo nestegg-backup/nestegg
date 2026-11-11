@@ -260,7 +260,10 @@ pub(super) fn registered_candidates(
         matches.sort_by_key(|d| d["path"].as_str());
         matches.dedup_by_key(|d| d["path"].as_str());
         if matches.len() > 1 {
-            bail!("cloned data UUID on multiple devices; refusing ambiguous registered stick");
+            bail!(super::target::error(
+                crate::state::ErrorKind::StickAmbiguous,
+                "cloned data UUID on multiple devices; refusing ambiguous registered stick"
+            ));
         }
         if let Some(d) = matches.first() {
             let parent = d["pkname"]

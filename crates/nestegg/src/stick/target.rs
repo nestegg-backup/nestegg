@@ -78,14 +78,27 @@ pub fn isolate_mounts() -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .context("cannot create private stick mount namespace");
     }
-    capture(Command::new("mount").args(["--make-rprivate", "/"]))?;
+    capture(Command::new("mount").args(["--make-rslave", "/"]))?;
     Ok(())
+}
+
+fn classify_open_error(e: anyhow::Error, present: bool) -> RunError {
+    if !present {
+        error(
+            ErrorKind::StickNotPluggedIn,
+            "stick disappeared while opening it",
+        )
+    } else if let Some(known) = e.downcast_ref::<RunError>() {
+        known.clone()
+    } else {
+        RunError::from_error(&e, ErrorKind::Internal)
+    }
 }
 
 impl Session {
     pub fn open(paths: &Paths, uuid: &str) -> std::result::Result<Self, RunError> {
         Self::open_inner(paths, uuid)
-            .map_err(|e| error(ErrorKind::FilesystemDamaged, format!("{e:#}")))
+            .map_err(|e| classify_open_error(e, super::valid_uuid(uuid) && device(uuid).exists()))
     }
     fn open_inner(paths: &Paths, uuid: &str) -> Result<Self> {
         use std::os::unix::fs::FileTypeExt;
@@ -94,7 +107,12 @@ impl Session {
         private_dir(&base)?;
         let lock = crate::state::open_private_lock(&base.join(format!("{uuid}.lock")))?;
         let lock = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
-            .map_err(|(_, e)| anyhow::anyhow!("stick is already in use: {e}"))?;
+            .map_err(|(_, e)| {
+                error(
+                    ErrorKind::StickBusy,
+                    format!("stick is already in use: {e}"),
+                )
+            })?;
         // A by-UUID symlink hides cloned filesystems. Apply the media commands'
         // complete-device check before opening any registered desktop target.
         let tree = super::cli::registered_tree()?;
@@ -116,7 +134,10 @@ impl Session {
         )?;
         anyhow::ensure!(
             actual.eq_ignore_ascii_case(uuid) && kind == "ext4",
-            "stick identity or filesystem changed"
+            error(
+                ErrorKind::FilesystemDamaged,
+                "stick identity or filesystem changed"
+            )
         );
         let mounted = Command::new("findmnt")
             .args(["-rn", "--source"])
@@ -125,35 +146,59 @@ impl Session {
             .status()?;
         anyhow::ensure!(
             mounted.code() == Some(1),
-            "stick is already mounted; unmount it before use"
+            error(
+                ErrorKind::StickAlreadyMounted,
+                "stick is already mounted; unmount it before use"
+            )
         );
         // Never replay a journal or attempt repair implicitly. PBS verify is a
         // different check and cannot repair ext4. This also covers power loss
         // while the desktop was off and has no local removal record.
-        let health = Command::new("e2fsck")
-            .args(["-f", "-n"])
+        // The checker parses untrusted filesystem metadata. It needs read
+        // access to the root-owned device, but no Linux capabilities and no
+        // way to gain privileges through exec. util-linux is already required.
+        let health = Command::new("/usr/bin/setpriv")
+            .args([
+                "--no-new-privs",
+                "--bounding-set=-all",
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+                "e2fsck",
+                "-f",
+                "-n",
+            ])
             .arg(&dev)
             .env("LC_ALL", "C")
             .output()?;
         anyhow::ensure!(
             filesystem_healthy(health.status.success(), &health.stdout, &health.stderr),
-            "stick filesystem needs offline repair (not PBS verification); unmount it and run e2fsck before reuse: {}",
-            crate::rescue::printable_block(
-                &String::from_utf8_lossy(&health.stdout)
-                    .chars()
-                    .rev()
-                    .take(2048)
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>()
+            error(
+                ErrorKind::FilesystemDamaged,
+                format!(
+                    "stick filesystem needs offline repair (not PBS verification); unmount it and run e2fsck before reuse: {}",
+                    crate::rescue::printable_block(
+                        &String::from_utf8_lossy(&health.stdout)
+                            .chars()
+                            .rev()
+                            .take(2048)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect::<String>()
+                    )
+                )
             )
         );
         let mount = base.join(format!("data-{uuid}"));
         private_dir(&mount)?;
         capture(
             Command::new("mount")
-                .args(["-t", "ext4", "-o", "nodev,nosuid,noexec,relatime"])
+                .args([
+                    "-t",
+                    "ext4",
+                    "-o",
+                    "nodev,nosuid,noexec,relatime,errors=remount-ro",
+                ])
                 .arg(&dev)
                 .arg(&mount),
         )?;
@@ -286,6 +331,29 @@ mod tests {
         ));
         assert!(!filesystem_healthy(false, b"", b""));
     }
+    #[test]
+    fn opening_errors_keep_their_distinct_kinds() {
+        for kind in [
+            ErrorKind::StickAlreadyMounted,
+            ErrorKind::StickAmbiguous,
+            ErrorKind::StickBusy,
+            ErrorKind::FilesystemDamaged,
+        ] {
+            assert_eq!(
+                classify_open_error(error(kind, "fixture").into(), true).kind,
+                kind
+            );
+            assert_eq!(
+                classify_open_error(error(kind, "fixture").into(), false).kind,
+                ErrorKind::StickNotPluggedIn
+            );
+        }
+        assert_eq!(
+            classify_open_error(anyhow::anyhow!("cannot spawn helper"), true).kind,
+            ErrorKind::Internal
+        );
+    }
+
     #[test]
     fn monthly_verification_handles_new_and_future_media() {
         let now = chrono::Utc::now();

@@ -245,3 +245,80 @@ fn isolated_pbs_backup_restore_and_restart() {
     let mut entries = fs::read_dir(&options.runtime_dir).unwrap();
     assert!(entries.all(|e| !e.unwrap().file_name().to_string_lossy().starts_with("pbs-")));
 }
+
+#[test]
+#[ignore = "requires root and mount namespaces; uses only a temporary tmpfs"]
+fn desktop_mounts_receive_host_changes_without_propagating_back() {
+    const MODE: &str = "NESTEGG_PROPAGATION_TEST";
+    let executable = std::env::current_exe().unwrap();
+    let test = "desktop_mounts_receive_host_changes_without_propagating_back";
+    let wait_for = |path: &Path| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < until,
+                "missing {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    match std::env::var(MODE).as_deref() {
+        Ok("child") => {
+            let base = PathBuf::from(std::env::var_os("NESTEGG_PROPAGATION_DIR").unwrap());
+            nestegg::stick::target::isolate_mounts().unwrap();
+            run(Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(base.join("outgoing")));
+            fs::write(base.join("ready"), "ready").unwrap();
+            wait_for(&base.join("incoming/source"));
+            assert_eq!(
+                fs::read(base.join("incoming/source")).unwrap(),
+                b"host mount"
+            );
+            fs::write(base.join("received"), "received").unwrap();
+            wait_for(&base.join("done"));
+        }
+        Ok("parent") => {
+            let work = tempfile::tempdir().unwrap();
+            let base = work.path();
+            run(Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(base));
+            run(Command::new("mount").arg("--make-rshared").arg(base));
+            fs::create_dir(base.join("incoming")).unwrap();
+            fs::create_dir(base.join("outgoing")).unwrap();
+            let mut child = Command::new(&executable)
+                .args(["--ignored", "--exact", test])
+                .env(MODE, "child")
+                .env("NESTEGG_PROPAGATION_DIR", base)
+                .spawn()
+                .unwrap();
+            wait_for(&base.join("ready"));
+            assert!(
+                !Command::new("mountpoint")
+                    .arg("-q")
+                    .arg(base.join("outgoing"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            run(Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(base.join("incoming")));
+            fs::write(base.join("incoming/source"), "host mount").unwrap();
+            wait_for(&base.join("received"));
+            fs::write(base.join("done"), "done").unwrap();
+            assert!(child.wait().unwrap().success());
+            run(Command::new("umount").arg(base.join("incoming")));
+            run(Command::new("umount").arg(base));
+        }
+        _ => {
+            run(Command::new("unshare")
+                .args(["--mount", "--propagation", "private"])
+                .arg(executable)
+                .args(["--ignored", "--exact", test])
+                .env(MODE, "parent"));
+        }
+    }
+}

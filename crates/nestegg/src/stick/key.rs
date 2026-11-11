@@ -98,8 +98,21 @@ pub fn password(fd: Option<i32>, confirm: bool) -> Result<Secret> {
     Ok(secret)
 }
 
+fn isolated_python() -> Command {
+    let mut cmd = Command::new("/usr/bin/python3");
+    cmd.arg("-I").current_dir("/");
+    // -I also ignores these for Python itself. Remove them so the official
+    // client (and any helpers it starts) cannot inherit Python injection.
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"PYTHON") {
+            cmd.env_remove(name);
+        }
+    }
+    cmd
+}
+
 fn change(path: &Path, password: &Secret, kdf: &str) -> Result<()> {
-    let mut cmd = Command::new("python3");
+    let mut cmd = isolated_python();
     cmd.args(["-c", include_str!("key_pty.py")])
         .arg(crate::client::client_binary())
         .arg(path)
@@ -255,6 +268,34 @@ mod tests {
         assert!(read_protected(&link).is_err());
         assert!(read_protected(dir.path()).is_err());
     }
+    #[test]
+    fn python_imports_ignore_untrusted_directory_and_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        for module in ["pty", "signal", "termios"] {
+            fs::write(
+                dir.path().join(format!("{module}.py")),
+                "raise RuntimeError('injected')",
+            )
+            .unwrap();
+        }
+        let mut cmd = isolated_python();
+        assert_eq!(cmd.get_program(), "/usr/bin/python3");
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+        let output = cmd
+            .current_dir(dir.path())
+            .env("PYTHONPATH", dir.path())
+            .env("PYTHONHOME", dir.path())
+            .args(["-c", "import pty, signal, termios; print('isolated')"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"isolated\n");
+    }
+
     #[test]
     fn password_policy() {
         for weak in [

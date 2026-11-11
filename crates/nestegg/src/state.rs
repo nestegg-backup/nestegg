@@ -119,6 +119,9 @@ impl RunState {
 pub enum ErrorKind {
     StickNotPluggedIn,
     StickFull,
+    StickAlreadyMounted,
+    StickAmbiguous,
+    StickBusy,
     FilesystemDamaged,
     StickUnsupported,
     KeyMismatch,
@@ -148,6 +151,13 @@ pub struct RunError {
     pub kind: ErrorKind,
     pub message: String,
 }
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for RunError {}
 
 impl RunError {
     /// Turn an error into a run error of kind `fallback`, unless it is a
