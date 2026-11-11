@@ -155,3 +155,23 @@ an explicit default-no wizard confirmation or non-interactive `--force-id`.
 The override never bypasses signature, snapshot binding or key ownership checks.
 A distinct backup ID remains the recommended choice. Exact OS clones that also
 share a machine-id cannot be distinguished by this identity check.
+
+LVM inspection uses `lvs -a --segments` with `lv_attr` and `lv_role`. Only
+inactive visible ordinary (`lv_attr[0] == '-'`) public linear LVs are accepted.
+Origins, pending merges, snapshots, virtual/mirror/RAID volumes and hidden LVs
+are refused before activating any VG. A separate read-only `vgcfgbackup` export
+must contain only striped segment metadata (the LV report also requires the
+single-stripe linear interpretation), rejecting hidden snapshot segments.
+Activation uses `lvchange` with a public/linear/ordinary LV selection evaluated
+under LVM's VG lock, read-only activation permissions, metadata-read-only and
+no background polling. Polling control alone cannot prevent kernel merges.
+The current LVM activation CLI exposes no unconditional no-merging switch;
+the upstream internal `no_merging` option is not a CLI guarantee.
+See [LVM device activation](https://github.com/lvmteam/lvm2/blob/main/lib/activate/dev_manager.c)
+and [LV activation command](https://github.com/lvmteam/lvm2/blob/main/tools/lvchange.c).
+
+The `pending-merge` VM scenario compares the entire image before/after refusal,
+checks that no mappings were acquired and that source read-only flags were
+restored, then tries the former activation on a separate disposable image copy.
+The `id-collision` scenario follows `plain`, shares its key, hostname and backup
+ID with a different machine-id, requires refusal, then exercises `--force-id`.

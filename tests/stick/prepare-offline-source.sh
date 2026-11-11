@@ -27,6 +27,24 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -p "$mnt" "$dst"
+if [[ $MODE == pending-merge ]]; then
+    truncate -s 512M /work/pending.img
+    target=$(losetup --find --show /work/pending.img)
+    vg=nestegg-pending-fixture
+    pvcreate --devices "$target" -y "$target" >/dev/null
+    vgcreate --devices "$target" "$vg" "$target" >/dev/null
+    lvcreate --devices "$target" -L 256M -n root "$vg" >/dev/null
+    printf 'before snapshot\n' | dd of="/dev/$vg/root" conv=notrunc status=none
+    lvcreate --devices "$target" -s -L 128M -n saved "$vg/root" >/dev/null
+    printf 'after snapshot!\n' | dd of="/dev/$vg/root" conv=notrunc status=none
+    # An open origin makes lvconvert record a pending merge without starting it.
+    exec 3<"/dev/$vg/root"
+    lvconvert --devices "$target" --merge "$vg/saved" | tee /work/pending-merge.log
+    grep -q 'next activation' /work/pending-merge.log
+    exec 3<&-
+    lvs --devices "$target" --segments -a --reportformat json -o vg_name,lv_name,segtype,lv_attr,lv_role > /work/pending-report.json
+    exit 0
+fi
 loop=$(losetup --find --show --partscan /work/source.img)
 if [[ $MODE == btrfs ]]; then
     apt-get install -y -qq --no-install-recommends btrfs-progs >/dev/null

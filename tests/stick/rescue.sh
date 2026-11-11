@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Phases 3/4 acceptance. ONLY disposable files, loops, containers and KVM VMs.
-# Usage: sudo tests/stick/rescue.sh BINARY RESCUE_ISO [desktop|plain|luks-lvm|dirty|no-nestegg|btrfs|id-collision|all]
+# Usage: sudo tests/stick/rescue.sh BINARY RESCUE_ISO [desktop|plain|luks-lvm|dirty|no-nestegg|btrfs|pending-merge|id-collision|all]
 set -Eeuo pipefail
 [[ $EUID == 0 && -e /dev/kvm ]] || { echo 'root and KVM required' >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
@@ -90,7 +90,7 @@ send mkdir -p /media/test; mount -o ro,noload /dev/vdc /media/test; cp /media/te
 expect root@.*# 30
 EOF
 }
-if [[ $modes == all ]]; then modes='desktop plain id-collision luks-lvm dirty no-nestegg btrfs'; fi
+if [[ $modes == all ]]; then modes='desktop plain id-collision luks-lvm dirty no-nestegg btrfs pending-merge'; fi
 for mode in $modes; do
     echo "== $mode"
     if [[ $mode == btrfs ]]; then
@@ -104,6 +104,39 @@ for mode in $modes; do
     fi
     docker run --rm --name "$container" --privileged -v /dev:/dev -v "$work:/work" -v "$here:/t:ro" \
         -e MODE="$mode" -e DATA_UUID="$uuid" ubuntu:24.04 bash /t/prepare-offline-source.sh > "$work/prepare-$mode.log" 2>&1
+    if [[ $mode == pending-merge ]]; then
+        mv "$work/pending.img" "$work/source.img"
+        sha256sum "$work/source.img" > "$work/pending-before.sha256"
+        {
+            common_steps
+            cat <<'EOF'
+send nestegg rescue backup --disk /dev/vdb --backup-id pending-fixture --keyfile /media/test/nestegg-paperkey.txt --confirm-clock >/run/pending-refusal.log 2>&1; code=$?; cat /run/pending-refusal.log; test "$code" != 0 && grep -q 'snapshots, merges and hidden LVs are refused' /run/pending-refusal.log && ! dmsetup table | grep -q snapshot && test "$(blockdev --getro /dev/vdb)" = 0; printf 'REFUSAL-%s=%s\n' EXIT "$?"
+expect REFUSAL-EXIT=0 240
+send poweroff -f
+EOF
+        } > "$work/pending.steps"
+        boot_stick pending-merge "$work/source.img" "$work/pending.steps"
+        sha256sum --check "$work/pending-before.sha256"
+        echo 'PASS pending merge: activation refused, no mappings, source flags restored, entire image SHA-256 unchanged'
+        # Reproduce the former activation on a COPY, never the checked source.
+        cp --reflink=auto --sparse=always "$work/source.img" "$work/unsafe.img"
+        sha256sum "$work/unsafe.img" > "$work/unsafe-before.sha256"
+        {
+            common_steps
+            cat <<'EOF'
+send lvs --reportformat json --devices /dev/vdb -o vg_name,lv_name,segtype,lv_attr; blockdev --setro /dev/vdb; vgchange -ay --monitor n --devices /dev/vdb --config 'global { metadata_read_only=1 } activation { read_only_volume_list=["nestegg-pending-fixture"] monitoring=0 } backup { backup=0 archive=0 }' nestegg-pending-fixture; dmsetup table; sleep 5; vgchange -an --devices /dev/vdb --config 'global { metadata_read_only=1 } backup { backup=0 archive=0 }' nestegg-pending-fixture; blockdev --setrw /dev/vdb; echo UNSAFE-REPRO-DONE
+expect UNSAFE-REPRO-DONE 120
+send poweroff -f
+EOF
+        } > "$work/unsafe.steps"
+        boot_stick unsafe-merge "$work/unsafe.img" "$work/unsafe.steps"
+        if sha256sum --check "$work/unsafe-before.sha256" > "$work/unsafe-check.log" 2>&1; then
+            echo 'OBSERVATION original activation: source checksum unchanged (inspect kernel/activation log)'
+        else
+            echo 'OBSERVATION original activation: SOURCE CHECKSUM CHANGED despite read-only flags'
+        fi
+        continue
+    fi
     id=offline-$mode
     [[ $mode != id-collision ]] || id=offline-plain
     if [[ $mode == desktop ]]; then

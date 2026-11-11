@@ -422,43 +422,46 @@ impl Sources {
             .collect();
         if !pvs.is_empty() {
             let devices = pvs.join(",");
+            // Include internal snapshot LVs and every segment, not just the
+            // visible origin/COW devices (both can report segtype=linear).
             let json = capture(Command::new("lvs").args([
+                "-a",
+                "--segments",
                 "--reportformat",
                 "json",
                 "--devices",
                 &devices,
                 "-o",
-                "vg_name,lv_name,segtype,lv_attr",
+                "vg_name,lv_name,segtype,lv_attr,lv_role",
             ]))?;
-            let json: serde_json::Value = serde_json::from_str(&json)?;
-            let lvs = json["report"][0]["lv"]
-                .as_array()
-                .context("missing LVM report")?;
-            let mut groups = BTreeSet::new();
-            for lv in lvs {
-                ensure!(
-                    lv["segtype"] == "linear",
-                    "only ordinary linear LVM volumes can be backed up offline"
-                );
-                let name = lv["vg_name"].as_str().context("missing VG name")?;
-                ensure!(valid_id(name), "invalid LVM group name");
-                ensure!(
-                    lv["lv_attr"]
-                        .as_str()
-                        .is_some_and(|a| a.as_bytes().get(4) == Some(&b'-')),
-                    "LVM source is already active"
-                );
-                groups.insert(name.to_owned());
+            let groups = ordinary_lvm_groups(&json)?;
+            // Validate every VG before activating any of them. Exporting the
+            // metadata is read-only; the file lives in the RAM workspace.
+            for vg in &groups {
+                let metadata = s.work.path().join("vg-metadata");
+                capture(
+                    Command::new("vgcfgbackup")
+                        .args(["--devices", &devices, "--config", &lvm_config(vg), "--file"])
+                        .arg(&metadata)
+                        .arg(vg),
+                )?;
+                ensure_linear_metadata(&fs::read_to_string(&metadata)?)?;
+                fs::remove_file(metadata)?;
             }
             for vg in groups {
                 let config = lvm_config(&vg);
-                // read_only_volume_list changes activation permissions without
-                // writing LV permissions into the VG metadata (unlike -pr).
+                // Selection is evaluated again under LVM's VG lock. A merge
+                // origin has O/o attributes and can never match. --poll n alone
+                // would NOT prevent the kernel snapshot-merge target loading.
                 s.vgs.push((vg.clone(), devices.clone()));
-                capture(Command::new("vgchange").args([
+                capture(Command::new("lvchange").args([
                     "-ay",
                     "--monitor",
                     "n",
+                    "--poll",
+                    "n",
+                    "--select",
+                    ORDINARY_LV_SELECTION,
                     "--devices",
                     &devices,
                     "--config",
@@ -896,6 +899,96 @@ fn device_identity(path: &str) -> String {
         .unwrap_or_else(|_| path.to_owned())
 }
 
+const ORDINARY_LV_SELECTION: &str = "lv_attr=~^- && lv_layout=linear && lv_role=public";
+
+fn ordinary_lvm_groups(report: &str) -> Result<BTreeSet<String>> {
+    let report: serde_json::Value = serde_json::from_str(report)?;
+    let lvs = report["report"][0]["seg"]
+        .as_array()
+        .context("missing LVM report")?;
+    ensure!(!lvs.is_empty(), "empty LVM report");
+    let mut groups = BTreeSet::new();
+    for lv in lvs {
+        let name = lv["vg_name"].as_str().context("missing VG name")?;
+        ensure!(valid_id(name), "invalid LVM group name");
+        ensure!(
+            lv["segtype"] == "linear"
+                && lv["lv_attr"]
+                    .as_str()
+                    .is_some_and(|a| a.len() == 10 && a.starts_with('-'))
+                && lv["lv_name"].as_str().is_some_and(valid_id)
+                && lv["lv_role"] == "public",
+            "only ordinary visible linear LVM volumes are supported; snapshots, merges and hidden LVs are refused"
+        );
+        ensure!(
+            lv["lv_attr"].as_str().unwrap().as_bytes()[4] == b'-',
+            "LVM source is already active"
+        );
+        groups.insert(name.to_owned());
+    }
+    Ok(groups)
+}
+
+/// Check the official vgcfgbackup export, independently of the LV report.
+/// A linear LV is represented as type=striped with one stripe. The report
+/// already checks the stripe count via segtype; reject all other metadata
+/// segment types, including the hidden type=snapshot segment of old snapshots.
+fn ensure_linear_metadata(text: &str) -> Result<()> {
+    let mut chars = text.chars().peekable();
+    let mut tokens = Vec::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '#' => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                let mut value = String::new();
+                let mut closed = false;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => value.push(chars.next().context("invalid LVM metadata escape")?),
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        c => value.push(c),
+                    }
+                }
+                ensure!(closed, "unterminated LVM metadata string");
+                tokens.push((true, value));
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let mut word = c.to_string();
+                while chars
+                    .peek()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                {
+                    word.push(chars.next().unwrap());
+                }
+                tokens.push((false, word));
+            }
+            c if c.is_whitespace() => {}
+            c => tokens.push((false, c.to_string())),
+        }
+    }
+    let mut segments = 0;
+    for t in tokens.windows(3) {
+        if t[0] == (false, "type".into()) && t[1] == (false, "=".into()) {
+            ensure!(
+                t[2] == (true, "striped".into()),
+                "LVM metadata contains a snapshot or unsupported segment; source activation refused"
+            );
+            segments += 1;
+        }
+    }
+    ensure!(segments > 0, "LVM metadata has no segments");
+    Ok(())
+}
+
 fn lvm_config(vg: &str) -> String {
     format!(
         "global {{ metadata_read_only=1 }} activation {{ read_only_volume_list=[\"{vg}\"] monitoring=0 }} backup {{ backup=0 archive=0 }}"
@@ -905,6 +998,12 @@ fn lvm_config(vg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn lv_report(attr: &str, name: &str, role: &str, segtype: &str) -> String {
+        serde_json::json!({"report":[{"seg":[{"vg_name":"fixture", "lv_name":name,
+            "lv_attr":attr, "lv_role":role, "segtype":segtype}]}]})
+        .to_string()
+    }
+
     #[test]
     fn ext_source_mounts_override_superblock_panic_policy() {
         for kind in ["ext2", "ext3", "ext4"] {
@@ -923,6 +1022,59 @@ mod tests {
         }
         assert!(!replay_options("xfs").contains("errors="));
         assert!(!replay_options("btrfs").contains("errors="));
+    }
+
+    #[test]
+    fn lvm_rejects_snapshot_origins_merges_hidden_and_special_lvs() {
+        assert_eq!(
+            ordinary_lvm_groups(&lv_report("-wi-------", "root", "public", "linear")).unwrap(),
+            BTreeSet::from(["fixture".into()])
+        );
+        for kind in ['o', 'O', 's', 'S', 'v', 'V', 'm', 'M', 'r', 't', 'C', 'e'] {
+            assert!(
+                ordinary_lvm_groups(&lv_report(
+                    &format!("{kind}wi-------"),
+                    "root",
+                    "public",
+                    "linear"
+                ))
+                .is_err()
+            );
+        }
+        for (attr, name, role, segtype) in [
+            ("-wi-------", "[snapshot0]", "private", "linear"),
+            ("-wi-------", "snapshot0", "private", "linear"),
+            ("-wi-a-----", "root", "public", "linear"),
+            ("-wi-------", "root", "public", "striped"),
+            ("-", "root", "public", "linear"),
+        ] {
+            assert!(ordinary_lvm_groups(&lv_report(attr, name, role, segtype)).is_err());
+        }
+        assert!(ordinary_lvm_groups(r#"{"report":[{"seg":[]}]}"#).is_err());
+        assert!(ordinary_lvm_groups("{}").is_err());
+    }
+
+    #[test]
+    fn lvm_metadata_independently_refuses_snapshot_segments() {
+        assert!(ensure_linear_metadata("segment1 { type = \"striped\" }").is_ok());
+        assert!(
+            ensure_linear_metadata("# type = \"snapshot\"\nsegment1 { type=\"striped\" }").is_ok()
+        );
+        assert!(
+            ensure_linear_metadata("description=\"type = \\\"snapshot\\\"\" type=\"striped\"")
+                .is_ok()
+        );
+        for text in [
+            "",
+            "# type=\"striped\"",
+            "type=\"striped",
+            "type=striped",
+            "type=\"striped\" type = \"snapshot\"",
+            "type=\"snapshot-merge\"",
+            "type=\"thin-pool\"",
+        ] {
+            assert!(ensure_linear_metadata(text).is_err(), "{text}");
+        }
     }
 
     #[test]
