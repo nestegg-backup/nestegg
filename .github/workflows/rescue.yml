@@ -12,7 +12,13 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - "crates/nestegg/src/rescue/**"
+      - "crates/nestegg/src/**"
+      - "crates/nestegg/tests/stick_launcher.rs"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/nestegg/Cargo.toml"
+      - "packaging/systemd/**"
+      - "packaging/udev/**"
       - "crates/nestegg/src/layout.rs"
       # The rescue path reads snapshots and checks keys through these.
       - "crates/nestegg/src/client.rs"
@@ -129,3 +135,60 @@ jobs:
         with:
           name: stick-rescue-logs
           path: ${{ runner.temp }}/stick-rescue-logs/
+
+  stick-media:
+    needs: iso
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rescue-iso
+          path: rescue-iso
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install stick and VM tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf gdisk e2fsprogs dosfstools squashfs-tools grub-common grub2-common grub-pc-bin grub-efi-amd64-bin parted iproute2 ripgrep
+      - run: cargo test --test stick_launcher --no-run
+      - name: Stick creation and updates (BIOS and UEFI)
+        run: |
+          chmod +x rescue-iso/release/nestegg
+          sudo env KEEP_LOGS="${{ runner.temp }}/stick-media-logs" tests/stick/create.sh rescue-iso/release/nestegg rescue-iso/nestegg-rescue-amd64.iso
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: stick-media-logs
+          path: ${{ runner.temp }}/stick-media-logs/
+
+  stick-desktop:
+    needs: iso
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rescue-iso
+          path: rescue-iso
+      - name: Install stick and VM tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf gdisk e2fsprogs dosfstools squashfs-tools parted iproute2 ripgrep
+      - name: Build disposable PBS and static client fixture
+        run: |
+          mkdir "${{ runner.temp }}/stick-fixture"
+          tests/stick/spike/build-root.sh "${{ runner.temp }}/stick-fixture"
+      - name: Desktop corruption, retention and device removal
+        run: |
+          chmod +x rescue-iso/release/nestegg
+          sudo env KEEP_LOGS="${{ runner.temp }}/stick-desktop-logs" tests/stick/desktop.sh rescue-iso/release/nestegg "${{ runner.temp }}/stick-fixture/pbs.squashfs" "${{ runner.temp }}/stick-fixture/client/usr/bin/proxmox-backup-client"
+          sudo env KEEP_LOGS="${{ runner.temp }}/stick-hotplug-logs" tests/stick/desktop-vm.sh rescue-iso/release/nestegg rescue-iso/nestegg-rescue-amd64.iso "${{ runner.temp }}/stick-fixture/pbs.squashfs" "${{ runner.temp }}/stick-fixture/client/usr/bin/proxmox-backup-client"
+      - name: Remove fixture
+        if: always()
+        run: sudo rm -rf "${{ runner.temp }}/stick-fixture"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: stick-desktop-logs
+          path: |
+            ${{ runner.temp }}/stick-desktop-logs/
+            ${{ runner.temp }}/stick-hotplug-logs/
