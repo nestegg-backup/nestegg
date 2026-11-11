@@ -149,7 +149,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install stick and VM tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf gdisk e2fsprogs dosfstools squashfs-tools grub-common grub2-common grub-pc-bin grub-efi-amd64-bin parted iproute2 ripgrep
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf gdisk e2fsprogs dosfstools squashfs-tools grub-common grub2-common grub-pc-bin grub-efi-amd64-bin parted iproute2 ripgrep strace dmsetup
       - run: cargo test --test stick_launcher --no-run
       - name: Stick creation and updates (BIOS and UEFI)
         run: |
@@ -172,7 +172,7 @@ jobs:
           name: rescue-iso
           path: rescue-iso
       - name: Install stick and VM tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf gdisk e2fsprogs dosfstools squashfs-tools parted iproute2 ripgrep
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf gdisk e2fsprogs dosfstools squashfs-tools parted iproute2 ripgrep strace dmsetup
       - name: Build disposable PBS and static client fixture
         run: |
           mkdir "${{ runner.temp }}/stick-fixture"
