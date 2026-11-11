@@ -384,6 +384,7 @@ describe("the daemon's detailed stick fields", () => {
     const ts = target({ state: "stick_damaged", server_verify_failed: ["host/other/2026-11-10T18:00:00Z"] });
     expect(stickView(ts).kind).toBe("store_damaged");
     expect(stickLine(ts, en, fen, now).lead).toBe(en.stick.storeDamaged);
+    expect(selfRowText(status({ targets: { pbs: target(), stick: ts } }), en, fen, now)).toBe(en.row.stickDamaged);
   });
   it("keeps the legacy mock endpoints on PBS when both targets exist", () => {
     const w = new World("both", "full");

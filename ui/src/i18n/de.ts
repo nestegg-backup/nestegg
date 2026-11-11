@@ -129,6 +129,7 @@ const de = {
       m.rel === "today" ? `Heute ${m.time} gesichert` : m.rel === "yesterday" ? `Gestern ${m.time} gesichert` : `${dayMonth} ${m.time} gesichert`,
     stickRunning: "Sichert auf den Stick",
     stickFull: "Stick voll",
+    stickDamaged: "Beschädigte Daten auf dem Stick",
     stickFailing: "Sicherung auf den Stick fehlgeschlagen",
     stickOverdue: (day: string) => `Stick überfällig, zuletzt ${day}`,
     stickNever: "Noch nicht auf den Stick gesichert",

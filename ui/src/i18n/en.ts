@@ -131,6 +131,7 @@ const en = {
           : `Backed up ${dayMonth} ${m.time}`,
     stickRunning: "Backing up to the stick",
     stickFull: "Stick full",
+    stickDamaged: "Damaged data on the stick",
     stickFailing: "Backup to the stick failed",
     stickOverdue: (day: string) => `Stick overdue, last ${day}`,
     stickNever: "Not backed up to the stick yet",

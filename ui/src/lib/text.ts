@@ -251,8 +251,9 @@ export function stickRowOverride(s: Status, t: Messages, f: Formatter): string |
       return t.row.stickRunning;
     case "full":
       return t.row.stickFull;
-    case "damaged":
     case "store_damaged":
+      return t.row.stickDamaged;
+    case "damaged":
     case "verify_failed":
     case "key_mismatch":
     case "unsupported":
