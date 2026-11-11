@@ -1,4 +1,4 @@
-//! Privileged PBS launcher. The caller supplies a desktop-trusted squashfs and
+//! Privileged PBS launcher. The fixed desktop cache supplies the squashfs and
 //! a mounted ext4 data partition. Only its `nestegg/` directory is persistent.
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -10,7 +10,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use nix::sys::memfd::{MFdFlags, memfd_create};
 
-use super::{capture, private_dir, trusted_path};
+use super::{capture, private_dir, trusted_file, trusted_path, valid_sha256};
+
+pub const IMAGE_PATH: &str = "/var/lib/nestegg/stick/pbs.squashfs";
 
 /// AF_INET6 is needed even when clients connect to IPv4 loopback.
 pub fn preflight() -> Result<()> {
@@ -48,8 +50,6 @@ fn socket_error(error: std::io::Error) -> anyhow::Error {
 }
 
 pub struct LauncherOptions {
-    /// Root-owned squashfs installed from a verified release ISO, never the stick.
-    pub image: PathBuf,
     /// Existing ext4 mount, with nodev,nosuid,noexec. Only nestegg/ is exposed.
     pub data_mount: PathBuf,
     /// Root-owned private runtime parent, normally /run/nestegg/stick.
@@ -157,12 +157,26 @@ impl Drop for Supervisor {
 impl LocalPbs {
     pub fn start(options: &LauncherOptions) -> Result<Self> {
         preflight()?;
-        trusted_path(&options.image)?;
-        if !fs::metadata(&options.image)?.is_file() {
-            bail!("PBS image must be a regular trusted squashfs");
+        use std::os::unix::fs::OpenOptionsExt;
+        let image_path = Path::new(IMAGE_PATH);
+        trusted_file(image_path)?;
+        let checksum_path = Path::new("/var/lib/nestegg/stick/pbs.squashfs.sha256");
+        trusted_file(checksum_path)?;
+        let expected = fs::read_to_string(checksum_path)?;
+        let expected = expected.trim();
+        let mut image = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(image_path)?;
+        if !valid_sha256(expected)
+            || !super::digest_reader(&mut image)?.eq_ignore_ascii_case(expected)
+        {
+            bail!("desktop PBS cache SHA-256 mismatch; reinstall from a trusted release ISO");
         }
         private_dir(&options.runtime_dir)?;
-        let data = fs::canonicalize(&options.data_mount)?;
+        trusted_path(&options.data_mount)?;
+        let data_root = open_directory(&options.data_mount)?;
+        let data = options.data_mount.clone();
         let mount: serde_json::Value = serde_json::from_str(&capture(
             Command::new("findmnt")
                 .args(["--json", "--mountpoint"])
@@ -182,43 +196,66 @@ impl LocalPbs {
         {
             bail!("datastore must be an ext4 mount with nodev,nosuid,noexec");
         }
-        let store = data.join("nestegg");
-        let meta = fs::symlink_metadata(&store).context("missing nestegg/ datastore directory")?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            bail!("nestegg/ must be a real directory");
-        }
-        // One local server per mounted datastore, across handles and processes.
-        let lock = File::open(&store)?;
-        let lock = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        let store = File::from(
+            nix::fcntl::openat(
+                &data_root,
+                "nestegg",
+                nix::fcntl::OFlag::O_RDONLY
+                    | nix::fcntl::OFlag::O_DIRECTORY
+                    | nix::fcntl::OFlag::O_NOFOLLOW
+                    | nix::fcntl::OFlag::O_CLOEXEC,
+                nix::sys::stat::Mode::empty(),
+            )
+            .context("missing or symbolic nestegg/ datastore directory")?,
+        );
+        validate_directory(&store)?;
+        // Lock and bind the same opened inode, never a subsequently resolved path.
+        let lock = nix::fcntl::Flock::lock(store, nix::fcntl::FlockArg::LockExclusiveNonblock)
             .map_err(|(_, e)| anyhow::anyhow!("datastore already in use: {e}"))?;
+        let pinned_mount = clone_datastore(&lock)?;
         let runtime = tempfile::Builder::new()
             .prefix("pbs-")
             .tempdir_in(&options.runtime_dir)?;
+        let pinned_target = runtime.path().join("data");
+        fs::create_dir(&pinned_target)?;
+        use std::os::unix::ffi::OsStrExt;
+        let mount_target = std::ffi::CString::new(pinned_target.as_os_str().as_bytes())?;
         fs::write(runtime.path().join("server.sh"), include_str!("server.sh"))?;
         let log = File::create(runtime.path().join("launcher.log"))?;
         let token = File::from(memfd_create(c"nestegg-stick-token", MFdFlags::MFD_CLOEXEC)?);
         let mut command = Command::new("unshare");
         command
             .args([
-                "--mount",
                 "--pid",
                 "--net",
                 "--uts",
                 "--fork",
                 "--kill-child=KILL",
-                "--propagation",
-                "private",
                 "bash",
                 "-c",
                 include_str!("namespace.sh"),
                 "--",
             ])
             .arg(runtime.path())
-            .arg(&options.image)
-            .arg(&store)
+            .arg(format!("/proc/self/fd/{}", image.as_raw_fd()))
+            .arg(&pinned_target)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(log);
+        // Prepare the mount namespace in the child before exec. Clone/attach
+        // the validated inode there, then the shell uses only this protected
+        // runtime path. No assumption about the caller's executable is needed.
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only async-signal-safe syscalls with prebuilt arguments.
+        unsafe {
+            command.pre_exec(move || {
+                attach_datastore(&pinned_mount, &mount_target)?;
+                if nix::libc::fcntl(image.as_raw_fd(), nix::libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let (supervisor, stdout) = Supervisor::start(command)?;
         let mut handle = Self {
             supervisor,
@@ -355,9 +392,97 @@ impl Drop for LocalPbs {
     }
 }
 
+/// Clone before unshare: directory fds retain their original mount namespace.
+/// A detached clone can then be attached in the helper's private namespace.
+fn clone_datastore(file: &File) -> Result<File> {
+    use std::os::fd::FromRawFd;
+    let tree = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_open_tree,
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            nix::libc::AT_EMPTY_PATH as u32
+                | nix::libc::OPEN_TREE_CLONE
+                | nix::libc::O_CLOEXEC as u32,
+        )
+    };
+    if tree < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot clone pinned datastore mount (open_tree required)");
+    }
+    // SAFETY: open_tree returned a newly owned mount descriptor.
+    Ok(unsafe { File::from_raw_fd(tree as i32) })
+}
+
+/// Called only after fork, before exec; keep this free of allocation/locks.
+fn attach_datastore(tree: &File, target: &std::ffi::CStr) -> std::io::Result<()> {
+    // SAFETY: valid descriptors/strings, in the spawning child only.
+    unsafe {
+        if nix::libc::unshare(nix::libc::CLONE_NEWNS) < 0
+            || nix::libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                nix::libc::MS_REC | nix::libc::MS_PRIVATE,
+                std::ptr::null(),
+            ) < 0
+            || nix::libc::syscall(
+                nix::libc::SYS_move_mount,
+                tree.as_raw_fd(),
+                c"".as_ptr(),
+                nix::libc::AT_FDCWD,
+                target.as_ptr(),
+                nix::libc::MOVE_MOUNT_F_EMPTY_PATH,
+            ) < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn open_directory(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(path)?;
+    validate_directory(&file)?;
+    Ok(file)
+}
+fn validate_directory(file: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+        bail!(
+            "data root and nestegg/ must be root-owned directories without group/other write permission"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refuses_symlink_and_writable_datastore_directories() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let d = tempfile::tempdir().unwrap();
+        let link = d.path().join("link");
+        symlink(d.path(), &link).unwrap();
+        assert!(open_directory(&link).is_err());
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(open_directory(d.path()).is_err());
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        if nix::unistd::Uid::effective().is_root() {
+            let pinned = open_directory(d.path()).unwrap();
+            let moved = d.path().join("moved");
+            fs::create_dir(&moved).unwrap();
+            let original = pinned.metadata().unwrap();
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(original.ino(), fs::metadata(d.path()).unwrap().ino());
+        }
+    }
     #[test]
     fn unsupported_ipv6_is_distinct_from_resource_failure() {
         assert!(

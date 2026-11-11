@@ -33,3 +33,20 @@ an attacker able to replace both inputs can supply any privileged code.
 Copy into the root-only desktop cache, not `$TMPDIR`. Install signal handling
 before opening the owned loop or copying the ISO; interruptible copying unwinds
 the temporary directory before loop detachment. SIGKILL cannot run cleanup.
+
+## Launcher provenance and pinned datastore (review findings 3 and 4)
+
+Remove `LauncherOptions.image`; `LocalPbs::start` uses only the public
+`IMAGE_PATH` constant `/var/lib/nestegg/stick/pbs.squashfs`. Verify the recorded
+SHA-256 of the opened image, reject removable/FAT backing storage, and mount
+that same descriptor. All other public launcher methods/options stay stable.
+Open the data mount with O_DIRECTORY|O_NOFOLLOW, open `nestegg/` relative to it,
+and validate both fstat results as root-owned and not group/other-writable.
+Lock and inherit the opened directory, then bind `/proc/self/fd/N` with mount
+canonicalization disabled. A later path replacement cannot change the inode.
+
+`nestegg/` is now a root-owned mount anchor; PBS owns its `store/` child. This
+is necessary because PBS changes the owner of its datastore root and needs
+write access there. The launcher refuses older prototype anchors owned by PBS;
+it does not silently migrate or chmod existing datastore trees. Preserve old
+media and migrate explicitly, or recreate disposable phase-one test media.

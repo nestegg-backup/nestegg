@@ -28,9 +28,17 @@ rm /run/token.json
 [[ $secret =~ ^[a-zA-Z0-9-]+$ ]]
 proxmox-backup-manager acl update /datastore/stick DatastoreAdmin --auth-id nestegg@pbs
 proxmox-backup-manager acl update /datastore/stick DatastoreAdmin --auth-id 'nestegg@pbs!stick'
+# nestegg/ stays a root-owned mount anchor. PBS owns only its child so its
+# normal datastore ownership cannot make the validated anchor user-writable.
+store=/mnt/stick/nestegg/store
+if [[ ! -e $store ]]; then
+  mkdir -m 0755 "$store"
+  chown backup:backup "$store"
+fi
+[[ -d $store && ! -L $store ]]
 reuse=()
-[[ ! -d /mnt/stick/nestegg/.chunks ]] || reuse=(--reuse-datastore true)
-proxmox-backup-manager datastore create stick /mnt/stick/nestegg "${reuse[@]}" --tuning gc-atime-cutoff=1
+[[ ! -d $store/.chunks ]] || reuse=(--reuse-datastore true)
+proxmox-backup-manager datastore create stick "$store" "${reuse[@]}" --tuning gc-atime-cutoff=1
 fingerprint=$(openssl x509 -in /etc/proxmox-backup/proxy.pem -noout -fingerprint -sha256 | cut -d= -f2)
 for ((i=0;i<120;i++)); do
   if curl -skf https://127.0.0.1:8007/api2/json/ping >/dev/null; then

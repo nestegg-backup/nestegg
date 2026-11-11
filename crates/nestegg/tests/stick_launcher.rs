@@ -30,11 +30,75 @@ fn token(handle: &LocalPbs) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "requires root and Linux open_tree/move_mount"]
+fn pinned_directory_survives_path_swap_across_mount_namespaces() {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, symlink};
+    use std::os::unix::process::CommandExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source");
+    let target = fixture.path().join("target");
+    let replacement = fixture.path().join("replacement");
+    for p in [&source, &target, &replacement] {
+        fs::create_dir(p).unwrap();
+    }
+    let pinned = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(&source)
+        .unwrap();
+    let inode = pinned.metadata().unwrap().ino();
+    fs::rename(&source, fixture.path().join("original")).unwrap();
+    symlink(&replacement, &source).unwrap();
+    use std::os::fd::FromRawFd;
+    let tree = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_open_tree,
+            pinned.as_raw_fd(),
+            c"".as_ptr(),
+            nix::libc::AT_EMPTY_PATH as u32
+                | nix::libc::OPEN_TREE_CLONE
+                | nix::libc::O_CLOEXEC as u32,
+        )
+    };
+    assert!(tree >= 0, "open_tree: {}", std::io::Error::last_os_error());
+    let tree = unsafe { File::from_raw_fd(tree as i32) };
+    let fd = tree.as_raw_fd();
+    use std::os::unix::ffi::OsStrExt;
+    let target_c = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+    let mut command = Command::new("stat");
+    command.args(["-c", "%i"]).arg(&target);
+    unsafe {
+        command.pre_exec(move || {
+            if nix::libc::unshare(nix::libc::CLONE_NEWNS) < 0
+                || nix::libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    nix::libc::MS_REC | nix::libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ) < 0
+                || nix::libc::syscall(
+                    nix::libc::SYS_move_mount,
+                    fd,
+                    c"".as_ptr(),
+                    nix::libc::AT_FDCWD,
+                    target_c.as_ptr(),
+                    nix::libc::MOVE_MOUNT_F_EMPTY_PATH,
+                ) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    assert_eq!(run(&mut command).trim(), inode.to_string());
+}
+
+#[test]
 #[ignore = "requires root, trusted PBS squashfs, mounted disposable ext4 and official client"]
 fn isolated_pbs_backup_restore_and_restart() {
     let env = |key| PathBuf::from(std::env::var_os(key).expect(key));
     let options = LauncherOptions {
-        image: env("NESTEGG_STICK_IMAGE"),
         data_mount: env("NESTEGG_STICK_DATA"),
         runtime_dir: env("NESTEGG_STICK_RUNTIME"),
     };
@@ -55,10 +119,23 @@ fn isolated_pbs_backup_restore_and_restart() {
     // A common async integration starts in a short-lived blocking thread and
     // moves the handle to the controller. PBS must outlive the start thread.
     let worker_options = LauncherOptions {
-        image: options.image.clone(),
         data_mount: options.data_mount.clone(),
         runtime_dir: options.runtime_dir.clone(),
     };
+    // Root-owned FAT-looking cache files are still rejected by filesystem type.
+    // Verify the cache bytes before any privileged helper or data operation.
+    let cache = Path::new(nestegg::stick::launcher::IMAGE_PATH);
+    let checksum = cache.with_extension("squashfs.sha256");
+    let saved_hash = fs::read(&checksum).unwrap();
+    fs::write(&checksum, "0".repeat(64)).unwrap();
+    assert!(
+        LocalPbs::start(&options)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("SHA-256 mismatch")
+    );
+    fs::write(&checksum, saved_hash).unwrap();
     let first = std::thread::spawn(move || LocalPbs::start(&worker_options))
         .join()
         .unwrap()
@@ -120,6 +197,16 @@ fn isolated_pbs_backup_restore_and_restart() {
     .unwrap();
     assert_eq!(value.as_array().unwrap().len(), 1);
     first.stop().unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let anchor = fs::metadata(options.data_mount.join("nestegg")).unwrap();
+    assert_eq!(anchor.uid(), 0);
+    assert_eq!(anchor.mode() & 0o022, 0);
+    let store = fs::metadata(options.data_mount.join("nestegg/store")).unwrap();
+    assert_eq!(
+        store.mode() & 0o777,
+        0o755,
+        "PBS requires this mode for reuse"
+    );
     let second = LocalPbs::start(&options).unwrap();
     assert_ne!(fp, second.fingerprint(), "TLS certificate must be fresh");
     assert!(secret != token(&second), "token secret must be fresh");

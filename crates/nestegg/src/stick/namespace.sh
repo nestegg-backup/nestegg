@@ -6,7 +6,7 @@ mount --make-rprivate /
 hostname pbs.example.com
 ip link set lo up
 mkdir "$base/lower" "$base/ram"
-mount -t squashfs -o loop,ro,nodev,nosuid "$image" "$base/lower"
+mount --no-canonicalize -t squashfs -o loop,ro,nodev,nosuid "$image" "$base/lower"
 mount -t tmpfs -o mode=0700 tmpfs "$base/ram"
 mkdir "$base/ram/upper" "$base/ram/work" "$base/ram/root"
 root=$base/ram/root
