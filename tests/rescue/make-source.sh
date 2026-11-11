@@ -12,8 +12,9 @@ export DEBIAN_FRONTEND=noninteractive
 mnt=/mnt/src
 
 apt-get update -qq
+read -r -a extra_host_packages <<< "${EXTRA_HOST_PACKAGES:-}"
 apt-get install -y -qq debootstrap gdisk dosfstools btrfs-progs e2fsprogs curl ca-certificates \
-  ${EXTRA_HOST_PACKAGES:-} >/dev/null
+  "${extra_host_packages[@]}" >/dev/null
 
 truncate -s 6G "$IMAGE"
 loop="$(losetup --find --show --partscan "$IMAGE")"
@@ -65,7 +66,7 @@ case "$VARIANT" in
 esac
 
 echo "== debootstrap $suite"
-debootstrap --variant=minbase --components="$components" --include="$packages" "$suite" "$mnt" "$mirror" >/dev/null
+debootstrap --variant=minbase --components="$components" --include="$packages${EXTRA_SOURCE_PACKAGES:+,$EXTRA_SOURCE_PACKAGES}" "$suite" "$mnt" "$mirror" >/dev/null
 
 for d in dev proc sys; do mount --rbind "/$d" "$mnt/$d"; mount --make-rslave "$mnt/$d"; done
 in_chroot() { chroot "$mnt" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive "$@"; }

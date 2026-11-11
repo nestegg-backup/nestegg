@@ -7,11 +7,16 @@
 //! See `docs/rescue.md`.
 
 pub mod cli;
+pub mod desktop_api;
 pub mod exec;
 pub mod fixup;
 pub mod guard;
+pub mod offline;
+pub mod offline_inventory;
+pub mod offline_storage;
 pub mod paperkey;
 pub mod plan;
+pub mod source;
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -122,6 +127,8 @@ impl Settings {
 pub struct Session {
     pub config: Config,
     pub store_dir: PathBuf,
+    local: Option<crate::stick::target::Session>,
+    _credentials: tempfile::TempDir,
 }
 
 impl Session {
@@ -129,8 +136,10 @@ impl Session {
         let config = settings.to_config()?;
         let dir = work_dir();
         secrets::create_private_dir(&dir)?;
-        let store_dir = dir.join("credentials");
-        secrets::create_private_dir(&store_dir)?;
+        let credentials = tempfile::Builder::new()
+            .prefix("credentials-")
+            .tempdir_in(&dir)?;
+        let store_dir = credentials.path().to_path_buf();
         secrets::write_private_file(&store_dir.join(secrets::PASSWORD), password.as_bytes())?;
         let key_path = store_dir.join(secrets::ENCRYPTION_KEY);
         match key {
@@ -139,7 +148,38 @@ impl Session {
                 let _ = fs::remove_file(&key_path);
             }
         }
-        Ok(Session { config, store_dir })
+        Ok(Session {
+            config,
+            store_dir,
+            local: None,
+            _credentials: credentials,
+        })
+    }
+
+    pub fn from_stick(local: crate::stick::target::Session) -> Result<Self> {
+        let settings = Settings {
+            server: "127.0.0.1".into(),
+            port: 8007,
+            datastore: "stick".into(),
+            auth_id: "nestegg@pbs!stick".into(),
+            ..Default::default()
+        };
+        // Local credentials live solely in the launcher's memfd. No user token
+        // or network connection is involved in this session.
+        let mut session = Self::new(&settings, &Secret::new(Vec::new()), None)?;
+        session.local = Some(local);
+        Ok(session)
+    }
+
+    pub fn close(mut self) -> Result<()> {
+        if let Some(local) = self.local.take() {
+            local.close()?;
+        }
+        Ok(())
+    }
+
+    pub fn stick_mount(&self) -> Option<&Path> {
+        self.local.as_ref().map(|s| s.mount.as_path())
     }
 
     /// Replace the key used for this session (after a key was rejected).
@@ -155,7 +195,11 @@ impl Session {
     }
 
     pub fn client(&self) -> Client<'_> {
-        Client::new(&self.config, SecretStore::new(&self.store_dir))
+        let store = SecretStore::new(&self.store_dir);
+        match &self.local {
+            Some(local) => Client::local(&self.config, store, local.pbs()),
+            None => Client::new(&self.config, store),
+        }
     }
 
     /// Backup groups (`host/<id>`) that contain a full system backup.

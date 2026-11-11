@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 
 use super::exec::{self, Job, Runner};
 use super::guard;
@@ -29,6 +29,10 @@ pub enum RescueCmd {
     Wizard,
     /// Non-interactive restore onto an empty disk (for automation).
     Restore(Box<RestoreArgs>),
+    /// Back up an offline computer to the booted backup stick.
+    Backup(Box<super::offline::BackupArgs>),
+    #[command(hide = true)]
+    StickApi,
     /// List the disks of this computer.
     Disks,
     /// Write the connection settings (no secrets) for the rescue stick to a
@@ -36,8 +40,20 @@ pub enum RescueCmd {
     ExportSettings { file: PathBuf },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RestoreSource {
+    Pbs,
+    Stick,
+}
+
 #[derive(Args)]
 pub struct RestoreArgs {
+    /// Use the PBS or the data partition of this booted backup stick.
+    #[arg(long, value_enum, default_value = "pbs")]
+    pub source: RestoreSource,
+    /// Password of the protected key copy on this stick (never a PBS token).
+    #[arg(long)]
+    pub key_password_file: Option<PathBuf>,
     /// Settings file (see `export-settings`); individual options override it.
     #[arg(long)]
     pub settings: Option<PathBuf>,
@@ -60,7 +76,7 @@ pub struct RestoreArgs {
     pub wake_mac: Option<String>,
     /// File with the PBS password or API token secret.
     #[arg(long)]
-    pub password_file: PathBuf,
+    pub password_file: Option<PathBuf>,
     /// Exported encryption key or saved paper key (omit for unencrypted
     /// backups).
     #[arg(long)]
@@ -109,6 +125,8 @@ pub fn run(cmd: Option<RescueCmd>) -> Result<u8> {
     match cmd.unwrap_or(RescueCmd::Wizard) {
         RescueCmd::Wizard => wizard().map_err(printable_error),
         RescueCmd::Restore(args) => restore(*args).map_err(printable_error),
+        RescueCmd::Backup(args) => super::offline::run(*args).map_err(printable_error),
+        RescueCmd::StickApi => super::desktop_api::run(),
         RescueCmd::Disks => {
             for d in list_disks()? {
                 let a = guard::assess(&d, &[], &[]);
@@ -238,15 +256,43 @@ fn restore(a: RestoreArgs) -> Result<u8> {
     if !a.dry_run {
         require_root()?;
     }
-    let password = read_secret_file(&a.password_file)?;
-    let key = a.keyfile.as_deref().map(read_key_file).transpose()?;
+    let session = match a.source {
+        RestoreSource::Pbs => {
+            let password = read_secret_file(
+                a.password_file
+                    .as_deref()
+                    .context("--password-file is required for --source pbs")?,
+            )?;
+            let key = a.keyfile.as_deref().map(read_key_file).transpose()?;
+            let session = Session::new(&s, &password, key.as_ref())?;
+            ensure_reachable(&session)?;
+            session
+        }
+        RestoreSource::Stick => {
+            let medium = super::source::BootMedium::detect()?;
+            let session = Session::from_stick(medium.open()?)?;
+            let key = match a.keyfile.as_deref() {
+                Some(path) => read_key_file(path)?,
+                None => {
+                    let password = read_secret_file(a.key_password_file.as_deref().context(
+                        "give --key-password-file or --keyfile for the stick's recovery key",
+                    )?)?;
+                    crate::stick::key::open_copy(
+                        &stick_key_path(&session, &backup_id)?,
+                        &password,
+                        &work_dir(),
+                    )?
+                }
+            };
+            session.set_key(Some(&key))?;
+            session
+        }
+    };
     let luks = a
         .encrypt_passphrase_file
         .as_deref()
         .map(read_secret_file)
         .transpose()?;
-    let session = Session::new(&s, &password, key.as_ref())?;
-    ensure_reachable(&session)?;
     let snaps = session.system_snapshots(&backup_id)?;
     let snapshot = if a.snapshot == "latest" {
         snaps
@@ -304,7 +350,7 @@ fn restore(a: RestoreArgs) -> Result<u8> {
         );
     }
     let assessment = guard::assess(disk, &inventory.recorded_ids(), &[]);
-    run_restore(
+    let result = run_restore(
         &session,
         &snapshot,
         &backup_time,
@@ -326,7 +372,11 @@ fn restore(a: RestoreArgs) -> Result<u8> {
             }
             Ok(true)
         },
-    )
+    );
+    let closed = session.close();
+    let code = result?;
+    closed?;
+    Ok(code)
 }
 
 /// An exported key file or a saved paper key (text or html).
@@ -490,6 +540,9 @@ fn run_restore(
         luks.is_some(),
     )?;
     let mut warnings = exec::preflight(&plan, selections.as_deref())?;
+    if !dry_run {
+        exec::check_live_grub()?;
+    }
     exec::check_disk_free(&plan.disk)?;
     let contents = exec::disk_contents(&plan.disk);
     // Something of the backed-up computer (a surviving /home or data disk,
@@ -594,125 +647,164 @@ fn network_report(ip_output: &str) -> Option<String> {
 fn wizard() -> Result<u8> {
     require_root()?;
     eprintln!();
-    eprintln!("nestegg rescue: restore a computer from its backup");
+    eprintln!("nestegg rescue: back up or restore a computer");
     eprintln!("====================================================");
+    let medium = super::source::BootMedium::detect().ok();
+    if medium.is_some() {
+        let action = choose(
+            "What would you like to do",
+            &[
+                "Restore this computer".into(),
+                "Back up this computer".into(),
+            ],
+            Some(0),
+        )?;
+        if action == 1 {
+            return super::offline::wizard();
+        }
+    }
     eprintln!("This erases the disk you choose and puts the backed-up system on it.");
     eprintln!("Nothing is changed before you confirm the final plan.");
     eprintln!();
-    show_network();
-    eprintln!();
-
-    eprintln!("Looking for settings and keys on the attached drives ...");
-    let media = scan_media();
-    for note in &media.notes {
-        say(note);
-    }
-    let keys = media.keys.clone();
-    let chosen = choose_settings(&media.settings)?;
-    let mut settings = match chosen {
-        Some(f) => f.settings.clone(),
-        None => Settings {
-            port: 8007,
-            ..Default::default()
-        },
-    };
-    // A certificate fingerprint from a settings file is only a suggestion;
-    // `trusted` is what the user confirmed in this session.
-    let file_fingerprint = chosen.and_then(|f| {
-        f.settings
-            .fingerprint
-            .clone()
-            .filter(|fp| !fp.is_empty())
-            .map(|fp| (fp, f.origin.clone()))
-    });
-    let mut trusted: Option<String> = None;
-    settings.fingerprint = None;
-
-    // Connection, repeated until the PBS answers.
-    let (session, backup_id) = loop {
-        eprintln!("Step 1/4: backup server");
-        settings.server = ask("PBS address (host name or IP)", Some(&settings.server))?;
-        settings.port = ask("Port", Some(&settings.port.to_string()))?
-            .parse()
-            .unwrap_or(8007);
-        settings.datastore = ask("Datastore", Some(&settings.datastore))?;
-        let ns = ask(
-            "Namespace (empty = none)",
-            Some(settings.namespace.as_deref().unwrap_or("-")),
-        )?;
-        settings.namespace = (ns != "-" && !ns.is_empty()).then_some(ns);
-        settings.auth_id = ask(
-            "User or API token (user@realm!token)",
-            Some(&settings.auth_id),
-        )?;
-        let mac = ask(
-            "MAC address for Wake-on-LAN (empty = none)",
-            Some(settings.wake_mac.as_deref().unwrap_or("-")),
-        )?;
-        settings.wake_mac = (mac != "-" && !mac.is_empty()).then_some(mac);
-        // Wake a sleeping PBS before asking it for its certificate.
-        if let Ok(c) = settings.to_config()
-            && let Err(e) = crate::wake::ensure_available(&c, |ev| say(ev.to_string()))
-        {
-            say(format!("Wake-on-LAN failed: {e:#}"));
-        }
-        match fetch_fingerprint(&settings.server, settings.port) {
-            Ok(fp) => {
-                eprintln!("Certificate fingerprint of the server:\n  {fp}");
-                let saved =
-                    file_fingerprint
-                        .as_ref()
-                        .map(|(fingerprint, origin)| SavedFingerprint {
-                            fingerprint,
-                            origin,
-                        });
-                trusted = decide_fingerprint(&fp, saved, trusted.as_deref(), &mut ask_yes)?;
-            }
-            Err(e) => say(format!("Could not read the certificate: {e:#}")),
-        }
-        // Only a confirmed fingerprint is ever pinned (never one taken
-        // unconfirmed from a settings file).
-        settings.fingerprint = trusted.clone();
-        let password = ask_secret("Password or API token secret")?;
-        let key = choose_key(&keys)?;
-        let session = match Session::new(&settings, &password, key.as_ref()) {
-            Ok(s) => s,
-            Err(e) => {
-                say(format!("Invalid settings: {e:#}\n"));
-                continue;
-            }
-        };
-        if let Err(e) = ensure_reachable(&session) {
-            say(format!("{e:#}\n"));
-            continue;
-        }
-        let machines = match session.machines() {
-            Ok(m) if !m.is_empty() => m,
-            Ok(_) => {
-                eprintln!("No backups found with these settings.\n");
-                continue;
-            }
-            Err(e) => {
-                say(format!("Login or listing failed: {e:#}"));
-                if settings.fingerprint.is_none() {
-                    eprintln!(
-                        "(No certificate was trusted. If the PBS uses its own certificate, \
-                         answer yes to \"Trust this certificate?\" next time.)"
-                    );
-                }
-                eprintln!();
-                continue;
-            }
-        };
+    let use_stick = medium.is_some()
+        && choose(
+            "Backup source",
+            &[
+                "Backups on this stick".into(),
+                "Proxmox Backup Server (network)".into(),
+            ],
+            Some(0),
+        )? == 0;
+    let keys;
+    let media_devices;
+    let (session, backup_id) = if use_stick {
+        keys = Vec::new();
+        media_devices = Vec::new();
+        let session = Session::from_stick(medium.context("no booted backup stick")?.open()?)?;
+        let machines = session.machines()?;
+        anyhow::ensure!(!machines.is_empty(), "no computer backups on this stick");
+        let i = choose("Which computer", &machines, Some(0))?;
+        let id = machines[i].clone();
+        let key = choose_session_key(&session, &keys, &id)?;
+        session.set_key(key.as_ref())?;
+        (session, id)
+    } else {
+        show_network();
         eprintln!();
-        eprintln!("Step 2/4: computer");
-        let default = settings
-            .backup_id
-            .as_ref()
-            .and_then(|id| machines.iter().position(|m| m == id))
-            .unwrap_or(0);
-        let i = choose("Which computer", &machines, Some(default))?;
-        break (session, machines[i].clone());
+
+        eprintln!("Looking for settings and keys on the attached drives ...");
+        let media = scan_media();
+        for note in &media.notes {
+            say(note);
+        }
+        keys = media.keys.clone();
+        media_devices = media.devices.clone();
+        let chosen = choose_settings(&media.settings)?;
+        let mut settings = match chosen {
+            Some(f) => f.settings.clone(),
+            None => Settings {
+                port: 8007,
+                ..Default::default()
+            },
+        };
+        // A certificate fingerprint from a settings file is only a suggestion;
+        // `trusted` is what the user confirmed in this session.
+        let file_fingerprint = chosen.and_then(|f| {
+            f.settings
+                .fingerprint
+                .clone()
+                .filter(|fp| !fp.is_empty())
+                .map(|fp| (fp, f.origin.clone()))
+        });
+        let mut trusted: Option<String> = None;
+        settings.fingerprint = None;
+
+        // Connection, repeated until the PBS answers.
+        loop {
+            eprintln!("Step 1/4: backup server");
+            settings.server = ask("PBS address (host name or IP)", Some(&settings.server))?;
+            settings.port = ask("Port", Some(&settings.port.to_string()))?
+                .parse()
+                .unwrap_or(8007);
+            settings.datastore = ask("Datastore", Some(&settings.datastore))?;
+            let ns = ask(
+                "Namespace (empty = none)",
+                Some(settings.namespace.as_deref().unwrap_or("-")),
+            )?;
+            settings.namespace = (ns != "-" && !ns.is_empty()).then_some(ns);
+            settings.auth_id = ask(
+                "User or API token (user@realm!token)",
+                Some(&settings.auth_id),
+            )?;
+            let mac = ask(
+                "MAC address for Wake-on-LAN (empty = none)",
+                Some(settings.wake_mac.as_deref().unwrap_or("-")),
+            )?;
+            settings.wake_mac = (mac != "-" && !mac.is_empty()).then_some(mac);
+            // Wake a sleeping PBS before asking it for its certificate.
+            if let Ok(c) = settings.to_config()
+                && let Err(e) = crate::wake::ensure_available(&c, |ev| say(ev.to_string()))
+            {
+                say(format!("Wake-on-LAN failed: {e:#}"));
+            }
+            match fetch_fingerprint(&settings.server, settings.port) {
+                Ok(fp) => {
+                    eprintln!("Certificate fingerprint of the server:\n  {fp}");
+                    let saved =
+                        file_fingerprint
+                            .as_ref()
+                            .map(|(fingerprint, origin)| SavedFingerprint {
+                                fingerprint,
+                                origin,
+                            });
+                    trusted = decide_fingerprint(&fp, saved, trusted.as_deref(), &mut ask_yes)?;
+                }
+                Err(e) => say(format!("Could not read the certificate: {e:#}")),
+            }
+            // Only a confirmed fingerprint is ever pinned (never one taken
+            // unconfirmed from a settings file).
+            settings.fingerprint = trusted.clone();
+            let password = ask_secret("Password or API token secret")?;
+            let key = choose_key(&keys)?;
+            let session = match Session::new(&settings, &password, key.as_ref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    say(format!("Invalid settings: {e:#}\n"));
+                    continue;
+                }
+            };
+            if let Err(e) = ensure_reachable(&session) {
+                say(format!("{e:#}\n"));
+                continue;
+            }
+            let machines = match session.machines() {
+                Ok(m) if !m.is_empty() => m,
+                Ok(_) => {
+                    eprintln!("No backups found with these settings.\n");
+                    continue;
+                }
+                Err(e) => {
+                    say(format!("Login or listing failed: {e:#}"));
+                    if settings.fingerprint.is_none() {
+                        eprintln!(
+                            "(No certificate was trusted. If the PBS uses its own certificate, \
+                         answer yes to \"Trust this certificate?\" next time.)"
+                        );
+                    }
+                    eprintln!();
+                    continue;
+                }
+            };
+            eprintln!();
+            eprintln!("Step 2/4: computer");
+            let default = settings
+                .backup_id
+                .as_ref()
+                .and_then(|id| machines.iter().position(|m| m == id))
+                .unwrap_or(0);
+            let i = choose("Which computer", &machines, Some(default))?;
+            break (session, machines[i].clone());
+        }
     };
 
     let snaps = session.system_snapshots(&backup_id)?;
@@ -776,7 +868,7 @@ fn wizard() -> Result<u8> {
             ];
             match choose("What now", &options, Some(default))? {
                 MENU_OTHER_KEY => {
-                    let key = choose_key(&keys)?;
+                    let key = choose_session_key(&session, &keys, &backup_id)?;
                     session.set_key(key.as_ref())?;
                 }
                 MENU_OTHER_BACKUP => continue 'backup,
@@ -809,7 +901,7 @@ fn wizard() -> Result<u8> {
         .iter()
         .map(|d| {
             let fits = make_plan(&inventory.layout, &target(d, uefi, archive_bytes), false).is_ok();
-            (guard::assess(d, &recorded, &media.devices), fits)
+            (guard::assess(d, &recorded, &media_devices), fits)
         })
         .collect();
     let items: Vec<String> = disks
@@ -896,6 +988,7 @@ fn wizard() -> Result<u8> {
             Ok(typed == phrase)
         },
     )?;
+    session.close()?;
     if code == 0 && ask_yes("Remove the rescue stick and restart now?", true)? {
         let _ = std::process::Command::new("systemctl")
             .arg("reboot")
@@ -1033,6 +1126,59 @@ fn key_list(found: &[PathBuf]) -> (&'static str, Vec<String>) {
 fn key_by_number<'a>(answer: &str, found: &'a [PathBuf]) -> Option<&'a Path> {
     let n: usize = answer.trim().parse().ok()?;
     found.get(n.checked_sub(1)?).map(PathBuf::as_path)
+}
+
+pub(super) fn stick_key_path(session: &Session, backup_id: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !backup_id.is_empty()
+            && backup_id != "."
+            && backup_id != ".."
+            && backup_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+        "invalid computer backup ID"
+    );
+    let base = session
+        .stick_mount()
+        .context("not a stick session")?
+        .join("nestegg-keys");
+    let meta = fs::symlink_metadata(&base)?;
+    anyhow::ensure!(
+        meta.is_dir() && !meta.file_type().is_symlink(),
+        "invalid recovery key directory"
+    );
+    Ok(base.join(format!("{backup_id}.json")))
+}
+
+pub(super) fn choose_session_key(
+    session: &Session,
+    found: &[PathBuf],
+    backup_id: &str,
+) -> Result<Option<Secret>> {
+    if session.stick_mount().is_some()
+        && let Ok(path) = stick_key_path(session, backup_id)
+        && path.exists()
+    {
+        loop {
+            let choice = choose(
+                "Encryption key",
+                &[
+                    "Password-protected copy on this stick".into(),
+                    "Paper key or exported key file".into(),
+                ],
+                Some(0),
+            )?;
+            if choice == 1 {
+                break;
+            }
+            let password = ask_secret("Stick key password")?;
+            match crate::stick::key::open_copy(&path, &password, &work_dir()) {
+                Ok(key) => return Ok(Some(key)),
+                Err(e) => say(format!("Could not open the stick key: {e:#}")),
+            }
+        }
+    }
+    choose_key(found)
 }
 
 /// Where the encryption key comes from: a key file or saved paper key on

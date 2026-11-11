@@ -234,6 +234,22 @@ pub fn execute(
     progress: &Progress,
     log: &mut dyn Write,
 ) -> Result<Vec<String>> {
+    let client = Client::new(
+        config,
+        crate::secrets::SecretStore::new(&paths.credentials_dir),
+    );
+    execute_with_client(paths, &client, job, requester, progress, log)
+}
+
+/// The same permission and staging rules for an isolated stick client.
+pub fn execute_with_client(
+    paths: &Paths,
+    client: &Client<'_>,
+    job: Job<'_>,
+    requester: &Requester,
+    progress: &Progress,
+    log: &mut dyn Write,
+) -> Result<Vec<String>> {
     let target = job.target;
     if !target.is_absolute() {
         return Err(
@@ -248,10 +264,6 @@ pub fn execute(
         return Err(RestoreError::TargetExists(target.to_path_buf()).into());
     }
     let direct = matches!(requester, Requester::Root { .. }) && root_controlled_parent(target)?;
-    let client = Client::new(
-        config,
-        crate::secrets::SecretStore::new(&paths.credentials_dir),
-    );
     if direct {
         client.restore(
             &RestoreRequest {
@@ -304,7 +316,7 @@ pub fn execute(
     for warning in crate::staging::cleanup_stale(&staging_root) {
         let _ = writeln!(log, "warning: {warning}");
     }
-    check_staging_space(&client, &job, &staging_root, log)?;
+    check_staging_space(client, &job, &staging_root, log)?;
     let staging = crate::staging::StagingDir::create(&staging_root)?;
     let data = staging.path().join("data");
 

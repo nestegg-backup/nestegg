@@ -7,3 +7,12 @@ done
 # The server package adds an enterprise source during installation. This live
 # system uses only the explicitly configured no-subscription repository.
 rm -f /etc/apt/sources.list.d/pbs-enterprise.sources /etc/apt/sources.list.d/pbs-enterprise.list
+
+# Offline sources must not acquire writable LVM holders before the wizard
+# applies kernel block-device write protection. Explicit rescue activation
+# uses a per-command read_only_volume_list without modifying VG metadata.
+cat > /etc/lvm/lvm.conf <<'EOF'
+global { event_activation = 0 }
+activation { auto_activation_volume_list = [] }
+EOF
+systemctl mask --force lvm2-monitor.service lvm2-pvscan@.service

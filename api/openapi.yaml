@@ -294,8 +294,15 @@ paths:
   /snapshots:
     get:
       operationId: listSnapshots
-      summary: Snapshots of this machine on the PBS, newest first.
-      description: Requires the PBS to be reachable; returns 503 `pbs_unreachable` otherwise.
+      summary: Snapshots of this machine on the selected backup target, newest first.
+      description: |
+        Defaults to PBS (503 `pbs_unreachable` when unavailable). With target=stick,
+        opens a registered attached stick using the fixed desktop image and this
+        computer's configured key. Never executes code from the attached medium.
+        Stick errors return 503 `stick_unavailable`; there is no fallback to PBS.
+      parameters:
+        - $ref: "#/components/parameters/RestoreTarget"
+        - $ref: "#/components/parameters/StickUuid"
       responses:
         "200":
           description: OK
@@ -321,8 +328,12 @@ paths:
         The first call for a snapshot reads its catalog from the PBS (needs
         the PBS to be reachable); later calls use a local cache. Users other
         than root see only their own home directory (ancestors show only the
-        branch towards it).
+        branch towards it). With target=stick the catalog is read in a private
+        worker, not retained across media attachments. Non-root callers require
+        signed snapshot metadata; all home-directory restrictions still apply.
       parameters:
+        - $ref: "#/components/parameters/RestoreTarget"
+        - $ref: "#/components/parameters/StickUuid"
         - name: snapshotTime
           in: path
           required: true
@@ -502,6 +513,16 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
 components:
   parameters:
+    RestoreTarget:
+      name: target
+      in: query
+      schema: { type: string, enum: [pbs, stick], default: pbs }
+      description: Source of the snapshots or files. Explicit selection; no fallback.
+    StickUuid:
+      name: stick_uuid
+      in: query
+      schema: { type: string, format: uuid }
+      description: Registered attached data UUID, only with target=stick; omit only when exactly one registered stick is attached.
     RunId:
       name: runId
       in: path
@@ -515,7 +536,7 @@ components:
         code:
           type: string
           description: Stable identifier.
-          enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, already_checking, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
+          enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, already_checking, not_found, pbs_unreachable, stick_unavailable, not_implemented, bad_request, forbidden, internal]
         message: { type: string, description: Human-readable English text. }
     Health:
       type: object
@@ -727,8 +748,17 @@ components:
     RestoreRequest:
       type: object
       required: [snapshot_time, target_dir]
-      description: Either `archive` (+ `paths`) or `archives`.
+      description: |
+        Either `archive` (+ `paths`) or `archives`. target defaults to pbs.
+        For stick, only this computer's registered medium and configured key are
+        used. stick_uuid selects one of several registered attached sticks;
+        when omitted exactly one must be attached. A per-medium and shared run
+        lock prevents concurrent backup/pruning. The job uses the same target
+        as validation and rechecks signed source metadata before writing files.
+        Stick progress bytes are reported on completion; total_bytes is null.
       properties:
+        target: { type: string, enum: [pbs, stick], default: pbs }
+        stick_uuid: { type: string, format: uuid, description: Registered data UUID; only with target=stick. }
         snapshot_time: { type: string, format: date-time }
         archive: { type: string, examples: ["home.pxar"] }
         paths:

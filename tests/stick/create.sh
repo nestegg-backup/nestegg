@@ -49,6 +49,7 @@ trap 'echo "ERROR: stick acceptance failed at line $LINENO" >&2' ERR
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+"$here/grub-config.sh"
 mkdir -p "$work/"{data,esp,iso,root,state,runtime,home,guard,tools}
 # All fixed cache paths and NSS fixtures exist only in this mount namespace.
 mount -t tmpfs -o mode=0755 tmpfs /var/lib
@@ -111,7 +112,7 @@ umount "$work/data"
 detach
 cat >"$work/steps" <<'STEPS'
 expect root@.*# 240
-send test "$(findmnt -rn -o SOURCE /run/live/medium)" = /dev/vda2 && test -s /run/live/medium/live/ACTIVE/filesystem.squashfs && printf 'STICK-%s\n' BOOT-OK
+send test "$(findmnt -rn -o SOURCE /run/live/medium)" = /dev/vda2 && grep -qw 'live-media-path=/live/ACTIVE' /proc/cmdline && test -s /run/live/medium/live/ACTIVE/filesystem.squashfs && printf 'STICK-%s\n' BOOT-OK
 expect STICK-BOOT-OK 30
 send for u in proxmox-backup.service proxmox-backup-proxy.service ssh.service ssh.socket exim4.service; do test "$(systemctl is-enabled "$u" 2>/dev/null)" = masked || exit 1; done; test -z "$(ss -H -lnt 'sport = :8007 or sport = :22 or sport = :25')" && printf 'LIVE-%s\n' MASKS-OK
 expect LIVE-MASKS-OK 30
@@ -137,6 +138,14 @@ both() {
     boot "$label-uefi" "$active" -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd -drive "if=pflash,format=raw,file=$work/vars.fd"
 }
 both created a
+# A committed old-format slot remains recognisable; updating it must actually
+# boot the new slot, including when the old parser added an earlier menu entry.
+"$here/legacy-slot.sh" "$bin" "$iso" "$stick" "$work/legacy.img"
+original_stick=$stick
+stick=$work/legacy.img
+both legacy-upgraded b
+stick=$original_stick
+rm "$work/legacy.img"
 # Observe actual fsync barriers in the real helper; do not replace their work.
 cat > "$work/tools/sync" <<'WRAPPER'
 #!/usr/bin/env bash

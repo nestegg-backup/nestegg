@@ -533,7 +533,96 @@ fn spawn_notify(paths: &Paths) {
     }
 }
 
-async fn list_snapshots(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Value>> {
+/// Optional restore source. Legacy callers continue to use the remote PBS.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RestoreTarget {
+    target: Option<String>,
+    stick_uuid: Option<String>,
+}
+impl RestoreTarget {
+    fn is_stick(&self) -> ApiResult<bool> {
+        match self.target.as_deref().unwrap_or("pbs") {
+            "stick" => Ok(true),
+            "pbs" if self.stick_uuid.is_none() => Ok(false),
+            _ => Err(bad_request(
+                "restore target must be pbs or stick; stick_uuid requires stick",
+            )),
+        }
+    }
+}
+
+fn stick_rpc(
+    paths: &Paths,
+    request: crate::rescue::desktop_api::Request,
+) -> ApiResult<serde_json::Value> {
+    use std::io::Write;
+    let mut child = Command::new(std::env::current_exe().map_err(ApiError::internal)?)
+        .args(["rescue", "stick-api"])
+        .env("NESTEGG_CONFIG", &paths.config_file)
+        .env("NESTEGG_CREDENTIALS_DIR", &paths.credentials_dir)
+        .env("NESTEGG_STATE_DIR", &paths.state_dir)
+        .env("NESTEGG_RUNTIME_DIR", &paths.runtime_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(ApiError::internal)?;
+    let bytes = serde_json::to_vec(&request).map_err(ApiError::internal)?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| ApiError::internal("missing worker stdin"))?
+        .write_all(&bytes)
+        .map_err(ApiError::internal)?;
+    let output = child.wait_with_output().map_err(ApiError::internal)?;
+    if !output.status.success() {
+        return Err(ApiError::internal(format!(
+            "stick worker failed: {}",
+            crate::rescue::printable_block(&String::from_utf8_lossy(&output.stderr))
+        )));
+    }
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(ApiError::internal)?;
+    if let Some(error) = envelope.get("error") {
+        let (status, code) = match error["code"].as_str() {
+            Some("forbidden") => (StatusCode::FORBIDDEN, "forbidden"),
+            Some("bad_request") => (StatusCode::BAD_REQUEST, "bad_request"),
+            Some("target_exists") => (StatusCode::CONFLICT, "target_exists"),
+            _ => (StatusCode::SERVICE_UNAVAILABLE, "stick_unavailable"),
+        };
+        return Err(ApiError::new(
+            status,
+            code,
+            error["message"]
+                .as_str()
+                .unwrap_or("stick operation failed"),
+        ));
+    }
+    envelope
+        .get("result")
+        .cloned()
+        .ok_or_else(|| ApiError::internal("missing stick worker result"))
+}
+
+async fn list_snapshots(
+    AxState(app): AxState<App>,
+    Query(target): Query<RestoreTarget>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if target.is_stick()? {
+        return tokio::task::spawn_blocking(move || {
+            stick_rpc(
+                &app.paths,
+                crate::rescue::desktop_api::Request {
+                    uuid: target.stick_uuid,
+                    uid: 0,
+                    action: crate::rescue::desktop_api::Action::List,
+                },
+            )
+            .map(Json)
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    }
     let result = tokio::task::spawn_blocking(
         move || -> Result<std::result::Result<serde_json::Value, String>> {
             let config = Config::load(&app.paths.config_file)?;
@@ -911,6 +1000,8 @@ async fn session(peer: PeerInfo) -> ApiResult<Json<serde_json::Value>> {
 
 #[derive(Deserialize)]
 struct BrowseQuery {
+    #[serde(flatten)]
+    source: RestoreTarget,
     archive: String,
     path: Option<String>,
 }
@@ -923,6 +1014,29 @@ async fn browse(
 ) -> ApiResult<Json<serde_json::Value>> {
     let Query(q) = q.map_err(|e| bad_request(e.body_text()))?;
     let requester = requester(&peer)?;
+    if q.source.is_stick()? {
+        let uid = match &requester {
+            crate::restore::Requester::User(u) => u.uid,
+            _ => 0,
+        };
+        return tokio::task::spawn_blocking(move || {
+            stick_rpc(
+                &app.paths,
+                crate::rescue::desktop_api::Request {
+                    uuid: q.source.stick_uuid,
+                    uid,
+                    action: crate::rescue::desktop_api::Action::Browse {
+                        time,
+                        archive: q.archive,
+                        path: q.path.unwrap_or_else(|| "/".into()),
+                    },
+                },
+            )
+            .map(Json)
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    }
     check_archive_name(&q.archive)?;
     let path = crate::restore::normalize_archive_path(q.path.as_deref().unwrap_or("/"))
         .map_err(restore_error)?;
@@ -974,15 +1088,12 @@ async fn browse(
     Ok(Json(json!({ "entries": entries })))
 }
 
-#[derive(Deserialize)]
-struct ArchivePaths {
-    archive: String,
-    #[serde(default)]
-    paths: Vec<String>,
-}
+type ArchivePaths = crate::rescue::desktop_api::Selection;
 
 #[derive(Deserialize)]
 struct RestoreBody {
+    #[serde(flatten)]
+    source: RestoreTarget,
     snapshot_time: String,
     archive: Option<String>,
     #[serde(default)]
@@ -1030,9 +1141,37 @@ async fn start_restore(
     })
     .await?;
     let snapshot = snapshot_of(&config, &body.snapshot_time)?;
+    let stick = body.source.is_stick()?;
+    let stick_uuid = body.source.stick_uuid;
+    let restore_time = body.snapshot_time.clone();
     // Validate archives and paths; unprivileged users are limited to their
     // own home directory, as recorded in the snapshot.
-    let (selections, config, snapshot, requester) = {
+    let (selections, config, snapshot, requester) = if stick {
+        let app = app.clone();
+        let target = target.clone();
+        let uuid = stick_uuid.clone();
+        let time = restore_time.clone();
+        let uid = owner;
+        let value = tokio::task::spawn_blocking(move || {
+            stick_rpc(
+                &app.paths,
+                crate::rescue::desktop_api::Request {
+                    uuid,
+                    uid,
+                    action: crate::rescue::desktop_api::Action::Validate {
+                        time,
+                        selections,
+                        target,
+                    },
+                },
+            )
+        })
+        .await
+        .map_err(ApiError::internal)??;
+        let selections: Vec<ArchivePaths> =
+            serde_json::from_value(value["selections"].clone()).map_err(ApiError::internal)?;
+        (selections, config, snapshot, requester)
+    } else {
         let app = app.clone();
         let target = target.clone();
         tokio::task::spawn_blocking(move || -> ApiResult<_> {
@@ -1125,17 +1264,47 @@ async fn start_restore(
     let paths = app.paths.clone();
     let restored = job.restored.clone();
     std::thread::spawn(move || {
-        let result = run_restore_job(
-            &paths,
-            &config,
-            &snapshot,
-            &selections,
-            &target,
-            &requester,
-            &restored,
-            &restores,
-            &id,
-        );
+        let result = if stick {
+            stick_rpc(
+                &paths,
+                crate::rescue::desktop_api::Request {
+                    uuid: stick_uuid,
+                    uid: owner,
+                    action: crate::rescue::desktop_api::Action::Restore {
+                        time: restore_time,
+                        selections,
+                        target,
+                    },
+                },
+            )
+            .map(|value| {
+                restored.store(
+                    value["restored_bytes"].as_u64().unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+                value["warnings"]
+                    .as_array()
+                    .map(|w| {
+                        w.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .map_err(|e| anyhow::anyhow!("{}: {}", e.code, e.message))
+        } else {
+            run_restore_job(
+                &paths,
+                &config,
+                &snapshot,
+                &selections,
+                &target,
+                &requester,
+                &restored,
+                &restores,
+                &id,
+            )
+        };
         let mut jobs = restores.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(j) = jobs.get_mut(&id) {
             j.finished_at = Some(Utc::now());
@@ -2073,6 +2242,35 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(Arc::strong_count(&jobs), 1);
         assert_eq!(Arc::strong_count(&src), 1);
+    }
+
+    #[test]
+    fn restore_sources_are_explicit_and_never_fall_back() {
+        assert!(RestoreTarget::default().is_stick().is_ok_and(|v| !v));
+        assert!(
+            RestoreTarget {
+                target: Some("stick".into()),
+                stick_uuid: None
+            }
+            .is_stick()
+            .is_ok_and(|v| v)
+        );
+        assert!(
+            RestoreTarget {
+                target: Some("all".into()),
+                stick_uuid: None
+            }
+            .is_stick()
+            .is_err()
+        );
+        assert!(
+            RestoreTarget {
+                target: None,
+                stick_uuid: Some("fixture".into())
+            }
+            .is_stick()
+            .is_err()
+        );
     }
 
     #[test]
