@@ -447,48 +447,201 @@ fn perform(session: &Session, sources: Sources, id: &str) -> Result<u8> {
         &crate::cancel::requested,
     ) {
         crate::verify::Outcome::Verified => {}
+        crate::verify::Outcome::Cancelled => {
+            bail!("cancelled: offline backup interrupted; no pruning was done")
+        }
         other => bail!("offline backup read-back failed: {other:?}; no pruning was done"),
     }
-    let pbs = session.local.as_ref().context("no local PBS")?.pbs();
-    // A live session has no durable local monthly timestamp: force a complete
-    // verification, which is stronger than phase two's monthly minimum.
-    pbs.maintenance(&["verify", "stick", "--ignore-verified", "false"])?;
-    let verified = client.list_snapshots(id)?;
-    ensure!(
-        verified
-            .iter()
-            .any(|s| s.snapshot == snapshot && s.verified.as_deref() == Some("ok")),
-        "PBS did not verify this snapshot; no pruning was done"
-    );
-    ensure!(
-        crate::verify::failed_snapshots(&verified).is_empty(),
-        "stick contains damaged snapshots; no pruning was done"
-    );
-    for group in client.list_groups()? {
-        let snapshots =
-            client.list_group_snapshots(&format!("{}/{}", group.backup_type, group.backup_id))?;
-        ensure!(
-            crate::verify::failed_snapshots(&snapshots).is_empty(),
-            "stick contains damaged snapshots; no pruning was done"
-        );
-    }
-    client.check_group_key(id)?;
     let retention = text_root(&sources.root, "/etc/nestegg/config.toml")
         .ok()
         .map(|text| crate::config::Config::parse(&text))
         .transpose()?
         .and_then(|config| config.stick.map(|s| s.retention))
         .unwrap_or_default();
-    client.prune_stick(id, &retention)?;
-    pbs.maintenance(&["garbage-collection", "start", "stick"])?;
+    finish_stick(
+        &mut SessionMaintenance {
+            session,
+            id,
+            time: now.timestamp(),
+            retention,
+        },
+        &mut |warning| eprintln!("{}", super::printable_block(warning)),
+    )?;
     sources.close()?;
     eprintln!("Offline backup verified: {snapshot}");
     Ok(0)
 }
 
+/// Separating the maintenance boundary lets tests prove that unrelated
+/// datastore damage cannot starve retention, while a bad new snapshot can.
+trait StickMaintenance {
+    fn checkpoint(&self) -> Result<()>;
+    fn verify_new(&mut self) -> Result<()>;
+    fn verify_all(&mut self) -> Result<()>;
+    fn prune(&mut self) -> Result<()>;
+    fn gc(&mut self) -> Result<()>;
+}
+
+fn finish_stick(store: &mut impl StickMaintenance, warn: &mut impl FnMut(&str)) -> Result<()> {
+    store.checkpoint()?;
+    store.verify_new()?;
+    store.checkpoint()?;
+    // Live sessions have no durable monthly timestamp: attempt a full pass.
+    // Its result is independent of the already verified new snapshot.
+    if let Err(e) = store.verify_all() {
+        store.checkpoint()?;
+        warn(&format!(
+            "stick_damaged: full datastore verification failed; the new snapshot is verified and this machine's retention continues: {e:#}"
+        ));
+    }
+    store.checkpoint()?;
+    store.prune()?;
+    store.checkpoint()?;
+    store.gc()?;
+    store.checkpoint()
+}
+
+struct SessionMaintenance<'a> {
+    session: &'a Session,
+    id: &'a str,
+    time: i64,
+    retention: crate::config::StickRetention,
+}
+
+fn maintenance_checkpoint(cancelled: bool, present: bool) -> Result<()> {
+    ensure!(!cancelled, "cancelled: offline backup interrupted");
+    ensure!(present, "stick_not_plugged_in: backup stick was removed");
+    Ok(())
+}
+
+impl StickMaintenance for SessionMaintenance<'_> {
+    fn checkpoint(&self) -> Result<()> {
+        maintenance_checkpoint(
+            crate::cancel::requested(),
+            self.session
+                .local
+                .as_ref()
+                .is_some_and(|s| crate::stick::target::present(&s.uuid)),
+        )
+    }
+    fn verify_new(&mut self) -> Result<()> {
+        let pbs = self.session.local.as_ref().context("no local PBS")?.pbs();
+        pbs.verify_snapshot(self.id, self.time)?;
+        let snapshots = self
+            .session
+            .client()
+            .list_snapshots_bounded(self.id, crate::client::readback_list_timeout())?;
+        let snapshot = snapshot_path(self.id, self.time);
+        ensure!(
+            snapshots
+                .iter()
+                .any(|s| s.snapshot == snapshot && s.verified.as_deref() == Some("ok")),
+            "PBS did not verify this snapshot; no pruning was done"
+        );
+        Ok(())
+    }
+    fn verify_all(&mut self) -> Result<()> {
+        let pbs = self.session.local.as_ref().context("no local PBS")?.pbs();
+        pbs.maintenance(&["verify", "stick", "--ignore-verified", "false"])
+    }
+    fn prune(&mut self) -> Result<()> {
+        let client = self.session.client();
+        client.check_group_key(self.id)?;
+        self.checkpoint()?;
+        client.prune_stick(self.id, &self.retention)
+    }
+    fn gc(&mut self) -> Result<()> {
+        self.session
+            .local
+            .as_ref()
+            .context("no local PBS")?
+            .pbs()
+            .maintenance(&["garbage-collection", "start", "stick"])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Default)]
+    struct TestMaintenance {
+        calls: Vec<&'static str>,
+        new_bad: bool,
+        foreign_bad: bool,
+        stop_after_full: bool,
+    }
+    impl StickMaintenance for TestMaintenance {
+        fn checkpoint(&self) -> Result<()> {
+            maintenance_checkpoint(self.stop_after_full && self.calls.contains(&"all"), true)
+        }
+        fn verify_new(&mut self) -> Result<()> {
+            self.calls.push("new");
+            ensure!(!self.new_bad, "new snapshot failed verification");
+            Ok(())
+        }
+        fn verify_all(&mut self) -> Result<()> {
+            self.calls.push("all");
+            ensure!(!self.foreign_bad, "another computer has a corrupt snapshot");
+            Ok(())
+        }
+        fn prune(&mut self) -> Result<()> {
+            self.calls.push("prune");
+            Ok(())
+        }
+        fn gc(&mut self) -> Result<()> {
+            self.calls.push("gc");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn foreign_damage_warns_but_does_not_starve_offline_retention() {
+        let mut store = TestMaintenance {
+            foreign_bad: true,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+        finish_stick(&mut store, &mut |s| warnings.push(s.to_owned())).unwrap();
+        assert_eq!(store.calls, ["new", "all", "prune", "gc"]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("stick_damaged:"));
+        assert!(warnings[0].contains("another computer"));
+    }
+
+    #[test]
+    fn new_snapshot_failure_blocks_full_verify_prune_and_gc() {
+        let mut store = TestMaintenance {
+            new_bad: true,
+            ..Default::default()
+        };
+        assert!(finish_stick(&mut store, &mut |_| panic!("not a warning")).is_err());
+        assert_eq!(store.calls, ["new"]);
+    }
+
+    #[test]
+    fn cancelled_full_verify_cannot_become_damage_or_start_retention() {
+        let mut store = TestMaintenance {
+            foreign_bad: true,
+            stop_after_full: true,
+            ..Default::default()
+        };
+        let e = finish_stick(&mut store, &mut |_| panic!("cancelled is not damage")).unwrap_err();
+        assert!(e.to_string().starts_with("cancelled:"));
+        assert_eq!(store.calls, ["new", "all"]);
+        assert!(
+            maintenance_checkpoint(false, false)
+                .unwrap_err()
+                .to_string()
+                .starts_with("stick_not_plugged_in:")
+        );
+        assert!(
+            maintenance_checkpoint(true, false)
+                .unwrap_err()
+                .to_string()
+                .starts_with("cancelled:")
+        );
+    }
+
     #[test]
     fn clock_checks_monotonicity_and_bad_rtc() {
         let now = DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")

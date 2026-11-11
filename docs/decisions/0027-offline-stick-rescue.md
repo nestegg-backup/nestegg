@@ -138,3 +138,11 @@ The phase-two integration audit also checked the shared Python key helper
 `BootMedium::open`'s shared recursively slave mount namespace. Both fixes are
 already reused by the offline flow. Cancellation handling is checked separately
 alongside verification and retention; offline sessions have no daemon retry state.
+
+Offline completion follows decision 0028: independently verify the exact new
+snapshot and require its PBS `ok` state, then attempt full datastore verification.
+Full verification failure emits `stick_damaged` but does not block this computer's
+key-guarded prune or GC. Cancellation and media removal are checked between
+maintenance steps, including before interpreting a failed full pass as damage.
+A cancelled read-back is labelled cancelled. Unit tests cover foreign corruption,
+new-snapshot failure, cancellation during the full pass and missing media.
