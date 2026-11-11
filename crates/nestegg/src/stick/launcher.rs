@@ -397,6 +397,48 @@ impl LocalPbs {
             .env("PBS_REPOSITORY", self.repository());
         Ok(cmd)
     }
+    /// Run the official manager inside the trusted PBS root. Verification and
+    /// GC are synchronous CLI tasks; a successful spawn alone is no evidence.
+    pub fn maintenance(&self, args: &[&str]) -> Result<()> {
+        let runtime = self.runtime.as_ref().context("PBS is stopped")?;
+        let mut cmd = Command::new("nsenter");
+        cmd.arg(format!("--mount=/proc/{}/ns/mnt", self.supervisor.id))
+            .arg(format!("--net=/proc/{}/ns/net", self.supervisor.id))
+            .arg("--")
+            .arg("chroot")
+            .arg(runtime.path().join("ram/root"))
+            .arg("/usr/sbin/proxmox-backup-manager")
+            .args(args);
+        let mut log = tempfile::tempfile()?;
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log.try_clone()?)
+            .spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(12 * 3600);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                if status.success() {
+                    return Ok(());
+                }
+                let len = log.metadata()?.len();
+                log.seek(SeekFrom::Start(len.saturating_sub(4096)))?;
+                let mut tail = String::new();
+                std::io::Read::read_to_string(&mut log, &mut tail)?;
+                bail!(
+                    "PBS maintenance failed: {}",
+                    crate::rescue::printable_block(&tail)
+                );
+            }
+            if crate::cancel::requested() || std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("PBS maintenance cancelled or timed out");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     pub fn stop(mut self) -> Result<()> {
         self.teardown()
     }

@@ -10,12 +10,11 @@ use crate::config::{Config, WakeConfig, parse_mac};
 /// The PBS API is considered reachable when its TCP port accepts a
 /// connection. No credentials are sent.
 pub fn is_reachable(config: &Config, timeout: Duration) -> bool {
-    let host = config
-        .pbs
-        .server
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    let Ok(addrs) = (host, config.pbs.port).to_socket_addrs() else {
+    let Some(pbs) = &config.pbs else {
+        return false;
+    };
+    let host = pbs.server.trim_start_matches('[').trim_end_matches(']');
+    let Ok(addrs) = (host, pbs.port).to_socket_addrs() else {
         return false;
     };
     addrs
@@ -231,7 +230,7 @@ mod tests {
 
     fn config_for(port: u16) -> Config {
         let mut c = crate::config::example("127.0.0.1", "backups", "backup@pbs!desktop");
-        c.pbs.port = port;
+        c.pbs.as_mut().unwrap().port = port;
         c
     }
 

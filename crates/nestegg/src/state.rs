@@ -12,12 +12,65 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Paths;
 
+/// A missing target in an old run means the network PBS.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Target {
+    #[default]
+    Pbs,
+    Stick,
+}
+impl Target {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pbs => "pbs",
+            Self::Stick => "stick",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum TargetSelection {
+    Pbs,
+    Stick,
+    #[default]
+    All,
+}
+impl TargetSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pbs => "pbs",
+            Self::Stick => "stick",
+            Self::All => "all",
+        }
+    }
+    pub fn includes(self, target: Target) -> bool {
+        matches!(
+            (self, target),
+            (Self::All, _) | (Self::Pbs, Target::Pbs) | (Self::Stick, Target::Stick)
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Trigger {
     Timer,
     Manual,
     Cli,
+    Plug,
     /// A trigger written by a newer version this one does not know. Kept so
     /// state.json and run records of a newer version stay readable.
     #[serde(other)]
@@ -35,6 +88,7 @@ pub enum RunState {
     Succeeded,
     Failed,
     PbsUnreachable,
+    StickNotPluggedIn,
     Cancelled,
     /// A run state written by a newer version this one does not know. It is
     /// kept so state.json, current.json and run records of a newer version
@@ -53,6 +107,7 @@ impl RunState {
             RunState::Succeeded
                 | RunState::Failed
                 | RunState::PbsUnreachable
+                | RunState::StickNotPluggedIn
                 | RunState::Cancelled
                 | RunState::Unknown
         )
@@ -62,6 +117,11 @@ impl RunState {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
+    StickNotPluggedIn,
+    StickFull,
+    FilesystemDamaged,
+    StickUnsupported,
+    KeyMismatch,
     PbsUnreachable,
     Authentication,
     SourceMissing,
@@ -122,6 +182,10 @@ pub struct ArchiveInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Run {
+    #[serde(default)]
+    pub target: Target,
+    #[serde(default)]
+    pub stick_uuid: Option<String>,
     pub id: String,
     pub trigger: Trigger,
     pub state: RunState,
@@ -171,6 +235,8 @@ pub struct Run {
 impl Run {
     pub fn new(trigger: Trigger, now: DateTime<Utc>) -> Run {
         Run {
+            target: Target::Pbs,
+            stick_uuid: None,
             id: run_id(trigger, now),
             trigger,
             state: RunState::Starting,
@@ -202,6 +268,7 @@ pub fn run_id(trigger: Trigger, now: DateTime<Utc>) -> String {
         Trigger::Timer => "timer",
         Trigger::Manual => "manual",
         Trigger::Cli => "cli",
+        Trigger::Plug => "plug",
         Trigger::Unknown => "unknown",
     };
     // Random suffix: two runs started within the same second stay distinct.
@@ -219,6 +286,15 @@ pub fn is_valid_run_id(id: &str) -> bool {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct State {
+    #[serde(default)]
+    pub stick: TargetState,
+    /// Per-medium verification and password proof. A rotation stick must earn its own proof.
+    #[serde(default)]
+    pub stick_media: std::collections::BTreeMap<String, StickMediaState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_verified_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_bytes: Option<u64>,
     #[serde(default)]
     pub last_run: Option<Run>,
     #[serde(default)]
@@ -270,6 +346,72 @@ pub struct State {
     /// not); runs that end before the read-back leave it alone.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub readback_unavailable_in_a_row: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StickMediaState {
+    pub key_digest: Option<String>,
+    pub password_checked_at: Option<DateTime<Utc>>,
+    pub full_verified_at: Option<DateTime<Utc>>,
+}
+
+impl State {
+    pub fn stick_key_exported(&self, uuid: &str) -> bool {
+        self.key_digest.as_ref().is_some_and(|digest| {
+            self.stick_media
+                .get(&uuid.to_ascii_lowercase())
+                .is_some_and(|m| m.key_digest.as_ref() == Some(digest))
+        })
+    }
+    pub fn for_target(&self, target: Target) -> Self {
+        let mut view = self.clone();
+        if target == Target::Stick {
+            self.stick.apply(&mut view);
+        }
+        view
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TargetState {
+    pub last_run: Option<Run>,
+    pub last_success: Option<Run>,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub failed_config: Option<String>,
+    #[serde(default)]
+    pub readback_unavailable_in_a_row: u32,
+    #[serde(default)]
+    pub server_verify_failed: Vec<String>,
+    #[serde(default)]
+    pub full_verified_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub available_bytes: Option<u64>,
+}
+impl TargetState {
+    fn from_state(s: &State) -> Self {
+        Self {
+            last_run: s.last_run.clone(),
+            last_success: s.last_success.clone(),
+            consecutive_failures: s.consecutive_failures,
+            failed_config: s.failed_config.clone(),
+            readback_unavailable_in_a_row: s.readback_unavailable_in_a_row,
+            server_verify_failed: s.server_verify_failed.clone(),
+            full_verified_at: s.full_verified_at,
+            available_bytes: s.available_bytes,
+        }
+    }
+    fn apply(&self, s: &mut State) {
+        s.last_run = self.last_run.clone();
+        s.last_success = self.last_success.clone();
+        s.consecutive_failures = self.consecutive_failures;
+        s.failed_config = self.failed_config.clone();
+        s.readback_unavailable_in_a_row = self.readback_unavailable_in_a_row;
+        s.server_verify_failed = self.server_verify_failed.clone();
+        s.full_verified_at = self.full_verified_at;
+        s.available_bytes = self.available_bytes;
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -549,21 +691,37 @@ pub fn next_due(state: &State, interval_hours: u32, now: DateTime<Utc>) -> DateT
 /// Storage for `state.json`, `current.json` and `runs/*.json`.
 pub struct Store {
     paths: Paths,
+    target: Target,
 }
 
 impl Store {
     pub fn new(paths: &Paths) -> Store {
         Store {
             paths: paths.clone(),
+            target: Target::Pbs,
+        }
+    }
+
+    pub fn for_target(paths: &Paths, target: Target) -> Self {
+        Self {
+            paths: paths.clone(),
+            target,
         }
     }
 
     pub fn load_state(&self) -> Result<State> {
-        read_json_or_default(&self.paths.state_file())
+        let state: State = read_json_or_default(&self.paths.state_file())?;
+        Ok(state.for_target(self.target))
     }
 
     pub fn save_state(&self, state: &State) -> Result<()> {
-        write_json_atomic(&self.paths.state_file(), state)
+        if self.target == Target::Pbs {
+            return write_json_atomic(&self.paths.state_file(), state);
+        }
+        let mut combined: State = read_json_or_default(&self.paths.state_file())?;
+        combined.stick = TargetState::from_state(state);
+        combined.stick_media = state.stick_media.clone();
+        write_json_atomic(&self.paths.state_file(), &combined)
     }
 
     pub fn load_current(&self) -> Result<Option<Run>> {
@@ -685,10 +843,11 @@ impl Store {
     /// the next timer check tries again at once.
     pub fn clear_failures(&self) -> Result<()> {
         let mut state = self.load_state()?;
+        state.stick.consecutive_failures = 0;
         if state.consecutive_failures != 0 {
             state.consecutive_failures = 0;
-            self.save_state(&state)?;
         }
+        self.save_state(&state)?;
         Ok(())
     }
 
@@ -727,6 +886,7 @@ impl Store {
     pub fn run_for_snapshot(&self, snapshot: &str) -> Result<Option<Run>> {
         for path in self.run_files()? {
             if let Ok(run) = read_json::<Run>(&path)
+                && run.target == self.target
                 && run.snapshot.as_deref() == Some(snapshot)
             {
                 return Ok(Some(run));
@@ -755,7 +915,16 @@ impl Store {
     }
 
     fn prune(&self, keep: usize) -> Result<()> {
-        let mut files = self.run_files()?;
+        let files = self.run_files()?;
+        // No target can exceed the limit while the combined history fits.
+        // Keep this common path free of extra JSON reads under the state lock.
+        if files.len() <= keep {
+            return Ok(());
+        }
+        let mut files: Vec<_> = files
+            .into_iter()
+            .filter(|path| read_json::<Run>(path).is_ok_and(|run| run.target == self.target))
+            .collect();
         if files.len() <= keep {
             return Ok(());
         }

@@ -41,6 +41,7 @@ if [ "$1" = "configure" ]; then
             fi
         fi
     fi
+    udevadm control --reload-rules >/dev/null 2>&1 || true
     running=no
     if [ -d /run/systemd/system ]; then
         running=yes

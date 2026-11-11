@@ -94,10 +94,22 @@ struct MetaKey {
 impl MetaKey {
     fn new(config: &Config, snapshot: &str) -> MetaKey {
         MetaKey {
-            server: config.pbs.server.clone(),
-            port: config.pbs.port,
-            datastore: config.pbs.datastore.clone(),
-            namespace: config.pbs.namespace.clone().unwrap_or_default(),
+            server: config
+                .pbs
+                .as_ref()
+                .map(|p| p.server.clone())
+                .unwrap_or_default(),
+            port: config.pbs.as_ref().map(|p| p.port).unwrap_or(8007),
+            datastore: config
+                .pbs
+                .as_ref()
+                .map(|p| p.datastore.clone())
+                .unwrap_or_default(),
+            namespace: config
+                .pbs
+                .as_ref()
+                .and_then(|p| p.namespace.clone())
+                .unwrap_or_default(),
             encryption: config.backup.encryption,
             snapshot: snapshot.to_string(),
         }
@@ -233,6 +245,10 @@ pub fn router(paths: Paths) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/status", get(status))
         .route("/api/v1/runs", get(list_runs).post(start_run))
+        .route(
+            "/api/v1/targets/{target}/runs",
+            get(target_runs).post(start_target_run),
+        )
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/snapshots", get(list_snapshots))
         .route("/api/v1/runs/{id}/cancel", axum::routing::post(cancel_run))
@@ -345,15 +361,75 @@ fn log_tail(path: &Path, lines: usize) -> Vec<String> {
 }
 
 async fn start_run(AxState(app): AxState<App>) -> ApiResult<(StatusCode, Json<Run>)> {
+    start_selected_run(app, crate::state::TargetSelection::All).await
+}
+
+fn selection(value: &str) -> ApiResult<crate::state::TargetSelection> {
+    match value {
+        "pbs" => Ok(crate::state::TargetSelection::Pbs),
+        "stick" => Ok(crate::state::TargetSelection::Stick),
+        "all" => Ok(crate::state::TargetSelection::All),
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "target must be pbs, stick or all",
+        )),
+    }
+}
+
+async fn target_runs(
+    AxState(app): AxState<App>,
+    UrlPath(target): UrlPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let target = selection(&target)?;
+    let runs = blocking(move || {
+        let store = Store::new(&app.paths);
+        let mut runs = store.list_runs(usize::MAX)?;
+        if let Some(current) = crate::run::active_run(&app.paths)? {
+            runs.insert(0, current);
+        }
+        runs.retain(|r| target.includes(r.target));
+        runs.truncate(200);
+        Ok(runs)
+    })
+    .await?;
+    Ok(Json(json!({ "runs": runs })))
+}
+
+async fn start_target_run(
+    AxState(app): AxState<App>,
+    UrlPath(target): UrlPath<String>,
+) -> ApiResult<(StatusCode, Json<Run>)> {
+    start_selected_run(app, selection(&target)?).await
+}
+
+async fn start_selected_run(
+    app: App,
+    target: crate::state::TargetSelection,
+) -> ApiResult<(StatusCode, Json<Run>)> {
     let run = blocking(move || -> Result<std::result::Result<Run, &'static str>> {
         let _guard = app.start.lock().unwrap_or_else(|e| e.into_inner());
         if crate::run::active_run(&app.paths)?.is_some() {
             return Ok(Err("a backup run is already in progress"));
         }
-        let run = Run::new(Trigger::Manual, Utc::now());
+        let config = Config::load(&app.paths.config_file)?;
+        let mut run = Run::new(Trigger::Manual, Utc::now());
+        run.target = if target.includes(crate::state::Target::Stick) && config.stick.is_some() {
+            crate::state::Target::Stick
+        } else {
+            crate::state::Target::Pbs
+        };
+        if !match run.target {
+            crate::state::Target::Stick => config.stick.is_some(),
+            crate::state::Target::Pbs => {
+                config.pbs.is_some() && target.includes(crate::state::Target::Pbs)
+            }
+        } {
+            return Ok(Err("requested target is not configured"));
+        }
         let store = Store::new(&app.paths);
         store.save_current(&run)?;
-        if let Err(e) = spawn_run(&run.id) {
+        if let Err(e) = spawn_run(&run.id, target) {
             let _ = store.clear_current_if(&run.id);
             return Err(e);
         }
@@ -362,6 +438,11 @@ async fn start_run(AxState(app): AxState<App>) -> ApiResult<(StatusCode, Json<Ru
     .await?;
     match run {
         Ok(run) => Ok((StatusCode::ACCEPTED, Json(run))),
+        Err("requested target is not configured") => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "requested target is not configured",
+        )),
         Err(msg) => Err(ApiError::new(StatusCode::CONFLICT, "run_in_progress", msg)),
     }
 }
@@ -369,7 +450,7 @@ async fn start_run(AxState(app): AxState<App>) -> ApiResult<(StatusCode, Json<Ru
 /// Start `nestegg run` outside the daemon process: as a transient systemd
 /// unit when running under systemd (own cgroup, journal), otherwise as a
 /// detached child process.
-fn spawn_run(run_id: &str) -> Result<()> {
+fn spawn_run(run_id: &str, target: crate::state::TargetSelection) -> Result<()> {
     let exe = std::env::current_exe().context("cannot locate nestegg binary")?;
     let under_systemd =
         Path::new("/run/systemd/system").exists() && nix::unistd::geteuid().is_root();
@@ -389,7 +470,15 @@ fn spawn_run(run_id: &str) -> Result<()> {
     } else {
         Command::new(&exe)
     };
-    cmd.args(["run", "--trigger", "manual", "--run-id", run_id]);
+    cmd.args([
+        "run",
+        "--trigger",
+        "manual",
+        "--run-id",
+        run_id,
+        "--target",
+        target.as_str(),
+    ]);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1344,8 +1433,13 @@ async fn cancel_run(
     let run_id = id.clone();
     let outcome = blocking(move || {
         let id = run_id;
-        if Store::new(&paths).get_run(&id)?.is_none() {
+        let Some(record) = Store::new(&paths).get_run(&id)? else {
             return Ok(CancelOutcome::Unknown);
+        };
+        // The finished record is durable before current.json/run.pid are
+        // cleared. That cleanup window must not accept another cancellation.
+        if record.state.is_finished() {
+            return Ok(CancelOutcome::Finished);
         }
         if crate::run::active_run(&paths)?.is_none_or(|r| r.id != id) {
             return Ok(CancelOutcome::Finished);
@@ -1512,9 +1606,9 @@ async fn pbs_info(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Valu
             None
         };
         Ok(json!({
-            "server": format!("{}:{}", config.pbs.server, config.pbs.port),
-            "datastore": config.pbs.datastore,
-            "namespace": config.pbs.namespace,
+            "server": format!("{}:{}", config.remote_pbs()?.server, config.pbs.as_ref().map(|p| p.port).unwrap_or(8007)),
+            "datastore": config.remote_pbs()?.datastore,
+            "namespace": config.remote_pbs()?.namespace,
             "reachable": reachable,
             "used_bytes": usage.map(|u| u.0),
             "total_bytes": usage.map(|u| u.1),
@@ -1751,7 +1845,7 @@ mod tests {
         let config = Config::parse(CONFIG).unwrap();
         let mut other = config.clone();
         // Same snapshot, different datastore -> different key -> no stale hit.
-        other.pbs.datastore = "other".into();
+        other.pbs.as_mut().unwrap().datastore = "other".into();
         let mut cache = MetadataCache::default();
         cache.insert(
             MetaKey::new(&config, SNAPSHOT),
@@ -1761,10 +1855,10 @@ mod tests {
         assert!(cache.get(&MetaKey::new(&other, SNAPSHOT)).is_none());
         // Another server with the same datastore and namespace names.
         let mut moved = config.clone();
-        moved.pbs.server = "other.example.com".into();
+        moved.pbs.as_mut().unwrap().server = "other.example.com".into();
         assert!(cache.get(&MetaKey::new(&moved, SNAPSHOT)).is_none());
         let mut port = config.clone();
-        port.pbs.port += 1;
+        port.pbs.as_mut().unwrap().port += 1;
         assert!(cache.get(&MetaKey::new(&port, SNAPSHOT)).is_none());
 
         // The cache is bounded: inserting far more than MAX evicts the oldest.
@@ -2126,6 +2220,43 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert_eq!(json(resp).await["code"], "cannot_cancel");
     }
+    #[tokio::test]
+    async fn a_finished_record_cannot_signal_the_still_live_cleanup_process() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildGuard(Command::new("sleep").arg("60").spawn().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let store = Store::new(&p);
+        let mut run = Run::new(Trigger::Manual, Utc::now());
+        store.save_current(&run).unwrap();
+        let _lock = crate::run::RunLock::try_acquire(&p).unwrap().unwrap();
+        run.finish(crate::state::RunState::Cancelled, Utc::now());
+        store.record_run_only(&run).unwrap();
+        std::fs::write(
+            p.runtime_dir.join("run.pid"),
+            format!("{} {}\n", child.0.id(), run.id),
+        )
+        .unwrap();
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/runs/{}/cancel", run.id))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(Peer {
+            uid: Some(0),
+            gid: Some(0),
+        }));
+        let response = router(p).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(child.0.try_wait().unwrap().is_none());
+    }
+
     #[test]
     fn the_status_reports_the_newer_of_run_and_connection_check() {
         let t = |h: u32| chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 5, h, 0, 0).unwrap();

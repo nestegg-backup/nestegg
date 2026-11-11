@@ -79,12 +79,20 @@ impl Settings {
 
     pub fn from_config(c: &Config) -> Settings {
         Settings {
-            server: c.pbs.server.clone(),
-            port: c.pbs.port,
-            datastore: c.pbs.datastore.clone(),
-            namespace: c.pbs.namespace.clone(),
-            auth_id: c.pbs.auth_id.clone(),
-            fingerprint: c.pbs.fingerprint.clone(),
+            server: c.pbs.as_ref().map(|p| p.server.clone()).unwrap_or_default(),
+            port: c.pbs.as_ref().map(|p| p.port).unwrap_or(8007),
+            datastore: c
+                .pbs
+                .as_ref()
+                .map(|p| p.datastore.clone())
+                .unwrap_or_default(),
+            namespace: c.pbs.as_ref().and_then(|p| p.namespace.clone()),
+            auth_id: c
+                .pbs
+                .as_ref()
+                .map(|p| p.auth_id.clone())
+                .unwrap_or_default(),
+            fingerprint: c.pbs.as_ref().and_then(|p| p.fingerprint.clone()),
             backup_id: Some(c.effective_backup_id()),
             wake_mac: c.wake.as_ref().map(|w| w.mac.clone()),
         }
@@ -92,9 +100,9 @@ impl Settings {
 
     pub fn to_config(&self) -> Result<Config> {
         let mut c = config::example(&self.server, &self.datastore, &self.auth_id);
-        c.pbs.port = self.port;
-        c.pbs.namespace = self.namespace.clone().filter(|n| !n.is_empty());
-        c.pbs.fingerprint = self.fingerprint.clone().filter(|f| !f.is_empty());
+        c.pbs.as_mut().unwrap().port = self.port;
+        c.pbs.as_mut().unwrap().namespace = self.namespace.clone().filter(|n| !n.is_empty());
+        c.pbs.as_mut().unwrap().fingerprint = self.fingerprint.clone().filter(|f| !f.is_empty());
         c.backup_id = self.backup_id.clone();
         if let Some(mac) = self.wake_mac.as_ref().filter(|m| !m.is_empty()) {
             c.wake = Some(WakeConfig {

@@ -190,8 +190,8 @@ fn ensure_reachable(session: &Session) -> Result<()> {
     match crate::wake::ensure_available(&session.config, |e| say(e.to_string()))? {
         crate::wake::Availability::Unreachable => bail!(
             "the PBS {}:{} does not answer",
-            session.config.pbs.server,
-            session.config.pbs.port
+            session.config.remote_pbs()?.server,
+            session.config.remote_pbs()?.port
         ),
         _ => Ok(()),
     }

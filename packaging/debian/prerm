@@ -2,6 +2,9 @@
 set -e
 marker=/var/lib/nestegg/enabled-units
 if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+    # Active removable-media workers must flush/unmount before their package
+    # disappears. Never enable an instance: udev owns device activation.
+    systemctl stop 'nestegg-stick-pbs@*.service' >/dev/null 2>&1 || true
     # Remember which units were enabled, so that installing the package again
     # enables them again (postinst). The state directory is kept on removal.
     enabled=""
