@@ -39,7 +39,7 @@ jobs:
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf gdisk e2fsprogs dosfstools squashfs-tools grub-common grub2-common grub-pc-bin grub-efi-amd64-bin parted iproute2 ripgrep strace dmsetup
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf gdisk e2fsprogs dosfstools squashfs-tools grub-common grub2-common grub-pc-bin grub-efi-amd64-bin parted iproute2 ripgrep strace dmsetup kmod
       - name: Rescue end-to-end test, Debian on btrfs with UEFI
         run: sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso debian-btrfs-uefi
       - name: Rescue end-to-end test, Ubuntu on ext4 with BIOS and LUKS

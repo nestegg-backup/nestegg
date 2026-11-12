@@ -359,7 +359,11 @@ impl Sources {
             ram_mounted: false,
         };
         // No source mount happens until the disk and every partition are
-        // kernel-read-only. The flag is restored only after all holders close.
+        // kernel-read-only. This refuses writable opens and stops filesystem
+        // error-info writes, but the block layer only warns about writes from
+        // in-kernel users (see decision 0027): nothing that could write, such
+        // as a snapshot merge, may ever be activated on top of the source.
+        // The flag is restored only after all holders close.
         for item in &disk.items {
             if capture(Command::new("blockdev").args(["--getro", &item.path]))? == "0" {
                 capture(Command::new("blockdev").args(["--setro", &item.path]))?;
@@ -431,6 +435,9 @@ impl Sources {
                 "json",
                 "--devices",
                 &devices,
+                // A report never needs to repair or archive metadata.
+                "--config",
+                "global { metadata_read_only=1 } backup { backup=0 archive=0 }",
                 "-o",
                 "vg_name,lv_name,segtype,lv_attr,lv_role",
             ]))?;

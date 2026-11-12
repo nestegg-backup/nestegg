@@ -10,7 +10,7 @@ if [[ ${NESTEGG_RESCUE_TEST_NS:-0} != 1 ]]; then
     exec unshare --mount --propagation private env NESTEGG_RESCUE_TEST_NS=1 "$0" "$@"
 fi
 work=$(mktemp -d /tmp/nestegg-stick-rescue.XXXXXX)
-qemu_pid=; loop=; container=nestegg-stick-source-$$
+qemu_pid=; loop=; container=nestegg-stick-source-$$; loaded_snapshot_module=0
 cleanup() {
     local rc=$? bad=0
     trap - EXIT ERR; trap '' INT TERM
@@ -25,6 +25,12 @@ cleanup() {
     if [[ -n ${KEEP_LOGS:-} ]]; then
         mkdir -p "$KEEP_LOGS"
         cp "$work/"*.log "$KEEP_LOGS/" 2>/dev/null
+    fi
+    # A mapping left by this test is a leak. The module itself may be in use
+    # by an unrelated parallel test, so failing to unload it is only a note.
+    if dmsetup ls 2>/dev/null | grep -q '^nestegg--pending--fixture-'; then bad=1; fi
+    if ((loaded_snapshot_module)) && ! modprobe -r dm_snapshot 2>/dev/null; then
+        echo 'note: dm_snapshot is in use elsewhere and stays loaded' >&2
     fi
     ((bad == 0)) || { echo "ERROR: retained owned resources: $work" >&2; exit 1; }
     if [[ ${KEEP:-0} == 1 ]]; then echo "work directory kept: $work"; else rm -rf "$work"; fi
@@ -56,10 +62,19 @@ printf '!7aA\n' >> "$work/key-password"
 openssl rand -base64 24 | tr -d '\n' > "$work/luks-password"
 chmod 600 "$work/"*password
 printf -v fingerprint '%s' "$(printf '00:%.0s' {1..31})00"
+if [[ $modes == pending-merge ]]; then
+    # This scenario must refuse before reading any OS or encryption key.
+    # No installed OS is needed on the tiny disposable LVM source.
+    truncate -s 2G "$work/source.img"
+    printf 'not reached by the refusal test\n' > "$work/nestegg-paperkey.txt"
+    printf '{}\n' > "$work/nestegg-key.json"
+    : > "$work/data.sha256"
+else
 echo '== build powered-off source system'
 docker run --rm --name "$container" --privileged -v /dev:/dev -v "$work:/work" -v "$repo/tests/rescue:/t:ro" \
     -e EXTRA_SOURCE_PACKAGES=iproute2 -e VARIANT=ubuntu-ext4-bios -e IMAGE=/work/source.img -e PBS_IP=192.0.2.10 \
     -e FP="$fingerprint" -e TOKEN_SECRET=fixture-only-not-used ubuntu:24.04 bash /t/make-source.sh > "$work/build-source.log" 2>&1
+fi
 cp --reflink=auto --sparse=always "$work/source.img" "$work/template.img"
 cp "$work/data.sha256" "$work/template-data.sha256"
 # Payload is read-only in all guests. It supplies the exact tested binary and
@@ -102,6 +117,10 @@ for mode in $modes; do
         cp --reflink=auto --sparse=always "$work/template.img" "$work/source.img"
         cp "$work/template-data.sha256" "$work/data.sha256"
     fi
+    if [[ $mode == pending-merge && ! -d /sys/module/dm_snapshot ]]; then
+        modprobe dm_snapshot
+        loaded_snapshot_module=1
+    fi
     docker run --rm --name "$container" --privileged -v /dev:/dev -v "$work:/work" -v "$here:/t:ro" \
         -e MODE="$mode" -e DATA_UUID="$uuid" ubuntu:24.04 bash /t/prepare-offline-source.sh > "$work/prepare-$mode.log" 2>&1
     if [[ $mode == pending-merge ]]; then
@@ -110,7 +129,7 @@ for mode in $modes; do
         {
             common_steps
             cat <<'EOF'
-send nestegg rescue backup --disk /dev/vdb --backup-id pending-fixture --keyfile /media/test/nestegg-paperkey.txt --confirm-clock >/run/pending-refusal.log 2>&1; code=$?; cat /run/pending-refusal.log; test "$code" != 0 && grep -q 'snapshots, merges and hidden LVs are refused' /run/pending-refusal.log && ! dmsetup table | grep -q snapshot && test "$(blockdev --getro /dev/vdb)" = 0; printf 'REFUSAL-%s=%s\n' EXIT "$?"
+send nestegg rescue backup --disk /dev/vdb --backup-id pending-fixture --keyfile /media/test/nestegg-paperkey.txt --confirm-clock >/run/pending-refusal.log 2>&1; code=$?; cat /run/pending-refusal.log; test "$code" != 0 && grep -q 'snapshots, merges and hidden LVs are refused' /run/pending-refusal.log && ! dmsetup table | grep -q snapshot && ! dmsetup ls | grep -q nestegg--pending--fixture && test "$(blockdev --getro /dev/vdb)" = 0; printf 'REFUSAL-%s=%s\n' EXIT "$?"
 expect REFUSAL-EXIT=0 240
 send poweroff -f
 EOF

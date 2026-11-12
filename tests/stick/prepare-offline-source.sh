@@ -28,7 +28,9 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$mnt" "$dst"
 if [[ $MODE == pending-merge ]]; then
-    truncate -s 512M /work/pending.img
+    # Sparse, but at least the 1 GiB the rescue system accepts as a computer
+    # disk: a smaller image is refused before the LVM checks are reached.
+    truncate -s 2G /work/pending.img
     target=$(losetup --find --show /work/pending.img)
     vg=nestegg-pending-fixture
     pvcreate --devices "$target" -y "$target" >/dev/null
