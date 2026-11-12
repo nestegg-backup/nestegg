@@ -48,26 +48,39 @@ if [[ $MODE == pending-merge ]]; then
     exit 0
 fi
 loop=$(losetup --find --show --partscan /work/source.img)
+# Partition nodes appear asynchronously, and the host's udev may re-read the
+# partition table (briefly removing them) after another loop was closed.
+settled_mount() {
+    local _
+    for _ in {1..100}; do
+        mount "$@" 2>/dev/null && return 0
+        sleep .2
+    done
+    mount "$@"
+}
 if [[ $MODE == btrfs ]]; then
     apt-get install -y -qq --no-install-recommends btrfs-progs >/dev/null
-    mount -o subvolid=5 "${loop}p3" "$dst"
+    settled_mount -o subvolid=5 "${loop}p3" "$dst"
     btrfs subvolume create "$dst/@mysql" >/dev/null
     printf 'offline database witness\n' > "$dst/@mysql/nestegg-db-marker"
-    mount -o subvol=@ "${loop}p3" "$mnt"
-    mount -o subvol=@home "${loop}p3" "$mnt/home"
+    settled_mount -o subvol=@ "${loop}p3" "$mnt"
+    settled_mount -o subvol=@home "${loop}p3" "$mnt/home"
     mkdir -p "$mnt/var/lib/mysql"
     printf 'UUID=%s /var/lib/mysql btrfs defaults,subvol=@mysql 0 0\n' "$(blkid -s UUID -o value "${loop}p3")" >> "$mnt/etc/fstab"
     # Keep the command substitution literal for the restored guest's boot.
     # shellcheck disable=SC2016
     sed -i '/echo "E2E-SHA /a\  echo "E2E-MYSQL $(cat /var/lib/mysql/nestegg-db-marker)"' "$mnt/usr/local/sbin/nestegg-e2e"
 else
-    mount "${loop}p2" "$mnt"
-    mount "${loop}p3" "$mnt/home"
+    settled_mount "${loop}p2" "$mnt"
+    settled_mount "${loop}p3" "$mnt/home"
 fi
 # Stable synthetic identities let the collision scenario share hostname/key
-# with plain while representing a different installed computer.
-printf '11111111111111111111111111111111\n' > "$mnt/etc/machine-id"
-if [[ $MODE == id-collision ]]; then
+# with plain while representing a different installed computer. Only these
+# two modes get one: systemd's host credential key is bound to the machine-id,
+# so changing it would make a booted source unable to decrypt its own key.
+if [[ $MODE == plain ]]; then
+    printf '11111111111111111111111111111111\n' > "$mnt/etc/machine-id"
+elif [[ $MODE == id-collision ]]; then
     printf '22222222222222222222222222222222\n' > "$mnt/etc/machine-id"
 fi
 case "$MODE" in

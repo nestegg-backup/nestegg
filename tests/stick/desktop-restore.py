@@ -2,6 +2,7 @@
 """VM-only API acceptance, executed as an ordinary group member."""
 import http.client
 import json
+import os
 from pathlib import Path
 import socket
 import time
@@ -50,27 +51,40 @@ def main():
     status, value = request('POST', '/restores', body)
     assert status == 403, (status, value)
     assert not Path(body['target_dir']).exists()
+    # Only the restored PATHS are confined to the caller's home. The target
+    # may be anywhere the caller can write: the worker creates it with the
+    # caller's identity (decision 0007; tests/e2e/systemd.sh uses /tmp).
     body['paths'] = ['/home/alice/notes.txt']
-    for outside in ['/home/bob/refused-target', '/tmp/refused-outside-home']:
-        body['target_dir'] = outside
-        status, value = request('POST', '/restores', body)
-        assert status == 403, (status, value)
-    assert not Path('/tmp/refused-outside-home').exists()
-    body['paths'] = ['/home/alice/notes.txt']
-    body['target_dir'] = '/home/alice/restored-stick-files'
+    body['target_dir'] = '/home/bob/refused-target'
     status, value = request('POST', '/restores', body)
-    assert status == 202, (status, value)
+    if status == 202:
+        value = finish(value)
+        assert value['state'] == 'failed', value
+    else:
+        assert status in (403, 409), (status, value)
+    # Absence inside bob's 0700 home is checked as root by the caller.
+    for target in ['/tmp/stick-restore-outside-home', '/home/alice/restored-stick-files']:
+        body['target_dir'] = target
+        status, value = request('POST', '/restores', body)
+        assert status == 202, (status, value)
+        value = finish(value)
+        assert value['state'] == 'succeeded', value
+        files = list(Path(target).rglob('notes.txt'))
+        assert len(files) == 1 and files[0].read_text() == 'hello from alice\n', files
+        for item in [Path(target), *Path(target).rglob('*')]:
+            assert item.lstat().st_uid == os.getuid(), item
+    print('PASS desktop stick API: list, scoped browse, refused system/other-user files, '
+          'other-user target fails, own-file restore into home and /tmp as the caller')
+
+
+def finish(value):
     job = value['id']
     deadline = time.monotonic() + 600
     while value['state'] == 'running' and time.monotonic() < deadline:
         time.sleep(.5)
         status, value = request('GET', '/restores/' + job)
         assert status == 200, (status, value)
-    assert value['state'] == 'succeeded', value
-    files = list(Path(body['target_dir']).rglob('notes.txt'))
-    assert len(files) == 1 and files[0].read_text() == 'hello from alice\n', files
-    print('PASS desktop stick API: list, scoped browse, refused system/other-user files and outside-home targets, own-file restore')
-
+    return value
 
 if __name__ == '__main__':
     main()

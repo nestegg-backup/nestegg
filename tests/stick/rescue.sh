@@ -125,6 +125,8 @@ for mode in $modes; do
         -e MODE="$mode" -e DATA_UUID="$uuid" ubuntu:24.04 bash /t/prepare-offline-source.sh > "$work/prepare-$mode.log" 2>&1
     if [[ $mode == pending-merge ]]; then
         mv "$work/pending.img" "$work/source.img"
+        # The fixture must really hold a merging origin and snapshot.
+        python3 -c 'import json,sys; a=[s["lv_attr"] for s in json.load(open(sys.argv[1]))["report"][0]["seg"]]; assert any(x[0]=="O" for x in a) and any(x[0]=="S" for x in a), a' "$work/pending-report.json"
         sha256sum "$work/source.img" > "$work/pending-before.sha256"
         {
             common_steps
@@ -242,7 +244,7 @@ PYTEST
         common_steps
         if [[ $mode == desktop ]]; then
             cat <<EOF
-send mkdir -p /var/lib/nestegg; mount -t tmpfs -o mode=0755 tmpfs /var/lib/nestegg; mkdir /var/lib/nestegg/stick; cp /run/live/medium/live/a/filesystem.squashfs /var/lib/nestegg/stick/pbs.squashfs; sha256sum /var/lib/nestegg/stick/pbs.squashfs | cut -d' ' -f1 > /var/lib/nestegg/stick/pbs.squashfs.sha256; mkdir -m700 /run/api-credentials; cp /media/test/nestegg-key.json /run/api-credentials/encryption-key; chmod 600 /run/api-credentials/encryption-key; printf 'backup_id = "e2e-src"\\n[stick]\\ndata_uuids = ["$uuid"]\\n' > /run/api-config.toml; groupadd -f nestegg; useradd -m -G nestegg alice; NESTEGG_CONFIG=/run/api-config.toml NESTEGG_RUNTIME_DIR=/run/desktop-api NESTEGG_STATE_DIR=/var/lib/nestegg NESTEGG_CREDENTIALS_DIR=/run/api-credentials nestegg daemon >/run/api-daemon.log 2>&1 & api_pid=\$!; for i in {1..100}; do test -S /run/desktop-api/api.sock && break; sleep .1; done; runuser -u alice -- python3 /media/test/desktop-restore.py; api_code=\$?; kill \$api_pid; wait \$api_pid; printf 'API-%s=%s\\n' EXIT \$api_code
+send mkdir -p /var/lib/nestegg; mount -t tmpfs -o mode=0755 tmpfs /var/lib/nestegg; mkdir /var/lib/nestegg/stick; cp /run/live/medium/live/a/filesystem.squashfs /var/lib/nestegg/stick/pbs.squashfs; sha256sum /var/lib/nestegg/stick/pbs.squashfs | cut -d' ' -f1 > /var/lib/nestegg/stick/pbs.squashfs.sha256; mkdir -m700 /run/api-credentials; cp /media/test/nestegg-key.json /run/api-credentials/encryption-key; chmod 600 /run/api-credentials/encryption-key; printf 'backup_id = "e2e-src"\\n[stick]\\ndata_uuids = ["$uuid"]\\n' > /run/api-config.toml; groupadd -f nestegg; useradd -m -G nestegg alice; useradd -m bob; chmod 0700 /home/bob; NESTEGG_CONFIG=/run/api-config.toml NESTEGG_RUNTIME_DIR=/run/desktop-api NESTEGG_STATE_DIR=/var/lib/nestegg NESTEGG_CREDENTIALS_DIR=/run/api-credentials nestegg daemon >/run/api-daemon.log 2>&1 & api_pid=\$!; for i in {1..100}; do test -S /run/desktop-api/api.sock && break; sleep .1; done; runuser -u alice -- python3 /media/test/desktop-restore.py; api_code=\$?; test ! -e /home/bob/refused-target || api_code=9; kill \$api_pid; wait \$api_pid; printf 'API-%s=%s\\n' EXIT \$api_code
 expect API-EXIT=0 900
 EOF
             cat <<'EOF'
