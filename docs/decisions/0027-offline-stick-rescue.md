@@ -182,8 +182,9 @@ Result on 2026-11-12 (Debian 13 rescue image, kernel 6.12.116, LVM 2.03.31,
 dm driver 4.48.0): `nestegg rescue backup` refused the VG with "snapshots,
 merges and hidden LVs are refused", created no mapping, restored the source
 read-only flag, and the SHA-256 of the entire source image was unchanged. The
-LV report showed the origin as `Owi---s---` and the hidden COW as `[saved]`
-with `Swi---s---`; the report check alone already refuses it, so the metadata
+fixture's own LV report is asserted to contain a merging origin and snapshot;
+in the reproduction VM, the byte-identical copy showed the origin as
+`Owi---s---` and the hidden COW as `[saved]` with `Swi---s---`; the report check alone already refuses it, so the metadata
 export and activation selection remain second and third lines of defence
 (covered by unit tests). The former `vgchange -ay` activation, with
 `read_only_volume_list`, `metadata_read_only=1`, `--monitor n` and
