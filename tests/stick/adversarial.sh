@@ -75,6 +75,7 @@ sync "$work/esp"; umount "$work/esp"; detach
 cp --reflink=auto --sparse=always "$stick" "$work/clone.img"
 attach
 clone_loop=$(losetup --find --show --partscan "$work/clone.img")
+udevadm settle --timeout=30 || true
 if "$bin" stick info > "$work/cloned-uuid.log" 2>&1; then exit 1; fi
 grep -q 'cloned data UUID' "$work/cloned-uuid.log"
 losetup -d "$clone_loop"; clone_loop=
@@ -87,6 +88,9 @@ cat > "$work/tools/losetup" <<'WRAPPER'
 set -euo pipefail
 if [[ $1 == --find ]]; then
     owned=$(/usr/sbin/losetup "$@")
+    # The partition nodes appear only after udev has processed the new loop.
+    udevadm settle --timeout=30 || true
+    for _ in {1..100}; do [[ -b ${owned}p3 ]] && break; sleep 0.1; done
     if [[ $NESTEGG_TEST_GUARD == mount ]]; then
         mount -o nodev,nosuid,noexec "${owned}p3" "$NESTEGG_TEST_GUARD_MOUNT"
     else

@@ -16,6 +16,7 @@ cleanup() {
 trap cleanup EXIT
 cp --reflink=auto --sparse=always "$source_image" "$legacy"
 loop=$(losetup --find --show --partscan "$legacy")
+udevadm settle --timeout=30 || true
 mkdir "$work/esp"
 mount -o nodev,nosuid,noexec "${loop}p2" "$work/esp"
 python3 - "$here/../../crates/nestegg/src/stick/media.sh" "$work/esp" <<'PY'
