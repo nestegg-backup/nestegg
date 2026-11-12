@@ -261,8 +261,10 @@ impl OwnedLoop {
             bail!("--test-image requires an existing regular disposable image file");
         }
         let image = fs::canonicalize(image)?;
-        // Never reuse somebody else's existing loop attachment.
-        if !capture(Command::new("losetup").arg("-j").arg(&image))?.is_empty() {
+        // Never reuse somebody else's existing loop attachment. A device that
+        // was just released can still be listed while udev finishes with its
+        // partitions, so give such a release a few seconds before refusing.
+        if !wait_until_detached(&image)? {
             bail!("test image already has a loop attachment");
         }
         let path = capture(
@@ -285,20 +287,26 @@ impl Drop for OwnedLoop {
     /// the next `--test-image` run does not see it as somebody else's.
     fn drop(&mut self) {
         let _ = Command::new("losetup").arg("-d").arg(&self.path).status();
-        for _ in 0..100 {
-            let _ = Command::new("udevadm")
-                .args(["settle", "--timeout=5"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            match capture(Command::new("losetup").arg("-j").arg(&self.image)) {
-                Ok(listed) if listed.is_empty() => return,
-                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
-                Err(_) => return,
-            }
-        }
+        let _ = wait_until_detached(&self.image);
     }
+}
+
+/// True once `losetup -j` lists no device for `image`; false after about ten
+/// seconds of waiting for udev to let go of a released device.
+fn wait_until_detached(image: &Path) -> Result<bool> {
+    for _ in 0..100 {
+        if capture(Command::new("losetup").arg("-j").arg(image))?.is_empty() {
+            return Ok(true);
+        }
+        let _ = Command::new("udevadm")
+            .args(["settle", "--timeout=5"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
