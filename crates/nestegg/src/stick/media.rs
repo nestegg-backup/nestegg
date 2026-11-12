@@ -253,6 +253,7 @@ fn confirmation_phrases(disk: &Disk) -> Vec<String> {
 
 pub(super) struct OwnedLoop {
     path: PathBuf,
+    image: PathBuf,
 }
 impl OwnedLoop {
     pub fn open(image: &Path) -> Result<Self> {
@@ -269,15 +270,34 @@ impl OwnedLoop {
                 .args(["--find", "--show", "--partscan"])
                 .arg(&image),
         )?;
-        Ok(Self { path: path.into() })
+        Ok(Self {
+            path: path.into(),
+            image,
+        })
     }
     pub fn path(&self) -> &Path {
         &self.path
     }
 }
 impl Drop for OwnedLoop {
+    /// `losetup -d` only marks a busy device for release (udev may still be
+    /// probing its partitions); wait until the image is really detached, so
+    /// the next `--test-image` run does not see it as somebody else's.
     fn drop(&mut self) {
         let _ = Command::new("losetup").arg("-d").arg(&self.path).status();
+        for _ in 0..100 {
+            let _ = Command::new("udevadm")
+                .args(["settle", "--timeout=5"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            match capture(Command::new("losetup").arg("-j").arg(&self.image)) {
+                Ok(listed) if listed.is_empty() => return,
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(_) => return,
+            }
+        }
     }
 }
 

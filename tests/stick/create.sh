@@ -96,7 +96,7 @@ grep -q data_uuids "$NESTEGG_CONFIG"
 [[ $(stat -c '%a:%U:%G' "$NESTEGG_CONFIG") == 640:root:nestegg ]]
 # Data UUID and partition layout must remain byte-for-byte stable after updates.
 attach() { loop=$(losetup --find --show --partscan "$stick"); }
-detach() { losetup -d "$loop"; loop=; }
+detach() { losetup -d "$loop"; loop=; udevadm settle --timeout=30 || true; }
 attach
 sfdisk --dump "$loop" | sed "s#$loop#DISK#g" >"$work/layout-before"
 mount -o nodev,nosuid,noexec "${loop}p3" "$work/data"
