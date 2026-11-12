@@ -164,6 +164,23 @@ pub fn systemctl_is_enabled(systemctl: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// True only when `systemctl` positively reports the backup timer as switched
+/// off (`disabled` or `masked`, the "automatic backups" setting). Any error,
+/// such as no systemd, is not taken as "off".
+pub fn timer_switched_off(systemctl: &std::path::Path) -> bool {
+    Command::new(systemctl)
+        .args(["is-enabled", TIMER_UNIT])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|out| {
+            matches!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "disabled" | "masked"
+            )
+        })
+}
+
 pub fn os_name() -> Option<String> {
     let text = std::fs::read_to_string("/etc/os-release").ok()?;
     text.lines()

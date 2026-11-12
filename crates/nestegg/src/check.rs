@@ -163,14 +163,16 @@ fn run_items(paths: &Paths, options: &CheckOptions, tracker: &mut WakeTracker) -
         Err(e) => r.report(false, "proxmox-backup-client", format!("{e:#}")),
     }
     let store = SecretStore::new(&paths.credentials_dir);
-    if options.login {
+    // A stick-only setup has no remote server: the local PBS of the stick
+    // gets a fresh token at every start, so no stored secret is needed.
+    if cfg.pbs.is_some() && options.login {
         let pw = store.load(secrets::PASSWORD);
         r.report(
             pw.is_ok(),
             "password / token secret",
             pw.err().map(|e| format!("{e:#}")).unwrap_or_default(),
         );
-    } else {
+    } else if cfg.pbs.is_some() {
         r.report(
             store.exists(secrets::PASSWORD),
             "password / token secret",
@@ -457,6 +459,27 @@ mod run_tests {
 
     fn item<'a>(items: &'a [CheckItem], name: &str) -> &'a CheckItem {
         items.iter().find(|i| i.name == name).unwrap()
+    }
+
+    #[test]
+    fn a_stick_only_setup_needs_no_stored_server_secret() {
+        let (_dir, paths) = setup(false);
+        std::fs::write(
+            &paths.config_file,
+            "[stick]\ndata_uuids = [\"01234567-89ab-cdef-0123-456789abcdef\"]\n",
+        )
+        .unwrap();
+        let items = run(
+            &paths,
+            &CheckOptions {
+                wake: false,
+                login: true,
+            },
+        );
+        assert!(
+            items.iter().all(|i| i.name != "password / token secret"),
+            "{items:?}"
+        );
     }
 
     #[test]

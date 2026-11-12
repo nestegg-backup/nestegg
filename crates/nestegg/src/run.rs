@@ -589,6 +589,9 @@ fn execute_target(
         }
     }
 
+    if plug_switched_off(paths, options) {
+        return Ok(RunExit::NotDue);
+    }
     if let Some(reason) = timer_skip(config, &state, config_stamp.as_deref(), options) {
         eprintln!("{reason}");
         return Ok(RunExit::NotDue);
@@ -711,6 +714,19 @@ fn execute_target(
     })
 }
 
+/// Plugging in a registered stick starts a backup only while automatic
+/// backups are on (the backup timer, decision 0013). With them switched off
+/// backups run only when started by hand, also for the stick.
+fn plug_switched_off(paths: &Paths, options: &RunOptions) -> bool {
+    let off = options.trigger == Trigger::Plug
+        && !options.force
+        && crate::status::timer_switched_off(&paths.systemctl);
+    if off {
+        eprintln!("automatic backups are switched off; plugging in the stick does not start one");
+    }
+    off
+}
+
 /// Why a timer run does not start now (not due yet, or the growing pause
 /// after failures in a row), `None` when it starts. Manual and CLI runs and
 /// forced runs always start.
@@ -768,6 +784,9 @@ fn record_blocked(paths: &Paths, options: &RunOptions, message: &str) -> Result<
     };
     let store = Store::for_target(paths, target);
     let state = store.load_state()?;
+    if plug_switched_off(paths, options) {
+        return Ok(RunExit::NotDue);
+    }
     if let Some(reason) = timer_skip(&config, &state, config_stamp.as_deref(), options) {
         eprintln!("{reason}");
         return Ok(RunExit::NotDue);
@@ -1788,6 +1807,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn plugging_in_does_not_back_up_while_automatic_backups_are_off() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = |answer: &str| {
+            let path = dir.path().join(format!("systemctl-{answer}"));
+            std::fs::write(&path, format!("#!/bin/sh\necho {answer}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let mut paths = Paths {
+            config_file: dir.path().join("config.toml"),
+            credentials_dir: dir.path().join("credentials"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+            systemctl: fake("disabled"),
+        };
+        let mut options = RunOptions {
+            target: TargetSelection::Stick,
+            stick_uuid: None,
+            trigger: Trigger::Plug,
+            run_id: None,
+            force: false,
+        };
+        assert!(plug_switched_off(&paths, &options));
+        paths.systemctl = fake("masked");
+        assert!(plug_switched_off(&paths, &options));
+        paths.systemctl = fake("enabled");
+        assert!(!plug_switched_off(&paths, &options));
+        // Without systemd nothing is known to be off.
+        paths.systemctl = dir.path().join("no-systemctl");
+        assert!(!plug_switched_off(&paths, &options));
+        // Timer and manual runs are not gated here.
+        paths.systemctl = fake("disabled");
+        options.trigger = Trigger::Manual;
+        assert!(!plug_switched_off(&paths, &options));
     }
 
     #[test]

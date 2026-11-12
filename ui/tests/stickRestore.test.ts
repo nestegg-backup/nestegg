@@ -128,6 +128,25 @@ describe("restore state with the stick as source", () => {
     expect(restore.selection).toEqual([]);
   });
 
+  it("pulling the stick out keeps a restore from the server as it was", () => {
+    restore.setSource("pbs");
+    restore.snapshotTime = "2026-11-10T18:10:00Z";
+    restore.selection = [sel("home.pxar", "/alice")];
+    restore.stickGone();
+    expect(restore.snapshotTime).toBe("2026-11-10T18:10:00Z");
+    expect(restore.selection).toEqual([sel("home.pxar", "/alice")]);
+    expect(restore.stickSnaps.state).toBe("idle");
+  });
+
+  it("pulling the stick out drops the choices of a restore from the stick", () => {
+    restore.setSource("stick");
+    restore.snapshotTime = "2026-11-10T18:10:00Z";
+    restore.selection = [sel("home.pxar", "/alice")];
+    restore.stickGone();
+    expect(restore.snapshotTime).toBeNull();
+    expect(restore.selection).toEqual([]);
+  });
+
   it("reads the stick's snapshots, and keeps a refusal as the stick's error", async () => {
     const w = new World("both", "full");
     serve(w);

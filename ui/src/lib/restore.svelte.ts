@@ -215,9 +215,13 @@ class RestoreState {
    * The stick was pulled out. Its catalog is not kept across plug-ins and another stick may come
    * next, so snapshots and selections are discarded before reading the next attachment.
    */
+  /** The stick was pulled out. Its cached snapshot list always goes; the
+   *  choices of a restore are dropped only when that restore reads from the
+   *  stick, so a restore from the server keeps its snapshot and selection. */
   stickGone() {
-    this.#generation++;
     this.stickSnaps = { state: "idle", list: [], error: null };
+    if (this.source !== "stick") return;
+    this.#generation++;
     this.snapshotTime = null;
     this.selection = [];
     this.roots = [];

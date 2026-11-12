@@ -175,7 +175,9 @@ different key is refused before upload or pruning; use a distinct backup ID for
 another machine with the same name. Its existing recovery key is not overwritten.
 
 The package's udev rule starts the device-bound service when a registered stick
-is plugged in and a backup is due. Unregistered drives are not mounted by
+is plugged in and a backup is due. With automatic backups switched off (the
+backup timer, setting "automatic backups"), plugging in starts nothing; back
+up to the stick by hand then. Unregistered drives are not mounted by
 nestegg. All partitions of a registered medium are hidden from the desktop
 automounter. The data mount is private and `nodev,nosuid,noexec,relatime`.
 The start notification says to keep the stick plugged in. **Wait for safe to

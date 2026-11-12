@@ -320,6 +320,18 @@ pub fn evaluate(
                 }
             }
         }
+        // The monthly full check of the stick can fail before PBS records a
+        // failed snapshot; the recorded damage state alone must still warn.
+        if *target == crate::state::Target::Stick
+            && view.state == "stick_damaged"
+            && view.server_verify_failed.is_empty()
+            && !conditions.iter().any(|c| c.kind == Event::StickDamaged)
+        {
+            conditions.push(Condition::new(
+                Event::StickDamaged,
+                "stick|full-verification".into(),
+            ));
+        }
         if view.password_reminder {
             conditions.push(Condition::new(
                 Event::StickPasswordReminder,
@@ -697,6 +709,20 @@ pub fn compose(lang: Lang, event: Event, condition: Option<&Condition>, detail: 
     if let Some(base) = base {
         let mut message = compose(lang, base, condition, detail);
         message.event = event;
+        if event == Event::StickDamaged
+            && detail == Detail::Full
+            && condition.is_some_and(|c| c.damaged == 0)
+        {
+            message.title = tr(lang, "Damaged data", "Beschädigte Daten");
+            message.body = tr(
+                lang,
+                "The full check of the backup stick found damaged data. Older files may \
+                 not be restorable from it. Details: \"nestegg ui\".",
+                "Die vollständige Prüfung des Sicherungssticks hat beschädigte Daten \
+                 gefunden. Ältere Dateien lassen sich daraus vielleicht nicht \
+                 wiederherstellen. Mehr dazu: \"nestegg ui\".",
+            );
+        }
         message.title = format!(
             "{}: {}",
             tr(lang, "Backup stick", "Sicherungsstick"),
@@ -4284,6 +4310,55 @@ mod tests {
             } => (conditions, settled),
             Evaluation::Skip(why) => panic!("skipped: {why}"),
         }
+    }
+
+    #[test]
+    fn a_failed_full_stick_check_without_snapshot_records_still_warns() {
+        let ok = run_with(RunState::Succeeded, t0() - Duration::hours(1));
+        let mut s = status(Health::Ok, Some(ok.clone()), Some(ok.clone()), &[]);
+        s.targets.insert(
+            crate::state::Target::Stick,
+            status::TargetStatus {
+                health: Health::Ok,
+                state: "stick_damaged".into(),
+                last_run: Some(ok.clone()),
+                last_success: Some(ok),
+                current_run: None,
+                consecutive_failures: 0,
+                overdue_after_hours: 168,
+                next_run: None,
+                available_bytes: None,
+                total_bytes: None,
+                space_checked_at: None,
+                plugged_in: Some(false),
+                plugged_in_uuids: Vec::new(),
+                in_use: None,
+                sticks: Default::default(),
+                last_checked_at: None,
+                full_verified_at: None,
+                server_verify_failed: Vec::new(),
+                password_reminder: false,
+                password_reminders: Default::default(),
+            },
+        );
+        let (conditions, _) = checked(evaluate(&s, true, None, t0()));
+        let damaged: Vec<_> = conditions
+            .iter()
+            .filter(|c| c.kind == Event::StickDamaged)
+            .collect();
+        assert_eq!(damaged.len(), 1, "{conditions:?}");
+        let message = compose(
+            Lang::En,
+            Event::StickDamaged,
+            Some(damaged[0]),
+            Detail::Full,
+        );
+        assert!(
+            message.body.contains("full check of the backup stick"),
+            "{}",
+            message.body
+        );
+        assert!(!message.body.contains("backup server"), "{}", message.body);
     }
 
     #[test]
