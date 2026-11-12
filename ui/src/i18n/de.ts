@@ -127,6 +127,12 @@ const de = {
       `${m.rel === "today" ? `Heute ${m.time} gesichert` : m.rel === "yesterday" ? `Gestern ${m.time} gesichert` : `${dayMonth} ${m.time} gesichert`}, automatische Sicherung aus`,
     ok: (m: Moment, dayMonth: string) =>
       m.rel === "today" ? `Heute ${m.time} gesichert` : m.rel === "yesterday" ? `Gestern ${m.time} gesichert` : `${dayMonth} ${m.time} gesichert`,
+    stickRunning: "Sichert auf den Stick",
+    stickFull: "Stick voll",
+    stickDamaged: "Beschädigte Daten auf dem Stick",
+    stickFailing: "Sicherung auf den Stick fehlgeschlagen",
+    stickOverdue: (day: string) => `Stick überfällig, zuletzt ${day}`,
+    stickNever: "Noch nicht auf den Stick gesichert",
     serverReachable: (time: string) => `Erreichbar, geprüft um ${time}`,
     serverReachableDay: (day: string) => `Erreichbar, geprüft am ${day}`,
     serverUnreachable: (time: string) => `Nicht erreichbar, geprüft um ${time}`,
@@ -315,7 +321,7 @@ const de = {
     keyCreateImport:
       "Hast du schon einen Schlüssel von früher, zum Beispiel nach einer Neuinstallation, legst du keinen neuen an, sondern holst den alten zurück: sudo nestegg key import <Schlüsseldatei>. Sonst lassen sich die älteren Sicherungen nicht öffnen.",
     keyStoreWhy:
-      "Ohne diesen Schlüssel kann niemand die Sicherungen öffnen, auch du nicht, wenn der PC kaputtgeht. Darum muss eine Kopie außerhalb dieses PCs liegen. Eine Kopie, die nur auf diesem PC liegt, zählt nicht, und eine in einem gesicherten Ordner auch nicht, selbst auf einer externen Platte. Es gibt zwei Wege, einer genügt. Gesichert wird erst, wenn du die Kopie bestätigt hast.",
+      "Ohne diesen Schlüssel kann niemand die Sicherungen öffnen, auch du nicht, wenn der PC kaputtgeht. Darum muss eine Kopie außerhalb dieses PCs liegen. Eine Kopie, die nur auf diesem PC liegt, zählt nicht, und eine in einem gesicherten Ordner auch nicht, selbst auf einer externen Platte. Es gibt mehrere Wege, einer genügt. Gesichert wird erst, wenn du die Kopie bestätigt hast.",
     usbTitle: "Auf einen USB-Stick",
     usbText:
       "Schreibe den Schlüssel auf einen USB-Stick und bewahre den Stick an einem anderen Ort auf als den PC. Trag ein, wo der Stick eingebunden ist, meist unter /media.",
@@ -343,6 +349,12 @@ const de = {
     codeHint: "Nicht geheim. Acht Zeichen aus 0–9 und A–F, mit oder ohne Bindestrich.",
     codeInvalid: "Das sieht nicht wie ein Prüfcode aus (acht Zeichen aus 0–9 und A–F).",
     fillCode: "Erst den Prüfcode eintragen.",
+    stickCopyTitle: "Auf den Backup-Stick, mit Passwort",
+    stickCopyText:
+      "nestegg legt eine mit deinem Passwort geschützte Kopie des Schlüssels auf den eingesteckten Backup-Stick und öffnet sie zur Probe wieder. Das Passwort tippst du im Terminal ein: mindestens 16 Zeichen aus drei Zeichenarten oder fünf verschiedene Wörter mit zusammen mindestens 24 Zeichen. Wähle eins, das du dir merken kannst.",
+    stickCopyPaper: "Bewahre zusätzlich einen Papierschlüssel getrennt vom Stick auf: Geht der Stick verloren, ist er der einzige Weg zurück.",
+    firstBackupStick:
+      "Alles ist vorbereitet. Steck den Backup-Stick ein: Ist eine Sicherung fällig, startet sie von selbst. Du kannst sie auch oben mit „Auf den Stick sichern“ starten. Beim ersten Mal wird alles geschrieben, das kann lange dauern.",
     firstBackupText:
       "Alles ist vorbereitet. Klicke oben auf „Jetzt sichern“. Beim ersten Mal wird alles hochgeladen, das kann lange dauern. Du kannst die Seite währenddessen schließen.",
   },
@@ -371,6 +383,9 @@ const de = {
     failed: (reason: string) => `Fehlgeschlagen: ${reason}`,
     pbs: "Server nicht erreichbar",
     pbsTimes: (n: number) => `Server nicht erreichbar, ${n} Versuche`,
+    stickAbsent: "Stick nicht eingesteckt",
+    stickAbsentTimes: (n: number) => `Stick nicht eingesteckt, ${n}-mal nachgesehen`,
+    succeededPlug: "Gesichert, beim Einstecken gestartet",
     cancelled: "Abgebrochen",
     unknown: "Nicht verstanden, bitte nestegg aktualisieren",
     succeededOtherStart: "Gesichert, auf unbekannte Weise gestartet",
@@ -395,6 +410,14 @@ const de = {
     emptyHere: "Noch keine Sicherung von dieser Installation. Die früheren liegen auf dem Server.",
   },
   reason: {
+    stick_not_plugged_in: "Stick nicht eingesteckt",
+    stick_already_mounted: "Stick bereits eingehängt",
+    stick_ambiguous: "Stick-UUID ist nicht eindeutig",
+    stick_busy: "Stick wird bereits benutzt",
+    stick_full: "Stick voll",
+    filesystem_damaged: "Dateisystem des Sticks beschädigt",
+    stick_unsupported: "auf diesem PC nicht möglich",
+    key_mismatch: "Sicherung mit anderem Schlüssel vorhanden",
     pbs_unreachable: "Server nicht erreichbar",
     authentication: "Zugang abgelehnt",
     source_missing: "Ordner fehlte",
@@ -409,6 +432,19 @@ const de = {
     unknown: "unbekannter Fehler",
   } satisfies Record<RunErrorKind, string>,
   explain: {
+    stick_not_plugged_in:
+      "Der Stick war nicht eingesteckt. Das ist kein Fehler: Sobald er eingesteckt ist und eine Sicherung fällig ist, sichert nestegg von selbst.",
+    stick_already_mounted: "Hänge den Stick aus, bevor nestegg ihn benutzt.",
+    stick_ambiguous: "Mehrere Laufwerke haben dieselbe UUID. Trenne die Kopie und versuche es erneut.",
+    stick_busy: "Eine andere Stick-Aktion läuft. Warte, bis sie beendet ist.",
+    stick_full:
+      "Auf dem Stick ist zu wenig Platz. nestegg hat abgebrochen und dabei keine älteren Sicherungen gelöscht, als die Aufbewahrungsregeln vorsehen. Abhilfe schafft ein größerer Stick.",
+    filesystem_damaged:
+      "Die Prüfung vor dem Schreiben hat Schäden im Dateisystem des Sticks gefunden, zum Beispiel weil er während einer Sicherung abgezogen wurde. nestegg schreibt erst wieder darauf, wenn es repariert ist. Reparieren lässt es sich nur, solange der Stick nicht eingehängt ist: als Administrator mit e2fsck im Terminal.",
+    stick_unsupported:
+      "Dieser PC kann den Backup-Dienst für den Stick nicht starten. Meist ist die IPv6-Unterstützung des Kernels abgeschaltet (ipv6.disable=1). nestegg braucht sie auch für die Verbindung innerhalb des PCs und ändert diese Einstellung nicht selbst.",
+    key_mismatch:
+      "Auf dem Ziel liegt unter dem Namen dieses PCs eine Sicherung, die mit einem anderen Schlüssel gemacht wurde, etwa von einem anderen PC mit demselben Namen. nestegg hat nichts geschrieben und nichts gelöscht. Abhilfe: Ein Administrator gibt diesem PC im Terminal eine eigene Backup-ID.",
     pbs_unreachable:
       "Der Backup-Server hat nicht geantwortet. Nicht dieser PC hat einen Fehler gemacht.",
     authentication:
@@ -508,11 +544,80 @@ const de = {
           : "Prüfung fertig, alles in Ordnung.",
     checkFailed: (msg: string) => `Die Prüfung ließ sich nicht ausführen. ${msg}`,
   },
+  stick: {
+    title: "Sicherungsziele",
+    server: "Backup-Server",
+    name: "Backup-Stick",
+    toServer: "Zum Backup-Server",
+    running: "Sichert gerade auf den Stick.",
+    ok: (m: Moment) => `Auf den Stick gesichert ${at(m)}.`,
+    okUndated: "Auf den Stick gesichert.",
+    incomplete: (m: Moment) => `Auf den Stick gesichert ${at(m)}, aber unvollständig.`,
+    never: "Noch keine Sicherung auf dem Stick.",
+    overdue: (days: number, hours: number) =>
+      days >= 2 ? `Seit ${days} Tagen nicht auf den Stick gesichert.` : `Seit ${hours} Stunden nicht auf den Stick gesichert.`,
+    full: "Der Stick ist voll.",
+    damaged: "Das Dateisystem des Sticks ist beschädigt.",
+    storeDamaged: "Die monatliche Kontrolle meldet beschädigte Daten auf dem Stick. Die neue Sicherung ist geprüft.",
+    verifyFailed: "Die Kontrolle der Sicherung auf dem Stick ist fehlgeschlagen.",
+    keyMismatch: "Auf dem Stick liegt eine Sicherung mit anderem Schlüssel.",
+    unsupported: "Auf diesem PC lässt sich nicht auf den Stick sichern.",
+    failing: (m: Moment) => `Die Sicherung auf den Stick ${at(m)} ist fehlgeschlagen.`,
+    failingUndated: "Die letzte Sicherung auf den Stick ist fehlgeschlagen.",
+    unknown: "Den letzten Eintrag des Sticks versteht diese nestegg-Version nicht. Aktualisiere nestegg.",
+    verifyText:
+      "Nach dem Schreiben prüft nestegg die neue Sicherung auf dem Stick. Diese Prüfung hat einen Fehler gefunden, deshalb gilt die Sicherung nicht als gelungen. Das kann ein Zeichen sein, dass der Stick verschleißt. Versuch es noch einmal; wiederholt es sich, nimm einen anderen Stick.",
+    absent: "Nicht eingesteckt.",
+    plugToBackUp: "Steck ihn ein, dann sichert nestegg, sobald eine Sicherung fällig ist.",
+    plugged: "Eingesteckt.",
+    safe: "Eingesteckt und nicht in Benutzung: Du kannst ihn abziehen.",
+    keepIn: "Lass ihn eingesteckt, bis hier steht, dass du ihn abziehen kannst.",
+    free: (size: string) => `${size} frei`,
+    filled: (n: number) => `${n} % belegt`,
+    freeNote: "Stand der letzten Prüfung",
+    lastSuccess: (m: Moment) => `Zuletzt gesichert ${at(m)}`,
+    fullCheck: (day: string) => `ganz geprüft am ${day}`,
+    damagedSnapshots: (n: number) => `${n} ${plural(n, "Sicherung", "Sicherungen")} auf dem Stick als beschädigt gemeldet`,
+    overdueAfter: (h: number) => `überfällig nach ${h % 24 === 0 ? `${h / 24} ${plural(h / 24, "Tag", "Tagen")}` : `${h} Stunden`}`,
+    runNow: "Auf den Stick sichern",
+    starting: "Wird gestartet …",
+    runFailed: (msg: string) => `Die Sicherung auf den Stick ließ sich nicht starten. ${msg}`,
+    waitPlug: "Gesichert wird, sobald der Stick eingesteckt ist und eine Sicherung fällig ist.",
+    keyCopyTitle: "Schlüsselkopie auf dem Stick anlegen",
+    keyCopyText: "Auf diesem registrierten Stick ist noch keine passwortgeschützte Kopie des aktuellen Schlüssels bestätigt. Lege sie im Terminal an und bewahre das Passwort sicher auf.",
+    passwordDueText: "Die Schlüsselkopie auf diesem Stick ist bestätigt. Prüfe nach 180 Tagen erneut, ob du sie mit deinem Passwort öffnen kannst. Die Sicherungen laufen weiter.",
+    passwordTitle: "Passwort des Sticks prüfen",
+    passwordText:
+      "Die Kopie des Schlüssels auf dem Stick ist mit einem Passwort geschützt. Damit ein vergessenes Passwort auffällt, bevor du es brauchst, fragt nestegg alle 180 Tage danach. Ist noch keine Kopie bestätigt, legst du sie mit key-copy an. Die Sicherungen laufen so lange weiter.",
+    passwordCmd: "Mit eingestecktem Stick im Terminal:",
+    uuidLabel: "UUID des Sticks",
+    uuidHint: "Zeigt sudo nestegg stick info, wenn genau ein registrierter Stick eingesteckt ist.",
+    uuidInvalid: "Das sieht nicht wie eine UUID aus (8-4-4-4-12 Zeichen aus 0–9 und a–f).",
+    fillUuid: "Erst die UUID des Sticks eintragen.",
+    noServer: "Dieser PC sichert nur auf einen Backup-Stick. Ein Backup-Server ist nicht eingerichtet.",
+    factBackupId: "Name der Sicherungen",
+    verifiedYes: "Nach dem Schreiben vom Stick zurückgelesen und geprüft",
+    colWritten: "Geschrieben",
+    retention: "Aufbewahrung auf dem Stick",
+    retentionText: "Die letzten 3, dazu 7 tägliche, 4 wöchentliche und 6 monatliche",
+    fixedOnly: "Verschlüsselung",
+    okServerOnly: "Auf dem Backup-Server ist alles in Ordnung, beim Backup-Stick nicht, siehe unten.",
+    history: "Verlauf von",
+    stepCheck: "Stick prüfen und einhängen",
+    stepCheckNow: "Das Dateisystem wird geprüft, der Backup-Dienst für den Stick startet.",
+    stepUpload: "Geänderte Dateien auf den Stick schreiben",
+    written: (size: string) => `${size} geschrieben`,
+    stepFinish: "Prüfen, aufräumen, aushängen",
+    stepFinishSub: "Die neue Sicherung wird geprüft, alte werden nach den Regeln aufgeräumt, dann wird der Stick ausgehängt.",
+    runningLead: "Sicherung auf den Stick läuft.",
+    runningText: "Lass den Stick eingesteckt, bis hier steht, dass du ihn abziehen kannst. Die Seite kannst du schließen.",
+    runningSincePlug: (dur: string) => `Beim Einstecken gestartet, läuft seit ${dur}`,
+  },
   settings: {
     title: "Einstellungen",
     intro: "Änderungen werden sofort gespeichert und gelten ab der nächsten Sicherung.",
     reported:
-      "Änderungen, die den Schutz verringern, werden allen gemeldet, die diesen PC benutzen: automatische Sicherung aus, ein neuer Ausschluss, ein längerer Rhythmus oder eine längere Zeit bis „überfällig“, Wake-on-LAN aus.",
+      "Änderungen, die den Schutz verringern, werden allen gemeldet, die diesen PC benutzen: automatische Sicherung aus, ein neuer Ausschluss, ein längerer Rhythmus oder eine längere Zeit bis „überfällig“, Wake-on-LAN aus, ein entferntes Sicherungsziel.",
     introReadOnly:
       "Diese nestegg-Version zeigt die Einstellungen nur an. Ändern lässt sich das im Terminal in der Datei /etc/nestegg/config.toml (sudoedit /etc/nestegg/config.toml).",
     offline: "Ohne Verbindung zum nestegg-Dienst lässt sich gerade nichts ändern.",
@@ -577,10 +682,30 @@ const de = {
     sumExcludeAdded: (pattern: string) => `${pattern} wird ab jetzt ausgelassen`,
     sumExcludeRemoved: (pattern: string) => `${pattern} wird wieder gesichert`,
     sumWol: (on: boolean) => `Wake-on-LAN ${on ? "eingeschaltet" : "ausgeschaltet"}`,
+    overdueServer: "Server überfällig melden nach",
+    overdueStick: "Stick überfällig melden nach",
+    overdueStickHint:
+      "Der Stick steckt nicht immer, darum sind es von Haus aus 7 Tage (168 Stunden). Wird gespeichert, wenn du das Feld verlässt oder Enter drückst.",
+    sumStickOverdue: (hours: number) => `Stick überfällig melden nach ${hours} Stunden`,
+    targetsHint: "Wohin dieser PC sichert. Hinzufügen geht nur im Terminal mit Administratorrechten.",
+    onlyTarget: "Das einzige Ziel. Es lässt sich nicht entfernen.",
+    removeTarget: "Entfernen …",
+    removeTargetLabel: (name: string) => `${name} als Sicherungsziel entfernen`,
+    removeAskPbs:
+      "Den Backup-Server als Ziel entfernen? Danach wird nur noch auf den Stick gesichert. Die Server-Einstellungen werden aus der Einrichtung gelöscht; wieder hinzufügen kann ihn nur ein Administrator im Terminal. Die Änderung wird allen gemeldet, die diesen PC benutzen.",
+    removeAskStick:
+      "Den Backup-Stick als Ziel entfernen? Danach wird nur noch auf den Backup-Server gesichert, und nestegg benutzt den Stick nicht mehr, wenn er eingesteckt wird. Die Sicherungen auf dem Stick bleiben, wie sie sind. Wieder hinzufügen kann ihn nur ein Administrator im Terminal. Die Änderung wird allen gemeldet, die diesen PC benutzen.",
+    removeConfirm: "Entfernen",
+    removeKeep: "Behalten",
+    sumRemoved: (name: string) => `${name} als Sicherungsziel entfernt`,
     overdueRaised: (hours: number) =>
       `Auf ${hours} Stunden angehoben, weil es länger sein muss als der Rhythmus.`,
     problem: {
       wholeNumber: "Bitte eine ganze Zahl von Stunden eingeben.",
+      stickOverdueRange: (max: number) =>
+        `Erlaubt sind 1 bis ${max} Stunden. Eine längere Zeit kann nur ein Administrator in /etc/nestegg/config.toml eintragen.`,
+      noStick: "Für diesen PC ist kein Backup-Stick eingerichtet.",
+      lastTarget: "Das letzte Sicherungsziel lässt sich nicht entfernen.",
       intervalRange: (min: number, max: number) => `Der Rhythmus muss zwischen ${min} und ${max} Stunden liegen.`,
       overdueRange: (min: number, max: number) => `Erlaubt sind ${min} bis ${max} Stunden.`,
       overdueCapped: (min: number, max: number, current: number | null) =>
@@ -684,6 +809,38 @@ const de = {
     backTo: (name: string) => `Zurück zu ${name}`,
     tryAgain: "Zurück zum Zielordner",
     startFailed: (msg: string) => `Das Wiederherstellen ließ sich nicht starten. ${msg}`,
+    // Restoring from the backup stick (the source is chosen only when there is a server as well).
+    sourceTitle: "Wiederherstellen von",
+    stickIn: "eingesteckt",
+    stickOut: "nicht eingesteckt",
+    loadingStick: "Der Stick wird geöffnet und seine Stände gelesen. Das dauert einen Moment …",
+    noSnapshotsStick: "Auf diesem Stick gibt es noch keinen Stand dieses PCs.",
+    stickAbsent: "Der Backup-Stick ist nicht eingesteckt. Steck ihn ein, dann zeigt nestegg hier seine Stände.",
+    chooseStick: "Stick auswählen",
+    stickReasons: {
+      not_plugged_in: "Der gewählte Stick ist nicht eingesteckt. Stecke ihn ein und versuche es erneut.",
+      ambiguous: "Mehrere Sticks sind eingesteckt. Wähle den Stick für die Wiederherstellung.",
+      busy: "Ein Backup oder eine Wiederherstellung verwendet den Stick. Versuche es danach erneut.",
+      snapshot_not_on_stick: "Dieses Backup ist nicht auf dem gewählten Stick. Wähle den passenden Stick.",
+      unreadable: "Der Stick kann nicht gelesen werden. Prüfe den Stick, bevor du es erneut versuchst.",
+      unsupported: "Dieses System unterstützt die Wiederherstellung vom Stick noch nicht.",
+    },
+    stickUnavailable: "Der Backup-Stick ließ sich nicht öffnen. Ist er eingesteckt? Dann versuch es noch einmal.",
+    stickNotSupported: "Diese nestegg-Version kann Dateien noch nicht vom Stick wiederherstellen. Aktualisiere nestegg.",
+    stickGoneBrowse:
+      "Der Backup-Stick ist nicht mehr eingesteckt. Steck ihn wieder ein, dann lassen sich die Ordner wieder öffnen. Was du schon ausgewählt hast, bleibt ausgewählt.",
+    stickFailedBrowse: "Der Backup-Stick ließ sich gerade nicht lesen. Ist er noch eingesteckt? Öffne den Ordner dann noch einmal.",
+    damagedSnapshotStick:
+      "Dieser Stand ist auf dem Stick als beschädigt markiert. Dateien daraus lassen sich vielleicht nicht vollständig zurückholen. Nimm lieber einen anderen Stand.",
+    damagedAllStick:
+      "Alle Stände sind auf dem Stick als beschädigt markiert, auch dieser. Dateien daraus lassen sich vielleicht nicht vollständig zurückholen. Du kannst es trotzdem versuchen.",
+    sumSource: "Quelle",
+    startNeedsStick: "Steck den Backup-Stick ein, um die Dateien zurückzuholen.",
+    startStick: (msg: string) => `Der Backup-Stick ließ sich nicht öffnen, es wurde nichts wiederhergestellt. Ist er eingesteckt? ${msg}`,
+    runningStick: "Dateien werden vom Stick zurückgeholt.",
+    runningStickText:
+      "Lass den Stick eingesteckt, bis hier „Fertig“ steht. Wie viel schon zurückgeholt ist, meldet der Stick erst am Ende.",
+    failedStickGone: "Der Backup-Stick ist nicht mehr eingesteckt.",
   },
 };
 

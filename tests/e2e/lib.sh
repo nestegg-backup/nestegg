@@ -53,7 +53,7 @@ absent_in() {
 }
 
 build_pbs_image() {
-  DOCKER_BUILDKIT=0 docker build -q -t nestegg-e2e-pbs -f "$here/pbs.Dockerfile" "$here" >/dev/null
+  DOCKER_BUILDKIT=0 docker build -q -t "${NESTEGG_E2E_PBS_IMAGE:-nestegg-e2e-pbs}" -f "$here/pbs.Dockerfile" "$here" >/dev/null
 }
 
 # Start a disposable PBS and prepare datastore "store1", namespace "desktops",
@@ -67,7 +67,7 @@ start_pbs() {
     # Short fixed host name: the PBS certificate CN is built from host name
     # and DNS search domain and must not exceed 64 characters.
     docker run -d --tmpfs /run --name "$pbs" --hostname pbs --dns-search e2e.test \
-      --network "$net" --network-alias pbs.e2e.test nestegg-e2e-pbs >/dev/null
+      --network "$net" --network-alias pbs.e2e.test "${NESTEGG_E2E_PBS_IMAGE:-nestegg-e2e-pbs}" >/dev/null
     for _ in $(seq 1 60); do
       if on_pbs curl -skf https://127.0.0.1:8007/api2/json/ping >/dev/null 2>&1; then up=1; break; fi
       [[ "$(docker inspect -f '{{.State.Running}}' "$pbs" 2>/dev/null)" == true ]] || break
@@ -103,7 +103,7 @@ start_pbs() {
 # same client with systemd as PID 1.
 build_systemd_images() {
   DOCKER_BUILDKIT=0 docker build -q -t nestegg-e2e-client:ubuntu-24.04 -f "$here/client.Dockerfile" "$here" >/dev/null
-  DOCKER_BUILDKIT=0 docker build -q -t nestegg-e2e-systemd -f "$here/systemd-client.Dockerfile" "$here" >/dev/null
+  DOCKER_BUILDKIT=0 docker build -q -t "${NESTEGG_E2E_SYSTEMD_IMAGE:-nestegg-e2e-systemd}" -f "$here/systemd-client.Dockerfile" "$here" >/dev/null
 }
 
 # Start "$client" with systemd as PID 1 and wait until it has booted. It needs
@@ -118,7 +118,7 @@ start_systemd_client() {
   docker run -d -t --name "$client" --network "$net" --cgroupns=host \
     --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
-    "$@" nestegg-e2e-systemd >/dev/null
+    "$@" "${NESTEGG_E2E_SYSTEMD_IMAGE:-nestegg-e2e-systemd}" >/dev/null
   local state
   for _ in $(seq 1 30); do
     state="$(on_client systemctl is-system-running 2>/dev/null || true)"

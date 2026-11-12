@@ -3,6 +3,7 @@
   import { app } from "../../lib/store.svelte";
   import { restore } from "../../lib/restore.svelte";
   import { href, router } from "../../lib/router.svelte";
+  import { stickView } from "../../lib/derive";
   import { f, t } from "../../lib/locale";
   import type { Status } from "../../lib/types";
 
@@ -11,6 +12,8 @@
   const job = $derived(restore.job);
   const target = $derived(job?.target_dir ?? "");
   const snapTime = $derived(restore.snapshotTime);
+  const fromStick = $derived(restore.jobSource === "stick");
+  const stickGone = $derived(fromStick && !!status.targets?.stick && stickView(status.targets.stick).plugged === false);
   const elapsed = $derived(
     job?.started_at ? Math.max(0, (app.now.getTime() - new Date(job.started_at).getTime()) / 1000) : 0,
   );
@@ -28,6 +31,11 @@
       <h2 class="lead"><Dot tone="warn" />{t.conn.lost}</h2>
       <p class="lead-text">{t.conn.restoreUnknown}</p>
       <p class="hint">{t.restore.runningTarget} <code>{target}</code></p>
+    {:else if job?.state === "running" && fromStick}
+      <!-- The stick reports the restored size only at the end: no bar, no percentage. -->
+      <h2 class="lead"><span class="pulse" aria-hidden="true"></span>{t.restore.runningStick}</h2>
+      <p class="lead-text">{t.restore.runningTarget} <code>{target}</code>{#if job.started_at}. {t.restore.runningSince(f.duration(elapsed))}{/if}</p>
+      <p class="hint">{t.restore.runningStickText}</p>
     {:else if job?.state === "running"}
       <h2 class="lead"><span class="pulse" aria-hidden="true"></span>{t.restore.running}</h2>
       <p class="lead-text">{t.restore.runningTarget} <code>{target}</code>{#if job.started_at}. {t.restore.runningSince(f.duration(elapsed))}{/if}</p>
@@ -43,12 +51,14 @@
       <h2 class="lead">{t.restore.done}</h2>
       <p class="target"><code>{target}</code></p>
       <p class="lead-text">{t.restore.doneText(restore.jobSelection.length, snapTime ? f.dayLong(snapTime) : "")}</p>
+      {#if fromStick && job.restored_bytes}<p class="hint">{t.restore.progressDone(f.size(job.restored_bytes))}</p>{/if}
       {#if job.warnings?.length}
         <p class="hint"><strong>{t.runs.warnings}:</strong> {job.warnings.join(" · ")}</p>
       {/if}
     {:else if job?.state === "failed"}
       <h2 class="lead bad"><Dot tone="bad" />{t.restore.failed}</h2>
       {#if job.error}<p class="lead-text">{job.error}</p>{/if}
+      {#if stickGone}<p class="hint">{t.restore.failedStickGone}</p>{/if}
     {/if}
   </div>
   <div class="acts">

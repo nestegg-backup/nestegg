@@ -11,11 +11,16 @@ use nix::fcntl::{Flock, FlockArg};
 use crate::client::{ArchiveSpec, BackupSpec, Client, snapshot_path};
 use crate::config::{Config, Paths};
 use crate::secrets::{self, SecretStore};
-use crate::state::{ArchiveInfo, ErrorKind, Run, RunError, RunState, Store, Trigger, is_due};
+use crate::state::{
+    ArchiveInfo, ErrorKind, Run, RunError, RunState, Store, Target, TargetSelection, Trigger,
+    is_due,
+};
 use crate::wake::{self, Availability, WakeEvent};
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
+    pub target: TargetSelection,
+    pub stick_uuid: Option<String>,
     pub trigger: Trigger,
     /// Pre-assigned run ID (used when the daemon starts a run).
     pub run_id: Option<String>,
@@ -342,6 +347,8 @@ struct Reporter<'a> {
     log: File,
     /// Written by the daemon before it cancels the run: who asked.
     cancel_note: PathBuf,
+    full_verification: Option<crate::state::FullVerification>,
+    reclaim_after_failure: bool,
 }
 
 /// File in which the daemon records who cancelled run `run_id`.
@@ -395,7 +402,7 @@ impl Reporter<'_> {
 
     /// Finish as cancelled if a cancel was requested. Returns true then.
     fn cancelled(&mut self) -> bool {
-        if crate::cancel::requested() && !self.run.state.is_finished() {
+        if !self.run.state.is_finished() && (crate::cancel::requested() || self.stick_missing()) {
             self.fail(
                 RunState::Cancelled,
                 RunError {
@@ -408,7 +415,26 @@ impl Reporter<'_> {
         false
     }
 
-    fn fail(&mut self, state: RunState, mut error: RunError) {
+    fn stick_missing(&self) -> bool {
+        self.run.target == Target::Stick
+            && self
+                .run
+                .stick_uuid
+                .as_deref()
+                .is_some_and(|uuid| !crate::stick::target::present(uuid))
+    }
+
+    fn fail(&mut self, state: RunState, error: RunError) {
+        let (state, mut error) = if self.run.target == Target::Stick {
+            stick_failure(
+                state,
+                error,
+                self.stick_missing(),
+                crate::cancel::requested(),
+            )
+        } else {
+            (state, error)
+        };
         if error.kind == ErrorKind::Cancelled
             && let Some(who) = read_cancel_note(&self.cancel_note)
         {
@@ -420,50 +446,159 @@ impl Reporter<'_> {
     }
 }
 
+fn stick_failure(
+    state: RunState,
+    error: RunError,
+    missing: bool,
+    cancelled: bool,
+) -> (RunState, RunError) {
+    if missing || error.kind == ErrorKind::StickNotPluggedIn {
+        (
+            RunState::StickNotPluggedIn,
+            crate::stick::target::error(
+                ErrorKind::StickNotPluggedIn,
+                format!("stick not plugged in; {}", error.message),
+            ),
+        )
+    } else if cancelled {
+        (
+            RunState::Cancelled,
+            crate::stick::target::error(
+                ErrorKind::Cancelled,
+                format!("the stick backup was cancelled; {}", error.message),
+            ),
+        )
+    } else {
+        (state, error)
+    }
+}
+
 pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
-    let _lock = match RunLock::try_acquire_for(paths, options.run_id.as_deref()) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => {
-            eprintln!("another backup run is in progress");
-            // A run promised by the daemon (pre-assigned ID) gets a final record
-            // so it does not stay "starting" forever. state.json belongs to the
-            // run holding the lock and is not touched.
-            if let Some(id) = options
-                .run_id
-                .as_deref()
-                .filter(|id| crate::state::is_valid_run_id(id))
-            {
-                let store = Store::new(paths);
-                let mut run = Run::new(options.trigger, Utc::now());
-                run.id = id.to_string();
-                run.error = Some(RunError {
-                    kind: ErrorKind::AlreadyRunning,
-                    message: "another backup run was already in progress".into(),
-                });
-                run.finish(RunState::Cancelled, Utc::now());
-                store.record_run_only(&run)?;
-                store.clear_current_if(id)?;
-            }
-            return Ok(RunExit::AlreadyRunning);
-        }
-        Err(e) => match e.downcast_ref::<LockBlocked>() {
-            Some(blocked) => return record_blocked(paths, options, &blocked.message),
-            None => return Err(e),
-        },
-    };
     crate::cancel::install_handler();
-    let store = Store::new(paths);
-    // Taken before the file is parsed: this is what a failure is tied to.
+    let wait_started = std::time::Instant::now();
+    let _lock = loop {
+        match RunLock::try_acquire_for(paths, options.run_id.as_deref()) {
+            Ok(Some(lock)) => break lock,
+            Ok(None) if options.trigger == Trigger::Plug => {
+                if crate::cancel::requested() {
+                    return Ok(RunExit::Cancelled);
+                }
+                if wait_started.elapsed() >= std::time::Duration::from_secs(12 * 3600) {
+                    anyhow::bail!("timed out waiting for the shared run lock");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Ok(None) => {
+                eprintln!("another backup run is in progress");
+                // A run promised by the daemon (pre-assigned ID) gets a final record
+                // so it does not stay "starting" forever. state.json belongs to the
+                // run holding the lock and is not touched.
+                if let Some(id) = options
+                    .run_id
+                    .as_deref()
+                    .filter(|id| crate::state::is_valid_run_id(id))
+                {
+                    let store = Store::new(paths);
+                    let mut run = Run::new(options.trigger, Utc::now());
+                    run.id = id.to_string();
+                    run.error = Some(RunError {
+                        kind: ErrorKind::AlreadyRunning,
+                        message: "another backup run was already in progress".into(),
+                    });
+                    run.finish(RunState::Cancelled, Utc::now());
+                    store.record_run_only(&run)?;
+                    store.clear_current_if(id)?;
+                }
+                return Ok(RunExit::AlreadyRunning);
+            }
+            Err(e) => match e.downcast_ref::<LockBlocked>() {
+                Some(blocked) => return record_blocked(paths, options, &blocked.message),
+                None => return Err(e),
+            },
+        }
+    };
     let config_stamp = crate::state::config_stamp(&paths.config_file);
     let config = Config::load(&paths.config_file);
-    let state = store.load_state()?;
+    let targets: Vec<Target> = match &config {
+        Ok(config) => [Target::Stick, Target::Pbs]
+            .into_iter()
+            .filter(|t| {
+                options.target.includes(*t)
+                    && match t {
+                        Target::Stick => config.stick.is_some(),
+                        Target::Pbs => config.pbs.is_some(),
+                    }
+            })
+            .collect(),
+        Err(_) => vec![if options.target == TargetSelection::Stick {
+            Target::Stick
+        } else {
+            Target::Pbs
+        }],
+    };
+    anyhow::ensure!(
+        !targets.is_empty(),
+        "requested backup target is not configured"
+    );
+    // The lock spans all selected targets. A newly plugged-in stick therefore
+    // completes before a possibly sleeping remote PBS is contacted.
+    let mut result = RunExit::NotDue;
+    for (index, target) in targets.into_iter().enumerate() {
+        let mut one = options.clone();
+        if index > 0 {
+            one.run_id = None;
+        }
+        let outcome = execute_target(paths, &one, target, &config, config_stamp.clone())?;
+        if outcome == RunExit::Cancelled {
+            return Ok(outcome);
+        }
+        result = match (result, outcome) {
+            (RunExit::Failed, _) | (_, RunExit::Failed) => RunExit::Failed,
+            (RunExit::PbsUnreachable, _) | (_, RunExit::PbsUnreachable) => RunExit::PbsUnreachable,
+            (_, RunExit::NotDue) => result,
+            (_, other) => other,
+        };
+    }
+    Ok(result)
+}
 
-    if let Some(reason) = timer_skip(&config, &state, config_stamp.as_deref(), options) {
+fn execute_target(
+    paths: &Paths,
+    options: &RunOptions,
+    target: Target,
+    config: &Result<Config>,
+    config_stamp: Option<String>,
+) -> Result<RunExit> {
+    crate::cancel::install_handler();
+    let store = Store::for_target(paths, target);
+    let mut state = store.load_state()?;
+
+    // An hourly presence probe is not a backup attempt. In particular it must
+    // not evict real runs or reset failure/last-success evidence.
+    if target == Target::Stick && options.trigger == Trigger::Timer {
+        state.last_checked_at = Some(Utc::now());
+        store.save_state(&state)?;
+        if let Ok(cfg) = config
+            && matches!(
+                crate::stick::target::attached(cfg, options.stick_uuid.as_deref()),
+                Ok(None)
+            )
+        {
+            eprintln!("stick not plugged in; presence checked without starting a run");
+            return Ok(RunExit::NotDue);
+        }
+    }
+
+    if plug_switched_off(paths, options) {
+        return Ok(RunExit::NotDue);
+    }
+    if let Some(reason) = timer_skip(config, &state, config_stamp.as_deref(), options) {
         eprintln!("{reason}");
         return Ok(RunExit::NotDue);
     }
 
     let mut run = Run::new(options.trigger, Utc::now());
+    run.target = target;
     if let Some(id) = &options.run_id
         && crate::state::is_valid_run_id(id)
     {
@@ -499,6 +634,8 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
         run,
         log,
         cancel_note: cancel_note.clone(),
+        full_verification: None,
+        reclaim_after_failure: false,
     };
     rep.phase(
         RunState::Starting,
@@ -511,7 +648,8 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
 
     let keep = config.as_ref().map(|c| c.backup.keep_runs).unwrap_or(200);
     let result = match &config {
-        Ok(cfg) => pipeline(paths, cfg, &mut rep),
+        Ok(cfg) if target == Target::Stick => stick_pipeline(paths, cfg, options, &mut rep),
+        Ok(cfg) => pipeline(paths, cfg, &mut rep, None),
         Err(e) => {
             rep.fail(
                 RunState::Failed,
@@ -541,9 +679,24 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
             },
         );
     }
+    if target == Target::Stick
+        && !matches!(
+            rep.run.state,
+            RunState::Cancelled | RunState::StickNotPluggedIn
+        )
+        && (crate::cancel::requested() || rep.stick_missing())
+    {
+        rep.fail(
+            RunState::Cancelled,
+            crate::stick::target::error(
+                ErrorKind::Cancelled,
+                "interrupted before completing stick cleanup",
+            ),
+        );
+    }
     let final_state = rep.run.state;
     rep.line(&format!("run finished: {:?}", final_state));
-    store.record_finished_with_config(&rep.run, keep, config_stamp)?;
+    store.record_finished_with_maintenance(&rep.run, keep, config_stamp, rep.full_verification)?;
     // The run is finished and recorded. Tidying up must not turn its result
     // into an error: if `current.json` cannot be removed now (its lock is
     // held past the time limit), it is left behind, counts as stale after a
@@ -555,10 +708,23 @@ pub fn execute(paths: &Paths, options: &RunOptions) -> Result<RunExit> {
     let _ = fs::remove_file(&cancel_note);
     Ok(match final_state {
         RunState::Succeeded => RunExit::Succeeded,
-        RunState::PbsUnreachable => RunExit::PbsUnreachable,
+        RunState::PbsUnreachable | RunState::StickNotPluggedIn => RunExit::PbsUnreachable,
         RunState::Cancelled => RunExit::Cancelled,
         _ => RunExit::Failed,
     })
+}
+
+/// Plugging in a registered stick starts a backup only while automatic
+/// backups are on (the backup timer, decision 0013). With them switched off
+/// backups run only when started by hand, also for the stick.
+fn plug_switched_off(paths: &Paths, options: &RunOptions) -> bool {
+    let off = options.trigger == Trigger::Plug
+        && !options.force
+        && crate::status::timer_switched_off(&paths.systemctl);
+    if off {
+        eprintln!("automatic backups are switched off; plugging in the stick does not start one");
+    }
+    off
 }
 
 /// Why a timer run does not start now (not due yet, or the growing pause
@@ -570,7 +736,8 @@ fn timer_skip(
     config_stamp: Option<&str>,
     options: &RunOptions,
 ) -> Option<String> {
-    let (Ok(cfg), Trigger::Timer, false) = (config, options.trigger, options.force) else {
+    let (Ok(cfg), Trigger::Timer | Trigger::Plug, false) = (config, options.trigger, options.force)
+    else {
         return None;
     };
     let now = Utc::now();
@@ -582,8 +749,9 @@ fn timer_skip(
     }
     // After failures in a row the timer pauses longer and longer; manual
     // runs and a changed configuration are not held back.
-    if let Some(not_before) =
-        crate::state::retry_not_before(state, cfg.schedule.interval_hours, config_stamp, now)
+    if options.trigger == Trigger::Timer
+        && let Some(not_before) =
+            crate::state::retry_not_before(state, cfg.schedule.interval_hours, config_stamp, now)
         && now < not_before
     {
         return Some(format!(
@@ -605,15 +773,26 @@ fn timer_skip(
 /// ([`Store::record_finished_serialised`]), so the count of failures in a
 /// row is not lost.
 fn record_blocked(paths: &Paths, options: &RunOptions, message: &str) -> Result<RunExit> {
-    let store = Store::new(paths);
     let config_stamp = crate::state::config_stamp(&paths.config_file);
     let config = Config::load(&paths.config_file);
+    let target = if options.target == TargetSelection::Stick
+        || config.as_ref().is_ok_and(|c| c.pbs.is_none())
+    {
+        Target::Stick
+    } else {
+        Target::Pbs
+    };
+    let store = Store::for_target(paths, target);
     let state = store.load_state()?;
+    if plug_switched_off(paths, options) {
+        return Ok(RunExit::NotDue);
+    }
     if let Some(reason) = timer_skip(&config, &state, config_stamp.as_deref(), options) {
         eprintln!("{reason}");
         return Ok(RunExit::NotDue);
     }
     let mut run = Run::new(options.trigger, Utc::now());
+    run.target = target;
     if let Some(id) = &options.run_id
         && crate::state::is_valid_run_id(id)
     {
@@ -645,7 +824,117 @@ fn record_blocked(paths: &Paths, options: &RunOptions, message: &str) -> Result<
     Ok(RunExit::Failed)
 }
 
-fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()> {
+fn stick_pipeline(
+    paths: &Paths,
+    config: &Config,
+    options: &RunOptions,
+    rep: &mut Reporter<'_>,
+) -> Result<()> {
+    let Some(uuid) = crate::stick::target::attached(config, options.stick_uuid.as_deref())? else {
+        rep.fail(
+            RunState::StickNotPluggedIn,
+            crate::stick::target::error(ErrorKind::StickNotPluggedIn, "stick not plugged in"),
+        );
+        return Ok(());
+    };
+    rep.run.stick_uuid = Some(uuid.clone());
+    if let Err(e) = crate::stick::launcher::preflight() {
+        rep.fail(
+            RunState::Failed,
+            RunError::from_error(&e, ErrorKind::StickUnsupported),
+        );
+        return Ok(());
+    }
+    crate::stick::target::isolate_mounts()?;
+    let mut session = match crate::stick::target::Session::open(paths, &uuid) {
+        Ok(session) => session,
+        Err(error) => {
+            rep.fail(RunState::Failed, error);
+            return Ok(());
+        }
+    };
+    if let Err(e) = session.start(paths) {
+        let kind = if format!("{e:#}")
+            .to_ascii_lowercase()
+            .contains("no space left")
+        {
+            ErrorKind::StickFull
+        } else {
+            ErrorKind::Internal
+        };
+        rep.fail(RunState::Failed, RunError::from_error(&e, kind));
+        return Ok(());
+    }
+    if let Err(e) = crate::notify::stick_event(
+        config,
+        crate::notify::StickEvent::Start,
+        "Backup to stick started",
+    ) {
+        rep.warn(format!("stick start notification failed: {e:#}"));
+    }
+    let result = pipeline(paths, config, rep, Some(session.pbs()));
+    if rep.reclaim_after_failure
+        && rep.run.state == RunState::Failed
+        && !crate::cancel::requested()
+        && !rep.stick_missing()
+    {
+        // Failed uploads can leave unreferenced chunks. GC alone may reclaim
+        // them after PBS's atime cutoff; never prune as a response to failure.
+        rep.line("reclaiming orphaned chunks after failed upload/full stick (no prune)");
+        if let Err(e) = session
+            .pbs()
+            .maintenance(&["garbage-collection", "start", "stick"])
+        {
+            rep.warn(format!("garbage collection after failure failed: {e:#}"));
+            if crate::cancel::requested() || rep.stick_missing() {
+                rep.fail(
+                    RunState::Failed,
+                    RunError::from_error(&e, ErrorKind::Internal),
+                );
+            }
+        }
+    }
+    // Publish the latest usage after retention or failure-only GC, rather
+    // than leaving the UI with the space measured before the upload.
+    if !crate::cancel::requested() && !rep.stick_missing() {
+        let usage = Client::local(
+            config,
+            SecretStore::new(&paths.credentials_dir),
+            session.pbs(),
+        )
+        .space_info();
+        match usage {
+            Ok((available, total)) => {
+                let mut state = rep.store.load_state()?;
+                state.available_bytes = Some(available);
+                state.total_bytes = total;
+                state.space_checked_at = Some(Utc::now());
+                rep.store.save_state(&state)?;
+            }
+            Err(e) => rep.warn(format!("could not refresh stick capacity: {e:#}")),
+        }
+    }
+    // Safe-to-unplug means server stopped, writes flushed and filesystem
+    // unmounted. Never emit it merely because the upload finished.
+    session.close()?;
+    if rep.run.state == RunState::Succeeded && result.is_ok() {
+        if let Err(e) = crate::notify::stick_event(
+            config,
+            crate::notify::StickEvent::SafeToUnplug,
+            "Stick backup finished; safe to unplug",
+        ) {
+            rep.warn(format!("stick completion notification failed: {e:#}"));
+        }
+    }
+    result
+}
+
+fn pipeline(
+    paths: &Paths,
+    config: &Config,
+    rep: &mut Reporter<'_>,
+    local: Option<&crate::stick::launcher::LocalPbs>,
+) -> Result<()> {
     // System mode: the effective sources depend on the current disk layout.
     let system_config;
     let mut system_layout = None;
@@ -712,7 +1001,15 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
                 return Ok(());
             }
         };
-        if state.key_exported_digest.as_deref() != Some(key_digest.as_str()) {
+        let stick_proof = local.is_some()
+            && config.pbs.is_none()
+            && rep
+                .run
+                .stick_uuid
+                .as_ref()
+                .and_then(|uuid| state.stick_media.get(uuid))
+                .is_some_and(|proof| proof.key_digest.as_deref() == Some(&key_digest));
+        if state.key_exported_digest.as_deref() != Some(key_digest.as_str()) && !stick_proof {
             rep.fail(
                 RunState::Failed,
                 config_error(
@@ -832,57 +1129,63 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         }
     }
 
-    // 3. PBS availability.
-    rep.phase(
-        RunState::WakingPbs,
-        &format!("checking PBS {}:{}", config.pbs.server, config.pbs.port),
-    );
-    let mut wake_send_failed = false;
-    let availability = wake::ensure_available(config, |event| match event {
-        WakeEvent::Info(msg) => rep.line(msg),
-        WakeEvent::SendFailed(msg) => {
-            wake_send_failed = true;
-            rep.warn(msg.to_string());
-        }
-        WakeEvent::SendRecovered => {
-            wake_send_failed = false;
-            rep.line(&event.to_string());
-        }
-        WakeEvent::PacketSent => {}
-    })?;
-    if rep.cancelled() {
-        return Ok(());
-    }
-    state.pbs_checked_at = Some(Utc::now());
-    state.pbs_reachable = Some(availability != Availability::Unreachable);
-    rep.store.save_state(&state)?;
-    match availability {
-        Availability::Reachable => rep.line("PBS reachable"),
-        Availability::ReachableAfterWake { waited_seconds } => rep.line(&format!(
-            "PBS reachable after Wake-on-LAN ({waited_seconds} s)"
-        )),
-        Availability::Unreachable => {
-            let message = if wake_send_failed {
-                "PBS did not answer, also not after Wake-on-LAN (sending the wake-up packet \
-                 failed, see the warning above)"
-            } else if config.active_wake().is_some() {
-                "PBS did not answer, also not after Wake-on-LAN"
-            } else {
-                "PBS did not answer"
-            };
-            rep.fail(
-                RunState::PbsUnreachable,
-                RunError {
-                    kind: ErrorKind::PbsUnreachable,
-                    message: message.into(),
-                },
-            );
+    if local.is_none() {
+        // 3. PBS availability.
+        rep.phase(
+            RunState::WakingPbs,
+            &format!(
+                "checking PBS {}:{}",
+                config.remote_pbs()?.server,
+                config.remote_pbs()?.port
+            ),
+        );
+        let mut wake_send_failed = false;
+        let availability = wake::ensure_available(config, |event| match event {
+            WakeEvent::Info(msg) => rep.line(msg),
+            WakeEvent::SendFailed(msg) => {
+                wake_send_failed = true;
+                rep.warn(msg.to_string());
+            }
+            WakeEvent::SendRecovered => {
+                wake_send_failed = false;
+                rep.line(&event.to_string());
+            }
+            WakeEvent::PacketSent => {}
+        })?;
+        if rep.cancelled() {
             return Ok(());
         }
-    }
+        state.pbs_checked_at = Some(Utc::now());
+        state.pbs_reachable = Some(availability != Availability::Unreachable);
+        rep.store.save_state(&state)?;
+        match availability {
+            Availability::Reachable => rep.line("PBS reachable"),
+            Availability::ReachableAfterWake { waited_seconds } => rep.line(&format!(
+                "PBS reachable after Wake-on-LAN ({waited_seconds} s)"
+            )),
+            Availability::Unreachable => {
+                let message = if wake_send_failed {
+                    "PBS did not answer, also not after Wake-on-LAN (sending the wake-up packet \
+                 failed, see the warning above)"
+                } else if config.active_wake().is_some() {
+                    "PBS did not answer, also not after Wake-on-LAN"
+                } else {
+                    "PBS did not answer"
+                };
+                rep.fail(
+                    RunState::PbsUnreachable,
+                    RunError {
+                        kind: ErrorKind::PbsUnreachable,
+                        message: message.into(),
+                    },
+                );
+                return Ok(());
+            }
+        }
 
-    if rep.cancelled() {
-        return Ok(());
+        if rep.cancelled() {
+            return Ok(());
+        }
     }
     // 4. Inventory.
     let mut inventory_dir = None;
@@ -958,7 +1261,11 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
     };
     let spec = BackupSpec {
         backup_id: backup_id.clone(),
-        namespace: config.pbs.namespace.clone(),
+        namespace: if local.is_some() {
+            None
+        } else {
+            config.remote_pbs()?.namespace.clone()
+        },
         backup_time,
         archives: archives.clone(),
         excludes: config.backup.excludes.clone(),
@@ -973,8 +1280,47 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
     if rep.cancelled() {
         return Ok(());
     }
-    let client = Client::new(config, secrets);
+    let client = match local {
+        Some(pbs) => Client::local(config, secrets, pbs),
+        None => Client::new(config, secrets),
+    };
+    if local.is_some() {
+        if let Err(e) = client.check_group_key(&backup_id) {
+            rep.fail(
+                RunState::Failed,
+                RunError::from_error(&e, crate::client::group_key_error_kind(&e)),
+            );
+            return Ok(());
+        }
+        match client.space_info() {
+            Ok((available, total)) => {
+                state.available_bytes = Some(available);
+                state.total_bytes = total;
+                state.space_checked_at = Some(Utc::now());
+                rep.store.save_state(&state)?;
+                if available
+                    < config
+                        .stick
+                        .as_ref()
+                        .context("missing stick configuration")?
+                        .minimum_free_bytes
+                {
+                    rep.reclaim_after_failure = true;
+                    rep.fail(RunState::Failed, crate::stick::target::error(ErrorKind::StickFull, "stick full: insufficient space available to the PBS user; retention policy was kept"));
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                rep.fail(
+                    RunState::Failed,
+                    RunError::from_error(&e, ErrorKind::Internal),
+                );
+                return Ok(());
+            }
+        }
+    }
     let mut log = rep.log.try_clone().context("cannot duplicate log handle")?;
+    rep.reclaim_after_failure = local.is_some();
     let outcome = client.backup(&spec, &mut log, &mut |stats| {
         // Live progress for the dashboard after each finished archive.
         rep.run.processed_bytes =
@@ -985,7 +1331,13 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
     });
     let outcome = match outcome {
         Ok(o) => o,
-        Err(error) => {
+        Err(mut error) => {
+            if local.is_some() {
+                let message = error.message.to_ascii_lowercase();
+                if message.contains("no space left") || message.contains("enospc") {
+                    error.kind = ErrorKind::StickFull;
+                }
+            }
             let state = match error.kind {
                 ErrorKind::PbsUnreachable => RunState::PbsUnreachable,
                 ErrorKind::Cancelled => RunState::Cancelled,
@@ -995,6 +1347,7 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             return Ok(());
         }
     };
+    rep.reclaim_after_failure = false;
     rep.run.snapshot = Some(snapshot.clone());
     rep.run.archives = archives
         .iter()
@@ -1105,8 +1458,98 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
             return Ok(());
         }
     }
-    // Verified: a cancel request that arrives now comes too late.
+    // Remote backups are complete after read-back. Stick backups still need
+    // server verification and maintenance, all of which remain cancellable.
     record_server_verification(rep, &client, &backup_id);
+
+    if let Some(pbs) = local {
+        if rep.cancelled() {
+            return Ok(());
+        }
+        let uuid = rep.run.stick_uuid.clone().context("stick UUID missing")?;
+        let state = rep.store.load_state()?;
+        let full_due = crate::stick::target::full_verify_due(
+            state
+                .stick_media
+                .get(&uuid)
+                .and_then(|m| m.full_checked_at.or(m.full_verified_at)),
+            Utc::now(),
+        );
+        rep.phase(
+            RunState::Finishing,
+            "verifying the new stick snapshot with PBS",
+        );
+        if let Err(e) = pbs.verify_snapshot(&backup_id, backup_time) {
+            record_server_verification(rep, &client, &backup_id);
+            rep.fail(
+                RunState::Failed,
+                RunError::from_error(&e, ErrorKind::VerificationFailed),
+            );
+            return Ok(());
+        }
+        if rep.cancelled() {
+            return Ok(());
+        }
+        record_server_verification(rep, &client, &backup_id);
+        let snapshots =
+            client.list_snapshots_bounded(&backup_id, crate::client::readback_list_timeout())?;
+        if !snapshots
+            .iter()
+            .any(|s| s.snapshot == snapshot && s.verified.as_deref() == Some("ok"))
+        {
+            rep.fail(
+                RunState::Failed,
+                crate::stick::target::error(
+                    ErrorKind::VerificationFailed,
+                    "PBS did not confirm the new stick snapshot as verified",
+                ),
+            );
+            return Ok(());
+        }
+        if full_due {
+            rep.phase(
+                RunState::Finishing,
+                "monthly PBS verification of the complete stick",
+            );
+            let checked = pbs.maintenance(&["verify", "stick", "--ignore-verified", "false"]);
+            if rep.cancelled() {
+                return Ok(());
+            }
+            rep.full_verification = Some(crate::state::FullVerification {
+                checked_at: Utc::now(),
+                succeeded: checked.is_ok(),
+            });
+            if let Err(e) = checked {
+                rep.warn(format!("stick damaged: monthly datastore verification failed; the new snapshot is verified and this machine's retention continues: {e:#}"));
+            }
+            record_server_verification(rep, &client, &backup_id);
+        }
+        rep.phase(
+            RunState::Finishing,
+            "applying stick retention and garbage collection",
+        );
+        // Prove ownership again immediately before destructive maintenance.
+        client.check_group_key(&backup_id)?;
+        if rep.cancelled() {
+            return Ok(());
+        }
+        client.prune_stick(
+            &backup_id,
+            &config
+                .stick
+                .as_ref()
+                .context("missing stick configuration")?
+                .retention,
+        )?;
+        if rep.cancelled() {
+            return Ok(());
+        }
+        pbs.maintenance(&["garbage-collection", "start", "stick"])?;
+        if rep.cancelled() {
+            return Ok(());
+        }
+        record_server_verification(rep, &client, &backup_id);
+    }
 
     // 7. Notes on the snapshot, readable by the read-only overview.
     rep.phase(RunState::Finishing, "writing snapshot notes");
@@ -1116,6 +1559,9 @@ fn pipeline(paths: &Paths, config: &Config, rep: &mut Reporter<'_>) -> Result<()
         client.set_notes_bounded(&snapshot, &notes, crate::client::readback_list_timeout())
     {
         rep.warn(format!("could not write snapshot notes: {e:#}"));
+    }
+    if local.is_some() && rep.cancelled() {
+        return Ok(());
     }
     rep.run.finish(RunState::Succeeded, Utc::now());
     Ok(())
@@ -1154,6 +1600,9 @@ fn backup_metadata(
         nestegg_version: env!("CARGO_PKG_VERSION").into(),
         backup_id: backup_id.into(),
         hostname: ctx.hostname.clone(),
+        machine_id: fs::read_to_string("/etc/machine-id")
+            .ok()
+            .and_then(|s| crate::metadata::machine_identity(&s)),
         backup_time,
         snapshot: snapshot_path(backup_id, backup_time),
         archive_sources: ctx
@@ -1195,16 +1644,19 @@ fn note_readback(rep: &mut Reporter<'_>, outcome: &crate::verify::Outcome) -> u3
 /// Store the snapshots of this machine that the server's own verification
 /// marked as failed (`State::server_verify_failed`).
 fn record_server_verification(rep: &mut Reporter<'_>, client: &Client, backup_id: &str) {
-    let failed =
-        match client.list_snapshots_bounded(backup_id, crate::client::readback_list_timeout()) {
-            Ok(list) => crate::verify::failed_snapshots(&list),
-            Err(e) => {
-                rep.warn(format!(
-                    "could not read the server's verification state: {e:#}"
-                ));
-                return;
-            }
-        };
+    let failed = match if rep.run.target == Target::Stick {
+        client.list_all_snapshots_bounded(crate::client::readback_list_timeout())
+    } else {
+        client.list_snapshots_bounded(backup_id, crate::client::readback_list_timeout())
+    } {
+        Ok(list) => crate::verify::failed_snapshots(&list),
+        Err(e) => {
+            rep.warn(format!(
+                "could not read the server's verification state: {e:#}"
+            ));
+            return;
+        }
+    };
     if !failed.is_empty() {
         rep.line(&format!(
             "the server's verification marked {} snapshot(s) as failed: {}",
@@ -1323,6 +1775,109 @@ pub fn parse_report(notes: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_stick_step_preserves_cancellation_and_device_loss() {
+        for (step, fallback) in [
+            ("new snapshot verify", ErrorKind::VerificationFailed),
+            ("monthly verify", ErrorKind::VerificationFailed),
+            ("prune", ErrorKind::Internal),
+            ("GC", ErrorKind::Internal),
+            ("group key", ErrorKind::KeyMismatch),
+            ("PBS startup", ErrorKind::Internal),
+            ("flush/unmount", ErrorKind::Internal),
+        ] {
+            let error = crate::stick::target::error(fallback, step);
+            assert_eq!(
+                stick_failure(RunState::Failed, error.clone(), false, false),
+                (RunState::Failed, error.clone())
+            );
+            let (state, cancelled) = stick_failure(RunState::Failed, error.clone(), false, true);
+            assert_eq!(
+                (state, cancelled.kind),
+                (RunState::Cancelled, ErrorKind::Cancelled),
+                "{step}"
+            );
+            for cancel in [false, true] {
+                let (state, missing) = stick_failure(RunState::Failed, error.clone(), true, cancel);
+                assert_eq!(
+                    (state, missing.kind),
+                    (RunState::StickNotPluggedIn, ErrorKind::StickNotPluggedIn),
+                    "{step}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plugging_in_does_not_back_up_while_automatic_backups_are_off() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = |answer: &str| {
+            let path = dir.path().join(format!("systemctl-{answer}"));
+            std::fs::write(&path, format!("#!/bin/sh\necho {answer}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let mut paths = Paths {
+            config_file: dir.path().join("config.toml"),
+            credentials_dir: dir.path().join("credentials"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+            systemctl: fake("disabled"),
+        };
+        let mut options = RunOptions {
+            target: TargetSelection::Stick,
+            stick_uuid: None,
+            trigger: Trigger::Plug,
+            run_id: None,
+            force: false,
+        };
+        assert!(plug_switched_off(&paths, &options));
+        paths.systemctl = fake("masked");
+        assert!(plug_switched_off(&paths, &options));
+        paths.systemctl = fake("enabled");
+        assert!(!plug_switched_off(&paths, &options));
+        // Without systemd nothing is known to be off.
+        paths.systemctl = dir.path().join("no-systemctl");
+        assert!(!plug_switched_off(&paths, &options));
+        // Timer and manual runs are not gated here.
+        paths.systemctl = fake("disabled");
+        options.trigger = Trigger::Manual;
+        assert!(!plug_switched_off(&paths, &options));
+    }
+
+    #[test]
+    fn plug_respects_due_time_but_bypasses_failure_pause() {
+        let cfg = crate::config::example("pbs.example.com", "store", "backup@pbs!desktop");
+        let mut run = Run::new(Trigger::Timer, Utc::now());
+        run.finish(RunState::Failed, Utc::now());
+        let mut state = crate::state::State {
+            last_run: Some(run),
+            consecutive_failures: 3,
+            failed_config: Some("same".into()),
+            ..Default::default()
+        };
+        let mut options = RunOptions {
+            target: TargetSelection::Stick,
+            stick_uuid: None,
+            trigger: Trigger::Timer,
+            run_id: None,
+            force: false,
+        };
+        let cfg = Ok(cfg);
+        assert!(timer_skip(&cfg, &state, Some("same"), &options).is_some());
+        options.trigger = Trigger::Plug;
+        assert!(timer_skip(&cfg, &state, Some("same"), &options).is_none());
+        let mut success = Run::new(Trigger::Plug, Utc::now());
+        success.finish(RunState::Succeeded, Utc::now());
+        state.last_success = Some(success);
+        assert!(
+            timer_skip(&cfg, &state, Some("same"), &options)
+                .unwrap()
+                .contains("not due yet")
+        );
+    }
 
     #[test]
     fn exit_codes() {

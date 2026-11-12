@@ -19,6 +19,7 @@ import type {
   SettingsChange,
   Snapshot,
   Status,
+  Target,
 } from "./types";
 
 export type FailureKind =
@@ -28,6 +29,7 @@ export type FailureKind =
   | "not_found" // 404
   | "conflict" // 409
   | "pbs_unreachable" // 503
+  | "stick_unavailable" // 503 `stick_unavailable`: the stick could not be opened (not plugged in, busy, unreadable)
   | "bad_request" // 400
   | "other";
 
@@ -37,6 +39,7 @@ export class ApiFailure extends Error {
     readonly status: number,
     readonly code: string | null,
     message: string,
+    readonly reason: string | null = null,
   ) {
     super(message);
   }
@@ -45,6 +48,7 @@ export class ApiFailure extends Error {
 function kindOf(status: number, code: string | null): FailureKind {
   if (status === 401) return "unauthorized";
   if (status === 501 || code === "not_implemented") return "not_implemented";
+  if (code === "stick_unavailable") return "stick_unavailable";
   if (status === 503 || code === "pbs_unreachable") return "pbs_unreachable";
   if (status === 502) return "daemon";
   if (status === 404) return "not_found";
@@ -72,40 +76,67 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     let code: string | null = null;
     let message = res.statusText;
+    let reason: string | null = null;
     const text = await res.text().catch(() => "");
     try {
-      const body = JSON.parse(text) as { code?: unknown; message?: unknown };
+      const body = JSON.parse(text) as { code?: unknown; message?: unknown; reason?: unknown };
+      if (typeof body.reason === "string") reason = body.reason;
       if (typeof body.code === "string") code = body.code;
       if (typeof body.message === "string") message = body.message;
     } catch {
       if (text.trim()) message = text.trim();
     }
-    throw new ApiFailure(kindOf(res.status, code), res.status, code, message);
+    throw new ApiFailure(kindOf(res.status, code), res.status, code, message, reason);
   }
   return (await res.json()) as T;
 }
 
 const q = (s: string) => encodeURIComponent(s);
+/** The server is the default target: requests for it stay as older daemons know them. */
+const sourceQuery = (source: Target, sep: "?" | "&", uuid?: string | null) => (source === "stick" ? `${sep}target=stick${uuid ? `&stick_uuid=${q(uuid)}` : ""}` : "");
+
+interface SourceEcho { target?: Target; stick_uuid?: string | null }
+/** Old PBS responses remain usable; stick data always needs a source echo. */
+export function verifySource<T extends SourceEcho>(value: T, source: Target, uuid?: string | null): T {
+  if ((value.target != null && value.target !== source)
+    || (source === "stick" && (value.target !== "stick" || typeof value.stick_uuid !== "string" || !value.stick_uuid || (uuid && value.stick_uuid.toLowerCase() !== uuid.toLowerCase())))) {
+    throw new ApiFailure("not_implemented", 0, "source_mismatch", "The daemon did not confirm the requested restore source. Update nestegg.");
+  }
+  return value;
+}
+async function snapshotSource(source: Target = "pbs", uuid?: string | null) {
+  return verifySource(await request<SourceEcho & { snapshots: Snapshot[] }>(`snapshots${sourceQuery(source, "?", uuid)}`), source, uuid);
+}
 
 export const api = {
   health: () => request<HealthInfo>("health"),
   status: () => request<Status>("status"),
   runs: (limit = 200) => request<{ runs: Run[] }>(`runs?limit=${limit}`).then((r) => r.runs),
   run: (id: string) => request<RunDetail>(`runs/${q(id)}`),
+  /** All configured targets (the stick first, then the backup server). */
   startRun: () => request<Run>("runs", { method: "POST" }),
+  /** Up to 200 runs of one target, newest first, including the active run. Older records without a target belong to the server. */
+  targetRuns: (target: Target) => request<{ runs: Run[] }>(`targets/${target}/runs`).then((r) => r.runs),
+  /**
+   * Back up to this target only. 202 means started: the run then shows up as `current_run`; a stick
+   * that is not plugged in ends that run as `stick_not_plugged_in`. 409: a backup is already running.
+   */
+  startTargetRun: (target: Target) => request<Run>(`targets/${target}/runs`, { method: "POST" }),
   /** Ask the daemon to stop a running backup. Rejects with kind `conflict` (`cannot_cancel`: still starting, or already over) or `not_found` (unknown run; older daemons also answered 404 for the former). */
   cancelRun: (id: string) => request<{ cancelling?: boolean }>(`runs/${q(id)}/cancel`, { method: "POST" }),
   pbs: () => request<PbsInfo>("pbs"),
   /** Runs the checks of `nestegg check`; without `wake` a sleeping PBS is reported as not checked; with `wake` it is woken first (can take minutes). */
   checkPbs: (wake: boolean) => request<PbsCheckResult>(`pbs/check${wake ? "?wake=true" : ""}`, { method: "POST" }),
-  snapshots: () => request<{ snapshots: Snapshot[] }>("snapshots").then((r) => r.snapshots),
-  browse: (time: string, archive: string, path: string) =>
-    request<{ entries: DirEntry[] }>(`snapshots/${q(time)}/browse?archive=${q(archive)}&path=${q(path)}`).then(
-      (r) => r.entries,
-    ),
-  startRestore: (body: RestoreRequest) =>
-    request<Restore>("restores", { method: "POST", body: JSON.stringify(body) }),
-  restore: (id: string) => request<Restore>(`restores/${q(id)}`),
+  /** Snapshots on the server, or with `stick` on the plugged-in stick (503 `stick_unavailable` when it cannot be opened). */
+  snapshotSource,
+  snapshots: (source: Target = "pbs", uuid?: string | null) => snapshotSource(source, uuid).then((r) => r.snapshots),
+  browse: async (time: string, archive: string, path: string, source: Target = "pbs", uuid?: string | null) =>
+    verifySource(await request<SourceEcho & { entries: DirEntry[] }>(
+      `snapshots/${q(time)}/browse?archive=${q(archive)}&path=${q(path)}${sourceQuery(source, "&", uuid)}`,
+    ), source, uuid).entries,
+  startRestore: async (body: RestoreRequest) =>
+    verifySource(await request<Restore>("restores", { method: "POST", body: JSON.stringify(body) }), body.target ?? "pbs", body.stick_uuid),
+  restore: async (id: string, source: Target = "pbs", uuid?: string | null) => verifySource(await request<Restore>(`restores/${q(id)}`), source, uuid),
   config: () => request<ConfigView>("config"),
   /**
    * Change settings (only the given fields); resolves to the new configuration.

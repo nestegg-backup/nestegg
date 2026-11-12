@@ -24,7 +24,7 @@ use crate::secrets::SecretStore;
 use crate::state::{Run, Store, Trigger, is_valid_run_id};
 
 pub const GROUP: &str = "nestegg";
-pub const API_VERSION: &str = "1";
+pub const API_VERSION: &str = "2";
 
 #[derive(Clone)]
 struct App {
@@ -94,10 +94,22 @@ struct MetaKey {
 impl MetaKey {
     fn new(config: &Config, snapshot: &str) -> MetaKey {
         MetaKey {
-            server: config.pbs.server.clone(),
-            port: config.pbs.port,
-            datastore: config.pbs.datastore.clone(),
-            namespace: config.pbs.namespace.clone().unwrap_or_default(),
+            server: config
+                .pbs
+                .as_ref()
+                .map(|p| p.server.clone())
+                .unwrap_or_default(),
+            port: config.pbs.as_ref().map(|p| p.port).unwrap_or(8007),
+            datastore: config
+                .pbs
+                .as_ref()
+                .map(|p| p.datastore.clone())
+                .unwrap_or_default(),
+            namespace: config
+                .pbs
+                .as_ref()
+                .and_then(|p| p.namespace.clone())
+                .unwrap_or_default(),
             encryption: config.backup.encryption,
             snapshot: snapshot.to_string(),
         }
@@ -170,6 +182,8 @@ fn requester(peer: &PeerInfo) -> ApiResult<crate::restore::Requester> {
 
 #[derive(Clone, serde::Serialize)]
 struct RestoreJob {
+    target: crate::state::Target,
+    stick_uuid: Option<String>,
     #[serde(skip)]
     owner: u32,
     id: String,
@@ -191,6 +205,7 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    reason: Option<crate::rescue::desktop_api::UnavailableReason>,
 }
 
 impl ApiError {
@@ -199,6 +214,7 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            reason: None,
         }
     }
 
@@ -211,7 +227,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
             self.status,
-            Json(json!({ "code": self.code, "message": self.message })),
+            Json(json!({ "code": self.code, "message": self.message, "reason": self.reason })),
         )
             .into_response()
     }
@@ -233,6 +249,10 @@ pub fn router(paths: Paths) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/status", get(status))
         .route("/api/v1/runs", get(list_runs).post(start_run))
+        .route(
+            "/api/v1/targets/{target}/runs",
+            get(target_runs).post(start_target_run),
+        )
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/snapshots", get(list_snapshots))
         .route("/api/v1/runs/{id}/cancel", axum::routing::post(cancel_run))
@@ -298,7 +318,11 @@ async fn list_runs(
         if let Some(current) = crate::run::active_run(&app.paths)? {
             runs.push(current);
         }
-        runs.extend(store.list_runs(limit)?);
+        runs.extend(store.list_runs(usize::MAX)?);
+        let target = Config::load(&app.paths.config_file)
+            .map(|c| legacy_target(&c))
+            .unwrap_or(crate::state::TargetSelection::Pbs);
+        runs.retain(|r| target.includes(r.target));
         runs.truncate(limit);
         Ok(runs)
     })
@@ -345,15 +369,85 @@ fn log_tail(path: &Path, lines: usize) -> Vec<String> {
 }
 
 async fn start_run(AxState(app): AxState<App>) -> ApiResult<(StatusCode, Json<Run>)> {
+    let paths = app.paths.clone();
+    let target = blocking(move || Ok(legacy_target(&Config::load(&paths.config_file)?))).await?;
+    start_selected_run(app, target).await
+}
+
+fn legacy_target(config: &Config) -> crate::state::TargetSelection {
+    if config.pbs.is_some() {
+        crate::state::TargetSelection::Pbs
+    } else {
+        crate::state::TargetSelection::Stick
+    }
+}
+
+fn selection(value: &str) -> ApiResult<crate::state::TargetSelection> {
+    match value {
+        "pbs" => Ok(crate::state::TargetSelection::Pbs),
+        "stick" => Ok(crate::state::TargetSelection::Stick),
+        "all" => Ok(crate::state::TargetSelection::All),
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "target must be pbs, stick or all",
+        )),
+    }
+}
+
+async fn target_runs(
+    AxState(app): AxState<App>,
+    UrlPath(target): UrlPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let target = selection(&target)?;
+    let runs = blocking(move || {
+        let store = Store::new(&app.paths);
+        let mut runs = store.list_runs(usize::MAX)?;
+        if let Some(current) = crate::run::active_run(&app.paths)? {
+            runs.insert(0, current);
+        }
+        runs.retain(|r| target.includes(r.target));
+        runs.truncate(200);
+        Ok(runs)
+    })
+    .await?;
+    Ok(Json(json!({ "runs": runs })))
+}
+
+async fn start_target_run(
+    AxState(app): AxState<App>,
+    UrlPath(target): UrlPath<String>,
+) -> ApiResult<(StatusCode, Json<Run>)> {
+    start_selected_run(app, selection(&target)?).await
+}
+
+async fn start_selected_run(
+    app: App,
+    target: crate::state::TargetSelection,
+) -> ApiResult<(StatusCode, Json<Run>)> {
     let run = blocking(move || -> Result<std::result::Result<Run, &'static str>> {
         let _guard = app.start.lock().unwrap_or_else(|e| e.into_inner());
         if crate::run::active_run(&app.paths)?.is_some() {
             return Ok(Err("a backup run is already in progress"));
         }
-        let run = Run::new(Trigger::Manual, Utc::now());
+        let config = Config::load(&app.paths.config_file)?;
+        let mut run = Run::new(Trigger::Manual, Utc::now());
+        run.target = if target.includes(crate::state::Target::Stick) && config.stick.is_some() {
+            crate::state::Target::Stick
+        } else {
+            crate::state::Target::Pbs
+        };
+        if !match run.target {
+            crate::state::Target::Stick => config.stick.is_some(),
+            crate::state::Target::Pbs => {
+                config.pbs.is_some() && target.includes(crate::state::Target::Pbs)
+            }
+        } {
+            return Ok(Err("requested target is not configured"));
+        }
         let store = Store::new(&app.paths);
         store.save_current(&run)?;
-        if let Err(e) = spawn_run(&run.id) {
+        if let Err(e) = spawn_run(&run.id, target) {
             let _ = store.clear_current_if(&run.id);
             return Err(e);
         }
@@ -362,6 +456,11 @@ async fn start_run(AxState(app): AxState<App>) -> ApiResult<(StatusCode, Json<Ru
     .await?;
     match run {
         Ok(run) => Ok((StatusCode::ACCEPTED, Json(run))),
+        Err("requested target is not configured") => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "requested target is not configured",
+        )),
         Err(msg) => Err(ApiError::new(StatusCode::CONFLICT, "run_in_progress", msg)),
     }
 }
@@ -369,7 +468,7 @@ async fn start_run(AxState(app): AxState<App>) -> ApiResult<(StatusCode, Json<Ru
 /// Start `nestegg run` outside the daemon process: as a transient systemd
 /// unit when running under systemd (own cgroup, journal), otherwise as a
 /// detached child process.
-fn spawn_run(run_id: &str) -> Result<()> {
+fn spawn_run(run_id: &str, target: crate::state::TargetSelection) -> Result<()> {
     let exe = std::env::current_exe().context("cannot locate nestegg binary")?;
     let under_systemd =
         Path::new("/run/systemd/system").exists() && nix::unistd::geteuid().is_root();
@@ -389,7 +488,15 @@ fn spawn_run(run_id: &str) -> Result<()> {
     } else {
         Command::new(&exe)
     };
-    cmd.args(["run", "--trigger", "manual", "--run-id", run_id]);
+    cmd.args([
+        "run",
+        "--trigger",
+        "manual",
+        "--run-id",
+        run_id,
+        "--target",
+        target.as_str(),
+    ]);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -444,7 +551,103 @@ fn spawn_notify(paths: &Paths) {
     }
 }
 
-async fn list_snapshots(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Value>> {
+/// Optional restore source. Legacy callers continue to use the remote PBS.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RestoreTarget {
+    target: Option<String>,
+    stick_uuid: Option<String>,
+}
+impl RestoreTarget {
+    fn is_stick(&self) -> ApiResult<bool> {
+        match self.target.as_deref().unwrap_or("pbs") {
+            "stick" => Ok(true),
+            "pbs" if self.stick_uuid.is_none() => Ok(false),
+            _ => Err(bad_request(
+                "restore target must be pbs or stick; stick_uuid requires stick",
+            )),
+        }
+    }
+}
+
+fn stick_rpc(
+    paths: &Paths,
+    request: crate::rescue::desktop_api::Request,
+) -> ApiResult<serde_json::Value> {
+    use std::io::Write;
+    let mut child = Command::new(std::env::current_exe().map_err(ApiError::internal)?)
+        .args(["rescue", "stick-api"])
+        .env("NESTEGG_CONFIG", &paths.config_file)
+        .env("NESTEGG_CREDENTIALS_DIR", &paths.credentials_dir)
+        .env("NESTEGG_STATE_DIR", &paths.state_dir)
+        .env("NESTEGG_RUNTIME_DIR", &paths.runtime_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(ApiError::internal)?;
+    let bytes = serde_json::to_vec(&request).map_err(ApiError::internal)?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| ApiError::internal("missing worker stdin"))?
+        .write_all(&bytes)
+        .map_err(ApiError::internal)?;
+    let output = child.wait_with_output().map_err(ApiError::internal)?;
+    if !output.status.success() {
+        return Err(ApiError::internal(format!(
+            "stick worker failed: {}",
+            crate::rescue::printable_block(&String::from_utf8_lossy(&output.stderr))
+        )));
+    }
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(ApiError::internal)?;
+    if let Some(error) = envelope.get("error") {
+        let (status, code) = match error["code"].as_str() {
+            Some("forbidden") => (StatusCode::FORBIDDEN, "forbidden"),
+            Some("bad_request") => (StatusCode::BAD_REQUEST, "bad_request"),
+            Some("target_exists") => (StatusCode::CONFLICT, "target_exists"),
+            _ => (StatusCode::SERVICE_UNAVAILABLE, "stick_unavailable"),
+        };
+        let mut failure = ApiError::new(
+            status,
+            code,
+            error["message"]
+                .as_str()
+                .unwrap_or("stick operation failed"),
+        );
+        if code == "stick_unavailable" {
+            failure.reason = Some(
+                serde_json::from_value(error["reason"].clone())
+                    .unwrap_or(crate::rescue::desktop_api::UnavailableReason::Unreadable),
+            );
+        }
+        return Err(failure);
+    }
+    envelope
+        .get("result")
+        .cloned()
+        .ok_or_else(|| ApiError::internal("missing stick worker result"))
+}
+
+async fn list_snapshots(
+    AxState(app): AxState<App>,
+    Query(target): Query<RestoreTarget>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if target.is_stick()? {
+        return tokio::task::spawn_blocking(move || {
+            stick_rpc(
+                &app.paths,
+                crate::rescue::desktop_api::Request {
+                    uuid: target.stick_uuid,
+                    uid: 0,
+                    action: crate::rescue::desktop_api::Action::List,
+                },
+            )
+            .map(Json)
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    }
     let result = tokio::task::spawn_blocking(
         move || -> Result<std::result::Result<serde_json::Value, String>> {
             let config = Config::load(&app.paths.config_file)?;
@@ -454,7 +657,9 @@ async fn list_snapshots(AxState(app): AxState<App>) -> ApiResult<Json<serde_json
             let client =
                 crate::client::Client::new(&config, SecretStore::new(&app.paths.credentials_dir));
             let snapshots = client.list_snapshots(&config.effective_backup_id())?;
-            Ok(Ok(json!({ "snapshots": snapshots })))
+            Ok(Ok(
+                json!({ "target": "pbs", "stick_uuid": null, "snapshots": snapshots }),
+            ))
         },
     )
     .await
@@ -822,6 +1027,8 @@ async fn session(peer: PeerInfo) -> ApiResult<Json<serde_json::Value>> {
 
 #[derive(Deserialize)]
 struct BrowseQuery {
+    #[serde(flatten)]
+    source: RestoreTarget,
     archive: String,
     path: Option<String>,
 }
@@ -834,6 +1041,29 @@ async fn browse(
 ) -> ApiResult<Json<serde_json::Value>> {
     let Query(q) = q.map_err(|e| bad_request(e.body_text()))?;
     let requester = requester(&peer)?;
+    if q.source.is_stick()? {
+        let uid = match &requester {
+            crate::restore::Requester::User(u) => u.uid,
+            _ => 0,
+        };
+        return tokio::task::spawn_blocking(move || {
+            stick_rpc(
+                &app.paths,
+                crate::rescue::desktop_api::Request {
+                    uuid: q.source.stick_uuid,
+                    uid,
+                    action: crate::rescue::desktop_api::Action::Browse {
+                        time,
+                        archive: q.archive,
+                        path: q.path.unwrap_or_else(|| "/".into()),
+                    },
+                },
+            )
+            .map(Json)
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    }
     check_archive_name(&q.archive)?;
     let path = crate::restore::normalize_archive_path(q.path.as_deref().unwrap_or("/"))
         .map_err(restore_error)?;
@@ -882,18 +1112,17 @@ async fn browse(
         })
         .await
         .map_err(ApiError::internal)??;
-    Ok(Json(json!({ "entries": entries })))
+    Ok(Json(
+        json!({ "target": "pbs", "stick_uuid": null, "entries": entries }),
+    ))
 }
 
-#[derive(Deserialize)]
-struct ArchivePaths {
-    archive: String,
-    #[serde(default)]
-    paths: Vec<String>,
-}
+type ArchivePaths = crate::rescue::desktop_api::Selection;
 
 #[derive(Deserialize)]
 struct RestoreBody {
+    #[serde(flatten)]
+    source: RestoreTarget,
     snapshot_time: String,
     archive: Option<String>,
     #[serde(default)]
@@ -941,9 +1170,44 @@ async fn start_restore(
     })
     .await?;
     let snapshot = snapshot_of(&config, &body.snapshot_time)?;
+    let stick = body.source.is_stick()?;
+    let mut stick_uuid = body.source.stick_uuid;
+    let restore_time = body.snapshot_time.clone();
     // Validate archives and paths; unprivileged users are limited to their
     // own home directory, as recorded in the snapshot.
-    let (selections, config, snapshot, requester) = {
+    let (selections, config, snapshot, requester) = if stick {
+        let app = app.clone();
+        let target = target.clone();
+        let uuid = stick_uuid.clone();
+        let time = restore_time.clone();
+        let uid = owner;
+        let value = tokio::task::spawn_blocking(move || {
+            stick_rpc(
+                &app.paths,
+                crate::rescue::desktop_api::Request {
+                    uuid,
+                    uid,
+                    action: crate::rescue::desktop_api::Action::Validate {
+                        time,
+                        selections,
+                        target,
+                    },
+                },
+            )
+        })
+        .await
+        .map_err(ApiError::internal)??;
+        // Pin the resolved medium across validation and the asynchronous job.
+        stick_uuid = Some(
+            value["stick_uuid"]
+                .as_str()
+                .ok_or_else(|| ApiError::internal("missing worker stick UUID"))?
+                .to_owned(),
+        );
+        let selections: Vec<ArchivePaths> =
+            serde_json::from_value(value["selections"].clone()).map_err(ApiError::internal)?;
+        (selections, config, snapshot, requester)
+    } else {
         let app = app.clone();
         let target = target.clone();
         tokio::task::spawn_blocking(move || -> ApiResult<_> {
@@ -1017,6 +1281,12 @@ async fn start_restore(
         rand::random::<u64>()
     );
     let job = RestoreJob {
+        target: if stick {
+            crate::state::Target::Stick
+        } else {
+            crate::state::Target::Pbs
+        },
+        stick_uuid: stick_uuid.clone(),
         owner,
         id: id.clone(),
         state: "running",
@@ -1036,17 +1306,47 @@ async fn start_restore(
     let paths = app.paths.clone();
     let restored = job.restored.clone();
     std::thread::spawn(move || {
-        let result = run_restore_job(
-            &paths,
-            &config,
-            &snapshot,
-            &selections,
-            &target,
-            &requester,
-            &restored,
-            &restores,
-            &id,
-        );
+        let result = if stick {
+            stick_rpc(
+                &paths,
+                crate::rescue::desktop_api::Request {
+                    uuid: stick_uuid,
+                    uid: owner,
+                    action: crate::rescue::desktop_api::Action::Restore {
+                        time: restore_time,
+                        selections,
+                        target,
+                    },
+                },
+            )
+            .map(|value| {
+                restored.store(
+                    value["restored_bytes"].as_u64().unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+                value["warnings"]
+                    .as_array()
+                    .map(|w| {
+                        w.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .map_err(|e| anyhow::anyhow!("{}: {}", e.code, e.message))
+        } else {
+            run_restore_job(
+                &paths,
+                &config,
+                &snapshot,
+                &selections,
+                &target,
+                &requester,
+                &restored,
+                &restores,
+                &id,
+            )
+        };
         let mut jobs = restores.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(j) = jobs.get_mut(&id) {
             j.finished_at = Some(Utc::now());
@@ -1344,8 +1644,13 @@ async fn cancel_run(
     let run_id = id.clone();
     let outcome = blocking(move || {
         let id = run_id;
-        if Store::new(&paths).get_run(&id)?.is_none() {
+        let Some(record) = Store::new(&paths).get_run(&id)? else {
             return Ok(CancelOutcome::Unknown);
+        };
+        // The finished record is durable before current.json/run.pid are
+        // cleared. That cleanup window must not accept another cancellation.
+        if record.state.is_finished() {
+            return Ok(CancelOutcome::Finished);
         }
         if crate::run::active_run(&paths)?.is_none_or(|r| r.id != id) {
             return Ok(CancelOutcome::Finished);
@@ -1512,9 +1817,9 @@ async fn pbs_info(AxState(app): AxState<App>) -> ApiResult<Json<serde_json::Valu
             None
         };
         Ok(json!({
-            "server": format!("{}:{}", config.pbs.server, config.pbs.port),
-            "datastore": config.pbs.datastore,
-            "namespace": config.pbs.namespace,
+            "server": format!("{}:{}", config.remote_pbs()?.server, config.pbs.as_ref().map(|p| p.port).unwrap_or(8007)),
+            "datastore": config.remote_pbs()?.datastore,
+            "namespace": config.remote_pbs()?.namespace,
             "reachable": reachable,
             "used_bytes": usage.map(|u| u.0),
             "total_bytes": usage.map(|u| u.1),
@@ -1681,6 +1986,7 @@ mod tests {
             nestegg_version: "0.1.0".into(),
             backup_id: "desktop".into(),
             hostname: "desktop".into(),
+            machine_id: None,
             backup_time,
             snapshot: crate::client::snapshot_path("desktop", backup_time),
             archive_sources: [("home.pxar".to_string(), "/home".to_string())].into(),
@@ -1688,6 +1994,17 @@ mod tests {
             system_mode: false,
             incomplete: vec![],
         }
+    }
+
+    #[test]
+    fn legacy_start_selects_one_compatible_target() {
+        let mut cfg = crate::config::example("pbs.example.com", "store", "backup@pbs!desktop");
+        cfg.stick = Config::parse("[stick]\ndata_uuids=['01234567-89ab-cdef-0123-456789abcdef']")
+            .unwrap()
+            .stick;
+        assert_eq!(legacy_target(&cfg), crate::state::TargetSelection::Pbs);
+        cfg.pbs = None;
+        assert_eq!(legacy_target(&cfg), crate::state::TargetSelection::Stick);
     }
 
     #[test]
@@ -1751,7 +2068,7 @@ mod tests {
         let config = Config::parse(CONFIG).unwrap();
         let mut other = config.clone();
         // Same snapshot, different datastore -> different key -> no stale hit.
-        other.pbs.datastore = "other".into();
+        other.pbs.as_mut().unwrap().datastore = "other".into();
         let mut cache = MetadataCache::default();
         cache.insert(
             MetaKey::new(&config, SNAPSHOT),
@@ -1761,10 +2078,10 @@ mod tests {
         assert!(cache.get(&MetaKey::new(&other, SNAPSHOT)).is_none());
         // Another server with the same datastore and namespace names.
         let mut moved = config.clone();
-        moved.pbs.server = "other.example.com".into();
+        moved.pbs.as_mut().unwrap().server = "other.example.com".into();
         assert!(cache.get(&MetaKey::new(&moved, SNAPSHOT)).is_none());
         let mut port = config.clone();
-        port.pbs.port += 1;
+        port.pbs.as_mut().unwrap().port += 1;
         assert!(cache.get(&MetaKey::new(&port, SNAPSHOT)).is_none());
 
         // The cache is bounded: inserting far more than MAX evicts the oldest.
@@ -1785,6 +2102,7 @@ mod tests {
             nestegg_version: "0.1.0".into(),
             backup_id: "desktop".into(),
             hostname: "desktop".into(),
+            machine_id: None,
             backup_time: 1_794_000_000,
             snapshot: SNAPSHOT.into(),
             archive_sources: [("home.pxar".to_string(), "/home".to_string())].into(),
@@ -1982,6 +2300,35 @@ mod tests {
     }
 
     #[test]
+    fn restore_sources_are_explicit_and_never_fall_back() {
+        assert!(RestoreTarget::default().is_stick().is_ok_and(|v| !v));
+        assert!(
+            RestoreTarget {
+                target: Some("stick".into()),
+                stick_uuid: None
+            }
+            .is_stick()
+            .is_ok_and(|v| v)
+        );
+        assert!(
+            RestoreTarget {
+                target: Some("all".into()),
+                stick_uuid: None
+            }
+            .is_stick()
+            .is_err()
+        );
+        assert!(
+            RestoreTarget {
+                target: None,
+                stick_uuid: Some("fixture".into())
+            }
+            .is_stick()
+            .is_err()
+        );
+    }
+
+    #[test]
     fn an_unprotected_restore_is_logged_with_snapshot_archive_and_requester() {
         let line = unprotected_restore_line(
             SNAPSHOT,
@@ -2126,6 +2473,43 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert_eq!(json(resp).await["code"], "cannot_cancel");
     }
+    #[tokio::test]
+    async fn a_finished_record_cannot_signal_the_still_live_cleanup_process() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildGuard(Command::new("sleep").arg("60").spawn().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let store = Store::new(&p);
+        let mut run = Run::new(Trigger::Manual, Utc::now());
+        store.save_current(&run).unwrap();
+        let _lock = crate::run::RunLock::try_acquire(&p).unwrap().unwrap();
+        run.finish(crate::state::RunState::Cancelled, Utc::now());
+        store.record_run_only(&run).unwrap();
+        std::fs::write(
+            p.runtime_dir.join("run.pid"),
+            format!("{} {}\n", child.0.id(), run.id),
+        )
+        .unwrap();
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/runs/{}/cancel", run.id))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(Peer {
+            uid: Some(0),
+            gid: Some(0),
+        }));
+        let response = router(p).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(child.0.try_wait().unwrap().is_none());
+    }
+
     #[test]
     fn the_status_reports_the_newer_of_run_and_connection_check() {
         let t = |h: u32| chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 5, h, 0, 0).unwrap();

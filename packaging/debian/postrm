@@ -2,6 +2,7 @@
 set -e
 # Configuration, credentials and state are kept on purpose (also on purge):
 # deleting the encryption key would make existing backups unreadable.
+udevadm control --reload-rules >/dev/null 2>&1 || true
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi

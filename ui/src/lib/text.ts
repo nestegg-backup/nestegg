@@ -2,10 +2,10 @@
 // can be tested with both languages.
 
 import type { Messages } from "../i18n";
-import { ageOf, errorKind, isUnknownRun, knownErrorKind, machineKind, otherWarnings, runEnd, runState, runTrigger, selfKind, setupGuide, succeededKind, type MachineKind, type SelfKind, type ServerBackups } from "./derive";
+import { ageOf, errorKind, hasPbs, isUnknownRun, knownErrorKind, machineKind, otherWarnings, runEnd, runState, runTarget, runTrigger, selfKind, setupGuide, stickOnly, stickTone, stickView, succeededKind, type MachineKind, type SelfKind, type ServerBackups, type StickKind, type StickView } from "./derive";
 import type { Reach } from "./check";
 import type { Formatter } from "./format";
-import type { Machine, Run, Status } from "./types";
+import type { Machine, Run, Status, TargetStatus } from "./types";
 
 /** The newest run was cancelled and no success came after it. */
 function cancelledAfter(last: Run | null, success: Run | null): Run | null {
@@ -14,6 +14,17 @@ function cancelledAfter(last: Run | null, success: Run | null): Run | null {
 
 /** As in the daemon (`FUTURE_TOLERANCE_MINUTES`): a stamp further ahead than this says nothing about the age. */
 const CLOCK_TOLERANCE_MS = 5 * 60_000;
+
+/**
+ * The plain-language explanation of a run's error. A failed check after writing means something
+ * else on the stick (no server to blame) than on the backup server.
+ */
+export function explainOf(run: Run, t: Messages): string | null {
+  const k = errorKind(run);
+  if (!k) return null;
+  if (k === "verification_failed" && runTarget(run) === "stick") return t.stick.verifyText;
+  return t.explain[k];
+}
 
 export interface Summary {
   kind: SelfKind;
@@ -39,6 +50,8 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
   // Times shown to the user are start times, like in the run history and the snapshot names.
   const successAt = success?.started_at ?? server?.latest ?? null;
   const lastSuccessText = successAt ? t.self.lastSuccessSentence(m(successAt)) : t.self.noSuccessYet;
+  // Stick only and the stick is not plugged in: nothing starts by itself until it is.
+  const waitStick = stickOnly(s) && s.schedule.enabled && s.targets?.stick != null && stickView(s.targets.stick).plugged === false;
   // The token secret comes before the key and before the first backup (see setupGuide).
   if ((kind === "key_missing" || kind === "never") && setupGuide(s)?.current === "credentials") {
     return { kind, lead: t.self.credentialsLead, text: t.self.credentialsText };
@@ -67,11 +80,11 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       }
       // The contract allows health=failing without run details; then the text stays undated.
       const failed = last && last.state === "failed" ? last : null;
-      const ek = failed ? errorKind(failed) : null;
+      const explained = failed ? explainOf(failed, t) : null;
       return {
         kind,
         lead: failed ? t.self.failingLead(m(failed.started_at)) : t.self.failingLeadUndated,
-        text: (ek ? `${t.explain[ek]} ${lastSuccessText}` : lastSuccessText) + tail,
+        text: (explained ? `${explained} ${lastSuccessText}` : lastSuccessText) + tail,
         ...off,
       };
     }
@@ -90,6 +103,7 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       if (cancelled) parts.push(t.self.lastCancelled(m(cancelled.started_at)));
       // Every promise of an automatic retry depends on the schedule being switched on.
       if (!s.schedule.enabled) parts.push(t.self.scheduleOff);
+      else if (waitStick) parts.push(t.stick.waitPlug);
       else parts.push(last?.state === "pbs_unreachable" ? t.self.autoRetry : t.self.overdueCatchUp);
       return { kind, lead: t.self.overdueLead(age.days, age.hours), text: parts.join(" ") };
     }
@@ -99,6 +113,7 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
       const cancelled = cancelledAfter(last, success);
       if (cancelled) parts.push(t.self.lastCancelled(m(cancelled.started_at)));
       if (!s.schedule.enabled) parts.push(t.self.scheduleOff);
+      else if (waitStick) parts.push(t.stick.waitPlug);
       else if (s.schedule.next_run) {
         parts.push(new Date(s.schedule.next_run) <= now ? t.self.nextRunDue : t.self.nextRun(m(s.schedule.next_run)));
       }
@@ -119,10 +134,11 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
         parts.push(t.self.neverUnknown(m(last.started_at)));
       } else if (last && last.state !== "succeeded") {
         parts.push(t.self.neverAttempt(m(last.started_at)));
-        const ek = errorKind(last);
-        if (ek) parts.push(t.explain[ek]);
+        const explained = explainOf(last, t);
+        if (explained) parts.push(explained);
       }
-      if (s.schedule.enabled && s.schedule.next_run && new Date(s.schedule.next_run) > now)
+      if (waitStick) parts.push(t.stick.waitPlug);
+      else if (s.schedule.enabled && s.schedule.next_run && new Date(s.schedule.next_run) > now)
         parts.push(t.self.neverNext(m(s.schedule.next_run)));
       else parts.push(t.self.neverNow);
       // Switched off: without this the page would let the reader wait for a first backup that never starts.
@@ -150,13 +166,17 @@ export function selfSummary(s: Status, t: Messages, f: Formatter, now: Date, ser
         off.push(t.self.okOffText);
         return { kind, lead: t.self.okOffLead, text: off.join(" "), autoOff: true };
       }
-      const parts = [damaged ? t.self.okTextDamaged : t.self.okText];
+      // The server is fine, the stick is not: "Everything is fine" would be untrue for the computer.
+      const stickTs = hasPbs(s) && s.targets?.pbs ? s.targets?.stick : undefined;
+      const stickBad = !!stickTs && ["bad", "warn"].includes(stickTone(stickView(stickTs).kind));
+      const parts = [damaged ? t.self.okTextDamaged : stickBad ? t.stick.okServerOnly : t.self.okText];
       const pbsAfterSuccess =
         !!last && last.state === "pbs_unreachable" && (!success || last.started_at > success.started_at);
       if (pbsAfterSuccess) parts.push(t.self.lastAttemptPbs(m(last.started_at)));
       const cancelled = cancelledAfter(last, success);
       if (cancelled) parts.push(t.self.lastCancelled(m(cancelled.started_at)));
       if (pbsAfterSuccess) parts.push(t.self.autoRetry);
+      else if (waitStick) parts.push(t.stick.waitPlug);
       else if (s.schedule.next_run) {
         parts.push(new Date(s.schedule.next_run) <= now ? t.self.nextRunDue : t.self.nextRun(m(s.schedule.next_run)));
       }
@@ -192,6 +212,8 @@ export function runResultText(r: Run, count: number, damaged: ReadonlySet<string
             case "manual":
             case "cli":
               return t.runs.succeededManual;
+            case "plug":
+              return t.runs.succeededPlug;
             case "unknown":
               return t.runs.succeededOtherStart;
           }
@@ -201,6 +223,8 @@ export function runResultText(r: Run, count: number, damaged: ReadonlySet<string
       return t.runs.failed(t.reason[errorKind(r) ?? "internal"]);
     case "pbs_unreachable":
       return count > 1 ? t.runs.pbsTimes(count) : t.runs.pbs;
+    case "stick_not_plugged_in":
+      return count > 1 ? t.runs.stickAbsentTimes(count) : t.runs.stickAbsent;
     case "cancelled":
       return t.runs.cancelled;
     case "unknown":
@@ -211,8 +235,42 @@ export function runResultText(r: Run, count: number, damaged: ReadonlySet<string
   }
 }
 
+/**
+ * With a server and a stick, the sidebar line is about the server, unless the server is fine and
+ * the stick is not: then it names the stick's problem (or that it is backing up right now).
+ */
+export function stickRowOverride(s: Status, t: Messages, f: Formatter): string | null {
+  const ts = s.targets?.stick;
+  if (!ts || !hasPbs(s) || !s.targets?.pbs) return null;
+  const own = selfKind(s);
+  if (own !== "ok" && own !== "incomplete") return null;
+  const v = stickView(ts);
+  const success = ts.last_success?.started_at ?? null;
+  switch (v.kind) {
+    case "running":
+      return t.row.stickRunning;
+    case "full":
+      return t.row.stickFull;
+    case "store_damaged":
+      return t.row.stickDamaged;
+    case "damaged":
+    case "verify_failed":
+    case "key_mismatch":
+    case "unsupported":
+    case "failing":
+    case "unknown":
+      return t.row.stickFailing;
+    case "overdue":
+      return success ? t.row.stickOverdue(f.dayMonth(success)) : t.row.overdueUndated;
+    default:
+      return null;
+  }
+}
+
 /** One short line for the list pane. `server` as in selfSummary. */
-export function selfRowText(s: Status, t: Messages, f: Formatter, now: Date, server: ServerBackups | null = null): string {
+export function selfRowText(s: Status, t: Messages, f: Formatter, now: Date, server: ServerBackups | null = null, withStick = true): string {
+  const stick = withStick ? stickRowOverride(s, t, f) : null;
+  if (stick) return stick;
   const kind = selfKind(s);
   const successAt = s.last_success?.started_at ?? server?.latest ?? null;
   if ((kind === "key_missing" || kind === "never") && setupGuide(s)?.current === "credentials") return t.row.credentials;
@@ -302,4 +360,90 @@ export function serverRow(p: Reach, t: Messages, f: Formatter, now: Date): { ton
     return { tone: "neutral", text: today ? t.row.serverReachable(mo.time) : t.row.serverReachableDay(f.dayMonth(p.checked_at)) };
   }
   return { tone: "pbs", text: today ? t.row.serverUnreachable(mo.time) : t.row.serverUnreachableDay(f.dayMonth(p.checked_at)) };
+}
+
+// ---------------------------------------------------------------- the stick
+
+export interface StickLine {
+  view: StickView;
+  /** The state, as one sentence. */
+  lead: string;
+  /** Why, for problems (plain language), or null. */
+  why: string | null;
+  /** Plugged in, not plugged in, safe to unplug; null while the state does not say. */
+  plug: string | null;
+}
+
+const STICK_LEAD: Record<Exclude<StickKind, "ok" | "incomplete" | "overdue" | "failing">, (t: Messages) => string> = {
+  running: (t) => t.stick.running,
+  full: (t) => t.stick.full,
+  damaged: (t) => t.stick.damaged,
+  verify_failed: (t) => t.stick.verifyFailed,
+  store_damaged: (t) => t.stick.storeDamaged,
+  key_mismatch: (t) => t.stick.keyMismatch,
+  unsupported: (t) => t.stick.unsupported,
+  unknown: (t) => t.stick.unknown,
+  never: (t) => t.stick.never,
+};
+
+/**
+ * What the stick row says about the stick target. `inUse`: this page is restoring files from the
+ * stick; the status does not know that, so it must not say the stick can be unplugged.
+ */
+export function stickLine(ts: TargetStatus, t: Messages, f: Formatter, now: Date, inUse = false): StickLine {
+  const seen = stickView(ts);
+  const view = inUse ? { ...seen, safeToUnplug: false } : seen;
+  const m = (iso: string) => f.moment(iso, now);
+  const last = ts.last_run ?? null;
+  const success = ts.last_success ?? null;
+  let lead: string;
+  switch (view.kind) {
+    case "ok":
+      lead = success ? t.stick.ok(m(success.started_at)) : t.stick.okUndated;
+      break;
+    case "incomplete":
+      lead = success ? t.stick.incomplete(m(success.started_at)) : t.stick.okUndated;
+      break;
+    case "overdue": {
+      const age = ageOf(success ? runEnd(success) : now.toISOString(), now);
+      lead = t.stick.overdue(age.days, age.hours);
+      break;
+    }
+    case "failing":
+      lead = last?.state === "failed" ? t.stick.failing(m(last.started_at)) : t.stick.failingUndated;
+      break;
+    default:
+      lead = STICK_LEAD[view.kind](t);
+  }
+  const failed = last?.state === "failed" ? last : null;
+  const why =
+    view.kind === "running" || view.kind === "ok" || view.kind === "incomplete" || view.kind === "never" || view.kind === "overdue"
+      ? null
+      : view.kind === "unknown"
+        ? null
+        : failed
+          ? explainOf(failed, t)
+          : view.kind === "full"
+            ? t.explain.stick_full
+            : null;
+  const plug =
+    view.kind === "running" || ((inUse || ts.in_use || Object.values(ts.sticks ?? {}).some((s) => s.in_use)) && view.plugged !== false)
+      ? t.stick.keepIn
+      : view.plugged === false
+        ? view.kind === "overdue" || view.kind === "never"
+          ? `${t.stick.absent} ${t.stick.plugToBackUp}`
+          : t.stick.absent
+        : view.safeToUnplug
+          ? t.stick.safe
+          : view.plugged
+            ? t.stick.plugged
+            : null;
+  return { view, lead, why, plug };
+}
+
+/** Stable stick reasons are translated; unknown reasons keep the generic fallback. */
+export function stickProblemText(error: { reason: string | null } | null, t: Messages): string {
+  const reasons = t.restore.stickReasons;
+  return error?.reason && Object.hasOwn(reasons, error.reason)
+    ? reasons[error.reason as keyof typeof reasons] : t.restore.stickUnavailable;
 }

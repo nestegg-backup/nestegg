@@ -2,7 +2,7 @@
 ARG CLIENT_IMAGE=nestegg-e2e-client:ubuntu-24.04
 FROM ${CLIENT_IMAGE}
 RUN apt-get update \
- && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd systemd-sysv dbus sudo \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd systemd-sysv dbus sudo udev e2fsprogs iproute2 python3 openssl util-linux \
  && rm -rf /var/lib/apt/lists/* \
  && systemctl mask getty.target systemd-logind.service console-getty.service
 STOPSIGNAL SIGRTMIN+3

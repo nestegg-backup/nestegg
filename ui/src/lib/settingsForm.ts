@@ -56,6 +56,9 @@ export function problemText(message: string, t: Messages): string | null {
   const p = t.settings.problem;
   let m: RegExpExecArray | null;
   if ((m = /^interval_hours must be between (\d+) and (\d+)/.exec(message))) return p.intervalRange(num(m[1]), num(m[2]));
+  if ((m = /^stick_overdue_after_hours must be between 1 and (\d+)/.exec(message))) return p.stickOverdueRange(num(m[1]));
+  if (/^no stick target configured/.test(message)) return p.noStick;
+  if (/^cannot remove the last configured backup target/.test(message)) return p.lastTarget;
   if ((m = /^overdue_after_hours must be between (\d+) and (\d+) hours through the web interface(?:; the current value of (\d+) can only be lowered here)?/.exec(message)))
     return p.overdueCapped(num(m[1]), num(m[2]), m[3] === undefined ? null : num(m[3]));
   if ((m = /^overdue_after_hours must be between (\d+) and (\d+)/.exec(message))) return p.overdueRange(num(m[1]), num(m[2]));

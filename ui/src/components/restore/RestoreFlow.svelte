@@ -7,6 +7,7 @@
   import { app } from "../../lib/store.svelte";
   import { restore } from "../../lib/restore.svelte";
   import { href, router } from "../../lib/router.svelte";
+  import { hasPbs, hasStick, stickView } from "../../lib/derive";
   import { t } from "../../lib/locale";
   import type { Status } from "../../lib/types";
 
@@ -14,8 +15,31 @@
 
   const n = $derived(step === "done" ? 0 : Number(step));
 
+  const pbs = $derived(hasPbs(status));
+  const stick = $derived(hasStick(status));
+  const plugged = $derived(status.targets?.stick ? stickView(status.targets.stick).plugged : null);
+
+  // The source follows the targets: the stick alone means the stick, no stick means the server.
+  // Before the steps' own effects, so they never start on the wrong source.
+  $effect.pre(() => {
+    const only = !pbs && stick ? "stick" : !stick ? "pbs" : null;
+    if (only) untrack(() => restore.setSource(only));
+  });
+
   $effect(() => {
-    untrack(() => void app.loadSnapshots());
+    if (pbs) untrack(() => void app.loadSnapshots());
+  });
+
+  // Pulled out: its snapshots are read again from whichever stick is plugged in next.
+  $effect(() => {
+    if (plugged === false) untrack(() => restore.stickGone());
+  });
+
+  // Waiting for the stick: notice it soon after it is plugged in, not only at the next regular status poll.
+  $effect(() => {
+    if (restore.source !== "stick" || plugged !== false) return;
+    const timer = setInterval(() => void app.poll(), 5_000);
+    return () => clearInterval(timer);
   });
 
   // Steps need the earlier choices; fall back to the first step that is complete.

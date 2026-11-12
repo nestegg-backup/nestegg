@@ -23,6 +23,7 @@ efibootmgr
 grub-efi-amd64-bin
 grub-pc-bin
 grub-common
+grub2-common
 kbd
 console-setup
 keyboard-configuration
@@ -38,3 +39,5 @@ firmware-iwlwifi
 firmware-atheros
 firmware-intel-sound
 proxmox-backup-client-static
+proxmox-backup-server
+curl

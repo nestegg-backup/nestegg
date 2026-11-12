@@ -2,7 +2,9 @@
 
 When the system disk has died, or a computer has to be set up again from
 scratch, the nestegg rescue stick puts the complete system back from the
-Proxmox Backup Server: partitions, files, users, settings, boot loader.
+Proxmox Backup Server or the backup stick itself: partitions, files, users,
+settings, boot loader. A backup stick can also back up a computer whose own
+system no longer starts, with all source disks kept read-only.
 
 Decision and scope: [decisions/0006](decisions/0006-bare-metal-restore-rescue-stick.md),
 target disk guard: [decisions/0010](decisions/0010-rescue-target-disk-guard.md),
@@ -311,3 +313,80 @@ sudo WIZARD=0 tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-a
 
 CI runs these three weekly, on pull requests that touch the rescue code
 (`.github/workflows/rescue.yml`) and before every release.
+
+## Backups on this stick
+
+When booted from a nestegg backup stick, `nestegg rescue` offers **Backups on
+this stick**. Choose the computer, open its protected key copy with its password
+(or use the paper key), and choose a snapshot. The existing restore plan and
+final disk-erasure confirmation apply. This path needs no network, PBS login
+or certificate approval. An ordinary rescue ISO still restores from a PBS.
+The medium is detected by its pinned boot ESP and sibling data partition;
+another attached drive with the same label is never selected automatically.
+
+For automation:
+
+```sh
+nestegg rescue restore --source stick --backup-id desktop \
+  --key-password-file /run/stick-key-password \
+  --disk /dev/nvme0n1 --wipe /dev/nvme0n1
+```
+
+Use `--keyfile /media/paperkey.txt` instead of `--key-password-file` to recover
+with an exported or saved paper key. `--password-file` is only for the remote
+PBS source. Keep passwords in RAM with mode 0600; never put them in arguments.
+
+In the live system, the local PBS image is the already booted squashfs at
+`/run/live/medium/live/a/filesystem.squashfs` (or slot `b`). nestegg checks the
+kernel boot arguments, the read-only ESP and the live root loop's backing file
+before using it. The desktop continues to use only its checked fixed cache at
+`/var/lib/nestegg/stick/pbs.squashfs`; attaching a stick cannot supply desktop
+executable code. In both cases the same private, loopback-only PBS launcher is
+used and stopped before the data partition is unmounted.
+
+## Back up a computer that cannot start
+
+Boot its backup stick and choose **Back up this computer**. Select the source
+disk, unlock LUKS if necessary, confirm the computer name and choose its stick
+key, paper key, or a new key. A new key requires a strong password for its
+recovery copy on the stick; keep the offered paper key elsewhere too. Confirm
+the displayed UTC clock against the newest snapshot and correct it if needed.
+
+The computer's disks remain read-only. Dirty journals are recovered into a
+bounded copy-on-write layer in RAM. Running out of RAM/COW capacity is a failed
+backup and never permits pruning. No filesystem repair, source executable,
+swap activation or hardware-clock write is performed. Inventory, package
+selections, Snap/Flatpak state and disk layout describe the mounted computer.
+Missing system mounts or an unsupported storage layout stop the backup.
+Supported sources are ordinary ext2/3/4, xfs and btrfs filesystems, optional LUKS
+and linear LVM volumes on the selected disk. RAID, thin/cache LVM, multi-disk
+systems, external filesystem journals and system bind mounts need manual
+recovery and are refused. ext2 must already be clean because it has no journal.
+Btrfs mounts selected only by `subvolid=` are refused before upload; named
+`subvol=` mounts use the same system/snapshot scope as normal desktop backups.
+
+The non-interactive equivalent is `nestegg rescue backup --disk /dev/nvme0n1
+--backup-id desktop --key-password-file /run/stick-key-password --confirm-clock`.
+Use `--luks-passphrase-file` for automation, `--root-device` when more than one
+installed system is detected, and `--time` for an explicit RFC3339 UTC time.
+`--new-key-password-file` creates a new key and its protected recovery copy.
+Every completed backup is read back, verified by PBS, then pruned using the
+usual stick retention. Keep the stick attached until the command finishes.
+
+### Disposable VM acceptance
+
+```sh
+sudo tests/stick/rescue.sh target/release/nestegg target/nestegg-rescue-amd64.iso
+```
+
+The matrix covers a desktop backup to the stick and offline backups of plain
+ext4, LUKS plus LVM, a VM killed while writing, a system without nestegg, and
+Btrfs with an additional application-data subvolume. The Btrfs case checks
+that the database witness survives and skipped snapshot subvolumes are recreated.
+Each offline case compares the entire source image's SHA-256 before and after;
+the dirty case also checks that journal recovery allocated COW sectors in RAM.
+Every snapshot is restored onto an empty disk and the result must boot with the
+original test file checksum and owner. The desktop API is exercised as a normal
+group member, including refusal of system files. All stick/rescue VMs have no
+network interface. The tests use generated credentials and disposable images,
+never a physical USB drive, and remove owned loops, mounts, containers and VMs.

@@ -76,22 +76,39 @@ const SYSTEM_DIRS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reduction {
+    TargetRemoved {
+        target: String,
+    },
+    StickOverdueRaised {
+        from: u32,
+        to: u32,
+    },
     /// Automatic backups (the timer) were switched off.
     AutomaticBackupsOff,
     /// Patterns were added to the exclude list, so that data is no longer
     /// backed up.
-    ExcludesAdded { patterns: Vec<String> },
+    ExcludesAdded {
+        patterns: Vec<String>,
+    },
     /// A `!` re-include pattern was removed, so what it kept in the backup is
     /// now excluded again.
-    ReincludesRemoved { patterns: Vec<String> },
+    ReincludesRemoved {
+        patterns: Vec<String>,
+    },
     /// The exclude list kept the same patterns but in a different order; later
     /// patterns win, so a re-include may no longer take effect.
     ExcludesReordered,
     /// The "overdue after" threshold was raised, so a stopped backup is
     /// noticed later.
-    OverdueRaised { from: u32, to: u32 },
+    OverdueRaised {
+        from: u32,
+        to: u32,
+    },
     /// The backup interval was raised, so backups run less often.
-    IntervalRaised { from: u32, to: u32 },
+    IntervalRaised {
+        from: u32,
+        to: u32,
+    },
     /// Wake-on-LAN was switched off, so a sleeping backup server is no longer
     /// woken for a run.
     WakeOnLanOff,
@@ -107,6 +124,35 @@ pub fn reductions(
     now_enabled: bool,
 ) -> Vec<Reduction> {
     let mut out = Vec::new();
+    if old.pbs.is_some() && new.pbs.is_none() {
+        out.push(Reduction::TargetRemoved {
+            target: "pbs".into(),
+        });
+    }
+    if let Some(before) = &old.stick {
+        match &new.stick {
+            None => out.push(Reduction::TargetRemoved {
+                target: "stick".into(),
+            }),
+            Some(after) => {
+                if before
+                    .data_uuids
+                    .iter()
+                    .any(|u| !after.data_uuids.contains(u))
+                {
+                    out.push(Reduction::TargetRemoved {
+                        target: "registered stick".into(),
+                    });
+                }
+                if after.overdue_after_hours > before.overdue_after_hours {
+                    out.push(Reduction::StickOverdueRaised {
+                        from: before.overdue_after_hours,
+                        to: after.overdue_after_hours,
+                    });
+                }
+            }
+        }
+    }
     if was_enabled && !now_enabled {
         out.push(Reduction::AutomaticBackupsOff);
     }
@@ -177,7 +223,9 @@ pub fn reductions(
 }
 
 /// Keys a settings change may contain.
-pub const EDITABLE: [&str; 5] = [
+pub const EDITABLE: [&str; 7] = [
+    "stick_overdue_after_hours",
+    "remove_target",
     "interval_hours",
     "overdue_after_hours",
     "excludes",
@@ -226,6 +274,8 @@ const TERMINAL_ONLY: &[&str] = &[
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsPatch {
+    pub stick_overdue_after_hours: Option<u32>,
+    pub remove_target: Option<crate::state::Target>,
     pub interval_hours: Option<u32>,
     pub overdue_after_hours: Option<u32>,
     /// The complete new list (replaces the old one).
@@ -296,6 +346,14 @@ pub fn limits_json(current: &Config) -> serde_json::Value {
             "per_interval_extra": OVERDUE_INTERVAL_EXTRA_HOURS,
             "file_minimum": current.overdue_after_hours,
         },
+        "stick_overdue_after_hours": current.stick.as_ref().map(|stick| serde_json::json!({
+            "min": 1,
+            "max": overdue_cap(interval, stick.overdue_after_hours),
+            "greater_than_interval": false,
+            "base": OVERDUE_API_MAX_HOURS,
+            "per_interval_extra": OVERDUE_INTERVAL_EXTRA_HOURS,
+            "file_minimum": stick.overdue_after_hours,
+        })),
         "excludes": { "max_items": MAX_EXCLUDES, "max_length": MAX_EXCLUDE_LEN },
     })
 }
@@ -329,6 +387,36 @@ fn validate_with_reader(
     home_dirs: &[PathBuf],
     read_children: &dyn FolderProbe,
 ) -> Result<(), SettingsError> {
+    if let Some(hours) = patch.stick_overdue_after_hours {
+        let stick = current
+            .stick
+            .as_ref()
+            .ok_or_else(|| invalid("no stick target configured"))?;
+        let maximum = overdue_cap(
+            patch
+                .interval_hours
+                .unwrap_or(current.schedule.interval_hours),
+            stick.overdue_after_hours,
+        );
+        if hours == 0 || hours > maximum {
+            return Err(invalid(format!(
+                "stick_overdue_after_hours must be between 1 and {maximum}"
+            )));
+        }
+        if patch.remove_target == Some(crate::state::Target::Stick) {
+            return Err(invalid(
+                "cannot change and remove the stick target together",
+            ));
+        }
+    }
+    if let Some(target) = patch.remove_target {
+        if current.pbs.is_none() || current.stick.is_none() {
+            return Err(invalid("cannot remove the last configured backup target"));
+        }
+        if target == crate::state::Target::Pbs && patch.wake_on_lan.is_some() {
+            return Err(invalid("cannot change Wake-on-LAN while removing PBS"));
+        }
+    }
     if let Some(h) = patch.interval_hours
         && !INTERVAL_HOURS.contains(&h)
     {
@@ -366,7 +454,9 @@ fn validate_with_reader(
     }
     // Only checked when one of the two changes, so an existing file that
     // does not follow the rule can still get other changes.
-    if patch.interval_hours.is_some() || patch.overdue_after_hours.is_some() {
+    if current.pbs.is_some()
+        && (patch.interval_hours.is_some() || patch.overdue_after_hours.is_some())
+    {
         let interval = patch
             .interval_hours
             .unwrap_or(current.schedule.interval_hours);
@@ -1438,6 +1528,20 @@ pub fn regular_home_dirs() -> Vec<PathBuf> {
 /// keys change; comments, order and formatting of everything else stay.
 pub fn rewrite(text: &str, patch: &SettingsPatch) -> Result<String> {
     let mut doc: DocumentMut = text.parse().context("cannot parse the configuration")?;
+    if let Some(hours) = patch.stick_overdue_after_hours {
+        set_value(
+            table_mut(&mut doc, "stick")?,
+            "overdue_after_hours",
+            i64::from(hours),
+        );
+    }
+    if let Some(target) = patch.remove_target {
+        doc.remove(target.as_str());
+        if target == crate::state::Target::Pbs {
+            doc.remove("wake");
+            doc.remove("overview");
+        }
+    }
     if let Some(hours) = patch.overdue_after_hours {
         set_value(doc.as_table_mut(), "overdue_after_hours", i64::from(hours));
     }
@@ -1641,13 +1745,14 @@ pub struct Outcome {
 
 /// Validate and apply a change: rewrite the configuration file, then switch
 /// the timer. If the timer cannot be switched, the old file is put back, so
-/// a failed request changes nothing. The caller serialises calls.
+/// a failed request changes nothing. A file lock also serialises CLI registration.
 pub fn update(
     config_file: &Path,
     patch: &SettingsPatch,
     timer: &dyn Timer,
     identity: Option<PeerIdentity>,
 ) -> Result<Outcome, SettingsError> {
+    let _config_lock = config_lock(config_file)?;
     let old_text = fs::read_to_string(config_file)
         .with_context(|| format!("cannot read configuration {}", config_file.display()))?;
     let current = Config::parse(&old_text).with_context(|| {
@@ -1736,9 +1841,20 @@ pub fn update(
 
 /// Guard against a rewrite that did not end up where `Config` reads it.
 fn check_applied(new: &Config, patch: &SettingsPatch) -> Result<()> {
-    let ok = patch
-        .interval_hours
-        .is_none_or(|h| new.schedule.interval_hours == h)
+    let target_ok = patch.remove_target.is_none_or(|t| match t {
+        crate::state::Target::Pbs => new.pbs.is_none(),
+        crate::state::Target::Stick => new.stick.is_none(),
+    });
+    let stick_ok = patch.stick_overdue_after_hours.is_none_or(|h| {
+        new.stick
+            .as_ref()
+            .is_some_and(|s| s.overdue_after_hours == h)
+    });
+    let ok = target_ok
+        && stick_ok
+        && patch
+            .interval_hours
+            .is_none_or(|h| new.schedule.interval_hours == h)
         && patch
             .overdue_after_hours
             .is_none_or(|h| new.overdue_after_hours == h)
@@ -1761,6 +1877,20 @@ fn on_off(on: bool) -> &'static str {
 
 fn describe(old: &Config, new: &Config) -> Vec<String> {
     let mut changes = Vec::new();
+    if old.pbs.is_some() && new.pbs.is_none() {
+        changes.push("PBS target removed".into());
+    }
+    if old.stick.is_some() && new.stick.is_none() {
+        changes.push("stick target removed".into());
+    }
+    if let (Some(a), Some(b)) = (&old.stick, &new.stick)
+        && a.overdue_after_hours != b.overdue_after_hours
+    {
+        changes.push(format!(
+            "stick_overdue_after_hours: {} -> {}",
+            a.overdue_after_hours, b.overdue_after_hours
+        ));
+    }
     if old.schedule.interval_hours != new.schedule.interval_hours {
         changes.push(format!(
             "interval_hours: {} -> {}",
@@ -1801,6 +1931,25 @@ fn describe(old: &Config, new: &Config) -> Vec<String> {
     changes
 }
 
+/// Cross-process lock held over the complete configuration read/modify/write.
+/// Keep the sidecar inode stable across atomic configuration replacements.
+pub(crate) fn config_lock(path: &Path) -> Result<nix::fcntl::Flock<fs::File>> {
+    let name = path
+        .file_name()
+        .context("config name missing")?
+        .to_string_lossy();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path.with_file_name(format!(".{name}.lock")))?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| anyhow!("cannot lock configuration: {e}"))
+}
+
 /// Write `text` to `path` atomically with a fixed `mode`: a new temporary file
 /// (exclusive, no symlinks) is created with the final mode from the start,
 /// written, synced and renamed over any old file, and the directory is synced.
@@ -1809,6 +1958,15 @@ fn describe(old: &Config, new: &Config) -> Vec<String> {
 /// create the configuration this way with no window at a looser mode and no
 /// symlink following (decision 0022, item 14).
 pub fn write_file_atomic(path: &Path, text: &str, mode: u32) -> Result<()> {
+    write_file_atomic_owned(path, text, mode, None)
+}
+
+pub(crate) fn write_file_atomic_owned(
+    path: &Path,
+    text: &str,
+    mode: u32,
+    owner: Option<(nix::unistd::Uid, nix::unistd::Gid)>,
+) -> Result<()> {
     if let Ok(meta) = fs::symlink_metadata(path)
         && meta.file_type().is_symlink()
     {
@@ -1831,6 +1989,9 @@ pub fn write_file_atomic(path: &Path, text: &str, mode: u32) -> Result<()> {
             .custom_flags(nix::libc::O_NOFOLLOW)
             .open(&tmp)
             .with_context(|| format!("cannot create {}", tmp.display()))?;
+        if let Some((uid, gid)) = owner {
+            nix::unistd::fchown(&file, Some(uid), Some(gid))?;
+        }
         file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
@@ -3859,6 +4020,25 @@ interval_hours = 24
     }
 
     #[test]
+    fn configuration_lock_coordinates_independent_processes() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("config.toml");
+        let lock = config_lock(&path).unwrap();
+        let try_lock = || {
+            Command::new("flock")
+                .args(["--nonblock", "--exclusive"])
+                .arg(path.with_file_name(".config.toml.lock"))
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(!try_lock());
+        drop(lock);
+        assert!(try_lock());
+    }
+
+    #[test]
     fn update_writes_atomically_and_keeps_mode() {
         let (dir, path) = config_file(COMMENTED, 0o640);
         let timer = FakeTimer::new(true, false);
@@ -3887,11 +4067,12 @@ interval_hours = 24
                 .contains("interval_hours = 12")
         );
         // No temporary files left behind.
-        let names: Vec<_> = fs::read_dir(dir.path())
+        let mut names: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(names, ["config.toml"]);
+        names.sort();
+        assert_eq!(names, [".config.toml.lock", "config.toml"]);
         // The same request again changes nothing and does not call systemctl.
         let again = update(
             &path,

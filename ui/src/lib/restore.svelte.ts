@@ -3,7 +3,14 @@
 
 import { api, ApiFailure } from "./api";
 import { isInventoryArchive, restorableArchives } from "./derive";
-import type { ConfigView, DirEntry, Restore, RestoreRequest, Snapshot } from "./types";
+import type { ConfigView, DirEntry, Restore, RestoreRequest, Snapshot, Target } from "./types";
+
+/** A list of snapshots as it is being loaded (the server's lives in the app store, the stick's here). */
+export interface SnapshotList {
+  state: "idle" | "loading" | "ok" | "error";
+  list: Snapshot[];
+  error: ApiFailure | null;
+}
 
 export interface TreeNode {
   archive: string;
@@ -61,13 +68,35 @@ export function archiveFolder(archive: string): string {
  * `archives`, and the daemon puts each into its own subfolder. An empty list
  * of paths restores a whole archive (when its root is selected).
  */
-export function restoreRequest(selection: Selection[], snapshotTime: string, targetDir: string): RestoreRequest {
+export function restoreRequest(
+  selection: Selection[],
+  snapshotTime: string,
+  targetDir: string,
+  source: Target = "pbs",
+  uuid?: string | null,
+): RestoreRequest {
   const groups = selectedArchives(selection).map((archive) => {
     const mine = selection.filter((s) => s.archive === archive);
     return { archive, paths: mine.some((s) => s.path === "/") ? [] : mine.map((s) => s.path) };
   });
-  if (groups.length === 1) return { snapshot_time: snapshotTime, archive: groups[0]!.archive, paths: groups[0]!.paths, target_dir: targetDir };
-  return { snapshot_time: snapshotTime, archives: groups, target_dir: targetDir };
+  // The server is the default: its request stays exactly as older daemons know it.
+  const from = source === "stick" ? { target: "stick" as const, ...(uuid ? { stick_uuid: uuid } : {}) } : {};
+  if (groups.length === 1)
+    return { ...from, snapshot_time: snapshotTime, archive: groups[0]!.archive, paths: groups[0]!.paths, target_dir: targetDir };
+  return { ...from, snapshot_time: snapshotTime, archives: groups, target_dir: targetDir };
+}
+
+/** The stick could not be opened or read (503 `stick_unavailable`): not plugged in, pulled out, busy or unreadable. */
+export function isStickProblem(e: unknown): e is ApiFailure {
+  return e instanceof ApiFailure && (e.kind === "stick_unavailable" || e.code === "stick_unavailable");
+}
+
+/**
+ * Asked for the stick, the daemon answered as for the server: a version that does not know
+ * `target=stick` yet (it ignores the parameter). Its answer is not about the stick.
+ */
+export function stickNotSupported(e: unknown): boolean {
+  return e instanceof ApiFailure && (e.kind === "pbs_unreachable" || e.kind === "not_implemented");
 }
 
 export function folderNameFor(snapshotTime: string): string {
@@ -96,6 +125,14 @@ function sortEntries(a: DirEntry, b: DirEntry): number {
 }
 
 class RestoreState {
+  /** Where the files come from: the backup server or the plugged-in stick. */
+  source = $state<Target>("pbs");
+  stickUuid = $state<string | null>(null);
+  #generation = 0;
+  /** Snapshots on the stick; read again whenever the stick is plugged in anew. */
+  stickSnaps = $state<SnapshotList>({ state: "idle", list: [], error: null });
+  /** The last request to the stick failed (unplugged mid-browse, busy, unreadable); cleared by the next success. */
+  stickProblem = $state<ApiFailure | null>(null);
   snapshotTime = $state<string | null>(null);
   showOlder = $state(false);
   /** Result of opening the first archive: tells whether this daemon can browse at all. */
@@ -107,8 +144,10 @@ class RestoreState {
   folder = $state("");
   fullPath = $state("");
   starting = $state(false);
-  startError = $state<{ exists: boolean; notImplemented: boolean; message: string } | null>(null);
+  startError = $state<{ exists: boolean; notImplemented: boolean; stick: boolean; message: string } | null>(null);
   job = $state<Restore | null>(null);
+  /** Source captured when starting, including legacy PBS jobs without an echo. */
+  jobSource = $state<Target>("pbs");
   /** The last poll of the job failed: its current state is unknown. */
   jobUnknown = $state(false);
   jobSelection = $state<Selection[]>([]);
@@ -118,8 +157,80 @@ class RestoreState {
     return list.find((s) => s.time === this.snapshotTime) ?? null;
   }
 
+  /** The snapshot list of the chosen source: the server's (from the app store) or the stick's. */
+  snaps(server: SnapshotList): SnapshotList {
+    return this.source === "stick" ? this.stickSnaps : server;
+  }
+
+  /** A restore from the stick is running in this page: the stick is in use and must stay plugged in. */
+  get usingStick(): boolean {
+    return this.job?.state === "running" && this.jobSource === "stick";
+  }
+
+  /** Switch the source. Snapshots, files and selection belong to one source, so they start over. */
+  setSource(source: Target) {
+    if (source === this.source) return;
+    this.source = source;
+    this.#generation++;
+    this.stickSnaps = { state: "idle", list: [], error: null };
+    this.snapshotTime = null;
+    this.showOlder = false;
+    this.selection = [];
+    this.folder = "";
+    this.roots = [];
+    this.rootsFor = null;
+    this.browse = "unknown";
+    this.browseError = null;
+    this.stickProblem = null;
+    this.startError = null;
+  }
+
+  setStick(uuid: string | null) {
+    if (uuid === this.stickUuid) return;
+    this.stickUuid = uuid;
+    this.reset();
+  }
+
+  /** Read the snapshots on the stick. Opening the stick takes a moment (it is checked and mounted first). */
+  async loadStickSnapshots(force = false) {
+    if (!force && this.stickSnaps.state !== "idle") return;
+    if (this.stickSnaps.state === "loading") return;
+    this.stickSnaps = { state: "loading", list: this.stickSnaps.list, error: null };
+    const generation = this.#generation;
+    try {
+      const response = await api.snapshotSource("stick", this.stickUuid);
+      if (generation !== this.#generation) return;
+      this.stickUuid = response.stick_uuid!;
+      const list = response.snapshots;
+      list.sort((a, b) => b.time.localeCompare(a.time));
+      this.stickSnaps = { state: "ok", list, error: null };
+      this.stickProblem = null;
+    } catch (e) {
+      if (generation !== this.#generation) return;
+      this.stickSnaps = { state: "error", list: [], error: e instanceof ApiFailure ? e : new ApiFailure("other", 0, null, String(e)) };
+    }
+  }
+
+  /**
+   * The stick was pulled out. Its catalog is not kept across plug-ins and another stick may come
+   * next, so snapshots and selections are discarded before reading the next attachment.
+   */
+  /** The stick was pulled out. Its cached snapshot list always goes; the
+   *  choices of a restore are dropped only when that restore reads from the
+   *  stick, so a restore from the server keeps its snapshot and selection. */
+  stickGone() {
+    this.stickSnaps = { state: "idle", list: [], error: null };
+    if (this.source !== "stick") return;
+    this.#generation++;
+    this.snapshotTime = null;
+    this.selection = [];
+    this.roots = [];
+    this.rootsFor = null;
+  }
+
   pick(time: string) {
     if (time === this.snapshotTime) return;
+    this.#generation++;
     this.snapshotTime = time;
     this.selection = [];
     this.folder = "";
@@ -164,8 +275,11 @@ class RestoreState {
     if (node.children || node.loading) return;
     node.loading = true;
     node.failed = false;
+    const generation = this.#generation;
     try {
-      const entries = await api.browse(this.rootsFor!, node.archive, node.path);
+      const entries = await api.browse(this.rootsFor!, node.archive, node.path, this.source, this.stickUuid);
+      if (generation !== this.#generation) return;
+      if (this.source === "stick") this.stickProblem = null;
       entries.sort(sortEntries);
       node.children = entries.map((e) => ({
         archive: node.archive,
@@ -180,8 +294,10 @@ class RestoreState {
       }));
       if (this.browse === "unknown") this.browse = "ok";
     } catch (e) {
+      if (generation !== this.#generation) return;
       node.failed = true;
       node.open = false;
+      if (this.source === "stick" && isStickProblem(e)) this.stickProblem = e;
       if (e instanceof ApiFailure && e.kind === "not_implemented") this.browse = "not_implemented";
       else if (this.browse === "unknown") {
         this.browse = "error";
@@ -224,17 +340,22 @@ class RestoreState {
 
   async start(home: string | null): Promise<boolean> {
     if (!this.selection.length || !this.snapshotTime) return false;
+    const source = this.source;
+    const selection = [...this.selection];
     this.starting = true;
     this.startError = null;
     try {
-      this.job = await api.startRestore(restoreRequest(this.selection, this.snapshotTime, this.targetDir(home)));
-      this.jobSelection = [...this.selection];
+      this.job = await api.startRestore(restoreRequest(this.selection, this.snapshotTime, this.targetDir(home), this.source, this.stickUuid));
+      this.jobSource = source;
+      this.jobSelection = selection;
       this.watch();
       return true;
     } catch (e) {
       const f = e instanceof ApiFailure ? e : null;
       const exists = !!f && (f.code === "target_exists" || (f.kind === "conflict" && /exist/i.test(f.message)));
-      this.startError = { exists, notImplemented: f?.kind === "not_implemented", message: f?.message ?? String(e) };
+      const stick = source === "stick" && isStickProblem(e);
+      if (stick) this.stickProblem = f;
+      this.startError = { exists, notImplemented: f?.kind === "not_implemented", stick, message: f?.message ?? String(e) };
       return false;
     } finally {
       this.starting = false;
@@ -247,7 +368,9 @@ class RestoreState {
     if (!job || job.state !== "running") return;
     this.#poll = setTimeout(async () => {
       try {
-        this.job = await api.restore(job.id);
+        const updated = await api.restore(job.id, this.jobSource, job.stick_uuid);
+        if (this.job?.id !== job.id) return;
+        this.job = updated;
         this.jobUnknown = false;
       } catch {
         // Keep the last known state, but say that it is unknown now, and try again.
@@ -258,7 +381,11 @@ class RestoreState {
   }
 
   reset() {
+    this.#generation++;
     if (this.#poll) clearTimeout(this.#poll);
+    // The source stays: it is chosen again on the first step, or fixed when there is only the stick.
+    this.stickProblem = null;
+    this.stickSnaps = { state: "idle", list: [], error: null };
     this.snapshotTime = null;
     this.showOlder = false;
     this.browse = "unknown";

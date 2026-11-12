@@ -14,7 +14,12 @@
     keyConfirmFileCommand,
     keyExportCommand,
     normalizeCheckCode,
+    STICK_INFO_COMMAND,
+    isUuid,
+    knownStickUuid,
     stickFile,
+    stickKeyCopyCommand,
+    stickOnly,
     type Guide,
     type GuideStep,
   } from "../lib/derive";
@@ -23,6 +28,7 @@
   import { app } from "../lib/store.svelte";
   import { statusBar } from "../lib/statusbar.svelte";
   import { f, t } from "../lib/locale";
+  import type { Status } from "../lib/types";
 
   /**
    * The way from a fresh install to the first backup. Everything happens in a
@@ -30,7 +36,14 @@
    * It shows where the user is and moves on by itself when /status says so.
    * A command that still has a placeholder cannot be copied (see Cmd).
    */
-  let { guide }: { guide: Guide } = $props();
+  let { guide, status }: { guide: Guide; status: Status } = $props();
+
+  // Stick only: the password-protected copy on the backup stick counts as the key proof (decision 0026).
+  const onStick = $derived(stickOnly(status));
+  const knownUuid = $derived(onStick ? knownStickUuid(app.runs.value, status.targets?.stick, app.config.value?.stick_data_uuids) : null);
+  let uuid = $state("");
+  const stickUuid = $derived(knownUuid ?? uuid);
+  const uuidBad = $derived(!knownUuid && uuid.trim() !== "" && !isUuid(uuid));
 
   const g = t.guide;
   const titles: Record<GuideStep, string> = {
@@ -136,6 +149,27 @@
             {:else if step === "key_store"}
               <p class="text">{g.keyStoreWhy}</p>
               <div class="ways">
+                {#if onStick}
+                  <section aria-labelledby="h-stickcopy">
+                    <h3 id="h-stickcopy">{g.stickCopyTitle}</h3>
+                    <p class="text">{g.stickCopyText}</p>
+                    {#if !knownUuid}
+                      <div class="field one">
+                        <label for="g-uuid">{t.stick.uuidLabel}</label>
+                        <input
+                          id="g-uuid" class="input" autocomplete="off" spellcheck="false" placeholder="01234567-89ab-cdef-0123-456789abcdef"
+                          bind:value={uuid} aria-invalid={uuidBad ? "true" : undefined}
+                          aria-describedby={uuidBad ? "g-uuid-hint g-uuid-bad" : "g-uuid-hint"}
+                        />
+                        <p class="hint" id="g-uuid-hint">{t.stick.uuidHint}</p>
+                        {#if uuidBad}<p class="hint bad" id="g-uuid-bad" use:reveal>{t.stick.uuidInvalid}</p>{/if}
+                      </div>
+                      <Cmd command={STICK_INFO_COMMAND} />
+                    {/if}
+                    <Cmd command={stickKeyCopyCommand(stickUuid)} missing={t.stick.fillUuid} />
+                    <p class="hint">{g.stickCopyPaper}</p>
+                  </section>
+                {/if}
                 <section aria-labelledby="h-usb">
                   <h3 id="h-usb">{g.usbTitle}</h3>
                   <p class="text">{g.usbText}</p>
@@ -204,7 +238,7 @@
               {/if}
               <Cmd command={ENABLE_TIMERS_COMMAND} />
             {:else}
-              <p class="text">{g.firstBackupText}</p>
+              <p class="text">{onStick ? g.firstBackupStick : g.firstBackupText}</p>
             {/if}
             <p class="hint foot">{step === "first_backup" ? g.moveOn : `${g.terminal} ${g.moveOn}`}</p>
           {/if}

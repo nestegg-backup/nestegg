@@ -56,6 +56,34 @@ local API described in [`../api/openapi.yaml`](../api/openapi.yaml).
   areas (several `archives` go into one subfolder each), restore into a new
   directory with progress in bytes (`/snapshots/{time}/browse`,
   `/restores`).
+- **Restore from the stick:** with a server and a stick the first step asks
+  where the files come from ("Restore from": backup server or backup stick,
+  the server is preselected); a stick-only setup goes straight to the stick.
+  The stick's requests carry `target=stick` (query for `/snapshots` and
+  `/browse`, body for `/restores`); the server's stay as they were. A stick
+  that `/status` reports as not plugged in is not opened: the page says so
+  and asks `/status` every 5 s until it is back. `503 stick_unavailable`
+  (pulled out mid-browse, busy, unreadable) is shown as the stick's problem
+  with the daemon's message, never as an unreachable server; the selection
+  stays. A running restore from the stick shows no bar or percentage (the
+  daemon reports the bytes only at the end) and asks to keep the stick
+  plugged in; meanwhile the stick row never says "safe to unplug".
+- **Backup stick (decisions 0023, 0026):** with a stick target the page of
+  this PC lists the destinations (server and stick, one row each): the
+  stick's state from `status.targets.stick` (backing up, not plugged in,
+  "safe to unplug" only after a successful stick run, full, file system
+  damaged, check failed, other key, not possible on this computer such as
+  missing IPv6, overdue after its own threshold), free space as of the last
+  run, the last full check, and "Back up to stick now" (`POST
+  /targets/stick/runs`) only while a registered stick is plugged in and no
+  backup runs. The history and the 14 days switch between the targets
+  (`/targets/{target}/runs`); hourly "not plugged in" records of a day are
+  folded. The password reminder shows `stick key-check`/`key-copy`. Stick-only
+  setups have no server row, no other computers and no token-secret step;
+  the key guide offers the
+  password-protected copy on the stick. Settings: "overdue after" per target
+  and removing one of two targets after a confirmation (decision 0022
+  reports both). Missing API pieces: `API-REQUESTS.md`, section 7.
 - **Overview of several machines:** same UI, a list fed by a read-only PBS
   connection (`/machines`).
 
@@ -177,10 +205,13 @@ Add faults to any scenario with `&fault=a,b`:
 | `unknown_stored` | `credentials_stored` and `key_present` are `null` (the daemon cannot tell) |
 | `no_usage` | `GET /pbs` does not know the datastore usage |
 | `long_overdue` | "overdue after" is 744 hours in the file, above the API's cap: `limits` reports 744 as the maximum (and as `file_minimum`) and the settings page can only lower it |
+| `stick_pulled` | the stick is pulled out: `plugged_in` is false, stick requests answer `503 stick_unavailable`, and a running restore from the stick fails |
+| `stick_busy` | the stick is plugged in but cannot be opened (`503 stick_unavailable`) |
 
 `down` can also be switched while the page is open:
 `curl -X POST 'http://127.0.0.1:5173/__mock/fault?down=1'` (and `down=0`); it
-applies to the current scenario.
+applies to the current scenario. The same works for `stick_pulled`, e.g. to
+pull the stick out in the middle of choosing files.
 
 Add `&daemon=today` to get what an older daemon offers: no `/machines`,
 `/session`, `/pbs` and `/pbs/check` (404), browse and restore answer 501, and
@@ -201,7 +232,11 @@ list of other computers is empty and the sidebar shows no note), and
 that other computers cannot be read.
 Restoring into `/home/alice/Dokumente` (or another existing folder of the
 mock) answers `409 target_exists`. A restore takes about 4 s and reports
-`restored_bytes` and `total_bytes` while it runs.
+`restored_bytes` and `total_bytes` while it runs. From the stick (scenarios
+`stick_only` and `both`; `stick_absent` and `both_absent` have it unplugged)
+listing takes about 2 s, a restore about 8 s with `restored_bytes` 0 until it
+is done and `total_bytes` always null. With `daemon=today` the parameter
+`target=stick` is ignored, like a daemon from before stick restores.
 `PATCH /config` changes the settings of the current scenario like the daemon
 (same validation and the same refusal texts, `src/lib/settings.ts`); later
 `/config` and `/status` calls show the new values. Reloading with `?scenario=`

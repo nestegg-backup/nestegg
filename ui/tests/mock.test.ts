@@ -32,6 +32,17 @@ describe("mock API", () => {
       cancelled: "ok",
       unknown_run: "failing",
       unknown_never: "never",
+      // The legacy fields describe the server, or the stick when it is the only target.
+      stick_only: "ok",
+      stick_absent: "overdue",
+      stick_full: "failing",
+      stick_running: "running",
+      both: "ok",
+      both_absent: "ok",
+      stick_damaged: "ok",
+      stick_verify_failed: "ok",
+      stick_key_mismatch: "ok",
+      stick_unsupported: "ok",
     };
     expect(s.health).toBe(expected[sc]);
     expect(s.encryption.key_exported).toBe(!["key_not_exported", "unconfigured", "no_credentials", "no_key"].includes(sc));

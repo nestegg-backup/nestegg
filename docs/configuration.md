@@ -697,3 +697,60 @@ Because
 backups are normal PBS snapshots, they can also be restored with plain
 `proxmox-backup-client` (with the exported key) or through the PBS web UI
 (unencrypted backups only).
+
+## Registered backup sticks (preparation only)
+
+`sudo nestegg stick add /dev/sdX --image nestegg-rescue-amd64.iso` preserves
+existing settings and adds the ext4 data UUID under:
+
+```toml
+[stick]
+data_uuids = ["01234567-89ab-cdef-0123-456789abcdef"]
+```
+
+UUIDs must be distinct and have ext4 UUID syntax; unknown keys are rejected,
+including inside `[stick]`. Existing `[pbs]`-only files require no migration.
+Phase one only prepares/registers media; it does not automatically back up to
+these drives. A file with just `[stick]` is accepted by the stick commands;
+the existing backup pipeline still requires `[pbs]`. Per-target settings and
+stick-only backups arrive in phase two. See [stick preparation](stick.md).
+
+
+## Optional backup-stick target
+
+A configuration may have `[pbs]`, `[stick]`, or both. Existing PBS-only files
+work unchanged; no dummy PBS is needed for a stick-only installation. Register
+media with `nestegg stick add` and use the ext4 data UUID reported by `stick info`.
+Unknown keys remain errors. Stick backups always use encryption and the same
+machine key as PBS backups.
+
+```toml
+[stick]
+data_uuids = ["01234567-89ab-cdef-0123-456789abcdef"]
+overdue_after_hours = 168       # 7 days, independent of the PBS threshold
+minimum_free_bytes = 268435456  # space available to the PBS user, not root
+
+[stick.retention]
+keep_last = 3
+keep_daily = 7
+keep_weekly = 4
+keep_monthly = 6
+```
+
+`keep_last` must be positive. Setting a daily, weekly or monthly criterion to
+zero disables that criterion. A stick that is absent has its own availability
+state and does not count as a failed run. Failure counters, success times,
+read-back checks and retry delays are independent for PBS and stick. The shared
+schedule interval applies to each target. `backup --target all` (the default)
+tries the stick first, then PBS; a manual `--target stick` does not wake PBS.
+
+A stick-only setup may prove its key using the password-protected copy made by
+`stick key-copy`; with PBS configured, the independent existing export proof is
+still required. `stick key-check` renews its 180-day password reminder. See
+[stick setup and safety](stick.md).
+
+The API adds `stick_overdue_after_hours` (same upper cap as the PBS threshold)
+and `remove_target` to editable settings. Only one of two targets may be removed;
+the last target is retained. Both target removal and raising the stick warning
+threshold announce reduced protection under decision 0022. Direct root edits
+keep the existing trusted-root behavior.

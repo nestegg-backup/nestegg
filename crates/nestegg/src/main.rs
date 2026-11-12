@@ -43,7 +43,10 @@ enum Cmd {
         wake: bool,
     },
     /// Start a backup now.
-    Backup,
+    Backup {
+        #[arg(long, value_enum, default_value_t = nestegg::state::TargetSelection::All)]
+        target: nestegg::state::TargetSelection,
+    },
     /// Show the backup status of this computer.
     Status {
         #[arg(long)]
@@ -100,6 +103,9 @@ enum Cmd {
         #[command(subcommand)]
         command: Option<nestegg::rescue::cli::RescueCmd>,
     },
+    /// Create, update or register a bootable backup stick (root).
+    #[command(subcommand)]
+    Stick(nestegg::stick::cli::StickCmd),
     /// Show the configuration.
     Config {
         /// Print an example configuration instead.
@@ -116,6 +122,10 @@ enum Cmd {
         /// Ignore the schedule interval.
         #[arg(long)]
         force: bool,
+        #[arg(long, value_enum, default_value_t = nestegg::state::TargetSelection::All)]
+        target: nestegg::state::TargetSelection,
+        #[arg(long)]
+        stick_uuid: Option<String>,
     },
     /// Internal: create a new 0600 file from stdin (runs as the sudo user).
     #[command(name = "__write-new-file", hide = true)]
@@ -272,6 +282,7 @@ enum TriggerArg {
     Timer,
     Manual,
     Cli,
+    Plug,
 }
 
 impl From<TriggerArg> for Trigger {
@@ -280,6 +291,7 @@ impl From<TriggerArg> for Trigger {
             TriggerArg::Timer => Trigger::Timer,
             TriggerArg::Manual => Trigger::Manual,
             TriggerArg::Cli => Trigger::Cli,
+            TriggerArg::Plug => Trigger::Plug,
         }
     }
 }
@@ -305,8 +317,9 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
         }) => set_password(paths, allow_plain, overview),
         Cmd::Key(k) => key(paths, k),
         Cmd::Check { wake } => check(paths, wake),
+        Cmd::Stick(command) => nestegg::stick::cli::run(command, paths),
         Cmd::Rescue { command } => nestegg::rescue::cli::run(command),
-        Cmd::Backup => backup_now(paths),
+        Cmd::Backup { target } => backup_now(paths, target),
         Cmd::Status { json } => status(paths, json),
         Cmd::Notify { test, dry_run } => {
             require_root("nestegg notify")?;
@@ -352,11 +365,15 @@ fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
             trigger,
             run_id,
             force,
+            target,
+            stick_uuid,
         } => {
             let options = RunOptions {
+                target,
+                stick_uuid,
                 trigger: trigger.into(),
                 run_id,
-                force: force || !matches!(trigger, TriggerArg::Timer),
+                force: force || !matches!(trigger, TriggerArg::Timer | TriggerArg::Plug),
             };
             Ok(execute(paths, &options)?.code() as u8)
         }
@@ -426,10 +443,10 @@ fn init(paths: &Paths, args: InitArgs) -> Result<u8> {
     }
     let mut cfg = config::example(&args.server, &args.datastore, &args.auth_id);
     if let Some(p) = args.port {
-        cfg.pbs.port = p;
+        cfg.pbs.as_mut().unwrap().port = p;
     }
-    cfg.pbs.namespace = args.namespace;
-    cfg.pbs.fingerprint = args.fingerprint;
+    cfg.pbs.as_mut().unwrap().namespace = args.namespace;
+    cfg.pbs.as_mut().unwrap().fingerprint = args.fingerprint;
     cfg.backup_id = args.backup_id;
     cfg.backup.encryption = !args.no_encryption;
     cfg.backup.system = !args.no_system;
@@ -817,8 +834,16 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                 backup_id: cfg.effective_backup_id(),
                 hostname: config::hostname(),
                 date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
-                server: format!("{}:{}", cfg.pbs.server, cfg.pbs.port),
-                datastore: cfg.pbs.datastore.clone(),
+                server: cfg
+                    .pbs
+                    .as_ref()
+                    .map(|p| format!("{}:{}", p.server, p.port))
+                    .unwrap_or_else(|| "backup stick".into()),
+                datastore: cfg
+                    .pbs
+                    .as_ref()
+                    .map(|p| p.datastore.clone())
+                    .unwrap_or_else(|| "stick".into()),
                 fingerprint,
                 check_code: material.check_code(),
             };
@@ -1508,16 +1533,22 @@ fn daemon_check(
     )))
 }
 
-fn backup_now(paths: &Paths) -> Result<u8> {
+fn backup_now(paths: &Paths, target: nestegg::state::TargetSelection) -> Result<u8> {
     if is_root() {
         let options = RunOptions {
+            target,
+            stick_uuid: None,
             trigger: Trigger::Cli,
             run_id: None,
             force: true,
         };
         return Ok(execute(paths, &options)?.code() as u8);
     }
-    let (code, body) = daemon_request(paths, "POST", "/api/v1/runs")?;
+    let (code, body) = daemon_request(
+        paths,
+        "POST",
+        &format!("/api/v1/targets/{}/runs", target.as_str()),
+    )?;
     match code {
         202 => {
             println!(
@@ -1609,6 +1640,15 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
         "Machine:      {} (backup id {})",
         status.machine.hostname, status.machine.backup_id
     );
+    for (target, view) in &status.targets {
+        println!(
+            "Target {}: {} (health {:?}, {} failures in a row)",
+            target.as_str(),
+            view.state,
+            view.health,
+            view.consecutive_failures
+        );
+    }
     if !status.pbs.server.is_empty() {
         println!(
             "PBS:          {} / {}{}",

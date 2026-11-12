@@ -9,6 +9,8 @@
 import type { SettingKey, SettingsChange, SettingsLimits } from "./types.ts";
 
 export const SETTING_KEYS: readonly SettingKey[] = [
+  "stick_overdue_after_hours",
+  "remove_target",
   "interval_hours",
   "overdue_after_hours",
   "excludes",
@@ -50,6 +52,21 @@ export function overdueCap(interval: number, limits: SettingsLimits = DEFAULT_LI
   return Math.max(od.base, interval + od.per_interval_extra, od.file_minimum ?? 0);
 }
 
+/**
+ * The largest "overdue after" of the stick: the same rule as for the server, with the stick's own
+ * value in the file as the floor. Prefer the stick's own daemon-supplied limits;
+ * older daemons fall back to the original server-cap rule.
+ */
+export function stickOverdueCap(interval: number, stickFile: number | null | undefined, limits: SettingsLimits = DEFAULT_LIMITS): number {
+  const own = limits.stick_overdue_after_hours;
+  if (own) {
+    if (own.base === undefined || own.per_interval_extra === undefined) return own.max;
+    return Math.max(own.base, interval + own.per_interval_extra, own.file_minimum ?? 0);
+  }
+  const od = limits.overdue_after_hours;
+  return Math.max(od.base ?? OVERDUE_BASE_HOURS, interval + (od.per_interval_extra ?? OVERDUE_INTERVAL_EXTRA_HOURS), stickFile ?? 0);
+}
+
 /** Keys that exist, but only root can change them in the terminal. */
 const TERMINAL_ONLY = new Set([
   "backup_id",
@@ -89,6 +106,10 @@ export interface CurrentSettings {
   wake_on_lan_configured: boolean;
   /** The exclude list as it is now: patterns that are already in it are not judged again. */
   excludes?: string[];
+  /** "Overdue after" of the stick; null or absent: no stick target. */
+  stick_overdue_after_hours?: number | null;
+  /** Which targets are configured; absent: only the backup server (older daemons). */
+  targets?: { pbs: boolean; stick: boolean };
 }
 
 // A pattern that matches every entry: only slashes, or wildcard-only
@@ -167,8 +188,12 @@ export function settingsProblem(
     return `unknown setting ${JSON.stringify(key)}; editable settings are: ${SETTING_KEYS.join(", ")}`;
   }
   const given = (k: SettingKey) => raw[k] !== undefined && raw[k] !== null;
-  for (const k of ["interval_hours", "overdue_after_hours"] as const)
+  for (const k of ["stick_overdue_after_hours", "interval_hours", "overdue_after_hours"] as const)
     if (given(k) && !isUint(raw[k])) return typeProblem(raw[k], "u32");
+  if (given("remove_target") && raw.remove_target !== "pbs" && raw.remove_target !== "stick")
+    return typeof raw.remove_target === "string"
+      ? `invalid settings: unknown variant \`${raw.remove_target}\`, expected \`pbs\` or \`stick\``
+      : typeProblem(raw.remove_target, "a string");
   for (const k of ["wake_on_lan", "automatic_backups"] as const)
     if (given(k) && typeof raw[k] !== "boolean") return typeProblem(raw[k], "a boolean");
   if (given("excludes")) {
@@ -177,6 +202,21 @@ export function settingsProblem(
     if (bad >= 0) return typeProblem(raw.excludes[bad], "a string");
   }
   const change = raw as SettingsChange;
+
+  const targets = current.targets ?? { pbs: true, stick: false };
+  // Same order as the daemon (settings::validate): the stick threshold, then the target removal.
+  if (given("stick_overdue_after_hours")) {
+    if (!targets.stick) return "no stick target configured";
+    const cap = stickOverdueCap(intervalAfter(raw, current), current.stick_overdue_after_hours, limits);
+    const h = raw.stick_overdue_after_hours as number;
+    if (h < (limits.stick_overdue_after_hours?.min ?? 1) || h > cap) return `stick_overdue_after_hours must be between 1 and ${cap}`;
+    if (raw.remove_target === "stick") return "cannot change and remove the stick target together";
+  }
+  if (given("remove_target")) {
+    if (!targets.pbs || !targets.stick) return "cannot remove the last configured backup target";
+    if (raw.remove_target === "pbs" && raw.wake_on_lan !== undefined && raw.wake_on_lan !== null)
+      return "cannot change Wake-on-LAN while removing PBS";
+  }
 
   const { interval_hours: iv, overdue_after_hours: od } = limits;
   if (given("interval_hours") && (change.interval_hours! < iv.min || change.interval_hours! > iv.max))
@@ -217,4 +257,9 @@ export function settingsProblem(
   if (change.wake_on_lan === true && !current.wake_on_lan_configured)
     return "Wake-on-LAN is not set up: the configuration has no [wake] section with the MAC address of the backup server. Add it in the terminal (see /usr/share/doc/nestegg/configuration.md), then switch it on here.";
   return null;
+}
+
+/** The rhythm in effect after a request (it may change in the same request). */
+function intervalAfter(raw: Record<string, unknown>, current: CurrentSettings): number {
+  return typeof raw.interval_hours === "number" ? raw.interval_hours : current.interval_hours;
 }

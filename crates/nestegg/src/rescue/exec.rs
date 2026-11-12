@@ -180,6 +180,25 @@ pub fn preflight(plan: &Plan, selections: Option<&str>) -> Result<Vec<String>> {
     Ok(warnings)
 }
 
+/// Check the live fallback installer before erasing a disk. A firmware-mode
+/// change can need it even when the source system has its own GRUB.
+pub fn check_live_grub() -> Result<()> {
+    let available = std::env::var_os("PATH").is_some_and(|paths| live_grub_available(&paths));
+    anyhow::ensure!(
+        available,
+        "the live system lacks grub-install (grub2-common); use a complete rescue image. Nothing was erased"
+    );
+    Ok(())
+}
+
+fn live_grub_available(paths: &std::ffi::OsStr) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(paths).any(|dir| {
+        fs::metadata(dir.join("grub-install"))
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
+}
+
 /// The rescue stick's mkfs tools are newer than many restored systems.
 /// These ext4 features are off so that GRUB 2.06 and e2fsprogs 1.46
 /// (Ubuntu 22.04, Linux Mint 21, Debian 12) can read and check the disk.
@@ -850,6 +869,19 @@ fn install_grub(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_grub_must_be_an_executable_file_before_restore() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!live_grub_available(dir.path().as_os_str()));
+        let binary = dir.path().join("grub-install");
+        fs::write(&binary, "fixture").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!live_grub_available(dir.path().as_os_str()));
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(live_grub_available(dir.path().as_os_str()));
+    }
 
     #[test]
     fn disk_membership() {

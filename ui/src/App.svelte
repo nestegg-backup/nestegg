@@ -12,7 +12,7 @@
   import RestoreFlow from "./components/restore/RestoreFlow.svelte";
   import { app } from "./lib/store.svelte";
   import { router } from "./lib/router.svelte";
-  import { machineName } from "./lib/derive";
+  import { machineName, stickOnly } from "./lib/derive";
   import { t } from "./lib/locale";
 
   app.start();
@@ -82,6 +82,9 @@
       <ThisPc {status} />
     {:else if route.view === "pc"}
       <OtherPc {machine} id={route.id} />
+    {:else if route.view === "server" && stickOnly(status)}
+      <!-- Stick only: there is no server to check (the address may come from an old link). -->
+      <p class="lead-text">{t.stick.noServer}</p>
     {:else if route.view === "server"}
       <ServerView {status} />
     {:else if route.view === "settings"}

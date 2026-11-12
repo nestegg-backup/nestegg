@@ -30,6 +30,8 @@ docker run --rm --privileged -v "$work/build:/build" -w /build \
     https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg
   echo "$KEYRING_SHA256  config/archives/pbs-client.key.chroot" | sha256sum -c - >/dev/null
   cp config/archives/pbs-client.key.chroot config/archives/pbs-client.key.binary
+  cp config/archives/pbs-client.key.chroot config/archives/pbs-server.key.chroot
+  cp config/archives/pbs-client.key.chroot config/archives/pbs-server.key.binary
   lb config \
     --distribution trixie \
     --archive-areas "main contrib non-free non-free-firmware" \

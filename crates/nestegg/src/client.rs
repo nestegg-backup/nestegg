@@ -254,6 +254,16 @@ fn bounded_failure(stderr: &[u8]) -> anyhow::Error {
     }
 }
 
+/// Distinguish an actual key/signature refusal from an unreadable manifest.
+pub fn group_key_error_kind(error: &anyhow::Error) -> ErrorKind {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if message.contains("wrong key") || message.contains("manifest has no signature") {
+        ErrorKind::KeyMismatch
+    } else {
+        ErrorKind::VerificationFailed
+    }
+}
+
 /// Map client output to an error category.
 pub fn classify_failure(output_tail: &[String]) -> ErrorKind {
     let text = output_tail.join("\n").to_lowercase();
@@ -307,6 +317,23 @@ pub struct SnapshotInfo {
     /// read with the key is (see [`Client::read_manifest_with_key`]).
     #[serde(skip)]
     pub crypt_modes: Vec<(String, String)>,
+}
+
+fn parse_space_info(v: &Value) -> Result<(u64, Option<u64>)> {
+    let available = v["avail"]
+        .as_u64()
+        .context("PBS did not report space available to its backup user")?;
+    Ok((available, v["total"].as_u64().filter(|total| *total > 0)))
+}
+
+/// PBS itself defines a finished snapshot by the presence of its manifest.
+/// A failed upload can leave a newer unfinished directory; it must not hide
+/// the last completed snapshot's key, nor prevent the official client retry.
+pub(crate) fn last_finished_snapshot(snapshots: &[SnapshotInfo]) -> Option<&SnapshotInfo> {
+    snapshots
+        .iter()
+        .filter(|s| s.archives.iter().any(|name| name == "index.json.blob"))
+        .max_by_key(|s| snapshot_epoch(&s.snapshot))
 }
 
 /// Convert the JSON of `snapshot list --output-format json`.
@@ -542,6 +569,7 @@ pub struct BackupOutcome {
 }
 
 pub struct Client<'a> {
+    local: Option<&'a crate::stick::launcher::LocalPbs>,
     config: &'a Config,
     secrets: SecretStore,
     /// Overrides `pbs.auth_id` (read-only overview credentials).
@@ -582,7 +610,18 @@ impl<'a> Client<'a> {
             secrets,
             auth_id: None,
             password_secret: secrets::PASSWORD,
+            local: None,
         }
+    }
+
+    pub fn local(
+        config: &'a Config,
+        secrets: SecretStore,
+        pbs: &'a crate::stick::launcher::LocalPbs,
+    ) -> Self {
+        let mut client = Self::new(config, secrets);
+        client.local = Some(pbs);
+        client
     }
 
     /// Client with other credentials (e.g. the read-only overview token).
@@ -597,6 +636,7 @@ impl<'a> Client<'a> {
             secrets,
             auth_id: Some(auth_id.to_string()),
             password_secret,
+            local: None,
         }
     }
 
@@ -604,7 +644,17 @@ impl<'a> Client<'a> {
         match &self.auth_id {
             Some(id) => format!(
                 "{id}@{}:{}:{}",
-                self.config.pbs.server, self.config.pbs.port, self.config.pbs.datastore
+                self.config
+                    .pbs
+                    .as_ref()
+                    .map(|p| p.server.as_str())
+                    .unwrap_or_default(),
+                self.config.pbs.as_ref().map(|p| p.port).unwrap_or(8007),
+                self.config
+                    .pbs
+                    .as_ref()
+                    .map(|p| p.datastore.as_str())
+                    .unwrap_or_default()
             ),
             None => self.config.repository(),
         }
@@ -618,9 +668,12 @@ impl<'a> Client<'a> {
             self.add_namespace(&mut cmd);
         }
         fds.apply(&mut cmd);
-        let output = cmd.output().context("cannot run proxmox-backup-client")?;
+        let output = run_capturing(&mut cmd, Some(std::time::Duration::from_secs(12 * 3600)))?;
+        if output.stopped != Stopped::No {
+            bail!("client query cancelled or timed out");
+        }
         if !output.status.success() {
-            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+            return Err(bounded_failure(&output.stderr));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
@@ -640,6 +693,17 @@ impl<'a> Client<'a> {
 
     pub fn notes(&self, snapshot: &str) -> Result<String> {
         self.output(&["snapshot", "notes", "show", snapshot], true)
+    }
+
+    pub fn available_bytes(&self) -> Result<u64> {
+        Ok(self.space_info()?.0)
+    }
+
+    /// Space available to the backup user and the datastore's total size.
+    pub fn space_info(&self) -> Result<(u64, Option<u64>)> {
+        let v: Value =
+            serde_json::from_str(&self.output(&["status", "--output-format", "json"], false)?)?;
+        parse_space_info(&v)
     }
 
     /// Datastore usage `(used, total)`; `None` if the token may not see it.
@@ -709,7 +773,13 @@ impl<'a> Client<'a> {
 
     /// Base command with repository, fingerprint and password descriptor.
     fn command(&self, fds: &mut FdPassing) -> Result<Command> {
-        let mut cmd = Command::new(client_binary());
+        let mut cmd = match self.local {
+            Some(local) => local.client_command(&client_binary())?,
+            None => {
+                self.config.remote_pbs()?;
+                Command::new(client_binary())
+            }
+        };
         for var in [
             "PBS_PASSWORD",
             "PBS_PASSWORD_FILE",
@@ -724,8 +794,15 @@ impl<'a> Client<'a> {
         ] {
             cmd.env_remove(var);
         }
+        if let Some(local) = self.local {
+            cmd.env("PBS_REPOSITORY", local.repository())
+                .env("PBS_FINGERPRINT", local.fingerprint())
+                .env("PBS_PASSWORD_FD", "9");
+            cmd.stdin(Stdio::null());
+            return Ok(cmd);
+        }
         cmd.env("PBS_REPOSITORY", self.repository());
-        if let Some(fp) = &self.config.pbs.fingerprint {
+        if let Some(fp) = &self.config.remote_pbs()?.fingerprint {
             cmd.env("PBS_FINGERPRINT", fp);
         }
         let password = self.secrets.load(self.password_secret)?;
@@ -736,9 +813,42 @@ impl<'a> Client<'a> {
     }
 
     fn add_namespace(&self, cmd: &mut Command) {
-        if let Some(ns) = &self.config.pbs.namespace {
+        if self.local.is_none()
+            && let Some(ns) = self.config.pbs.as_ref().and_then(|p| p.namespace.as_ref())
+        {
             cmd.args(["--ns", ns]);
         }
+    }
+
+    pub fn check_group_key(&self, backup_id: &str) -> Result<()> {
+        let snapshots = self.list_snapshots_bounded(backup_id, readback_list_timeout())?;
+        if let Some(last) = last_finished_snapshot(&snapshots) {
+            let key = self.secrets.load(secrets::ENCRYPTION_KEY)?;
+            // The official client itself rejects unsigned/wrong-key manifests.
+            self.read_manifest_with_key(&last.snapshot, &key)?;
+        }
+        Ok(())
+    }
+
+    pub fn prune_stick(
+        &self,
+        backup_id: &str,
+        retention: &crate::config::StickRetention,
+    ) -> Result<()> {
+        let group = format!("host/{backup_id}");
+        let mut args = vec!["prune".to_string(), group];
+        for (flag, count) in [
+            ("--keep-last", retention.keep_last),
+            ("--keep-daily", retention.keep_daily),
+            ("--keep-weekly", retention.keep_weekly),
+            ("--keep-monthly", retention.keep_monthly),
+        ] {
+            if count > 0 {
+                args.extend([flag.into(), count.to_string()]);
+            }
+        }
+        self.output(&args.iter().map(String::as_str).collect::<Vec<_>>(), false)?;
+        Ok(())
     }
 
     /// Run a backup, streaming all client output into `log`.
@@ -829,15 +939,28 @@ impl<'a> Client<'a> {
         backup_id: &str,
         timeout: std::time::Duration,
     ) -> Result<Vec<SnapshotInfo>> {
+        self.list_snapshot_scope_bounded(Some(backup_id), timeout)
+    }
+
+    pub fn list_all_snapshots_bounded(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<SnapshotInfo>> {
+        self.list_snapshot_scope_bounded(None, timeout)
+    }
+
+    fn list_snapshot_scope_bounded(
+        &self,
+        backup_id: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<SnapshotInfo>> {
         let mut fds = FdPassing::new();
         let mut cmd = self.command(&mut fds)?;
-        cmd.args([
-            "snapshot",
-            "list",
-            &format!("host/{backup_id}"),
-            "--output-format",
-            "json",
-        ]);
+        cmd.args(["snapshot", "list"]);
+        if let Some(id) = backup_id {
+            cmd.arg(format!("host/{id}"));
+        }
+        cmd.args(["--output-format", "json"]);
         self.add_namespace(&mut cmd);
         fds.apply(&mut cmd);
         let cap = run_capturing(&mut cmd, Some(timeout))?;
@@ -1021,9 +1144,16 @@ impl<'a> Client<'a> {
         cmd.args(["--keyfd", &KEY_FD.to_string()]);
         self.add_namespace(&mut cmd);
         fds.apply(&mut cmd);
-        let output = cmd.output().context("cannot run proxmox-backup-client")?;
+        let output = run_capturing(&mut cmd, Some(readback_list_timeout()))?;
+        match output.stopped {
+            Stopped::TimedOut => {
+                return Err(TimedOut("reading the signed manifest timed out".into()).into());
+            }
+            Stopped::Cancelled => bail!("reading the signed manifest was cancelled"),
+            Stopped::No => {}
+        }
         if !output.status.success() {
-            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+            return Err(bounded_failure(&output.stderr));
         }
         serde_json::from_slice::<Value>(&output.stdout)
             .context("the client did not return the manifest of the snapshot")
@@ -1415,6 +1545,33 @@ pub fn parse_time(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_uses_backup_user_availability_and_optional_total() {
+        assert_eq!(
+            parse_space_info(&serde_json::json!({"avail": 25, "used": 60, "total": 100})).unwrap(),
+            (25, Some(100))
+        );
+        assert_eq!(
+            parse_space_info(&serde_json::json!({"avail": 0})).unwrap(),
+            (0, None)
+        );
+        assert!(parse_space_info(&serde_json::json!({"used": 10, "total": 100})).is_err());
+    }
+
+    #[test]
+    fn key_gate_uses_last_completed_snapshot_after_an_interrupted_upload() {
+        let snapshots = parse_snapshot_list(r#"[
+          {"backup-type":"host","backup-id":"desktop","backup-time":30,"files":[{"filename":"files.pxar.didx"}]},
+          {"backup-type":"host","backup-id":"desktop","backup-time":20,"files":[{"filename":"index.json.blob"}]},
+          {"backup-type":"host","backup-id":"desktop","backup-time":10,"files":[{"filename":"index.json.blob"}]}
+        ]"#).unwrap();
+        assert_eq!(
+            snapshot_epoch(&last_finished_snapshot(&snapshots).unwrap().snapshot),
+            Some(20)
+        );
+        assert!(last_finished_snapshot(&snapshots[..1]).is_none());
+    }
 
     fn spec() -> BackupSpec {
         BackupSpec {

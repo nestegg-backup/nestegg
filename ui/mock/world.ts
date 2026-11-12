@@ -21,6 +21,8 @@ import type {
   SettingsLimits,
   Snapshot,
   Status,
+  Target,
+  TargetStatus,
 } from "../src/lib/types.ts";
 import { DEFAULT_LIMITS, OVERDUE_BASE_HOURS, OVERDUE_INTERVAL_EXTRA_HOURS, SETTING_KEYS, overdueCap, settingsProblem } from "../src/lib/settings.ts";
 import { malformedProblem, wholeFolderProblem } from "./folderRule.ts";
@@ -53,6 +55,17 @@ export const SCENARIOS = [
   "unknown_never",
   "daemon_down",
   "unauthorized",
+  // Backup stick (decisions 0023 and 0026). `stick_*` without a server, `both*` with one.
+  "stick_only",
+  "stick_absent",
+  "stick_full",
+  "stick_running",
+  "both",
+  "both_absent",
+  "stick_damaged",
+  "stick_verify_failed",
+  "stick_key_mismatch",
+  "stick_unsupported",
 ] as const;
 export type Scenario = (typeof SCENARIOS)[number];
 
@@ -84,6 +97,10 @@ export type Flavor = "full" | "today";
  * - `unknown_stored`: `credentials_stored` and `key_present` are null (the daemon cannot tell)
  * - `long_overdue`: an administrator set "overdue after" to 744 hours in the file: above the API's
  *   limit of 168, so the settings page can only lower it (`limits` reports 744 as the maximum)
+ * - `stick_password`: the stick's key copy is due for its password re-check (`password_reminder`)
+ * - `stick_pulled`: the stick is pulled out (also at runtime: `POST /__mock/fault?stick_pulled=1|0`);
+ *   stick requests answer 503 `stick_unavailable` and a running restore from it fails
+ * - `stick_busy`: opening the stick fails although it is plugged in (503 `stick_unavailable`)
  */
 export const FAULTS = [
   "down",
@@ -102,6 +119,10 @@ export const FAULTS = [
   "no_encryption",
   "unknown_stored",
   "long_overdue",
+  "stick_password",
+  "stick_pulled",
+  "stick_busy",
+  "stick_multiple",
 ] as const;
 export type Fault = (typeof FAULTS)[number];
 
@@ -115,6 +136,10 @@ export interface Reply {
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 const GB = 1_000_000_000;
+
+/** The documentation UUID of docs/stick.md; never a real medium. */
+export const SECOND_STICK_UUID = "01234567-89ab-cdef-0123-456789abcdee";
+export const STICK_UUID = "01234567-89ab-cdef-0123-456789abcdef";
 
 const iso = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
 
@@ -149,7 +174,10 @@ interface StoredRun extends Run {
 interface ActiveRun {
   run: StoredRun;
   startedMs: number;
-  outcome: "succeeded" | "pbs_unreachable" | "config";
+  /** `stick_full`, `absent`: stick runs only. */
+  outcome: "succeeded" | "pbs_unreachable" | "config" | "stick_full" | "absent";
+  /** "Back up now" with both targets: the server's run follows the stick's. */
+  then?: "pbs";
   /** Message of a `config` failure. */
   configMessage?: string;
   /** When the user asked to cancel (ms); the run ends as `cancelled` shortly after. */
@@ -160,11 +188,61 @@ interface RestoreJob {
   restore: Restore;
   startedMs: number;
   totalBytes: number;
+  /** From the stick: no progress until the end, and it fails when the stick is pulled out. */
+  stick?: boolean;
 }
 
 const fmtClock = (ms: number) => new Date(ms).toTimeString().slice(0, 8);
 
+/** The stick as the mock knows it. */
+interface StickWorld {
+  plugged: boolean;
+  availableBytes: number;
+  overdueHours: number;
+  runs: StoredRun[];
+  fullVerifiedMs: number | null;
+  damagedPaths: string[];
+}
+
+function stickLogFor(run: Run, startMs: number): string[] {
+  const t = (offsetS: number) => fmtClock(startMs + offsetS * 1000);
+  const end = run.duration_seconds ?? 600;
+  const head = `${t(0)}  start: trigger=${run.trigger} target=stick backup-id=desktop`;
+  const mounted = [
+    `${t(1)}  stick ${STICK_UUID}: e2fsck -f -n clean; mounted nodev,nosuid,noexec,relatime`,
+    `${t(3)}  local PBS started from /var/lib/nestegg/stick/pbs.squashfs (loopback only)`,
+  ];
+  switch (run.state) {
+    case "stick_not_plugged_in":
+      return [head, `${t(0)}  no registered stick is plugged in`, `${t(0)}  result: stick_not_plugged_in`];
+    case "succeeded":
+      return [
+        head,
+        ...mounted,
+        `${t(6)}  proxmox-backup-client backup home.pxar:/home etc.pxar:/etc root.pxar:/root usr-local.pxar:/usr/local inventory.pxar`,
+        `${t(end - 40)}  uploaded ${((run.uploaded_bytes ?? 0) / GB).toFixed(2)} GB; read back and compared`,
+        `${t(end - 20)}  PBS verification of the new snapshot: ok`,
+        `${t(end - 10)}  prune keep-last=3 keep-daily=7 keep-weekly=4 keep-monthly=6; garbage collection done`,
+        `${t(end)}  local PBS stopped, file system flushed and unmounted: safe to unplug`,
+        `${t(end)}  result: succeeded (${run.snapshot})`,
+      ];
+    case "failed":
+      return [
+        head,
+        ...(run.error?.kind === "stick_unsupported" || run.error?.kind === "filesystem_damaged" ? [] : mounted),
+        `${t(end - 2)}  ${run.error?.message ?? "error"}`,
+        `${t(end)}  local PBS stopped and stick unmounted`,
+        `${t(end)}  result: failed (${run.error?.kind ?? "internal"})`,
+      ];
+    case "cancelled":
+      return [head, ...mounted, `${t(end - 1)}  cancelled by the user`, `${t(end)}  result: cancelled`];
+    default:
+      return [head];
+  }
+}
+
 function logFor(run: Run, startMs: number): string[] {
+  if (run.target === "stick") return stickLogFor(run, startMs);
   const t = (offsetS: number) => fmtClock(startMs + offsetS * 1000);
   const head = `${t(0)}  start: trigger=${run.trigger} backup-id=desktop`;
   switch (run.state) {
@@ -212,14 +290,19 @@ function makeRun(
     warnings?: string[];
     incomplete?: string[];
     verified?: boolean;
+    /** Only set when given: PBS records of older versions have no target. */
+    target?: Target;
   } = {},
 ): StoredRun {
   const d = new Date(startMs);
   const stamp = d.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
   const trigger = opts.trigger ?? "timer";
-  const duration = opts.duration ?? (state === "pbs_unreachable" ? 300 : state === "failed" ? 66 : 600);
+  const duration =
+    opts.duration ?? (state === "stick_not_plugged_in" ? 1 : state === "pbs_unreachable" ? 300 : state === "failed" ? 66 : 600);
   const run: Run = {
-    id: `${stamp}-${trigger}`,
+    ...(opts.target ? { target: opts.target } : {}),
+    ...(opts.target === "stick" && state !== "stick_not_plugged_in" ? { stick_uuid: STICK_UUID } : {}),
+    id: `${stamp}-${trigger}${opts.target === "stick" ? "-stick" : ""}`,
     trigger,
     state,
     started_at: iso(startMs),
@@ -321,6 +404,10 @@ export class World {
   keyCreated = true;
   /** false: the token secret is not stored yet (`no_credentials`, `unconfigured`). */
   credentialsStored = true;
+  /** The configuration has a `[pbs]` section (false: the stick is the only target). */
+  pbsTarget = true;
+  /** The configuration has a `[stick]` section. */
+  stick: StickWorld | null = null;
   faults = new Set<Fault>();
 
   constructor(
@@ -354,8 +441,90 @@ export class World {
     }
   }
 
+  /** Stick backups on the given days (days ago), in the evening, started by plugging the stick in. */
+  private stickHistory(now: number, days: number[], last?: number) {
+    const r = rng(7);
+    const runs: StoredRun[] = [];
+    for (const d of days) {
+      const start = d === 0 && last !== undefined ? last : localAt(now, d, 19, 10 + Math.floor(r() * 30));
+      if (start > now) continue;
+      runs.unshift(
+        makeRun(start, "succeeded", {
+          target: "stick",
+          trigger: "plug",
+          duration: 420 + Math.floor(r() * 300),
+          uploaded: Math.round((0.6 + r() * 2.4) * GB),
+          verified: true,
+        }),
+      );
+    }
+    return runs;
+  }
+
+  private makeStick(now: number, plugged: boolean, days: number[], opts: { last?: number; availableBytes?: number } = {}): StickWorld {
+    return {
+      plugged,
+      availableBytes: opts.availableBytes ?? 212 * GB,
+      overdueHours: 168,
+      runs: this.stickHistory(now, days, opts.last),
+      fullVerifiedMs: localAt(now, 9, 19, 40),
+      damagedPaths: [],
+    };
+  }
+
+  /** A failed stick run today (or two hours ago, before 19:00). */
+  private stickFailure(now: number, kind: NonNullable<Run["error"]>["kind"], message: string) {
+    const at = localAt(now, 0, 19, 12) < now ? localAt(now, 0, 19, 12) : now - 2 * HOUR;
+    this.stick!.runs.unshift(makeRun(at, "failed", { target: "stick", trigger: "plug", duration: 95, error: { kind, message } }));
+  }
+
   private build(now: number) {
     switch (this.scenario) {
+      case "stick_only":
+        this.pbsTarget = false;
+        this.reachable = null;
+        this.stick = this.makeStick(now, true, [13, 11, 8, 6, 4, 2, 0], { last: now - 70 * 60_000, availableBytes: 312 * GB });
+        break;
+      case "stick_absent":
+        // Last plugged in nine days ago: overdue after seven. The hourly timer looked for it today.
+        this.pbsTarget = false;
+        this.reachable = null;
+        this.stick = this.makeStick(now, false, [13, 9]);
+        for (const h of [3, 2, 1]) this.stick.runs.unshift(makeRun(now - h * HOUR, "stick_not_plugged_in", { target: "stick", error: { kind: "stick_not_plugged_in", message: "stick not plugged in" } }));
+        break;
+      case "stick_full":
+        this.pbsTarget = false;
+        this.reachable = null;
+        this.stick = this.makeStick(now, true, [13, 11, 8, 6, 4, 2], { availableBytes: 180 * 1_000_000 });
+        this.stickFailure(now, "stick_full", "stick full: insufficient space available to the PBS user; retention policy was kept");
+        break;
+      case "both":
+      case "both_absent":
+      case "stick_running":
+      case "stick_damaged":
+      case "stick_verify_failed":
+      case "stick_key_mismatch":
+      case "stick_unsupported": {
+        this.history(now, 13, 0, { skip: [10], pbsNight: 7 });
+        for (const r of this.runs) r.target = "pbs";
+        const absent = this.scenario === "both_absent";
+        this.stick = this.makeStick(now, !absent, absent ? [12, 8, 4] : [12, 9, 5, 2]);
+        if (absent) {
+          for (const h of [2, 1]) this.stick.runs.unshift(makeRun(now - h * HOUR - 20 * 60_000, "stick_not_plugged_in", { target: "stick", error: { kind: "stick_not_plugged_in", message: "stick not plugged in" } }));
+        }
+        if (this.scenario === "stick_running") this.beginRun(now - 9_000, "succeeded", "plug", "stick");
+        if (this.scenario === "stick_damaged")
+          this.stickFailure(now, "filesystem_damaged", "e2fsck -f -n on the stick's data partition: Free blocks count wrong for group #0 (expected 0, counted 512); repair the unmounted file system offline");
+        if (this.scenario === "stick_verify_failed") {
+          this.stickFailure(now, "verification_failed", "PBS verification of the new snapshot failed: chunk 3f9a… is corrupt");
+          this.stick.damagedPaths = [this.stick.runs.find((r) => r.state === "succeeded")!.snapshot!];
+        }
+        if (this.scenario === "stick_key_mismatch")
+          this.stickFailure(now, "key_mismatch", "the newest snapshot of host/desktop on this target was made with another encryption key; nothing was written or pruned");
+        if (this.scenario === "stick_unsupported")
+          this.stickFailure(now, "stick_unsupported", "kernel IPv6 socket support is missing (Address family not supported by protocol); the local PBS needs it, also for loopback over IPv4. Host settings were not changed.");
+        break;
+      }
       case "ok":
       case "running":
         this.history(now, 13, 0, { skip: [10], pbsNight: 7 });
@@ -557,14 +726,74 @@ export class World {
     this.snapshots = [...made, ...this.inherited].sort((a, b) => b.time.localeCompare(a.time));
   }
 
-  private beginRun(startMs: number, outcome: ActiveRun["outcome"], trigger: Run["trigger"]) {
-    const run = makeRun(startMs, "starting", { trigger });
+  private beginRun(startMs: number, outcome: ActiveRun["outcome"], trigger: Run["trigger"], target?: Target, then?: "pbs") {
+    const run = makeRun(startMs, "starting", { trigger, target });
     run.finished_at = null;
     run.duration_seconds = null;
     run.uploaded_bytes = null;
     run.snapshot = null;
     run.archives = [];
-    this.active = { run, startedMs: startMs, outcome };
+    run.warnings = [];
+    if (target === "stick" && outcome === "absent") delete run.stick_uuid;
+    this.active = { run, startedMs: startMs, outcome, then };
+  }
+
+  /** How a run to the server ends in this scenario. */
+  private pbsOutcome(): ActiveRun["outcome"] {
+    return this.scenario === "pbs_unreachable" || this.scenario === "overdue" ? "pbs_unreachable" : "succeeded";
+  }
+
+  /** How a run to the stick ends in this scenario. */
+  private stickOutcome(): ActiveRun["outcome"] {
+    if (!this.stickIn()) return "absent";
+    return this.scenario === "stick_full" ? "stick_full" : "succeeded";
+  }
+
+  /**
+   * Start a run as `POST /runs` and `POST /targets/{target}/runs` do; null when it starts, the
+   * daemon's refusal otherwise. `all` backs up to the stick first, then to the server.
+   */
+  private startRun(target: Target | "all", now: number): Reply | null {
+    const err = (status: number, code: string, message: string): Reply => ({ status, body: { code, message } });
+    if (this.active) return err(409, "run_in_progress", "a backup run is already in progress");
+    const wantStick = target !== "pbs" && !!this.stick;
+    const wantPbs = target !== "stick" && this.pbsTarget;
+    if ((target === "stick" && !this.stick) || (target === "pbs" && !this.pbsTarget) || (!wantStick && !wantPbs))
+      return err(400, "invalid_target", "requested target is not configured");
+    const needKey = this.encryptionOn() && !this.keyExported;
+    const first: Target = wantStick ? "stick" : "pbs";
+    const blocked = !this.configured || (this.pbsTarget && !this.credentialsStored) || needKey;
+    if (blocked) {
+      this.beginRun(now, "config", "manual", this.stick ? first : undefined);
+      if (this.pbsTarget && !this.credentialsStored) {
+        this.active!.configMessage = "password / token secret: cannot read /etc/nestegg/credentials/password.cred: No such file or directory (os error 2); store it with `sudo nestegg credentials set-password`";
+      }
+      return null;
+    }
+    if (first === "stick") this.beginRun(now, this.stickOutcome(), "manual", "stick", wantPbs ? "pbs" : undefined);
+    else this.beginRun(now, this.pbsOutcome(), "manual", this.stick ? "pbs" : undefined);
+    return null;
+  }
+
+  /** A registered stick is plugged in right now. */
+  stickIn(): boolean {
+    return !!this.stick?.plugged && !this.faults.has("stick_pulled");
+  }
+
+  /** Snapshots on the stick, made by its successful runs (`GET /snapshots?target=stick`). */
+  stickSnapshots(): Snapshot[] {
+    return (this.stick?.runs ?? [])
+      .filter((r) => r.state === "succeeded" && r.snapshot)
+      .map((r) => ({
+        time: r.started_at,
+        snapshot: r.snapshot!,
+        size_bytes: 412 * GB,
+        archives: [...ARCHIVES.map((a) => `${a.name}.didx`), "inventory.pxar.didx", "index.json.blob"],
+        encrypted: true,
+        verified: this.stick!.damagedPaths.includes(r.snapshot!) ? "failed" : "ok",
+        protected: false,
+        comment: null,
+      }));
   }
 
   /** Advance the simulated run to the current time. */
@@ -572,6 +801,19 @@ export class World {
     for (const job of this.restores.values()) {
       if (job.restore.state !== "running") continue;
       const el = now - job.startedMs;
+      if (job.stick) {
+        // Like the stick worker: the bytes are reported once everything is copied.
+        if (!this.stickIn()) {
+          job.restore.state = "failed";
+          job.restore.finished_at = iso(now);
+          job.restore.error = "reading the stick failed: the device disappeared (stick removed?); nothing was moved into the target folder";
+        } else if (el > 8_000) {
+          job.restore.state = "succeeded";
+          job.restore.finished_at = iso(now);
+          job.restore.restored_bytes = Math.round(job.totalBytes);
+        }
+        continue;
+      }
       job.restore.restored_bytes = Math.round(Math.min(1, el / 4_000) * job.totalBytes);
       if (el > 4_000) {
         job.restore.state = "succeeded";
@@ -582,20 +824,51 @@ export class World {
     if (!a) return;
     const el = now - a.startedMs;
     const run = a.run;
+    const target = run.target;
     if (a.cancelAtMs !== undefined && now - a.cancelAtMs > 1_200) {
-      this.finish(now, makeRun(a.startedMs, "cancelled", { trigger: run.trigger, duration: Math.round(el / 1000), error: { kind: "cancelled", message: "cancelled by the user" } }));
+      this.finish(now, makeRun(a.startedMs, "cancelled", { target, trigger: run.trigger, duration: Math.round(el / 1000), error: { kind: "cancelled", message: "cancelled by the user" } }));
       return;
     }
     if (a.outcome === "config") {
-      if (el > 1_500) this.finish(now, makeRun(a.startedMs, "failed", { trigger: run.trigger, duration: 1, error: { kind: "config", message: a.configMessage ?? "encryption key export not confirmed: run `sudo nestegg key confirm-exported`" } }));
+      if (el > 1_500) this.finish(now, makeRun(a.startedMs, "failed", { target, trigger: run.trigger, duration: 1, error: { kind: "config", message: a.configMessage ?? "encryption key export not confirmed: run `sudo nestegg key confirm-exported`" } }));
       else run.state = "starting";
+      return;
+    }
+    if (target === "stick") {
+      const stick = this.stick!;
+      if (a.outcome === "absent") {
+        if (el > 1_500) this.finish(now, makeRun(a.startedMs, "stick_not_plugged_in", { target, trigger: run.trigger, error: { kind: "stick_not_plugged_in", message: "stick not plugged in" } }));
+        else run.state = "starting";
+        return;
+      }
+      if (a.outcome === "stick_full") {
+        if (el > 3_000) this.finish(now, makeRun(a.startedMs, "failed", { target, trigger: run.trigger, duration: 3, error: { kind: "stick_full", message: "stick full: insufficient space available to the PBS user; retention policy was kept" } }));
+        else run.state = "starting";
+        return;
+      }
+      const total = 1.6 * GB;
+      if (el < 2_000) run.state = "starting";
+      else if (el < 5_000) run.state = "inventory";
+      else if (el < 14_000) {
+        run.state = "uploading";
+        const progress = (el - 5_000) / 9_000;
+        run.uploaded_bytes = Math.round(progress * total);
+        run.expected_bytes = 412 * GB;
+        run.processed_bytes = Math.round((Math.floor(progress * 5) / 5) * 412 * GB);
+      } else if (el < 19_000) {
+        run.state = "finishing";
+        run.uploaded_bytes = total;
+      } else {
+        stick.availableBytes = Math.max(0, stick.availableBytes - total);
+        this.finish(now, makeRun(a.startedMs, "succeeded", { target, trigger: run.trigger, duration: Math.round(el / 1000), uploaded: total, verified: true }));
+      }
       return;
     }
     if (a.outcome === "pbs_unreachable") {
       if (el > 8_000) {
         this.reachable = false;
         this.checkedMs = now;
-        this.finish(now, makeRun(a.startedMs, "pbs_unreachable", { trigger: run.trigger, duration: Math.round(el / 1000) }));
+        this.finish(now, makeRun(a.startedMs, "pbs_unreachable", { target, trigger: run.trigger, duration: Math.round(el / 1000) }));
       } else run.state = el < 1_500 ? "starting" : "waking_pbs";
       return;
     }
@@ -616,18 +889,30 @@ export class World {
     } else {
       this.reachable = true;
       this.checkedMs = a.startedMs + 5_000;
-      this.finish(now, makeRun(a.startedMs, "succeeded", { trigger: run.trigger, duration: Math.round(el / 1000), uploaded: total, verified: true }));
+      this.finish(now, makeRun(a.startedMs, "succeeded", { target, trigger: run.trigger, duration: Math.round(el / 1000), uploaded: total, verified: true }));
     }
   }
 
   private finish(now: number, run: StoredRun) {
-    run.id = this.active!.run.id;
+    const a = this.active!;
+    run.id = a.run.id;
     this.active = null;
-    this.runs.unshift(run);
-    if (run.state === "succeeded") this.rebuildSnapshots(now);
+    if (run.target === "stick") {
+      this.stick!.runs.unshift(run);
+    } else {
+      this.runs.unshift(run);
+      if (run.state === "succeeded") this.rebuildSnapshots(now);
+    }
+    // "Back up now" with both targets: the server follows the stick, under the same run lock.
+    if (a.then === "pbs" && run.state !== "cancelled") this.beginRun(now, this.pbsOutcome(), run.trigger, "pbs");
   }
 
   // ---------------------------------------------------------------- derived API objects
+
+  /** Every finished run of both targets, newest first. */
+  private allRuns(): StoredRun[] {
+    return [...this.runs, ...(this.stick?.runs ?? [])].sort((a, b) => b.started_at.localeCompare(a.started_at));
+  }
 
   private lastSuccess(): StoredRun | null {
     return this.runs.find((r) => r.state === "succeeded") ?? null;
@@ -640,30 +925,118 @@ export class World {
     return rest;
   }
 
+  /** Health of one target from its own runs, like `state::health` of the daemon. */
+  private healthOf(runs: StoredRun[], running: boolean, overdueH: number, now: number): Status["health"] {
+    const success = runs.find((r) => r.state === "succeeded") ?? null;
+    const last = runs[0] ?? null;
+    if (!this.configured) return "unconfigured";
+    if (running) return "running";
+    if (!success) return "never";
+    if (last?.state === "failed" || last?.state === "unknown") return "failing";
+    if (now - new Date(success.finished_at ?? success.started_at).getTime() > overdueH * HOUR) return "overdue";
+    if (success.incomplete?.length) return "incomplete";
+    return "ok";
+  }
+
+  /** The timer fires hourly; a run starts at the first full hour after it is due. */
+  private nextRunOf(runs: StoredRun[], now: number): string | null {
+    if (!this.configured || this.active) return null;
+    const success = runs.find((r) => r.state === "succeeded") ?? null;
+    const due = success ? new Date(success.started_at).getTime() + this.intervalHours * HOUR : now;
+    const next = new Date(Math.max(due, now));
+    next.setMinutes(0, 0, 0);
+    next.setHours(next.getHours() + 1);
+    return iso(next.getTime());
+  }
+
+  /** `targets` of `/status`: only the configured ones (none before the setup). */
+  private targets(now: number): Partial<Record<Target, TargetStatus>> {
+    const out: Partial<Record<Target, TargetStatus>> = {};
+    if (!this.configured) return out;
+    const active = (t: Target) => (this.active && (this.active.run.target ?? "pbs") === t ? this.strip(this.active.run) : null);
+    const failures = (runs: StoredRun[]) => {
+      let n = 0;
+      for (const r of runs) {
+        if (r.state === "succeeded") break;
+        if (r.state === "failed" || r.state === "unknown") n++;
+      }
+      return n;
+    };
+    if (this.pbsTarget) {
+      const health = this.healthOf(this.runs, !!active("pbs"), this.overdue(), now);
+      out.pbs = {
+        health,
+        state: health,
+        last_run: this.strip(this.runs[0] ?? null),
+        last_success: this.strip(this.lastSuccess()),
+        current_run: active("pbs"),
+        consecutive_failures: failures(this.runs),
+        overdue_after_hours: this.overdue(),
+        next_run: this.timerOn() ? this.nextRunOf(this.runs, now) : null,
+        available_bytes: null,
+        full_verified_at: null,
+        server_verify_failed: [...this.damagedPaths],
+        password_reminder: false,
+        password_reminders: {},
+        plugged_in: null,
+      };
+    }
+    const st = this.stick;
+    if (st) {
+      const running = active("stick");
+      const health = this.healthOf(st.runs, !!running, st.overdueHours, now);
+      const last = st.runs[0] ?? null;
+      const state = running
+        ? health
+        : last?.state === "failed" && last.error?.kind === "stick_full"
+          ? "stick_full"
+          : !this.stickIn()
+            ? "stick_not_plugged_in"
+            : health;
+      out.stick = {
+        health,
+        state,
+        last_run: this.strip(last),
+        last_success: this.strip(st.runs.find((r) => r.state === "succeeded") ?? null),
+        current_run: running,
+        consecutive_failures: failures(st.runs),
+        overdue_after_hours: st.overdueHours,
+        next_run: this.timerOn() ? this.nextRunOf(st.runs, now) : null,
+        available_bytes: st.runs.some((r) => r.state === "succeeded" || r.error?.kind === "stick_full") ? st.availableBytes : null,
+        full_verified_at: st.fullVerifiedMs ? iso(st.fullVerifiedMs) : null,
+        server_verify_failed: [...st.damagedPaths],
+        password_reminder: this.faults.has("stick_password"),
+        password_reminders: this.faults.has("stick_password") ? { [STICK_UUID]: "password_check_due" } : {},
+        plugged_in: this.stickIn(),
+        ...(this.flavor !== "today" ? {
+          plugged_in_uuids: this.stickIn() ? this.faults.has("stick_multiple") ? [STICK_UUID, SECOND_STICK_UUID] : [STICK_UUID] : [],
+          in_use: [...this.restores.values()].some((j) => j.stick && j.restore.state === "running") ? "restore" as const : running ? "backup" as const : null,
+          sticks: Object.fromEntries((this.faults.has("stick_multiple") ? [STICK_UUID, SECOND_STICK_UUID] : [STICK_UUID]).map((uuid) => [uuid, {
+            plugged_in: this.stickIn(),
+            in_use: [...this.restores.values()].some((j) => j.stick && j.restore.stick_uuid === uuid && j.restore.state === "running") ? "restore" : running ? "backup" : null,
+          }])),
+        } : {}),
+        total_bytes: 256e9,
+        space_checked_at: last?.started_at ?? null,
+      };
+    }
+    return out;
+  }
+
   status(now = Date.now()): Status {
-    const success = this.lastSuccess();
-    const last = this.runs[0] ?? null;
-    const overdueH = this.overdue();
-    let health: Status["health"];
-    if (!this.configured) health = "unconfigured";
-    else if (this.active) health = "running";
-    else if (!success) health = "never";
-    else if (last?.state === "failed" || last?.state === "unknown") health = "failing";
-    else if (now - new Date(success.finished_at ?? success.started_at).getTime() > overdueH * HOUR) health = "overdue";
-    else if (success.incomplete?.length) health = "incomplete";
-    else health = "ok";
-    const nextRun = (() => {
-      if (!this.configured || this.active) return null;
-      // The timer fires hourly; a run starts at the first full hour after it is due.
-      const due = success ? new Date(success.started_at).getTime() + this.intervalHours * HOUR : now;
-      const next = new Date(Math.max(due, now));
-      next.setMinutes(0, 0, 0);
-      next.setHours(next.getHours() + 1);
-      return iso(next.getTime());
-    })();
+    // Like the daemon: the legacy fields describe the server, or the stick when it is the only target.
+    const own = this.pbsTarget || !this.stick ? this.runs : this.stick.runs;
+    const success = own.find((r) => r.state === "succeeded") ?? null;
+    const last = own[0] ?? null;
+    const overdueH = this.pbsTarget || !this.stick ? this.overdue() : this.stick.overdueHours;
+    const health = this.healthOf(own, !!this.active, overdueH, now);
+    const nextRun = this.nextRunOf(own, now);
+    const targets = this.targets(now);
+    const legacyDamaged = this.pbsTarget || !this.stick ? this.damagedPaths : this.stick.damagedPaths;
     return {
+      ...(this.stick ? { targets } : {}),
       machine: { hostname: "desktop", backup_id: "desktop", os: "Linux Mint 22.2" },
-      pbs: this.configured
+      pbs: this.configured && this.pbsTarget
         ? {
             server: "pbs.example.com:8007",
             datastore: "backups",
@@ -680,6 +1053,7 @@ export class World {
             reachable: null,
             checked_at: null,
             wake_on_lan: false,
+            // No backup server: no token secret is stored (the daemon reports false).
             credentials_stored: this.faults.has("unknown_stored") ? null : false,
           },
       schedule: {
@@ -699,7 +1073,7 @@ export class World {
         key_exported: this.encryptionOn() && this.keyExported,
         key_present: this.faults.has("unknown_stored") ? null : this.configured && this.keyCreated,
       },
-      ...(this.damagedPaths.length ? { server_verify_failed: [...this.damagedPaths] } : {}),
+      ...(legacyDamaged.length ? { server_verify_failed: [...legacyDamaged] } : {}),
     };
   }
 
@@ -722,7 +1096,7 @@ export class World {
   }
 
   private wakeConfigured(): boolean {
-    return !this.faults.has("no_wake");
+    return this.pbsTarget && !this.faults.has("no_wake");
   }
 
   private wakeOn(): boolean {
@@ -739,10 +1113,21 @@ export class World {
       interval_hours: this.intervalHours,
       encryption: this.encryptionOn(),
       overdue_after_hours: this.overdue(),
+      stick_overdue_after_hours: this.stick ? this.stick.overdueHours : null,
+      stick_data_uuids: this.stick ? [STICK_UUID] : [],
       automatic_backups: this.timerOn(),
       wake_on_lan: this.wakeOn(),
       wake_on_lan_configured: this.wakeConfigured(),
-      editable: SETTING_KEYS.filter((k) => k !== "wake_on_lan" || this.wakeConfigured()),
+      // Like `status::config_view`: the stick keys only with a stick, removing only with both targets.
+      editable: SETTING_KEYS.filter((k) =>
+        k === "wake_on_lan"
+          ? this.wakeConfigured()
+          : k === "stick_overdue_after_hours"
+            ? !!this.stick
+            : k === "remove_target"
+              ? !!this.stick && this.pbsTarget
+              : true,
+      ),
       limits: this.limits(),
     };
   }
@@ -764,6 +1149,11 @@ export class World {
       },
     };
     limits.overdue_after_hours.max = overdueCap(this.intervalHours, limits);
+    limits.stick_overdue_after_hours = this.stick ? {
+      ...limits.overdue_after_hours, min: 1, greater_than_interval: false,
+      file_minimum: this.stick.overdueHours,
+      max: Math.max(OVERDUE_BASE_HOURS, this.intervalHours + OVERDUE_INTERVAL_EXTRA_HOURS, this.stick.overdueHours),
+    } : null;
     return limits;
   }
 
@@ -780,6 +1170,8 @@ export class World {
         overdue_after_hours: this.overdue(),
         wake_on_lan_configured: this.wakeConfigured(),
         excludes: this.excludes,
+        stick_overdue_after_hours: this.stick?.overdueHours ?? null,
+        targets: { pbs: this.pbsTarget, stick: !!this.stick },
       },
       current.limits,
       (pattern) => malformedProblem(pattern) ?? wholeFolderProblem(pattern, sources),
@@ -802,6 +1194,13 @@ export class World {
     if (change.excludes != null) this.excludes = [...change.excludes];
     if (change.wake_on_lan != null && this.wakeConfigured()) this.wakeEnabled = change.wake_on_lan;
     if (timer != null) this.timerEnabled = timer;
+    if (change.stick_overdue_after_hours != null && this.stick) this.stick.overdueHours = change.stick_overdue_after_hours;
+    if (change.remove_target === "stick") this.stick = null;
+    if (change.remove_target === "pbs") {
+      // Like the daemon: [pbs] and [wake] go; the history of the server stays on disk.
+      this.pbsTarget = false;
+      this.reachable = null;
+    }
     return { status: 200, body: this.config() };
   }
 
@@ -891,7 +1290,7 @@ export class World {
 
     const route = `${method} ${path}`;
     let m: RegExpExecArray | null;
-    if (route === "GET /health") return { status: 200, body: { version: "0.1.0", api_version: "1" } };
+    if (route === "GET /health") return { status: 200, body: { version: "0.1.0", api_version: today ? "1" : "2" } };
     if (route === "GET /status") {
       const st = this.status(now);
       if (this.faults.has("no_run_details")) {
@@ -906,30 +1305,36 @@ export class World {
       return err(500, "internal", "invalid configuration /etc/nestegg/config.toml; fix it in the terminal first: expected `=`");
     if (route === "GET /runs") {
       const limit = Math.min(500, Math.max(1, Number(query.get("limit") ?? 50) || 50));
-      const list = [...(this.active ? [this.active.run] : []), ...this.runs].slice(0, limit).map((r) => this.strip(r));
+      const target = this.pbsTarget ? "pbs" : "stick";
+      const list = [...(this.active ? [this.active.run] : []), ...this.allRuns()]
+        .filter((r) => (r.target ?? "pbs") === target).slice(0, limit).map((r) => this.strip(r));
+      return { status: 200, body: { runs: list } };
+    }
+    if ((m = /^\/targets\/([^/]+)\/runs$/.exec(path)) && (method === "GET" || method === "POST")) {
+      const target = decodeURIComponent(m[1]!);
+      if (target !== "pbs" && target !== "stick" && target !== "all") return err(400, "invalid_target", "target must be pbs, stick or all");
+      if (method === "POST") {
+        const refused = this.startRun(target, now);
+        return refused ?? { status: 202, body: this.strip(this.active!.run) };
+      }
+      const of = (r: Run) => target === "all" || (r.target ?? "pbs") === target;
+      const list = [...(this.active ? [this.active.run] : []), ...this.allRuns()].filter(of).slice(0, 200).map((r) => this.strip(r));
       return { status: 200, body: { runs: list } };
     }
     if (route === "POST /runs") {
-      if (this.active) return err(409, "run_in_progress", "a backup run is already in progress");
-      const needKey = this.encryptionOn() && !this.keyExported;
-      const outcome = !this.configured || !this.credentialsStored || needKey ? "config" : this.scenario === "pbs_unreachable" || this.scenario === "overdue" ? "pbs_unreachable" : "succeeded";
-      this.beginRun(now, outcome, "manual");
-      const started = this.active as ActiveRun | null;
-      if (started && !this.credentialsStored) {
-        started.configMessage = "password / token secret: cannot read /etc/nestegg/credentials/password.cred: No such file or directory (os error 2); store it with `sudo nestegg credentials set-password`";
-      }
-      return { status: 202, body: this.strip(this.active!.run) };
+      const refused = this.startRun(this.pbsTarget ? "pbs" : "stick", now);
+      return refused ?? { status: 202, body: this.strip(this.active!.run) };
     }
     if (method === "GET" && (m = /^\/runs\/([^/]+)$/.exec(path))) {
       const id = decodeURIComponent(m[1]!);
-      const run = this.active?.run.id === id ? this.active.run : this.runs.find((r) => r.id === id);
+      const run = this.active?.run.id === id ? this.active.run : this.allRuns().find((r) => r.id === id);
       if (!run) return err(404, "not_found", "unknown run");
       return { status: 200, body: run satisfies RunDetail };
     }
     if (method === "POST" && (m = /^\/runs\/([^/]+)\/cancel$/.exec(path))) {
       const a = this.active;
       const id = decodeURIComponent(m[1]!);
-      const known = a?.run.id === id || this.runs.some((r) => r.id === id);
+      const known = a?.run.id === id || this.allRuns().some((r) => r.id === id);
       // Like the daemon: 404 for an id that does not exist, 409 `cannot_cancel` for a run that exists
       // but is over or has no process to signal yet. A daemon from before that (flavour `today`)
       // answered 404 "no running backup with this id" for all of these.
@@ -946,7 +1351,7 @@ export class World {
       return { status: 202, body: { cancelling: true } };
     }
     if (route === "GET /pbs") {
-      if (!this.configured) return notConfigured();
+      if (!this.configured || !this.pbsTarget) return notConfigured();
       if (today) return err(404, "not_found", "unknown endpoint");
       const info: PbsInfo = {
         server: "pbs.example.com:8007",
@@ -1036,10 +1441,59 @@ export class World {
       const body: PbsCheckResult = { checked_at: checkedAt, checks };
       return { status: 200, body, delayMs };
     }
+    // Restoring from the stick (`target=stick`). A daemon from before that (`today`) ignores the parameter.
+    const fromStick = query.get("target") === "stick" || (body as Partial<RestoreRequest> | null)?.target === "stick";
+    if (fromStick && !today && (route === "GET /snapshots" || route === "POST /restores" || /^GET \/snapshots\/[^/]+\/browse$/.test(route))) {
+      const slow = (r: Reply, ms: number): Reply => ({ ...r, delayMs: ms });
+      if (!this.configured) return notConfigured();
+      const unavailable = (reason: string, message: string): Reply => ({ status: 503, body: { code: "stick_unavailable", reason, message } });
+      const uuid = query.get("stick_uuid") ?? (body as Partial<RestoreRequest> | null)?.stick_uuid;
+      const selected = uuid ?? STICK_UUID;
+      if (uuid && ![STICK_UUID, ...(this.faults.has("stick_multiple") ? [SECOND_STICK_UUID] : [])].includes(uuid)) return err(400, "bad_request", "stick UUID is not registered");
+      if (!uuid && this.faults.has("stick_multiple")) return unavailable("ambiguous", "choose a stick to restore from");
+      const echo = { target: "stick" as const, stick_uuid: selected };
+      if (!this.stick) return unavailable("unsupported", "no stick target is configured");
+      if (!this.stickIn()) return slow(unavailable("not_plugged_in", "registered stick not plugged in"), 600);
+      if (this.faults.has("stick_busy")) return slow(unavailable("unreadable", "the stick filesystem could not be read"), 1_500);
+      if (this.active || [...this.restores.values()].some((j) => j.restore.state === "running"))
+        return unavailable("busy", "a backup or stick restore is running");
+      const list = this.stickSnapshots();
+      if (route === "GET /snapshots") return slow({ status: 200, body: { ...echo, snapshots: list } }, 1_800);
+      if (method === "GET") {
+        const time = decodeURIComponent(/^\/snapshots\/([^/]+)\/browse$/.exec(path)![1]!);
+        if (!list.some((s) => s.time === time)) return unavailable("snapshot_not_on_stick", `snapshot ${time} not found on this stick`);
+        const entries = browseTree(query.get("archive") ?? "", query.get("path") ?? "/");
+        if (!entries) return err(404, "not_found", "no such directory");
+        return slow({ status: 200, body: { ...echo, entries } }, 700);
+      }
+      const req = body as Partial<RestoreRequest>;
+      const many = Array.isArray(req.archives) && req.archives.length > 0;
+      if (!req.snapshot_time || !req.target_dir || (!many && (!req.archive || !Array.isArray(req.paths))))
+        return err(400, "bad_request", "snapshot_time, archive (or archives), paths and target_dir are required");
+      if (!list.some((s) => s.time === req.snapshot_time)) return unavailable("snapshot_not_on_stick", `snapshot ${req.snapshot_time} not found on this stick`);
+      if (EXISTING_TARGETS.includes(req.target_dir.replace(/\/$/, "")))
+        return err(409, "target_exists", `target directory ${req.target_dir} already exists`);
+      const id = `restore-${this.restores.size + 1}`;
+      const restore: Restore = {
+        ...echo,
+        id,
+        state: "running",
+        target_dir: req.target_dir,
+        started_at: iso(now),
+        finished_at: null,
+        error: null,
+        restored_bytes: 0,
+        total_bytes: null,
+        warnings: [],
+      };
+      this.restores.set(id, { restore, startedMs: now, totalBytes: (many ? req.archives!.length : 1) * 1.7 * GB, stick: true });
+      return slow({ status: 202, body: restore }, 1_500);
+    }
     if (route === "GET /snapshots") {
       if (!this.configured) return notConfigured();
-      if (this.reachable === false) return err(503, "pbs_unreachable", "PBS is not reachable");
-      return { status: 200, body: { snapshots: this.snapshots } };
+      // Like the daemon: without [pbs] the reachability probe fails.
+      if (this.reachable === false || !this.pbsTarget) return err(503, "pbs_unreachable", "PBS is not reachable");
+      return { status: 200, body: { ...(today ? {} : { target: "pbs", stick_uuid: null }), snapshots: this.snapshots } };
     }
     if (method === "GET" && (m = /^\/snapshots\/([^/]+)\/browse$/.exec(path))) {
       if (today) return err(501, "not_implemented", "planned for v0.2");
@@ -1048,7 +1502,7 @@ export class World {
       if (!this.snapshots.some((s) => s.time === time)) return err(404, "not_found", "unknown snapshot");
       const entries = browseTree(query.get("archive") ?? "", query.get("path") ?? "/");
       if (!entries) return err(404, "not_found", "no such directory");
-      return { status: 200, body: { entries } };
+      return { status: 200, body: { target: "pbs", stick_uuid: null, entries } };
     }
     if (route === "POST /restores") {
       if (today) return err(501, "not_implemented", "planned for v0.2");
@@ -1064,6 +1518,8 @@ export class World {
       const id = `restore-${this.restores.size + 1}`;
       const totalBytes = (many ? req.archives!.length : 1) * 3.2 * GB;
       const restore: Restore = {
+        target: "pbs",
+        stick_uuid: null,
         id,
         state: "running",
         target_dir: req.target_dir,
@@ -1092,7 +1548,7 @@ export class World {
     if (route === "GET /machines" && !today) {
       if (!this.configured) return notConfigured();
       // The daemon probes the server first (3 s) and answers 503 when nobody answers.
-      if (this.serverOff()) return err(503, "pbs_unreachable", "PBS is not reachable");
+      if (this.serverOff() || !this.pbsTarget) return err(503, "pbs_unreachable", "PBS is not reachable");
       return { status: 200, body: this.machines(now) };
     }
     if (route === "GET /session" && !today) return { status: 200, body: { user: "alice", home: "/home/alice" } };

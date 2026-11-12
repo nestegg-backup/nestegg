@@ -3,7 +3,7 @@
 import { api, ApiFailure, optional } from "./api";
 import { initBrowserSession } from "./session";
 import { newestReach, reachOfCheck, type Reach } from "./check";
-import { isActive } from "./derive";
+import { hasPbs, hasStick, isActive, primaryTarget } from "./derive";
 import type {
   ConfigView,
   HealthInfo,
@@ -15,6 +15,7 @@ import type {
   SettingsChange,
   Snapshot,
   Status,
+  Target,
 } from "./types";
 
 const POLL_RUNNING_MS = 2_000;
@@ -40,7 +41,10 @@ class AppState {
   fatal = $state<ApiFailure | null>(null);
   /** Time of the last successful status request. */
   lastContact = $state<Date | null>(null);
+  /** History of the target the legacy fields of /status describe (the server, or the stick in a stick-only setup). */
   runs = $state<Loadable<Run[]>>({ state: "loading", value: [], error: null });
+  /** History of the stick when there is a backup server as well (otherwise the stick's runs are `runs`). */
+  stickRuns = $state<Loadable<Run[]>>({ state: "loading", value: [], error: null });
   config = $state<Loadable<ConfigView | null>>({ state: "loading", value: null, error: null });
   /** undefined: not offered by this daemon (404/501); null: not loaded yet. */
   machines = $state<MachinesResponse | null | undefined>(null);
@@ -74,6 +78,9 @@ class AppState {
   now = $state(new Date());
   starting = $state(false);
   startError = $state<{ kind: "conflict" | "other"; message: string } | null>(null);
+  /** "Back up to stick now": waiting for the daemon's answer, and why it refused. */
+  stickStarting = $state(false);
+  stickStartError = $state<{ kind: "conflict" | "other"; message: string } | null>(null);
 
   #timer: ReturnType<typeof setTimeout> | null = null;
   #started = false;
@@ -95,8 +102,8 @@ class AppState {
   start() {
     if (this.#started) return;
     this.#started = true;
+    // The history follows the first status: it says which targets there are.
     void this.poll();
-    void this.loadRuns();
     void this.loadConfig();
     void this.loadMachines();
     // The sidebar strip of this PC needs the server's snapshots on every page.
@@ -135,10 +142,13 @@ class AppState {
     if (!this.fatal && after) {
       // A run may have started or finished between two polls (timer, CLI, another browser tab):
       // refresh the history and the snapshot list whenever the run ids change.
-      const changed =
-        before?.last_run?.id !== after.last_run?.id ||
-        before?.last_success?.id !== after.last_success?.id ||
-        before?.current_run?.id !== after.current_run?.id;
+      const ids = (s: Status | null) => [
+        s?.last_run?.id,
+        s?.last_success?.id,
+        s?.current_run?.id,
+        ...(["pbs", "stick"] as const).flatMap((k) => [s?.targets?.[k]?.last_run?.id, s?.targets?.[k]?.current_run?.id]),
+      ];
+      const changed = !before || JSON.stringify(ids(before)) !== JSON.stringify(ids(after)) || !!before.targets !== !!after.targets;
       if (changed || this.running || wasRunning || wasOffline) void this.loadRuns();
       // A cancel request is over as soon as the run it was meant for is no longer active.
       if (this.cancel.state === "requested" && after.current_run?.id !== this.cancel.runId) this.cancel = { state: "idle" };
@@ -164,14 +174,32 @@ class AppState {
   }
 
   async loadRuns() {
-    if (this.runs.state !== "ok") this.runs = { ...this.runs, state: "loading", error: null };
+    const s = this.status;
+    // A daemon with targets has a history per target; an older one (or none known yet) has /runs.
+    const primary: Target | null = s?.targets ? primaryTarget(s) : null;
+    const both = !!s && hasPbs(s) && hasStick(s);
+    await Promise.all([
+      this.#load("runs", () => (primary ? api.targetRuns(primary) : api.runs())),
+      both ? this.#load("stickRuns", () => api.targetRuns("stick")) : Promise.resolve(),
+    ]);
+  }
+
+  async #load(key: "runs" | "stickRuns", fetch: () => Promise<Run[]>) {
+    if (this[key].state !== "ok") this[key] = { ...this[key], state: "loading", error: null };
     try {
-      this.runs = { state: "ok", value: await api.runs(), error: null };
+      this[key] = { state: "ok", value: await fetch(), error: null };
     } catch (e) {
       // Keep a list loaded earlier (it stays correct up to its age); only a
       // never-loaded list becomes an error state.
-      if (this.runs.state !== "ok") this.runs = { state: "error", value: [], error: asFailure(e) };
+      if (this[key].state !== "ok") this[key] = { state: "error", value: [], error: asFailure(e) };
     }
+  }
+
+  /** The history of one target. */
+  runsOf(target: Target): Loadable<Run[]> {
+    const s = this.status;
+    if (!s || primaryTarget(s) === target) return this.runs;
+    return this.stickRuns;
   }
 
   async loadConfig() {
@@ -277,9 +305,28 @@ class AppState {
     void this.loadPbs();
   }
 
+  /**
+   * "Back up to stick now". The daemon answers 202 when the run has started; what happens then
+   * (progress, "safe to unplug", a stick that is not plugged in after all) comes from /status.
+   */
+  async startStickRun() {
+    this.stickStarting = true;
+    this.stickStartError = null;
+    this.startError = null;
+    try {
+      await api.startTargetRun("stick");
+    } catch (e) {
+      const f = asFailure(e);
+      this.stickStartError = { kind: f.kind === "conflict" ? "conflict" : "other", message: f.message };
+    }
+    await this.poll();
+    this.stickStarting = false;
+  }
+
   async startRun() {
     this.starting = true;
     this.startError = null;
+    this.stickStartError = null;
     try {
       await api.startRun();
     } catch (e) {

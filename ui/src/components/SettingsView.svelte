@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import Cmd from "./Cmd.svelte";
   import LoadError from "./LoadError.svelte";
   import Switch from "./Switch.svelte";
@@ -8,15 +8,15 @@
   import { href } from "../lib/router.svelte";
   import { statusBar } from "../lib/statusbar.svelte";
   import { ApiFailure } from "../lib/api";
-  import { scheduleHours } from "../lib/derive";
+  import { hasPbs, hasStick, scheduleHours } from "../lib/derive";
   import { DEFAULT_LIMITS, settingsProblem } from "../lib/settings";
   import { intervalOptions, overdueFor, parseHours, problemText, saveFailure, serialListEdits } from "../lib/settingsForm";
   import { f, t } from "../lib/locale";
-  import type { SettingKey, SettingsChange, Status } from "../lib/types";
+  import type { SettingKey, SettingsChange, Status, Target } from "../lib/types";
 
   let { status }: { status: Status } = $props();
 
-  type Row = "automatic" | "interval" | "overdue" | "excludes" | "wol";
+  type Row = "automatic" | "interval" | "overdue" | "stickOverdue" | "target" | "excludes" | "wol";
   /** `offline`: refused because the daemon did not answer; cleared when it is back. */
   type Problem = { text: string; detail: string | null; offline?: boolean };
 
@@ -35,12 +35,18 @@
   const wol = $derived(c?.wake_on_lan ?? !!status.pbs.wake_on_lan);
   const wolConfigured = $derived(c?.wake_on_lan_configured ?? null);
   const excludes = $derived(c?.excludes ?? []);
+  // Targets: the server and the stick (decision 0026). Without `targets` (older daemons) only the server.
+  const pbs = $derived(hasPbs(status));
+  const stick = $derived(hasStick(status));
+  const stickOverdue = $derived(c?.stick_overdue_after_hours ?? status.targets?.stick?.overdue_after_hours ?? null);
   const sources = $derived((c?.sources ?? []).filter((x) => x.archive !== "inventory.pxar").map((x) => x.path));
   const current = $derived({
     interval_hours: interval ?? 24,
     overdue_after_hours: overdue ?? 36,
     wake_on_lan_configured: wolConfigured ?? false,
     excludes,
+    stick_overdue_after_hours: stickOverdue,
+    targets: { pbs, stick },
   });
 
   // ---- per-row state: saving, just saved, not saved
@@ -54,6 +60,10 @@
   const timers: Partial<Record<Row, ReturnType<typeof setTimeout>>> = {};
 
   let overdueRaw = $state("");
+  let stickOverdueRaw = $state("");
+  /** The removal of this target waits for "Remove" or "Keep". */
+  let asking = $state<Target | null>(null);
+  let keepButton: HTMLButtonElement | undefined = $state();
   let pattern = $state("");
   let patternInput: HTMLInputElement | undefined = $state();
 
@@ -62,6 +72,13 @@
     const v = overdue;
     untrack(() => {
       if (!problems.overdue) overdueRaw = v == null ? "" : String(v);
+    });
+  });
+
+  $effect(() => {
+    const v = stickOverdue;
+    untrack(() => {
+      if (!problems.stickOverdue) stickOverdueRaw = v == null ? "" : String(v);
     });
   });
 
@@ -83,6 +100,8 @@
     automatic: () => s.automatic,
     interval: () => s.interval,
     overdue: () => s.overdue,
+    stickOverdue: () => s.overdueStick,
+    target: () => t.stick.title,
     excludes: () => s.excludes,
     wol: () => s.wol,
   };
@@ -158,6 +177,30 @@
     }
     raised = null;
     await save("overdue", { overdue_after_hours: hours }, s.sumOverdue(hours));
+  }
+
+  async function commitStickOverdue() {
+    const hours = parseHours(stickOverdueRaw);
+    if (hours === null) return refuse("stickOverdue", { text: s.problem.wholeNumber, detail: null });
+    if (hours === stickOverdue) {
+      problems.stickOverdue = undefined;
+      return;
+    }
+    await save("stickOverdue", { stick_overdue_after_hours: hours }, s.sumStickOverdue(hours));
+  }
+
+  const targetName = (x: Target) => (x === "pbs" ? t.stick.server : t.stick.name);
+
+  async function ask(x: Target) {
+    asking = x;
+    problems.target = undefined;
+    await tick();
+    keepButton?.focus();
+  }
+
+  async function removeTarget(x: Target) {
+    asking = null;
+    await save("target", { remove_target: x }, s.sumRemoved(targetName(x)));
   }
 
   async function freshExcludes(): Promise<string[]> {
@@ -291,13 +334,14 @@
           {@render problemLine("interval", "e-interval")}
         </div>
 
+        {#if pbs}
         <div class="pref" class:err={!!problems.overdue}>
           <div class="txt">
             {#if editable.has("overdue_after_hours")}
-              <label class="l" for="overdue">{s.overdue}</label>
+              <label class="l" for="overdue">{stick ? s.overdueServer : s.overdue}</label>
               <p class="h" id="h-overdue">{raised ? s.overdueRaised(raised) : s.overdueHint}</p>
             {:else}
-              <span class="l">{s.overdue}</span>
+              <span class="l">{stick ? s.overdueServer : s.overdue}</span>
             {/if}
           </div>
           <div class="c">
@@ -327,8 +371,87 @@
           </div>
           {@render problemLine("overdue", "e-overdue")}
         </div>
+        {/if}
+
+        {#if stick}
+          <div class="pref" class:err={!!problems.stickOverdue}>
+            <div class="txt">
+              {#if editable.has("stick_overdue_after_hours")}
+                <label class="l" for="stick-overdue">{s.overdueStick}</label>
+                <p class="h" id="h-stick-overdue">{s.overdueStickHint}</p>
+              {:else}
+                <span class="l">{s.overdueStick}</span>
+              {/if}
+            </div>
+            <div class="c">
+              {@render savedMark("stickOverdue")}
+              {#if editable.has("stick_overdue_after_hours")}
+                <input
+                  class="inp n"
+                  id="stick-overdue"
+                  inputmode="numeric"
+                  autocomplete="off"
+                  bind:value={stickOverdueRaw}
+                  disabled={!can("stick_overdue_after_hours") || !!pending.stickOverdue}
+                  aria-invalid={problems.stickOverdue ? "true" : undefined}
+                  aria-describedby={describe("h-stick-overdue", problems.stickOverdue && "e-stick-overdue")}
+                  onchange={commitStickOverdue}
+                  onkeydown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void commitStickOverdue();
+                    }
+                  }}
+                />
+                <span class="unit">{s.hours}</span>
+              {:else}
+                <span class="ro">{stickOverdue != null ? `${stickOverdue} ${s.hours}` : "–"}</span>
+              {/if}
+            </div>
+            {@render problemLine("stickOverdue", "e-stick-overdue")}
+          </div>
+        {/if}
       </div>
     </section>
+
+    {#if stick}
+      <section class="pgrp" aria-labelledby="pg-targets">
+        <h2 id="pg-targets">{t.stick.title}</h2>
+        <p class="sub">{s.targetsHint}</p>
+        <div class="box">
+          {#each (pbs ? ["pbs", "stick"] : ["stick"]) as Target[] as x (x)}
+            <div class="pref" class:err={!!problems.target && asking === null}>
+              <div class="txt">
+                <span class="l" id="l-target-{x}">{targetName(x)}</span>
+                <p class="h">{x === "pbs" ? status.pbs.server : !pbs ? s.onlyTarget : t.stick.overdueAfter(stickOverdue ?? 168)}</p>
+              </div>
+              <div class="c">
+                {#if editable.has("remove_target") && asking !== x}
+                  <button
+                    class="btn small"
+                    type="button"
+                    aria-label={s.removeTargetLabel(targetName(x))}
+                    disabled={!can("remove_target") || !!pending.target}
+                    onclick={() => ask(x)}>{s.removeTarget}</button
+                  >
+                {/if}
+              </div>
+              {#if asking === x}
+                <div class="ask" role="group" aria-labelledby="l-target-{x}" aria-describedby="ask-{x}">
+                  <p id="ask-{x}">{x === "pbs" ? s.removeAskPbs : s.removeAskStick}</p>
+                  <div class="ask-b">
+                    <button class="btn small" type="button" onclick={() => removeTarget(x)}>{s.removeConfirm}</button>
+                    <button class="btn small" type="button" bind:this={keepButton} onclick={() => (asking = null)}>{s.removeKeep}</button>
+                  </div>
+                </div>
+              {/if}
+            </div>
+          {/each}
+        </div>
+        {#if problems.target}<div class="pref err">{@render problemLine("target", "e-target")}</div>{/if}
+        {#if pending.target}<p class="hint">{s.saving}</p>{/if}
+      </section>
+    {/if}
 
     <section class="pgrp" aria-labelledby="pg-excludes">
       <h2 id="pg-excludes">{s.excludes}</h2>
@@ -385,6 +508,7 @@
       </div>
     </section>
 
+    {#if pbs}
     <section class="pgrp" aria-labelledby="pg-wake">
       <h2 id="pg-wake">{s.wake}</h2>
       <div class="box">
@@ -412,18 +536,21 @@
         </div>
       </div>
     </section>
+    {/if}
 
     <section class="pgrp" aria-labelledby="pg-fixed">
-      <h2 id="pg-fixed">{s.fixed}</h2>
+      <h2 id="pg-fixed">{pbs ? s.fixed : t.stick.fixedOnly}</h2>
       <p class="sub">{s.fixedHint}</p>
       <dl class="box">
-        <div class="pref ro-row"><dt class="l">{s.address}</dt><dd class="c">{status.pbs.server}</dd></div>
-        <div class="pref ro-row"><dt class="l">{t.server.datastore}</dt><dd class="c">{status.pbs.datastore}</dd></div>
+        {#if pbs}
+          <div class="pref ro-row"><dt class="l">{s.address}</dt><dd class="c">{status.pbs.server}</dd></div>
+          <div class="pref ro-row"><dt class="l">{t.server.datastore}</dt><dd class="c">{status.pbs.datastore}</dd></div>
+          <div class="pref ro-row">
+            <dt class="l">{t.server.namespace}</dt><dd class="c">{status.pbs.namespace || t.server.noNamespace}</dd>
+          </div>
+        {/if}
         <div class="pref ro-row">
-          <dt class="l">{t.server.namespace}</dt><dd class="c">{status.pbs.namespace || t.server.noNamespace}</dd>
-        </div>
-        <div class="pref ro-row">
-          <dt class="l">{s.backupId}</dt><dd class="c"><code>{c?.backup_id ?? status.machine.backup_id}</code></dd>
+          <dt class="l">{pbs ? s.backupId : t.stick.factBackupId}</dt><dd class="c"><code>{c?.backup_id ?? status.machine.backup_id}</code></dd>
         </div>
         <div class="pref ro-row">
           <dt class="l">{s.encryption}</dt>
@@ -440,13 +567,14 @@
             <dt class="l">{s.fingerprint}</dt><dd class="c"><code>{status.encryption.key_fingerprint}</code></dd>
           </div>
         {/if}
-        <div class="pref ro-row"><dt class="l">{s.retention}</dt><dd class="c">{s.retentionText}</dd></div>
+        {#if pbs}<div class="pref ro-row"><dt class="l">{s.retention}</dt><dd class="c">{s.retentionText}</dd></div>{/if}
+        {#if stick}<div class="pref ro-row"><dt class="l">{t.stick.retention}</dt><dd class="c">{t.stick.retentionText}</dd></div>{/if}
       </dl>
       {#if status.encryption.enabled && status.encryption.key_exported}
         <p class="hint">{s.keyVerify}</p>
       {/if}
       <Cmd label={s.changeIn} command="sudoedit /etc/nestegg/config.toml" />
-      <Cmd label={s.checkIn} command="sudo nestegg check" />
+      {#if pbs}<Cmd label={s.checkIn} command="sudo nestegg check" />{/if}
     </section>
   </div>
 {/if}
@@ -493,6 +621,9 @@
   .addrow { grid-column: 1 / -1; display: flex; gap: 8px; min-width: 0; }
   .addrow .inp { flex: 1; min-width: 0; font-size: 13.5px; }
   .ro-row dt { font-weight: 500; }
+  .ask { grid-column: 1 / -1; margin-top: 6px; }
+  .ask p { color: var(--text); font-size: 13px; max-width: 66ch; }
+  .ask-b { display: flex; gap: 8px; margin-top: 8px; }
   .ro-row dd { color: var(--muted); text-align: right; overflow-wrap: anywhere; }
   .pgrp :global(.cmd) { margin-top: 8px; }
 

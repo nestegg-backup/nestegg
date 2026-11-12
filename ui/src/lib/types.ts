@@ -12,14 +12,31 @@ export type RunState =
   | "succeeded"
   | "failed"
   | "pbs_unreachable"
+  /** A stick run found no registered stick. Not a failure: it neither counts nor resets the failure counter. */
+  | "stick_not_plugged_in"
   | "cancelled"
   /** Written by a newer version of nestegg that this one does not understand (forward compatibility). */
   | "unknown";
 
-/** `timer`, `manual`, `cli`; `unknown` is a value written by a newer version. */
-export type RunTrigger = "timer" | "manual" | "cli" | "unknown";
+/** `timer`, `manual`, `cli`, `plug` (a registered stick was plugged in); `unknown` is a value written by a newer version. */
+export type RunTrigger = "timer" | "manual" | "cli" | "plug" | "unknown";
+
+/** Where a backup goes: the backup server (PBS) or a registered stick. */
+export type Target = "pbs" | "stick";
 
 export type RunErrorKind =
+  | "stick_not_plugged_in"
+  /** Too little space left on the stick for the PBS backup user; nothing beyond the retention rules was deleted. */
+  | "stick_full"
+  | "stick_already_mounted"
+  | "stick_ambiguous"
+  | "stick_busy"
+  /** The offline check of the stick's ext4 file system found damage; it needs an offline repair. */
+  | "filesystem_damaged"
+  /** This computer cannot start the stick's local backup server (kernel IPv6 support missing, no root helper). */
+  | "stick_unsupported"
+  /** The newest backup of this computer's group on the target was made with another key. */
+  | "key_mismatch"
   | "pbs_unreachable"
   | "authentication"
   | "source_missing"
@@ -46,6 +63,10 @@ export interface Archive {
 }
 
 export interface Run {
+  /** Absent in records of older versions: those belong to the backup server. */
+  target?: Target;
+  /** The physical stick a stick run used. */
+  stick_uuid?: string | null;
   id: string;
   trigger: RunTrigger;
   state: RunState;
@@ -74,7 +95,41 @@ export interface RunDetail extends Run {
   log_tail?: string[];
 }
 
+/** One configured backup target in `/status` (`targets`). */
+export interface TargetStatus {
+  health: Health;
+  /** Like `health`, or a target-specific state: `stick_full`, `stick_not_plugged_in`. Other words may follow. */
+  state: Health | "stick_full" | "stick_not_plugged_in" | (string & {});
+  last_run?: Run | null;
+  last_success?: Run | null;
+  current_run?: Run | null;
+  consecutive_failures: number;
+  /** Stick default: 168 hours (7 days). */
+  overdue_after_hours: number;
+  next_run?: string | null;
+  /** Free space for the PBS backup user, as found at the last run of this target. */
+  available_bytes?: number | null;
+  total_bytes?: number | null;
+  space_checked_at?: string | null;
+  last_checked_at?: string | null;
+  /** Live presence, independent of a previous run's outcome; null means unknown. */
+  plugged_in?: boolean | null;
+  plugged_in_uuids?: string[];
+  in_use?: "backup" | "restore" | null;
+  sticks?: Record<string, { plugged_in: boolean; in_use: "backup" | "restore" | null }>;
+  /** Last complete verification of the whole stick. */
+  full_verified_at?: string | null;
+  server_verify_failed?: string[];
+  /** A registered stick has no password proof yet, or its 180-day password re-check is due (root-only CLI). */
+  password_reminder: boolean;
+  /** Only media needing attention; absence means the proof is current. */
+  password_reminders?: Record<string, "key_copy_missing" | "password_check_due">;
+}
+
 export interface Status {
+  /** Only the configured targets; older daemons leave it out (then there is only the backup server). */
+  targets?: Partial<Record<Target, TargetStatus>>;
+  /** Legacy fields below describe the backup server when one is configured, otherwise the stick. */
   machine: { hostname: string; backup_id: string; os?: string | null };
   pbs: {
     server: string;
@@ -124,6 +179,10 @@ export interface DirEntry {
 
 /** Either `archive` (+ `paths`) or `archives` (takes precedence; each goes into its own subfolder). */
 export interface RestoreRequest {
+  /** Where the files come from; absent means the server (the default, understood by every daemon). */
+  target?: Target;
+  /** One of several registered sticks plugged in at the same time; omitted when exactly one is plugged in. */
+  stick_uuid?: string;
   snapshot_time: string;
   archive?: string;
   paths?: string[];
@@ -132,15 +191,17 @@ export interface RestoreRequest {
 }
 
 export interface Restore {
+  target?: Target;
+  stick_uuid?: string | null;
   id: string;
   state: "running" | "succeeded" | "failed";
   target_dir?: string;
   started_at?: string;
   finished_at?: string | null;
   error?: string | null;
-  /** Bytes restored so far (staging copy). */
+  /** Bytes restored so far (staging copy). From the stick only known at completion. */
   restored_bytes?: number;
-  /** Expected total when whole archives are restored. */
+  /** Expected total when whole archives are restored; always null from the stick. */
   total_bytes?: number | null;
   warnings?: string[];
 }
@@ -153,6 +214,9 @@ export interface ConfigView {
   interval_hours?: number;
   encryption?: boolean;
   overdue_after_hours?: number;
+  /** "Overdue after" of the stick target; null or absent without a stick. */
+  stick_overdue_after_hours?: number | null;
+  stick_data_uuids?: string[];
   /** `nestegg-backup.timer` is enabled. */
   automatic_backups?: boolean;
   /** Wake-on-LAN is configured and switched on. */
@@ -165,10 +229,21 @@ export interface ConfigView {
 }
 
 /** Settings the web UI may change (`PATCH /api/v1/config`, decision 0013). */
-export type SettingKey = "interval_hours" | "overdue_after_hours" | "excludes" | "wake_on_lan" | "automatic_backups";
+export type SettingKey =
+  | "interval_hours"
+  | "overdue_after_hours"
+  | "stick_overdue_after_hours"
+  | "remove_target"
+  | "excludes"
+  | "wake_on_lan"
+  | "automatic_backups";
 
 /** Body of `PATCH /api/v1/config`: absent fields stay unchanged. */
 export interface SettingsChange {
+  /** "Overdue after" of the stick (1 to the same cap as the server's). Raising it is reported (decision 0022). */
+  stick_overdue_after_hours?: number;
+  /** Remove one of two configured targets; the last one cannot be removed. Reported (decision 0022). */
+  remove_target?: Target;
   interval_hours?: number;
   /** Must be greater than `interval_hours`. */
   overdue_after_hours?: number;
@@ -179,6 +254,7 @@ export interface SettingsChange {
 }
 
 export interface SettingsLimits {
+  stick_overdue_after_hours?: SettingsLimits["overdue_after_hours"] | null;
   interval_hours: { min: number; max: number };
   overdue_after_hours: {
     min: number;

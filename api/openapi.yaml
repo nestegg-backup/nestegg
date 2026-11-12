@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: nestegg local API
-  version: 0.3.0
+  version: 0.5.0
   summary: Local control API of the nestegg daemon.
   description: |
     Served by `nestegg daemon` on the Unix socket `/run/nestegg/api.sock`
@@ -58,6 +58,10 @@ paths:
     get:
       operationId: listRuns
       summary: Run history, newest first.
+      description: |
+        Legacy target view: PBS runs only when a PBS is configured, otherwise
+        stick runs only. Includes that target's current run. Use
+        /targets/{target}/runs for explicit target selection or combined history.
       parameters:
         - name: limit
           in: query
@@ -77,6 +81,11 @@ paths:
     post:
       operationId: startRun
       summary: Start a backup now.
+      description: |
+        No body. Legacy target view: starts PBS only when a PBS is configured
+        (even with a stick attached); a stick-only configuration starts the
+        stick. The returned run belongs to that target. To start both targets,
+        explicitly POST /targets/all/runs (stick first).
       responses:
         "202":
           description: Accepted; the run is starting.
@@ -85,6 +94,47 @@ paths:
               schema: { $ref: "#/components/schemas/Run" }
         "409":
           description: A run is already in progress.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /targets/{target}/runs:
+    parameters:
+      - name: target
+        in: path
+        required: true
+        schema: { type: string, enum: [pbs, stick, all] }
+    get:
+      operationId: listTargetRuns
+      summary: Up to 200 runs of this target, newest first, including the active run.
+      responses:
+        "200":
+          description: Target history; old records without a target belong to PBS.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs: { type: array, items: { $ref: "#/components/schemas/Run" } }
+        "400":
+          description: Unknown target.
+    post:
+      operationId: startTargetRun
+      summary: Back up to stick, PBS, or all configured targets now.
+      description: |
+        No body. Uses the shared run lock. With all, the stick runs first.
+        The response identifies the first run; following runs appear in history.
+        An absent stick ends as stick_not_plugged_in, without counting as failure.
+      responses:
+        "202":
+          description: Accepted; follow current_run and per-target history.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "400":
+          description: Unknown or unconfigured target.
+        "409":
+          description: A backup is already running.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -253,8 +303,15 @@ paths:
   /snapshots:
     get:
       operationId: listSnapshots
-      summary: Snapshots of this machine on the PBS, newest first.
-      description: Requires the PBS to be reachable; returns 503 `pbs_unreachable` otherwise.
+      summary: Snapshots of this machine on the selected backup target, newest first.
+      description: |
+        Defaults to PBS (503 `pbs_unreachable` when unavailable). With target=stick,
+        opens a registered attached stick using the fixed desktop image and this
+        computer's configured key. Never executes code from the attached medium.
+        Stick errors return 503 `stick_unavailable`; there is no fallback to PBS.
+      parameters:
+        - $ref: "#/components/parameters/RestoreTarget"
+        - $ref: "#/components/parameters/StickUuid"
       responses:
         "200":
           description: OK
@@ -262,13 +319,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [snapshots]
+                required: [target, stick_uuid, snapshots]
                 properties:
+                  target: { type: string, enum: [pbs, stick], description: Actual source; clients must reject a mismatching or missing stick echo. }
+                  stick_uuid: { type: [string, "null"], format: uuid, description: Resolved physical stick; null for PBS. }
                   snapshots:
                     type: array
                     items: { $ref: "#/components/schemas/Snapshot" }
         "503":
-          description: PBS not reachable.
+          description: PBS not reachable, or stick unavailable (reason explains why).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -280,8 +339,12 @@ paths:
         The first call for a snapshot reads its catalog from the PBS (needs
         the PBS to be reachable); later calls use a local cache. Users other
         than root see only their own home directory (ancestors show only the
-        branch towards it).
+        branch towards it). With target=stick the catalog is read in a private
+        worker, not retained across media attachments. Non-root callers require
+        signed snapshot metadata; all home-directory restrictions still apply.
       parameters:
+        - $ref: "#/components/parameters/RestoreTarget"
+        - $ref: "#/components/parameters/StickUuid"
         - name: snapshotTime
           in: path
           required: true
@@ -300,8 +363,10 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entries]
+                required: [target, stick_uuid, entries]
                 properties:
+                  target: { type: string, enum: [pbs, stick], description: Actual source; clients must reject a mismatching or missing stick echo. }
+                  stick_uuid: { type: [string, "null"], format: uuid, description: Resolved physical stick; null for PBS. }
                   entries:
                     type: array
                     items: { $ref: "#/components/schemas/DirEntry" }
@@ -461,6 +526,16 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
 components:
   parameters:
+    RestoreTarget:
+      name: target
+      in: query
+      schema: { type: string, enum: [pbs, stick], default: pbs }
+      description: Source of the snapshots or files. Explicit selection; no fallback.
+    StickUuid:
+      name: stick_uuid
+      in: query
+      schema: { type: string, format: uuid }
+      description: Registered attached data UUID, only with target=stick; omit only when exactly one registered stick is attached.
     RunId:
       name: runId
       in: path
@@ -474,18 +549,94 @@ components:
         code:
           type: string
           description: Stable identifier.
-          enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, already_checking, not_found, pbs_unreachable, not_implemented, bad_request, forbidden, internal]
+          enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, already_checking, not_found, pbs_unreachable, stick_unavailable, not_implemented, bad_request, forbidden, internal]
         message: { type: string, description: Human-readable English text. }
+        reason:
+          oneOf: [{ $ref: "#/components/schemas/StickUnavailableReason" }, { type: "null" }]
+          description: Always set for 503 stick_unavailable; null or absent for other errors.
+    StickUnavailableReason:
+      type: string
+      enum: [not_plugged_in, ambiguous, busy, snapshot_not_on_stick, unreadable, unsupported]
+    StickUsage:
+      type: [string, "null"]
+      enum: [backup, restore, null]
+      description: Restore includes listing, validation and browsing while the worker holds the stick. Usage lasts through PBS shutdown, flush and unmount.
+
     Health:
       type: object
       required: [version, api_version]
       properties:
         version: { type: string, examples: ["0.1.0"] }
-        api_version: { type: string, examples: ["1"] }
+        api_version: { type: string, examples: ["2"], description: Version 2 adds source echoes and live per-stick usage; old clients remain supported. }
+    TargetStatus:
+      type: object
+      required: [health, state, consecutive_failures, overdue_after_hours, password_reminder]
+      properties:
+        health: { type: string, enum: [ok, running, overdue, failing, incomplete, never, unconfigured] }
+        state:
+          type: string
+          description: Availability or target-specific state alongside independently computed health.
+          enum: [ok, running, overdue, failing, incomplete, never, unconfigured, stick_full, stick_not_plugged_in, stick_damaged]
+        last_run:
+          oneOf: [{ $ref: "#/components/schemas/Run" }, { type: "null" }]
+        last_success:
+          oneOf: [{ $ref: "#/components/schemas/Run" }, { type: "null" }]
+        current_run:
+          oneOf: [{ $ref: "#/components/schemas/Run" }, { type: "null" }]
+        consecutive_failures: { type: integer, minimum: 0 }
+        overdue_after_hours: { type: integer, description: Stick default is 168 hours (7 days). }
+        next_run: { type: [string, "null"], format: date-time }
+        plugged_in:
+          type: [boolean, "null"]
+          description: Current presence of any registered stick, independent of state/health/history. Null for PBS. Does not mount the medium or mean it is safe to unplug.
+        plugged_in_uuids:
+          type: array
+          items: { type: string, format: uuid }
+          description: Currently present registered sticks; empty for PBS.
+        in_use:
+          $ref: "#/components/schemas/StickUsage"
+        sticks:
+          type: object
+          description: Every registered UUID with live usage, even if unplugged during use. Empty for PBS. Never infer safe removal from backup history alone.
+          additionalProperties:
+            type: object
+            required: [plugged_in, in_use]
+            properties:
+              plugged_in: { type: boolean }
+              in_use: { $ref: "#/components/schemas/StickUsage" }
+        available_bytes: { type: [integer, "null"], description: Free space as reported for the PBS backup user; cached from space_checked_at. }
+        total_bytes: { type: [integer, "null"], description: Datastore filesystem capacity measured with available_bytes; null before first measurement. }
+        space_checked_at: { type: [string, "null"], format: date-time, description: Last successful capacity measurement (also refreshed after retention or failure-only GC). }
+        last_checked_at: { type: [string, "null"], format: date-time, description: Last hourly stick presence check; absent media create no run record. }
+        full_verified_at: { type: [string, "null"], format: date-time }
+        server_verify_failed: { type: array, items: { type: string } }
+        password_reminder: { type: boolean, description: True when password_reminders is nonempty; retained for older clients. The API never accepts passwords. }
+        password_reminders:
+          type: object
+          description: |
+            Registered data UUID to reminder reason; absent UUID means no reminder.
+            key_copy_missing means no confirmed password-protected copy of the
+            current key on that medium (use root-only stick key-copy).
+            password_check_due means that copy exists but its 180-day password
+            check is due, missing, or has a future timestamp (use stick key-check).
+            The status is stored proof, not an inspection of files on an unplugged stick.
+          additionalProperties:
+            type: string
+            enum: [key_copy_missing, password_check_due]
     Status:
       type: object
       required: [machine, pbs, schedule, encryption, health]
+      description: |
+        Legacy fields describe PBS when configured, otherwise the sole stick target.
+        The pbs object stays present (empty server/datastore in stick-only setups).
+        New clients should use targets for independent target health and histories.
       properties:
+        targets:
+          type: object
+          description: Only configured targets; old daemons may omit it.
+          properties:
+            pbs: { $ref: "#/components/schemas/TargetStatus" }
+            stick: { $ref: "#/components/schemas/TargetStatus" }
         machine:
           type: object
           required: [hostname, backup_id]
@@ -558,12 +709,14 @@ components:
       type: object
       required: [id, trigger, state, started_at]
       properties:
+        target: { type: string, enum: [pbs, stick], description: Absent in older records means pbs. }
+        stick_uuid: { type: [string, "null"], format: uuid, description: Physical medium used by this stick run. }
         id: { type: string }
-        trigger: { type: string, enum: [timer, manual, cli, unknown] }
+        trigger: { type: string, enum: [timer, manual, cli, plug, unknown] }
         state:
           type: string
           description: "`unknown`: a value written by a newer version this one does not recognise (forward compatibility)."
-          enum: [starting, waking_pbs, inventory, uploading, finishing, succeeded, failed, pbs_unreachable, cancelled, unknown]
+          enum: [starting, waking_pbs, inventory, uploading, finishing, succeeded, failed, pbs_unreachable, stick_not_plugged_in, cancelled, unknown]
         started_at: { type: string, format: date-time }
         finished_at: { type: [string, "null"], format: date-time }
         duration_seconds: { type: [integer, "null"] }
@@ -616,7 +769,7 @@ components:
         kind:
           type: string
           description: "`verification_failed`: the upload finished, but reading the snapshot back from the server failed or did not match. `already_running`: the run did not start because another backup run held the run lock (state `cancelled`). `internal` also covers a run lock that could not be taken although no backup was running (the message names the holders). `unknown`: a kind written by a newer version this one does not recognise (forward compatibility)."
-          enum: [pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, credentials_unreadable, verification_failed, cancelled, internal, unknown]
+          enum: [stick_not_plugged_in, stick_full, stick_already_mounted, stick_ambiguous, stick_busy, filesystem_damaged, stick_unsupported, key_mismatch, pbs_unreachable, authentication, source_missing, client_missing, client_failed, already_running, config, credentials_unreadable, verification_failed, cancelled, internal, unknown]
         message: { type: string }
     RunDetail:
       allOf:
@@ -652,8 +805,17 @@ components:
     RestoreRequest:
       type: object
       required: [snapshot_time, target_dir]
-      description: Either `archive` (+ `paths`) or `archives`.
+      description: |
+        Either `archive` (+ `paths`) or `archives`. target defaults to pbs.
+        For stick, only this computer's registered medium and configured key are
+        used. stick_uuid selects one of several registered attached sticks;
+        when omitted exactly one must be attached. A per-medium and shared run
+        lock prevents concurrent backup/pruning. The job uses the same target
+        as validation and rechecks signed source metadata before writing files.
+        Stick progress bytes are reported on completion; total_bytes is null.
       properties:
+        target: { type: string, enum: [pbs, stick], default: pbs }
+        stick_uuid: { type: string, format: uuid, description: Registered data UUID; only with target=stick. }
         snapshot_time: { type: string, format: date-time }
         archive: { type: string, examples: ["home.pxar"] }
         paths:
@@ -671,8 +833,10 @@ components:
         target_dir: { type: string, examples: ["/home/alice/nestegg-restore-2026-11-08"] }
     Restore:
       type: object
-      required: [id, state]
+      required: [id, state, target, stick_uuid]
       properties:
+        target: { type: string, enum: [pbs, stick] }
+        stick_uuid: { type: [string, "null"], format: uuid, description: Resolved and pinned during validation; null for PBS. }
         id: { type: string }
         state: { type: string, enum: [running, succeeded, failed] }
         target_dir: { type: string }
@@ -702,19 +866,32 @@ components:
         interval_hours: { type: integer }
         encryption: { type: boolean }
         overdue_after_hours: { type: integer }
+        stick_overdue_after_hours: { type: [integer, "null"] }
+        stick_data_uuids:
+          type: array
+          description: Registered data partition UUIDs in configuration order; empty without a stick target. Read-only, not secret.
+          items: { type: string, format: uuid }
         automatic_backups: { type: boolean, description: "`nestegg-backup.timer` is enabled." }
         wake_on_lan: { type: boolean, description: Wake-on-LAN is configured and switched on. }
         wake_on_lan_configured: { type: boolean, description: "A `[wake]` section with a MAC address exists; only then can `wake_on_lan` be switched on." }
         editable:
           type: array
           description: Fields `PATCH /config` accepts for this configuration (`wake_on_lan` only when configured).
-          items: { type: string, enum: [interval_hours, overdue_after_hours, excludes, wake_on_lan, automatic_backups] }
+          items: { type: string, enum: [interval_hours, overdue_after_hours, stick_overdue_after_hours, remove_target, excludes, wake_on_lan, automatic_backups] }
         limits: { $ref: "#/components/schemas/SettingsLimits" }
     SettingsChange:
       type: object
       additionalProperties: false
       description: Absent or `null` fields stay unchanged.
       properties:
+        stick_overdue_after_hours:
+          type: [integer, "null"]
+          minimum: 1
+          description: Stick warning threshold; same cap as PBS. Raising it announces reduced protection.
+        remove_target:
+          type: [string, "null"]
+          enum: [pbs, stick, null]
+          description: Remove one of two configured targets. The last target cannot be removed. Announces reduced protection.
         interval_hours:
           type: [integer, "null"]
           minimum: 1
@@ -787,6 +964,16 @@ components:
             base: { type: integer, description: "Base cap in hours (168)." }
             per_interval_extra: { type: integer, description: "Hours added on top of the interval (72)." }
             file_minimum: { type: integer, description: "A larger value already in the file; the cap is never below it." }
+        stick_overdue_after_hours:
+          type: [object, "null"]
+          description: Same cap calculation as overdue_after_hours, using the stick's own file_minimum. Null without a stick target. Minimum 1; need not exceed the backup interval.
+          properties:
+            min: { type: integer }
+            max: { type: integer }
+            greater_than_interval: { type: boolean }
+            base: { type: integer }
+            per_interval_extra: { type: integer }
+            file_minimum: { type: integer }
         excludes:
           type: object
           description: "`max_length` is a byte count (decision 0022)."

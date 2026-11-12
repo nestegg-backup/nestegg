@@ -95,6 +95,16 @@ old_run="$(on_client nestegg history --json | sed -n 's/.*"id": "\([^"]*\)".*/\1
 old_snapshot="$(on_client nestegg history --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
 check "old run recorded" test -n "$old_run"
 check "old run has a snapshot" test -n "$old_snapshot"
+# Accept both historical baselines: early packages have only the local run
+# record, while the phase-two baseline already writes per-snapshot metadata.
+# Capture the old capability before upgrade, then prove it is preserved.
+snapshot_metadata() {
+  docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$pbs" \
+    proxmox-backup-client snapshot files "$1" --ns desktops \
+      --repository admin@pbs@127.0.0.1:store1 --output-format json \
+    | python3 -c 'import json,sys; print(int(any(f["filename"]=="nestegg-meta.conf.blob" for f in json.load(sys.stdin))))'
+}
+old_metadata="$(snapshot_metadata "$old_snapshot")"
 sums_before="$(config_sums)"
 run_record_before="$(on_client sha256sum "/var/lib/nestegg/runs/$old_run.json")"
 pid_before="$(daemon_pid)"
@@ -150,6 +160,15 @@ check "check passes after the upgrade" on_client nestegg check
 check "a key confirmed before the upgrade stays confirmed" bash -c "docker exec $client nestegg key show | grep -Eq 'exported: +yes'"
 check "the exported key file still verifies after the upgrade" bash -c "docker exec $client nestegg key verify /root/key.json | grep -q 'opens the newest backup: yes'"
 
+echo "== target migration keeps the old PBS state and independent stick availability"
+check "legacy success is projected into the PBS target" on_client python3 -c 'import json,subprocess; s=json.loads(subprocess.check_output(["nestegg","status","--json"])); assert s["targets"]["pbs"]["last_success"]["id"]==s["last_success"]["id"]; assert "stick" not in s["targets"]'
+check "legacy history defaults to PBS" on_client python3 -c 'import json,subprocess; runs=json.loads(subprocess.check_output(["curl","-sf","--unix-socket","/run/nestegg/api.sock","http://localhost/api/v1/targets/pbs/runs"]))["runs"]; assert runs and all(r["target"]=="pbs" for r in runs)'
+on_client cp /etc/nestegg/config.toml /root/before-stick.toml
+on_client python3 -c 'open("/etc/nestegg/config.toml","a").write("\n[stick]\ndata_uuids = [\"01234567-89ab-cdef-0123-456789abcdef\"]\n")'
+check "absent newly registered stick exits as availability" exits_with 75 on_client nestegg backup --target stick
+check "stick availability cannot replace PBS success or failure counters" on_client python3 -c 'import json; s=json.load(open("/var/lib/nestegg/state.json")); assert s["last_success"]["target"]=="pbs" if "target" in s["last_success"] else True; assert s["stick"]["last_run"]["state"]=="stick_not_plugged_in"; assert not s["stick"].get("last_success"); assert s["stick"]["consecutive_failures"]==0'
+on_client cp /root/before-stick.toml /etc/nestegg/config.toml
+
 echo "== after the upgrade all lock files are 0600, the same files, closed to members"
 for lf in $lock_files; do
   b="$(basename "$lf")"
@@ -182,9 +201,9 @@ user_browse_names() {
     "http://localhost/api/v1/snapshots/${1##*/}/browse?archive=home.pxar&path=/" \
     | grep -o '"name":"[^"]*"' | sort -u | tr -d '\n'
 }
-check "pre-upgrade snapshot has no metadata blob" bash -c "! docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot files '$old_snapshot' --ns desktops --repository admin@pbs@127.0.0.1:store1 | grep -q nestegg-meta"
+check "pre-upgrade snapshot metadata availability is preserved" test "$(snapshot_metadata "$old_snapshot")" == "$old_metadata"
 check "post-upgrade snapshot has the metadata blob" bash -c "docker exec -e PBS_PASSWORD='$admin_pw' -e PBS_FINGERPRINT='$fp' $pbs proxmox-backup-client snapshot files '$new_snapshot' --ns desktops --repository admin@pbs@127.0.0.1:store1 | grep -q nestegg-meta.conf.blob"
-check "user browses the pre-upgrade snapshot (local run record)" test "$(user_browse_names "$old_snapshot")" == '"name":"alice"'
+check "user browses the pre-upgrade snapshot (local record or metadata)" test "$(user_browse_names "$old_snapshot")" == '"name":"alice"'
 check "user browses the post-upgrade snapshot (metadata blob)" test "$(user_browse_names "$new_snapshot")" == '"name":"alice"'
 
 echo "== apt remove keeps configuration, credentials and state"

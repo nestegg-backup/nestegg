@@ -2332,7 +2332,7 @@ fn daemon_serves_status_runs_and_snapshots() {
 
     let (code, health) = request(&socket, "GET", "/api/v1/health");
     assert_eq!(code, 200);
-    assert_eq!(health["api_version"], "1");
+    assert_eq!(health["api_version"], "2");
 
     let (code, status) = request(&socket, "GET", "/api/v1/status");
     assert_eq!(code, 200);
@@ -2602,11 +2602,12 @@ fn daemon_changes_settings() {
     assert_eq!(view["excludes"], serde_json::json!(["**/.cache"]));
     assert_eq!(view["wake_on_lan"], true);
     assert_eq!(view["automatic_backups"], false);
-    let leftovers: Vec<_> = fs::read_dir(env.root().join("etc"))
+    let mut leftovers: Vec<_> = fs::read_dir(env.root().join("etc"))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
-    assert_eq!(leftovers, ["config.toml"]);
+    leftovers.sort();
+    assert_eq!(leftovers, [".config.toml.lock", "config.toml"]);
 }
 
 #[test]
@@ -2906,4 +2907,44 @@ fn check_says_when_the_server_was_not_woken_again() {
     let out = env.run(&["check", "--wake"]);
     let second = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(second.contains("was not woken again"), "{second}");
+}
+
+#[test]
+fn stick_api_never_falls_back_to_pbs_and_explains_absence() {
+    let env = Env::new();
+    let mut config = fs::read_to_string(env.root().join("etc/config.toml")).unwrap();
+    config.push_str("\n[stick]\ndata_uuids = ['01234567-89ab-cdef-0123-456789abcdef']\n");
+    fs::write(env.root().join("etc/config.toml"), config).unwrap();
+    let _daemon = start_daemon(&env);
+    let socket = env.root().join("run/api.sock");
+    for path in [
+        "/api/v1/snapshots?target=stick",
+        "/api/v1/snapshots/2026-11-08T21:30:12Z/browse?target=stick&archive=home.pxar&path=/",
+    ] {
+        let (code, error) = request(&socket, "GET", path);
+        assert_eq!(code, 503, "{error}");
+        assert_eq!(error["code"], "stick_unavailable");
+        assert_eq!(
+            error["reason"],
+            if nix::unistd::Uid::effective().is_root() {
+                "not_plugged_in"
+            } else {
+                "unsupported"
+            }
+        );
+        assert!(error.get("snapshots").is_none());
+    }
+    if nix::unistd::Uid::effective().is_root() {
+        let (code, error) = request(
+            &socket,
+            "GET",
+            "/api/v1/snapshots?target=stick&stick_uuid=not-registered",
+        );
+        assert_eq!(code, 400, "{error}");
+        assert_eq!(error["code"], "bad_request");
+    }
+    let (code, snapshots) = request(&socket, "GET", "/api/v1/snapshots");
+    assert_eq!(code, 200, "{snapshots}");
+    assert_eq!(snapshots["target"], "pbs");
+    assert!(snapshots["stick_uuid"].is_null());
 }

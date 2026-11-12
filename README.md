@@ -3,13 +3,14 @@
 # nestegg
 
 Unattended, encrypted backups of Linux desktops (Ubuntu, Linux Mint, Debian)
-to a Proxmox Backup Server – controllable from the terminal and from a local
-web interface.
+to a Proxmox Backup Server or to a USB backup stick – controllable from the
+terminal and from a local web interface.
 
 > **Status: not released.** Backup, restore, the web UI, notifications and
-> the rescue stick are implemented and pass the automated tests (containers
-> and virtual machines). It has not yet run against a real installation;
-> do not rely on it for your only backup.
+> the rescue stick and the backup stick are implemented and pass the
+> automated tests (containers and virtual machines). It has not yet run
+> against a real installation or a real USB drive; do not rely on it for your
+> only backup.
 
 nestegg does not implement any backup logic itself. It drives the official
 `proxmox-backup-client`, so every backup is a normal PBS snapshot that stays
@@ -33,6 +34,10 @@ What it does:
   server
 - a rescue stick (bootable ISO) that restores the whole computer onto an
   empty disk: partitions, files, boot loader ([docs/rescue.md](docs/rescue.md))
+- a backup stick (USB stick or USB SSD) that works with or without a PBS:
+  the desktop backs itself up onto it when it is plugged in, and booted from
+  it a computer is restored onto an empty disk or backed up even when its own
+  system no longer starts ([docs/stick.md](docs/stick.md))
 
 See [docs/roadmap.md](docs/roadmap.md), [docs/architecture.md](docs/architecture.md)
 and the [decision records](docs/decisions/).

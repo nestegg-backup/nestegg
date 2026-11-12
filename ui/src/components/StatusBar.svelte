@@ -2,13 +2,15 @@
   import Dot from "./Dot.svelte";
   import { app } from "../lib/store.svelte";
   import { statusBar } from "../lib/statusbar.svelte";
+  import { stickOnly } from "../lib/derive";
   import { f, t } from "../lib/locale";
 
   // The quiet default line: what the last check of the backup server said.
   const line = $derived.by((): { text: string; tone: "neutral" | "pbs" | "warn" } | null => {
     if (app.fatal) return { text: app.fatal.kind === "unauthorized" ? t.sbar.sessionEnded : t.sbar.offline, tone: "warn" };
     const p = app.reach;
-    if (!p) return null;
+    // Stick only: there is no backup server whose reachability could be reported.
+    if (!p || (app.status && stickOnly(app.status))) return null;
     if (p.reachable == null || !p.checked_at) return { text: t.sbar.serverUnknown, tone: "neutral" };
     const m = f.moment(p.checked_at, app.now);
     const day = f.dayMonth(p.checked_at);

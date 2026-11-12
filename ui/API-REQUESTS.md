@@ -3,7 +3,7 @@
 What the UI still needs from `api/openapi.yaml` and the daemon, written by the
 UI side. The core side decides and updates the contract. Every item says what
 the UI does today without it. Checked against `api/openapi.yaml` (version
-0.3.0); items that were requested earlier and are in the contract by now are
+0.4.0); items that were requested earlier and are in the contract by now are
 listed at the end.
 
 ## 1. Search inside a snapshot
@@ -111,7 +111,49 @@ is needed.
   The UI offers the button to every user of the page and shows the daemon's
   message for any other error.
 
-## 7. Integration notes for the core side (not API)
+## 7. Stick target fields (implemented)
+
+The daemon and `api/openapi.yaml` now provide all requested fields. The UI uses:
+
+- `TargetStatus.plugged_in` for live presence, independent of a full/damaged
+  state or old history. Null means unknown; absent fields retain the legacy fallback.
+- `total_bytes` with `available_bytes` for the fill percentage in the existing
+  free-space line. `space_checked_at` identifies the cached measurement, also
+  refreshed after retention or failure-only GC.
+- `ConfigView.stick_data_uuids` for commands even before the first run.
+  `TargetStatus.password_reminders` maps each UUID needing attention to
+  `key_copy_missing` or `password_check_due`, selecting key-copy or key-check
+  and its explanation. The original boolean remains supported.
+- `limits.stick_overdue_after_hours` for the stick's own cap, minimum and
+  file value. Older daemons retain the original computed fallback.
+
+`state = stick_damaged` reports a failed monthly datastore check separately
+from the successful newly verified backup. Legacy GET/POST `/runs` select PBS
+when configured, otherwise the stick; explicit target endpoints select both.
+
+## 8. Restoring from the stick (implemented)
+
+API version 2 echoes `target` and the resolved `stick_uuid` in snapshot lists,
+browse responses and restore jobs. The UI refuses missing stick echoes and
+mismatches, including a successful PBS response from an older daemon. PBS
+responses without an echo remain supported for old daemons.
+
+`TargetStatus.plugged_in_uuids` drives the medium selector. The UI sends
+`stick_uuid` for list, browse and restore; the daemon pins an implicitly resolved
+UUID across validation and job execution. `503 stick_unavailable` carries the
+stable `reason` enum, translated by the UI in German and English.
+
+`TargetStatus.sticks` reports each registered UUID's live `plugged_in` and
+`in_use` (`backup`, `restore` or null). The aggregate `in_use` also covers
+listing, validation and browsing, through shutdown, flush and unmount. The UI
+requires explicit idle usage before saying safe to unplug; missing usage on an
+older daemon does not count as idle.
+
+Running byte counts for stick restores remain deferred: the isolated worker
+currently sends a single final result, so bytes arrive at completion and
+`total_bytes` remains null. Elapsed time remains visible without a percentage.
+
+## 9. Integration notes for the core side (not API)
 
 - **Websockets through `--dev-proxy`:** the forwarding in `nestegg ui` does
   not pass websocket upgrades on, so Vite's live reload would not work
@@ -153,6 +195,11 @@ All of these are in `api/openapi.yaml` and the UI uses them:
 - `status.pbs.credentials_stored` and `status.encryption.key_present` (the
   setup guide uses them to show the steps after `nestegg init`; null or absent
   means unknown and never counts as missing).
+
+- Restoring from the stick: `target=stick` on `GET /snapshots` and
+  `/snapshots/{time}/browse` and in the body of `POST /restores`, `503
+  stick_unavailable`, `TargetStatus.plugged_in` (the source choice and "not
+  plugged in" in the restore flow). Details: section 8.
 
 Not used by the UI: `MachinesResponse.complete` (the list simply shows who is
 visible), `PbsInfo.overview_configured` and `SessionInfo.uid` / `root`.
