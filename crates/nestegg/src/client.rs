@@ -329,7 +329,7 @@ fn parse_space_info(v: &Value) -> Result<(u64, Option<u64>)> {
 /// PBS itself defines a finished snapshot by the presence of its manifest.
 /// A failed upload can leave a newer unfinished directory; it must not hide
 /// the last completed snapshot's key, nor prevent the official client retry.
-fn last_finished_snapshot(snapshots: &[SnapshotInfo]) -> Option<&SnapshotInfo> {
+pub(crate) fn last_finished_snapshot(snapshots: &[SnapshotInfo]) -> Option<&SnapshotInfo> {
     snapshots
         .iter()
         .filter(|s| s.archives.iter().any(|name| name == "index.json.blob"))

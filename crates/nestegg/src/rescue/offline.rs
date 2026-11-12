@@ -526,7 +526,9 @@ fn identity_difference(
 fn identity_warning(session: &Session, root: &Path, id: &str) -> Result<Option<String>> {
     let client = session.client();
     let snapshots = client.list_snapshots_bounded(id, crate::client::readback_list_timeout())?;
-    let Some(newest) = snapshots.iter().max_by_key(|s| snapshot_epoch(&s.snapshot)) else {
+    // An interrupted upload can leave a newer unfinished snapshot; the identity
+    // reference is the last completed one, as in `Client::check_group_key`.
+    let Some(newest) = crate::client::last_finished_snapshot(&snapshots) else {
         return Ok(None);
     };
     let scratch = tempfile::Builder::new()
