@@ -39,13 +39,29 @@ jobs:
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf gdisk e2fsprogs dosfstools squashfs-tools grub-common grub2-common grub-pc-bin grub-efi-amd64-bin parted iproute2 ripgrep strace dmsetup kmod
       - name: Rescue end-to-end test, Debian on btrfs with UEFI
         run: sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso debian-btrfs-uefi
       - name: Rescue end-to-end test, Ubuntu on ext4 with BIOS and LUKS
         run: sudo tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso ubuntu-ext4-bios-luks
       - name: Rescue end-to-end test, non-interactive restore (Ubuntu, BIOS, LUKS)
         run: sudo WIZARD=0 tests/rescue/run.sh target/release/nestegg target/nestegg-rescue-amd64.iso ubuntu-ext4-bios-luks
+      - run: cargo test --test stick_launcher --no-run
+      - name: Stick creation and updates (BIOS and UEFI)
+        run: sudo tests/stick/create.sh target/release/nestegg target/nestegg-rescue-amd64.iso
+      - name: Stick restore and offline backup matrix
+        run: sudo tests/stick/rescue.sh target/release/nestegg target/nestegg-rescue-amd64.iso
+      - name: Build disposable PBS and static client fixture
+        run: |
+          mkdir "${{ runner.temp }}/stick-fixture"
+          tests/stick/spike/build-root.sh "${{ runner.temp }}/stick-fixture"
+      - name: Desktop stick and hotplug acceptance
+        run: |
+          sudo tests/stick/desktop.sh target/release/nestegg "${{ runner.temp }}/stick-fixture/pbs.squashfs" "${{ runner.temp }}/stick-fixture/client/usr/bin/proxmox-backup-client"
+          sudo tests/stick/desktop-vm.sh target/release/nestegg target/nestegg-rescue-amd64.iso "${{ runner.temp }}/stick-fixture/pbs.squashfs" "${{ runner.temp }}/stick-fixture/client/usr/bin/proxmox-backup-client"
+      - name: Remove stick fixture
+        if: always()
+        run: sudo rm -rf "${{ runner.temp }}/stick-fixture"
       - name: Checksums
         run: |
           cd target

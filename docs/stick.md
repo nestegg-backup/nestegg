@@ -289,3 +289,12 @@ On the desktop, the file-restore API accepts `target=stick` (and optionally
 It uses this computer's configured key and the desktop's trusted PBS image.
 Non-root users retain their home-directory restriction. The UI integration is
 separate; see [api/openapi.yaml](../api/openapi.yaml) for the contract.
+
+### Offline computer identity
+
+Offline backup compares the installed hostname and machine-id hash with the
+newest snapshot's signed metadata before reusing a backup ID. If they differ,
+choose a distinct ID. Combining the group deliberately requires a default-no
+wizard confirmation or `nestegg rescue backup --force-id`. Older snapshots
+without machine identity also require confirmation; signature/key failures
+cannot be overridden.

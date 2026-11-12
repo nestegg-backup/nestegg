@@ -27,25 +27,68 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -p "$mnt" "$dst"
+if [[ $MODE == pending-merge ]]; then
+    # Sparse, but at least the 1 GiB the rescue system accepts as a computer
+    # disk: a smaller image is refused before the LVM checks are reached.
+    truncate -s 2G /work/pending.img
+    target=$(losetup --find --show /work/pending.img)
+    vg=nestegg-pending-fixture
+    pvcreate --devices "$target" -y "$target" >/dev/null
+    vgcreate --devices "$target" "$vg" "$target" >/dev/null
+    lvcreate --devices "$target" -L 256M -n root "$vg" >/dev/null
+    printf 'before snapshot\n' | dd of="/dev/$vg/root" conv=notrunc status=none
+    lvcreate --devices "$target" -s -L 128M -n saved "$vg/root" >/dev/null
+    printf 'after snapshot!\n' | dd of="/dev/$vg/root" conv=notrunc status=none
+    # An open origin makes lvconvert record a pending merge without starting it.
+    exec 3<"/dev/$vg/root"
+    lvconvert --devices "$target" --merge "$vg/saved" | tee /work/pending-merge.log
+    grep -q 'next activation' /work/pending-merge.log
+    exec 3<&-
+    lvs --devices "$target" --segments -a --reportformat json -o vg_name,lv_name,segtype,lv_attr,lv_role > /work/pending-report.json
+    exit 0
+fi
 loop=$(losetup --find --show --partscan /work/source.img)
+# Partition nodes appear asynchronously, and the host's udev may re-read the
+# partition table (briefly removing them) after another loop was closed.
+settled_mount() {
+    local _
+    for _ in {1..100}; do
+        mount "$@" 2>/dev/null && return 0
+        sleep .2
+    done
+    mount "$@"
+}
 if [[ $MODE == btrfs ]]; then
     apt-get install -y -qq --no-install-recommends btrfs-progs >/dev/null
-    mount -o subvolid=5 "${loop}p3" "$dst"
+    settled_mount -o subvolid=5 "${loop}p3" "$dst"
     btrfs subvolume create "$dst/@mysql" >/dev/null
     printf 'offline database witness\n' > "$dst/@mysql/nestegg-db-marker"
-    mount -o subvol=@ "${loop}p3" "$mnt"
-    mount -o subvol=@home "${loop}p3" "$mnt/home"
+    settled_mount -o subvol=@ "${loop}p3" "$mnt"
+    settled_mount -o subvol=@home "${loop}p3" "$mnt/home"
     mkdir -p "$mnt/var/lib/mysql"
     printf 'UUID=%s /var/lib/mysql btrfs defaults,subvol=@mysql 0 0\n' "$(blkid -s UUID -o value "${loop}p3")" >> "$mnt/etc/fstab"
     # Keep the command substitution literal for the restored guest's boot.
     # shellcheck disable=SC2016
     sed -i '/echo "E2E-SHA /a\  echo "E2E-MYSQL $(cat /var/lib/mysql/nestegg-db-marker)"' "$mnt/usr/local/sbin/nestegg-e2e"
 else
-    mount "${loop}p2" "$mnt"
-    mount "${loop}p3" "$mnt/home"
+    settled_mount "${loop}p2" "$mnt"
+    settled_mount "${loop}p3" "$mnt/home"
+fi
+# Stable synthetic identities let the collision scenario share hostname/key
+# with plain while representing a different installed computer. Only these
+# two modes get one: systemd's host credential key is bound to the machine-id,
+# so changing it would make a booted source unable to decrypt its own key.
+if [[ $MODE == plain ]]; then
+    printf '11111111111111111111111111111111\n' > "$mnt/etc/machine-id"
+elif [[ $MODE == id-collision ]]; then
+    printf '22222222222222222222222222222222\n' > "$mnt/etc/machine-id"
 fi
 case "$MODE" in
     desktop)
+        chroot "$mnt" useradd -m -s /bin/bash bob
+        printf 'second user private file\n' > "$mnt/home/bob/private.txt"
+        chroot "$mnt" chown -R bob:bob /home/bob
+        chmod 0700 "$mnt/home/bob"
         mkdir -p "$mnt/var/lib/nestegg/stick"
         cp /work/pbs.squashfs "$mnt/var/lib/nestegg/stick/pbs.squashfs"
         sha256sum "$mnt/var/lib/nestegg/stick/pbs.squashfs" | cut -d' ' -f1 > "$mnt/var/lib/nestegg/stick/pbs.squashfs.sha256"
@@ -75,7 +118,7 @@ p=pathlib.Path(sys.argv[1]);s=p.read_text();s=s.replace('  echo "E2E-SOURCE-BOOT
 ''');p.write_text(s)
 PY
         ;;
-    plain|btrfs) ;;
+    plain|btrfs|id-collision) ;;
     luks-lvm)
         rm -f /work/encrypted.img
         truncate -s 8G /work/encrypted.img

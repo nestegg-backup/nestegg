@@ -24,6 +24,9 @@ pub struct BackupArgs {
     /// Confirm the computer's backup ID (from its config or hostname).
     #[arg(long)]
     pub backup_id: String,
+    /// Explicitly allow an existing ID belonging to another/unknown computer.
+    #[arg(long)]
+    pub force_id: bool,
     #[arg(long)]
     pub luks_passphrase_file: Option<PathBuf>,
     /// Exported or saved paper key instead of the stick's protected copy.
@@ -179,7 +182,7 @@ pub fn run(args: BackupArgs) -> Result<u8> {
         args.confirm_clock || args.time.is_some(),
         "confirm the live clock with --confirm-clock or --time"
     );
-    let result = perform(&session, sources, &args.backup_id);
+    let result = perform(&session, sources, &args.backup_id, args.force_id);
     let closed = session.close();
     let code = result?;
     closed?;
@@ -276,6 +279,20 @@ pub fn wizard() -> Result<u8> {
     };
     session.set_key(Some(&key))?;
     session.client().check_group_key(&id)?;
+    let collision = identity_warning(&session, &sources.root, &id)?;
+    let force_id = if let Some(reason) = collision {
+        eprintln!("Backup ID collision: {}", super::printable_block(&reason));
+        ensure!(
+            ask_yes(
+                "Use this ID anyway, combining this computer's backups and retention with the existing group",
+                false
+            )?,
+            "choose a distinct backup ID for this computer"
+        );
+        true
+    } else {
+        false
+    };
     let snapshots = session.client().list_snapshots(&id)?;
     let newest = snapshots
         .iter()
@@ -305,7 +322,7 @@ pub fn wizard() -> Result<u8> {
         ask_yes("Start the encrypted backup to this stick", false)?,
         "backup cancelled"
     );
-    let result = perform(&session, sources, &id);
+    let result = perform(&session, sources, &id, force_id);
     let closed = session.close();
     let code = result?;
     closed?;
@@ -313,7 +330,7 @@ pub fn wizard() -> Result<u8> {
     Ok(code)
 }
 
-fn perform(session: &Session, sources: Sources, id: &str) -> Result<u8> {
+fn perform(session: &Session, sources: Sources, id: &str, force_id: bool) -> Result<u8> {
     let layout = sources.layout()?;
     ensure!(
         layout.bootloader == "grub",
@@ -369,12 +386,19 @@ fn perform(session: &Session, sources: Sources, id: &str) -> Result<u8> {
         clock_problem(now, newest).is_none(),
         "correct the live clock before backing up"
     );
+    if let Some(reason) = identity_warning(session, &sources.root, id)? {
+        ensure!(
+            force_id,
+            "backup ID collision: {reason}; choose a distinct --backup-id or explicitly pass --force-id"
+        );
+    }
     let snapshot = snapshot_path(id, now.timestamp());
     let meta = crate::metadata::BackupMetadata {
         format: crate::metadata::FORMAT,
         nestegg_version: env!("CARGO_PKG_VERSION").into(),
         backup_id: id.into(),
         hostname: layout.hostname.clone(),
+        machine_id: offline_machine_identity(&sources.root),
         backup_time: now.timestamp(),
         snapshot: snapshot.clone(),
         archive_sources: BTreeMap::from([("system.pxar".into(), "/".into())]),
@@ -447,48 +471,282 @@ fn perform(session: &Session, sources: Sources, id: &str) -> Result<u8> {
         &crate::cancel::requested,
     ) {
         crate::verify::Outcome::Verified => {}
+        crate::verify::Outcome::Cancelled => {
+            bail!("cancelled: offline backup interrupted; no pruning was done")
+        }
         other => bail!("offline backup read-back failed: {other:?}; no pruning was done"),
     }
-    let pbs = session.local.as_ref().context("no local PBS")?.pbs();
-    // A live session has no durable local monthly timestamp: force a complete
-    // verification, which is stronger than phase two's monthly minimum.
-    pbs.maintenance(&["verify", "stick", "--ignore-verified", "false"])?;
-    let verified = client.list_snapshots(id)?;
-    ensure!(
-        verified
-            .iter()
-            .any(|s| s.snapshot == snapshot && s.verified.as_deref() == Some("ok")),
-        "PBS did not verify this snapshot; no pruning was done"
-    );
-    ensure!(
-        crate::verify::failed_snapshots(&verified).is_empty(),
-        "stick contains damaged snapshots; no pruning was done"
-    );
-    for group in client.list_groups()? {
-        let snapshots =
-            client.list_group_snapshots(&format!("{}/{}", group.backup_type, group.backup_id))?;
-        ensure!(
-            crate::verify::failed_snapshots(&snapshots).is_empty(),
-            "stick contains damaged snapshots; no pruning was done"
-        );
-    }
-    client.check_group_key(id)?;
     let retention = text_root(&sources.root, "/etc/nestegg/config.toml")
         .ok()
         .map(|text| crate::config::Config::parse(&text))
         .transpose()?
         .and_then(|config| config.stick.map(|s| s.retention))
         .unwrap_or_default();
-    client.prune_stick(id, &retention)?;
-    pbs.maintenance(&["garbage-collection", "start", "stick"])?;
+    finish_stick(
+        &mut SessionMaintenance {
+            session,
+            id,
+            time: now.timestamp(),
+            retention,
+        },
+        &mut |warning| eprintln!("{}", super::printable_block(warning)),
+    )?;
     sources.close()?;
     eprintln!("Offline backup verified: {snapshot}");
     Ok(0)
 }
 
+fn offline_machine_identity(root: &Path) -> Option<String> {
+    text_root(root, "/etc/machine-id")
+        .ok()
+        .and_then(|s| crate::metadata::machine_identity(&s))
+}
+
+fn identity_difference(
+    hostname: &str,
+    machine: Option<&str>,
+    previous: Option<&crate::metadata::BackupMetadata>,
+) -> Option<&'static str> {
+    let Some(previous) = previous else {
+        return Some("the newest snapshot has no signed computer identity");
+    };
+    if previous.hostname != hostname {
+        Some("the newest snapshot belongs to a different hostname")
+    } else {
+        match (machine, previous.machine_id.as_deref()) {
+            (Some(current), Some(old)) if current == old => None,
+            (Some(_), Some(_)) => {
+                Some("the newest snapshot belongs to a different machine identity")
+            }
+            _ => Some("the computer identity cannot be compared with the newest snapshot"),
+        }
+    }
+}
+
+fn identity_warning(session: &Session, root: &Path, id: &str) -> Result<Option<String>> {
+    let client = session.client();
+    let snapshots = client.list_snapshots_bounded(id, crate::client::readback_list_timeout())?;
+    let Some(newest) = snapshots.iter().max_by_key(|s| snapshot_epoch(&s.snapshot)) else {
+        return Ok(None);
+    };
+    let scratch = tempfile::Builder::new()
+        .prefix("identity-")
+        .tempdir_in(work_dir())?;
+    // fetch always supplies the configured key, verifying the manifest's
+    // signature; malformed/tampered metadata is an error, never an override.
+    let previous = crate::metadata::fetch(&client, &newest.snapshot, scratch.path())?
+        .map(|f| crate::metadata::BackupMetadata::parse(&f.bytes))
+        .transpose()?;
+    if let Some(meta) = &previous {
+        ensure!(
+            meta.belongs_to(&newest.snapshot),
+            "computer metadata belongs to a different snapshot"
+        );
+    }
+    let hostname = text_root(root, "/etc/hostname")?;
+    let machine = offline_machine_identity(root);
+    Ok(
+        identity_difference(hostname.trim(), machine.as_deref(), previous.as_ref())
+            .map(str::to_owned),
+    )
+}
+
+/// Separating the maintenance boundary lets tests prove that unrelated
+/// datastore damage cannot starve retention, while a bad new snapshot can.
+trait StickMaintenance {
+    fn checkpoint(&self) -> Result<()>;
+    fn verify_new(&mut self) -> Result<()>;
+    fn verify_all(&mut self) -> Result<()>;
+    fn prune(&mut self) -> Result<()>;
+    fn gc(&mut self) -> Result<()>;
+}
+
+fn finish_stick(store: &mut impl StickMaintenance, warn: &mut impl FnMut(&str)) -> Result<()> {
+    store.checkpoint()?;
+    store.verify_new()?;
+    store.checkpoint()?;
+    // Live sessions have no durable monthly timestamp: attempt a full pass.
+    // Its result is independent of the already verified new snapshot.
+    if let Err(e) = store.verify_all() {
+        store.checkpoint()?;
+        warn(&format!(
+            "stick_damaged: full datastore verification failed; the new snapshot is verified and this machine's retention continues: {e:#}"
+        ));
+    }
+    store.checkpoint()?;
+    store.prune()?;
+    store.checkpoint()?;
+    store.gc()?;
+    store.checkpoint()
+}
+
+struct SessionMaintenance<'a> {
+    session: &'a Session,
+    id: &'a str,
+    time: i64,
+    retention: crate::config::StickRetention,
+}
+
+fn maintenance_checkpoint(cancelled: bool, present: bool) -> Result<()> {
+    ensure!(!cancelled, "cancelled: offline backup interrupted");
+    ensure!(present, "stick_not_plugged_in: backup stick was removed");
+    Ok(())
+}
+
+impl StickMaintenance for SessionMaintenance<'_> {
+    fn checkpoint(&self) -> Result<()> {
+        maintenance_checkpoint(
+            crate::cancel::requested(),
+            self.session
+                .local
+                .as_ref()
+                .is_some_and(|s| crate::stick::target::present(&s.uuid)),
+        )
+    }
+    fn verify_new(&mut self) -> Result<()> {
+        let pbs = self.session.local.as_ref().context("no local PBS")?.pbs();
+        pbs.verify_snapshot(self.id, self.time)?;
+        let snapshots = self
+            .session
+            .client()
+            .list_snapshots_bounded(self.id, crate::client::readback_list_timeout())?;
+        let snapshot = snapshot_path(self.id, self.time);
+        ensure!(
+            snapshots
+                .iter()
+                .any(|s| s.snapshot == snapshot && s.verified.as_deref() == Some("ok")),
+            "PBS did not verify this snapshot; no pruning was done"
+        );
+        Ok(())
+    }
+    fn verify_all(&mut self) -> Result<()> {
+        let pbs = self.session.local.as_ref().context("no local PBS")?.pbs();
+        pbs.maintenance(&["verify", "stick", "--ignore-verified", "false"])
+    }
+    fn prune(&mut self) -> Result<()> {
+        let client = self.session.client();
+        client.check_group_key(self.id)?;
+        self.checkpoint()?;
+        client.prune_stick(self.id, &self.retention)
+    }
+    fn gc(&mut self) -> Result<()> {
+        self.session
+            .local
+            .as_ref()
+            .context("no local PBS")?
+            .pbs()
+            .maintenance(&["garbage-collection", "start", "stick"])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_key_and_hostname_do_not_hide_an_id_collision() {
+        let mut previous = crate::metadata::BackupMetadata {
+            format: crate::metadata::FORMAT,
+            nestegg_version: "test".into(),
+            backup_id: "desktop".into(),
+            hostname: "same-name".into(),
+            machine_id: Some("first-machine".into()),
+            backup_time: 1,
+            snapshot: snapshot_path("desktop", 1),
+            archive_sources: BTreeMap::new(),
+            sources: vec![],
+            system_mode: true,
+            incomplete: vec![],
+        };
+        assert!(identity_difference("same-name", Some("first-machine"), Some(&previous)).is_none());
+        assert!(
+            identity_difference("same-name", Some("second-machine"), Some(&previous)).is_some()
+        );
+        assert!(identity_difference("renamed", Some("first-machine"), Some(&previous)).is_some());
+        assert!(identity_difference("same-name", None, Some(&previous)).is_some());
+        previous.machine_id = None;
+        assert!(identity_difference("same-name", Some("first-machine"), Some(&previous)).is_some());
+        assert!(identity_difference("same-name", Some("first-machine"), None).is_some());
+    }
+
+    #[derive(Default)]
+    struct TestMaintenance {
+        calls: Vec<&'static str>,
+        new_bad: bool,
+        foreign_bad: bool,
+        stop_after_full: bool,
+    }
+    impl StickMaintenance for TestMaintenance {
+        fn checkpoint(&self) -> Result<()> {
+            maintenance_checkpoint(self.stop_after_full && self.calls.contains(&"all"), true)
+        }
+        fn verify_new(&mut self) -> Result<()> {
+            self.calls.push("new");
+            ensure!(!self.new_bad, "new snapshot failed verification");
+            Ok(())
+        }
+        fn verify_all(&mut self) -> Result<()> {
+            self.calls.push("all");
+            ensure!(!self.foreign_bad, "another computer has a corrupt snapshot");
+            Ok(())
+        }
+        fn prune(&mut self) -> Result<()> {
+            self.calls.push("prune");
+            Ok(())
+        }
+        fn gc(&mut self) -> Result<()> {
+            self.calls.push("gc");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn foreign_damage_warns_but_does_not_starve_offline_retention() {
+        let mut store = TestMaintenance {
+            foreign_bad: true,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+        finish_stick(&mut store, &mut |s| warnings.push(s.to_owned())).unwrap();
+        assert_eq!(store.calls, ["new", "all", "prune", "gc"]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("stick_damaged:"));
+        assert!(warnings[0].contains("another computer"));
+    }
+
+    #[test]
+    fn new_snapshot_failure_blocks_full_verify_prune_and_gc() {
+        let mut store = TestMaintenance {
+            new_bad: true,
+            ..Default::default()
+        };
+        assert!(finish_stick(&mut store, &mut |_| panic!("not a warning")).is_err());
+        assert_eq!(store.calls, ["new"]);
+    }
+
+    #[test]
+    fn cancelled_full_verify_cannot_become_damage_or_start_retention() {
+        let mut store = TestMaintenance {
+            foreign_bad: true,
+            stop_after_full: true,
+            ..Default::default()
+        };
+        let e = finish_stick(&mut store, &mut |_| panic!("cancelled is not damage")).unwrap_err();
+        assert!(e.to_string().starts_with("cancelled:"));
+        assert_eq!(store.calls, ["new", "all"]);
+        assert!(
+            maintenance_checkpoint(false, false)
+                .unwrap_err()
+                .to_string()
+                .starts_with("stick_not_plugged_in:")
+        );
+        assert!(
+            maintenance_checkpoint(true, false)
+                .unwrap_err()
+                .to_string()
+                .starts_with("cancelled:")
+        );
+    }
+
     #[test]
     fn clock_checks_monotonicity_and_bad_rtc() {
         let now = DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")

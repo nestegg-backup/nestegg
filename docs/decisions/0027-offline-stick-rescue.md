@@ -43,7 +43,11 @@
 5. Offline backup first refuses mounted sources, swap and existing holders,
    requires a RAM workspace before opening keys, then sets the whole source
    disk and its partitions kernel-read-only before
-   opening LUKS or probing filesystems. LUKS is opened with `--readonly`. LVM
+   opening LUKS or probing filesystems. This flag refuses writable opens and
+   makes filesystems skip error-info writes, but it is not a block-layer write
+   barrier: the kernel only warns when an in-kernel user such as a device-mapper
+   target writes (reproduced below). Safety therefore rests on never activating
+   anything that writes on top of the source. LUKS is opened with `--readonly`. LVM
    activation uses `read_only_volume_list`, not a metadata-changing LV permission
    edit, and `metadata_read_only=1`; ordinary linear LVs are supported. Automatic
    LVM activation is disabled in the live image. Restore source flags after
@@ -125,3 +129,70 @@ ext4 and Btrfs, not a complete XFS or ext2/3 restore cycle.
 
 - [Kernel dm-snapshot documentation](https://www.kernel.org/doc/html/latest/admin-guide/device-mapper/snapshot.html)
 - [LVM activation and metadata-read-only configuration](https://gitlab.com/lvmteam/lvm2/-/blob/main/conf/example.conf.in)
+
+## Offline review hardening
+
+All ext2/3/4 source mounts, including the RAM journal replay mount, explicitly
+use `errors=continue`. The mount is already read-only, so remount-ro cannot add
+protection; overriding the source superblock's `errors=panic` avoids a live-kernel
+panic. The writeable RAM snapshot alone receives journal replay.
+
+The phase-two integration audit also checked the shared Python key helper
+(`/usr/bin/python3 -I`, root working directory and cleared PYTHON variables) and
+`BootMedium::open`'s shared recursively slave mount namespace. Both fixes are
+already reused by the offline flow. Cancellation handling is checked separately
+alongside verification and retention; offline sessions have no daemon retry state.
+
+Offline completion follows decision 0028: independently verify the exact new
+snapshot and require its PBS `ok` state, then attempt full datastore verification.
+Full verification failure emits `stick_damaged` but does not block this computer's
+key-guarded prune or GC. Cancellation and media removal are checked between
+maintenance steps, including before interpreting a failed full pass as damage.
+A cancelled read-back is labelled cancelled. Unit tests cover foreign corruption,
+new-snapshot failure, cancellation during the full pass and missing media.
+
+The immutable encrypted metadata now optionally includes a normalized SHA-256
+of `/etc/machine-id`, populated by desktop and offline backups. Before upload,
+offline backup compares hostname and machine identity with the newest group's
+signed metadata. A mismatch, missing old metadata or unavailable identity needs
+an explicit default-no wizard confirmation or non-interactive `--force-id`.
+The override never bypasses signature, snapshot binding or key ownership checks.
+A distinct backup ID remains the recommended choice. Exact OS clones that also
+share a machine-id cannot be distinguished by this identity check.
+
+LVM inspection uses `lvs -a --segments` with `lv_attr` and `lv_role`. Only
+inactive visible ordinary (`lv_attr[0] == '-'`) public linear LVs are accepted.
+Origins, pending merges, snapshots, virtual/mirror/RAID volumes and hidden LVs
+are refused before activating any VG. A separate read-only `vgcfgbackup` export
+must contain only striped segment metadata (the LV report also requires the
+single-stripe linear interpretation), rejecting hidden snapshot segments.
+Activation uses `lvchange` with a public/linear/ordinary LV selection evaluated
+under LVM's VG lock, read-only activation permissions, metadata-read-only and
+no background polling. Polling control alone cannot prevent kernel merges.
+The current LVM activation CLI exposes no unconditional no-merging switch;
+the upstream internal `no_merging` option is not a CLI guarantee.
+See [LVM device activation](https://github.com/lvmteam/lvm2/blob/main/lib/activate/dev_manager.c)
+and [LV activation command](https://github.com/lvmteam/lvm2/blob/main/tools/lvchange.c).
+
+The `pending-merge` VM scenario compares the entire image before/after refusal,
+checks that no mappings were acquired and that source read-only flags were
+restored, then tries the former activation on a separate disposable image copy.
+
+Result on 2026-11-12 (Debian 13 rescue image, kernel 6.12.116, LVM 2.03.31,
+dm driver 4.48.0): `nestegg rescue backup` refused the VG with "snapshots,
+merges and hidden LVs are refused", created no mapping, restored the source
+read-only flag, and the SHA-256 of the entire source image was unchanged. The
+fixture's own LV report is asserted to contain a merging origin and snapshot;
+in the reproduction VM, the byte-identical copy showed the origin as
+`Owi---s---` and the hidden COW as `[saved]` with `Swi---s---`; the report check alone already refuses it, so the metadata
+export and activation selection remain second and third lines of defence
+(covered by unit tests). The former `vgchange -ay` activation, with
+`read_only_volume_list`, `metadata_read_only=1`, `--monitor n` and
+`blockdev --setro` on the whole disk, loaded a `snapshot-merge` table. The
+kernel logged "Trying to write to read-only block-device" for `dm-0` and `vdb`
+and the image copy's checksum changed: the original write behaviour was
+reproduced. An earlier attempt of this scenario never reached the LVM check,
+because its 512 MiB fixture was below the 1 GiB minimum for a computer disk;
+the fixture is now 2 GiB (sparse) and the test asserts the exact LVM refusal.
+The `id-collision` scenario follows `plain`, shares its key, hostname and backup
+ID with a different machine-id, requires refusal, then exercises `--force-id`.

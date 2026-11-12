@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Phases 3/4 acceptance. ONLY disposable files, loops, containers and KVM VMs.
-# Usage: sudo tests/stick/rescue.sh BINARY RESCUE_ISO [desktop|plain|luks-lvm|dirty|no-nestegg|btrfs|all]
+# Usage: sudo tests/stick/rescue.sh BINARY RESCUE_ISO [desktop|plain|luks-lvm|dirty|no-nestegg|btrfs|pending-merge|id-collision|all]
 set -Eeuo pipefail
 [[ $EUID == 0 && -e /dev/kvm ]] || { echo 'root and KVM required' >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
@@ -10,7 +10,7 @@ if [[ ${NESTEGG_RESCUE_TEST_NS:-0} != 1 ]]; then
     exec unshare --mount --propagation private env NESTEGG_RESCUE_TEST_NS=1 "$0" "$@"
 fi
 work=$(mktemp -d /tmp/nestegg-stick-rescue.XXXXXX)
-qemu_pid=; loop=; container=nestegg-stick-source-$$
+qemu_pid=; loop=; container=nestegg-stick-source-$$; loaded_snapshot_module=0
 cleanup() {
     local rc=$? bad=0
     trap - EXIT ERR; trap '' INT TERM
@@ -25,6 +25,12 @@ cleanup() {
     if [[ -n ${KEEP_LOGS:-} ]]; then
         mkdir -p "$KEEP_LOGS"
         cp "$work/"*.log "$KEEP_LOGS/" 2>/dev/null
+    fi
+    # A mapping left by this test is a leak. The module itself may be in use
+    # by an unrelated parallel test, so failing to unload it is only a note.
+    if dmsetup ls 2>/dev/null | grep -q '^nestegg--pending--fixture-'; then bad=1; fi
+    if ((loaded_snapshot_module)) && ! modprobe -r dm_snapshot 2>/dev/null; then
+        echo 'note: dm_snapshot is in use elsewhere and stays loaded' >&2
     fi
     ((bad == 0)) || { echo "ERROR: retained owned resources: $work" >&2; exit 1; }
     if [[ ${KEEP:-0} == 1 ]]; then echo "work directory kept: $work"; else rm -rf "$work"; fi
@@ -56,10 +62,19 @@ printf '!7aA\n' >> "$work/key-password"
 openssl rand -base64 24 | tr -d '\n' > "$work/luks-password"
 chmod 600 "$work/"*password
 printf -v fingerprint '%s' "$(printf '00:%.0s' {1..31})00"
+if [[ $modes == pending-merge ]]; then
+    # This scenario must refuse before reading any OS or encryption key.
+    # No installed OS is needed on the tiny disposable LVM source.
+    truncate -s 2G "$work/source.img"
+    printf 'not reached by the refusal test\n' > "$work/nestegg-paperkey.txt"
+    printf '{}\n' > "$work/nestegg-key.json"
+    : > "$work/data.sha256"
+else
 echo '== build powered-off source system'
 docker run --rm --name "$container" --privileged -v /dev:/dev -v "$work:/work" -v "$repo/tests/rescue:/t:ro" \
     -e EXTRA_SOURCE_PACKAGES=iproute2 -e VARIANT=ubuntu-ext4-bios -e IMAGE=/work/source.img -e PBS_IP=192.0.2.10 \
     -e FP="$fingerprint" -e TOKEN_SECRET=fixture-only-not-used ubuntu:24.04 bash /t/make-source.sh > "$work/build-source.log" 2>&1
+fi
 cp --reflink=auto --sparse=always "$work/source.img" "$work/template.img"
 cp "$work/data.sha256" "$work/template-data.sha256"
 # Payload is read-only in all guests. It supplies the exact tested binary and
@@ -90,7 +105,7 @@ send mkdir -p /media/test; mount -o ro,noload /dev/vdc /media/test; cp /media/te
 expect root@.*# 30
 EOF
 }
-if [[ $modes == all ]]; then modes='desktop plain luks-lvm dirty no-nestegg btrfs'; fi
+if [[ $modes == all ]]; then modes='desktop plain id-collision luks-lvm dirty no-nestegg btrfs pending-merge'; fi
 for mode in $modes; do
     echo "== $mode"
     if [[ $mode == btrfs ]]; then
@@ -102,9 +117,49 @@ for mode in $modes; do
         cp --reflink=auto --sparse=always "$work/template.img" "$work/source.img"
         cp "$work/template-data.sha256" "$work/data.sha256"
     fi
+    if [[ $mode == pending-merge && ! -d /sys/module/dm_snapshot ]]; then
+        modprobe dm_snapshot
+        loaded_snapshot_module=1
+    fi
     docker run --rm --name "$container" --privileged -v /dev:/dev -v "$work:/work" -v "$here:/t:ro" \
         -e MODE="$mode" -e DATA_UUID="$uuid" ubuntu:24.04 bash /t/prepare-offline-source.sh > "$work/prepare-$mode.log" 2>&1
+    if [[ $mode == pending-merge ]]; then
+        mv "$work/pending.img" "$work/source.img"
+        # The fixture must really hold a merging origin and snapshot.
+        python3 -c 'import json,sys; a=[s["lv_attr"] for s in json.load(open(sys.argv[1]))["report"][0]["seg"]]; assert any(x[0]=="O" for x in a) and any(x[0]=="S" for x in a), a' "$work/pending-report.json"
+        sha256sum "$work/source.img" > "$work/pending-before.sha256"
+        {
+            common_steps
+            cat <<'EOF'
+send nestegg rescue backup --disk /dev/vdb --backup-id pending-fixture --keyfile /media/test/nestegg-paperkey.txt --confirm-clock >/run/pending-refusal.log 2>&1; code=$?; cat /run/pending-refusal.log; test "$code" != 0 && grep -q 'snapshots, merges and hidden LVs are refused' /run/pending-refusal.log && ! dmsetup table | grep -q snapshot && ! dmsetup ls | grep -q nestegg--pending--fixture && test "$(blockdev --getro /dev/vdb)" = 0; printf 'REFUSAL-%s=%s\n' EXIT "$?"
+expect REFUSAL-EXIT=0 240
+send poweroff -f
+EOF
+        } > "$work/pending.steps"
+        boot_stick pending-merge "$work/source.img" "$work/pending.steps"
+        sha256sum --check "$work/pending-before.sha256"
+        echo 'PASS pending merge: activation refused, no mappings, source flags restored, entire image SHA-256 unchanged'
+        # Reproduce the former activation on a COPY, never the checked source.
+        cp --reflink=auto --sparse=always "$work/source.img" "$work/unsafe.img"
+        sha256sum "$work/unsafe.img" > "$work/unsafe-before.sha256"
+        {
+            common_steps
+            cat <<'EOF'
+send uname -r; lvm version; lvs -a --segments --reportformat json --devices /dev/vdb -o vg_name,lv_name,segtype,lv_attr,lv_role; lvs --reportformat json --devices /dev/vdb -o vg_name,lv_name,segtype,lv_attr; blockdev --setro /dev/vdb; vgchange -ay --monitor n --devices /dev/vdb --config 'global { metadata_read_only=1 } activation { read_only_volume_list=["nestegg-pending-fixture"] monitoring=0 } backup { backup=0 archive=0 }' nestegg-pending-fixture; dmsetup table; sleep 5; vgchange -an --devices /dev/vdb --config 'global { metadata_read_only=1 } backup { backup=0 archive=0 }' nestegg-pending-fixture; blockdev --setrw /dev/vdb; echo UNSAFE-REPRO-DONE
+expect UNSAFE-REPRO-DONE 120
+send poweroff -f
+EOF
+        } > "$work/unsafe.steps"
+        boot_stick unsafe-merge "$work/unsafe.img" "$work/unsafe.steps"
+        if sha256sum --check "$work/unsafe-before.sha256" > "$work/unsafe-check.log" 2>&1; then
+            echo 'OBSERVATION original activation: source checksum unchanged (inspect kernel/activation log)'
+        else
+            echo 'OBSERVATION original activation: SOURCE CHECKSUM CHANGED despite read-only flags'
+        fi
+        continue
+    fi
     id=offline-$mode
+    [[ $mode != id-collision ]] || id=offline-plain
     if [[ $mode == desktop ]]; then
         id=e2e-src
         timeout 1800 qemu-system-x86_64 -enable-kvm -cpu host -m 4096 -smp 2 -display none -monitor none \
@@ -158,6 +213,13 @@ EOF
             else
                 extra=
                 [[ $mode != luks-lvm ]] || extra='--luks-passphrase-file /media/test/luks-password'
+                if [[ $mode == id-collision ]]; then
+                    cat <<'EOF'
+send nestegg rescue backup --disk /dev/vdb --backup-id offline-plain --keyfile /media/test/nestegg-paperkey.txt --confirm-clock >/run/collision.log 2>&1; code=$?; cat /run/collision.log; test "$code" != 0 && grep -q 'backup ID collision:.*different machine identity' /run/collision.log; printf 'COLLISION-%s=%s\n' EXIT "$?"
+expect COLLISION-EXIT=0 300
+EOF
+                    extra=--force-id
+                fi
                 printf '%s\n' "send nestegg rescue backup --disk /dev/vdb --backup-id $id --keyfile /media/test/nestegg-paperkey.txt --confirm-clock $extra; printf 'BACKUP-%s=%s\\n' EXIT \"\$?\""
                 echo 'expect BACKUP-EXIT=0 1800'
             fi
@@ -182,7 +244,7 @@ PYTEST
         common_steps
         if [[ $mode == desktop ]]; then
             cat <<EOF
-send mkdir -p /var/lib/nestegg; mount -t tmpfs -o mode=0755 tmpfs /var/lib/nestegg; mkdir /var/lib/nestegg/stick; cp /run/live/medium/live/a/filesystem.squashfs /var/lib/nestegg/stick/pbs.squashfs; sha256sum /var/lib/nestegg/stick/pbs.squashfs | cut -d' ' -f1 > /var/lib/nestegg/stick/pbs.squashfs.sha256; mkdir -m700 /run/api-credentials; cp /media/test/nestegg-key.json /run/api-credentials/encryption-key; chmod 600 /run/api-credentials/encryption-key; printf 'backup_id = "e2e-src"\\n[stick]\\ndata_uuids = ["$uuid"]\\n' > /run/api-config.toml; groupadd -f nestegg; useradd -m -G nestegg alice; NESTEGG_CONFIG=/run/api-config.toml NESTEGG_RUNTIME_DIR=/run/desktop-api NESTEGG_STATE_DIR=/var/lib/nestegg NESTEGG_CREDENTIALS_DIR=/run/api-credentials nestegg daemon >/run/api-daemon.log 2>&1 & api_pid=\$!; for i in {1..100}; do test -S /run/desktop-api/api.sock && break; sleep .1; done; runuser -u alice -- python3 /media/test/desktop-restore.py; api_code=\$?; kill \$api_pid; wait \$api_pid; printf 'API-%s=%s\\n' EXIT \$api_code
+send mkdir -p /var/lib/nestegg; mount -t tmpfs -o mode=0755 tmpfs /var/lib/nestegg; mkdir /var/lib/nestegg/stick; cp /run/live/medium/live/a/filesystem.squashfs /var/lib/nestegg/stick/pbs.squashfs; sha256sum /var/lib/nestegg/stick/pbs.squashfs | cut -d' ' -f1 > /var/lib/nestegg/stick/pbs.squashfs.sha256; mkdir -m700 /run/api-credentials; cp /media/test/nestegg-key.json /run/api-credentials/encryption-key; chmod 600 /run/api-credentials/encryption-key; printf 'backup_id = "e2e-src"\\n[stick]\\ndata_uuids = ["$uuid"]\\n' > /run/api-config.toml; groupadd -f nestegg; useradd -m -G nestegg alice; useradd -m bob; chmod 0700 /home/bob; NESTEGG_CONFIG=/run/api-config.toml NESTEGG_RUNTIME_DIR=/run/desktop-api NESTEGG_STATE_DIR=/var/lib/nestegg NESTEGG_CREDENTIALS_DIR=/run/api-credentials nestegg daemon >/run/api-daemon.log 2>&1 & api_pid=\$!; for i in {1..100}; do test -S /run/desktop-api/api.sock && break; sleep .1; done; runuser -u alice -- python3 /media/test/desktop-restore.py; api_code=\$?; test ! -e /home/bob/refused-target || api_code=9; kill \$api_pid; wait \$api_pid; printf 'API-%s=%s\\n' EXIT \$api_code
 expect API-EXIT=0 900
 EOF
             cat <<'EOF'

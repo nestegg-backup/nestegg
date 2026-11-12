@@ -32,6 +32,10 @@ pub struct BackupMetadata {
     pub nestegg_version: String,
     pub backup_id: String,
     pub hostname: String,
+    /// SHA-256 of the installed system's machine-id, for offline ID collision
+    /// checks. Absent on older snapshots and uninitialized systems.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
     /// Backup time in epoch seconds (the snapshot's time).
     pub backup_time: i64,
     /// `host/<backup id>/<RFC 3339 time>`.
@@ -47,6 +51,18 @@ pub struct BackupMetadata {
     /// for (same as `Run::incomplete`).
     #[serde(default)]
     pub incomplete: Vec<String>,
+}
+
+pub fn machine_identity(text: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let id = text.trim().to_ascii_lowercase();
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) && id.bytes().any(|b| b != b'0'))
+        .then(|| {
+            Sha256::digest(id.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        })
 }
 
 impl BackupMetadata {
@@ -167,6 +183,7 @@ mod tests {
             nestegg_version: "0.1.0".into(),
             backup_id: "desktop".into(),
             hostname: "desktop".into(),
+            machine_id: None,
             backup_time: 1_794_000_000,
             snapshot: crate::client::snapshot_path("desktop", 1_794_000_000),
             archive_sources: [("home.pxar".to_string(), "/home".to_string())].into(),
@@ -174,6 +191,39 @@ mod tests {
             system_mode: false,
             incomplete: vec![],
         }
+    }
+
+    #[test]
+    fn machine_identity_is_normalized_and_legacy_metadata_still_parses() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            machine_identity(id),
+            machine_identity(&format!("{}\n", id.to_uppercase()))
+        );
+        assert_eq!(machine_identity(id).unwrap().len(), 64);
+        for bad in [
+            "",
+            "uninitialized",
+            "00000000000000000000000000000000",
+            "not-a-machine-id",
+        ] {
+            assert_eq!(machine_identity(bad), None);
+        }
+        let legacy = meta();
+        assert!(
+            !String::from_utf8(legacy.to_bytes())
+                .unwrap()
+                .contains("machine_id")
+        );
+        assert_eq!(
+            BackupMetadata::parse(&legacy.to_bytes())
+                .unwrap()
+                .machine_id,
+            None
+        );
+        let mut current = legacy;
+        current.machine_id = machine_identity(id);
+        assert_eq!(BackupMetadata::parse(&current.to_bytes()).unwrap(), current);
     }
 
     #[test]
