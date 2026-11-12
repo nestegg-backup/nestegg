@@ -83,6 +83,10 @@ impl std::ops::Deref for InspectedDisk {
     }
 }
 
+/// lsblk reads file systems, UUIDs and labels from the udev database. Callers
+/// let udev finish probing a just attached or plugged-in disk first
+/// ([`settle_udev`]), before any lock on the device, so two inspections of an
+/// unchanged disk see the same identity.
 pub(super) fn inspect(path: &Path, owned_loop: bool) -> Result<InspectedDisk> {
     let path = fs::canonicalize(path)?;
     if !fs::metadata(&path)?.file_type().is_block_device() {
@@ -272,6 +276,7 @@ impl OwnedLoop {
                 .args(["--find", "--show", "--partscan"])
                 .arg(&image),
         )?;
+        settle_udev();
         Ok(Self {
             path: path.into(),
             image,
@@ -291,6 +296,15 @@ impl Drop for OwnedLoop {
     }
 }
 
+pub(super) fn settle_udev() {
+    let _ = Command::new("udevadm")
+        .args(["settle", "--timeout=30"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// True once `losetup -j` lists no device for `image`; false after about ten
 /// seconds of waiting for udev to let go of a released device.
 fn wait_until_detached(image: &Path) -> Result<bool> {
@@ -298,12 +312,7 @@ fn wait_until_detached(image: &Path) -> Result<bool> {
         if capture(Command::new("losetup").arg("-j").arg(image))?.is_empty() {
             return Ok(true);
         }
-        let _ = Command::new("udevadm")
-            .args(["settle", "--timeout=5"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        settle_udev();
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Ok(false)
@@ -346,6 +355,7 @@ pub(super) fn operate(
 ) -> Result<Info> {
     // Coordinate with udev block-device probes while writing the partition
     // table/filesystems; all our child tools use their normal device access.
+    settle_udev();
     let _device_lock = lock_device(&disk.path)?;
     // Fail closed immediately before the helper starts, after confirmation and
     // ISO verification, including mounts/holders that appeared in the meantime.

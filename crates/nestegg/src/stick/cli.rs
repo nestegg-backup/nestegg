@@ -156,6 +156,7 @@ pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
         None
     };
     let target = owned.as_ref().map(OwnedLoop::path).unwrap_or(&disk);
+    media::settle_udev();
     let disk = media::inspect(target, owned.is_some())?;
     let cache = paths.state_dir.join("stick");
     let image = image
