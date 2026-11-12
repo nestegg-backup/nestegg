@@ -1,6 +1,6 @@
 # 0023 – Backup stick: back up to, boot from and restore from one USB drive
 
-- Status: proposed for release; phases 0–4 implemented, UI integration and hardware gates remain
+- Status: proposed for release; phases 0–5 implemented and tested in containers and VMs, phase 6 (real hardware) remains
 - Date: 2026-11-11
 - Changes: 0002 (nestegg also runs a PBS, locally and only for the stick),
   0006 (a second kind of stick), 0019 point 4 (password-protected key copy
