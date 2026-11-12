@@ -43,7 +43,11 @@
 5. Offline backup first refuses mounted sources, swap and existing holders,
    requires a RAM workspace before opening keys, then sets the whole source
    disk and its partitions kernel-read-only before
-   opening LUKS or probing filesystems. LUKS is opened with `--readonly`. LVM
+   opening LUKS or probing filesystems. This flag refuses writable opens and
+   makes filesystems skip error-info writes, but it is not a block-layer write
+   barrier: the kernel only warns when an in-kernel user such as a device-mapper
+   target writes (reproduced below). Safety therefore rests on never activating
+   anything that writes on top of the source. LUKS is opened with `--readonly`. LVM
    activation uses `read_only_volume_list`, not a metadata-changing LV permission
    edit, and `metadata_read_only=1`; ordinary linear LVs are supported. Automatic
    LVM activation is disabled in the live image. Restore source flags after
@@ -173,5 +177,21 @@ and [LV activation command](https://github.com/lvmteam/lvm2/blob/main/tools/lvch
 The `pending-merge` VM scenario compares the entire image before/after refusal,
 checks that no mappings were acquired and that source read-only flags were
 restored, then tries the former activation on a separate disposable image copy.
+
+Result on 2026-11-12 (Debian 13 rescue image, kernel 6.12.116, LVM 2.03.31,
+dm driver 4.48.0): `nestegg rescue backup` refused the VG with "snapshots,
+merges and hidden LVs are refused", created no mapping, restored the source
+read-only flag, and the SHA-256 of the entire source image was unchanged. The
+LV report showed the origin as `Owi---s---` and the hidden COW as `[saved]`
+with `Swi---s---`; the report check alone already refuses it, so the metadata
+export and activation selection remain second and third lines of defence
+(covered by unit tests). The former `vgchange -ay` activation, with
+`read_only_volume_list`, `metadata_read_only=1`, `--monitor n` and
+`blockdev --setro` on the whole disk, loaded a `snapshot-merge` table. The
+kernel logged "Trying to write to read-only block-device" for `dm-0` and `vdb`
+and the image copy's checksum changed: the original write behaviour was
+reproduced. An earlier attempt of this scenario never reached the LVM check,
+because its 512 MiB fixture was below the 1 GiB minimum for a computer disk;
+the fixture is now 2 GiB (sparse) and the test asserts the exact LVM refusal.
 The `id-collision` scenario follows `plain`, shares its key, hostname and backup
 ID with a different machine-id, requires refusal, then exercises `--force-id`.
