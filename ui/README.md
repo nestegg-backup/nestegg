@@ -210,6 +210,8 @@ Add faults to any scenario with `&fault=a,b`:
 | `long_overdue` | "overdue after" is 744 hours in the file, above the API's cap: `limits` reports 744 as the maximum (and as `file_minimum`) and the settings page can only lower it |
 | `stick_pulled` | the stick is pulled out: `plugged_in` is false, stick requests answer `503 stick_unavailable`, and a running restore from the stick fails |
 | `stick_busy` | the stick is plugged in but cannot be opened (`503 stick_unavailable`) |
+| `stick_multiple` | two registered sticks are plugged in: the first is named "Blue stick", the second has no name |
+| `stick_no_progress` | like a daemon before API 0.6.0: a stick restore reports `restored_bytes` only when it is done |
 
 `down` can also be switched while the page is open:
 `curl -X POST 'http://127.0.0.1:5173/__mock/fault?down=1'` (and `down=0`); it
@@ -237,8 +239,11 @@ Restoring into `/home/alice/Dokumente` (or another existing folder of the
 mock) answers `409 target_exists`. A restore takes about 4 s and reports
 `restored_bytes` and `total_bytes` while it runs. From the stick (scenarios
 `stick_only` and `both`; `stick_absent` and `both_absent` have it unplugged)
-listing takes about 2 s, a restore about 8 s with `restored_bytes` 0 until it
-is done and `total_bytes` always null. With `daemon=today` the parameter
+listing takes about 2 s, a restore about 8 s; after opening the stick it
+reports `restored_bytes` once a second and `total_bytes` for whole archives
+(null for selected paths). Successful runs carry `transferred_bytes` (the
+compressed amount, about 40 % of `uploaded_bytes`); records older than eleven
+days lack it, like records of older versions. With `daemon=today` the parameter
 `target=stick` is ignored, like a daemon from before stick restores.
 `PATCH /config` changes the settings of the current scenario like the daemon
 (same validation and the same refusal texts, `src/lib/settings.ts`); later

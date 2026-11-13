@@ -49,7 +49,7 @@ pub enum StickCmd {
         #[arg(long, hide = true)]
         test_image: bool,
     },
-    /// Write the inactive live slot and switch boot configuration last.
+    /// Write only the inactive live partition; publish its checksum commit last.
     Update {
         /// Whole disk; omitted only when exactly one registered disk is present.
         disk: Option<PathBuf>,
@@ -75,8 +75,22 @@ pub enum StickCmd {
         /// SHA-256 obtained independently (takes precedence over adjacent .sha256).
         #[arg(long)]
         sha256: Option<String>,
+        /// Optional name shown instead of the UUID, e.g. "Blue stick" (at most 40 characters).
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long, hide = true)]
         test_image: bool,
+    },
+    /// Give a registered stick a name, change it, or remove it with --clear.
+    Name {
+        #[arg(long)]
+        uuid: String,
+        /// New name (at most 40 characters).
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        name: Option<String>,
+        /// Remove the name; the stick is shown by its UUID again.
+        #[arg(long)]
+        clear: bool,
     },
 }
 
@@ -112,6 +126,20 @@ pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
     if !nix::unistd::Uid::effective().is_root() {
         bail!("stick commands need root; run sudo nestegg stick …");
     }
+    if let StickCmd::Name { uuid, name, clear } = command {
+        let name = if clear { None } else { name };
+        set_name(&paths.config_file, &uuid, name.as_deref())?;
+        match name {
+            Some(name) => println!(
+                "stick {} is now named \"{}\"",
+                uuid.to_ascii_lowercase(),
+                name.trim()
+            ),
+            None => println!("stick {} has no name now", uuid.to_ascii_lowercase()),
+        }
+        return Ok(0);
+    }
+    let mut name = None;
     let (action, disk, image, sha256, test_image) = match command {
         StickCmd::Create {
             disk,
@@ -130,8 +158,16 @@ pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
             disk,
             image,
             sha256,
+            name: n,
             test_image,
-        } => ("add", disk, Some(image), sha256, test_image),
+        } => {
+            // Refuse a bad name before anything is written to the stick.
+            if let Some(n) = &n {
+                crate::config::validate_stick_name(n.trim())?;
+            }
+            name = n;
+            ("add", disk, Some(image), sha256, test_image)
+        }
         _ => unreachable!("handled above"),
     };
     // Serialize media operations and cache/registration updates on this desktop.
@@ -177,6 +213,14 @@ pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
     let info = media::operate(action, &disk, image.as_ref(), &cache)?;
     if action == "add" {
         register(&paths.config_file, &info.data_uuid)?;
+        if let Some(name) = &name {
+            set_name(&paths.config_file, &info.data_uuid, Some(name))?;
+        }
+    }
+    if info.inactive_slot_damaged {
+        eprintln!(
+            "The active live slot is valid; the inactive slot filesystem or marker is damaged. Repair it with nestegg stick update DISK --image RELEASE.iso; backups are preserved. Do not recreate the stick."
+        );
     }
     println!("{}", serde_json::to_string_pretty(&info)?);
     Ok(0)
@@ -287,21 +331,8 @@ fn registration_document(path: &Path) -> Result<toml_edit::DocumentMut> {
     } else {
         String::new()
     };
-    let doc: toml_edit::DocumentMut = text.parse()?;
-    if doc.contains_key("pbs") || doc.contains_key("backup") || doc.contains_key("backup_id") {
-        Config::parse(&text)?;
-    } else {
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Registration {
-            stick: Option<StickConfig>,
-        }
-        let r: Registration = toml::from_str(&text)?;
-        if let Some(s) = r.stick {
-            s.validate()?;
-        }
-    }
-    Ok(doc)
+    validate_document(&text)?;
+    Ok(text.parse()?)
 }
 fn register(path: &Path, uuid: &str) -> Result<()> {
     fs::create_dir_all(path.parent().context("config parent missing")?)?;
@@ -340,6 +371,76 @@ fn register(path: &Path, uuid: &str) -> Result<()> {
             Some((nix::unistd::Uid::from_raw(0), group.gid)),
         )
     }
+}
+
+/// Set (`Some`) or remove (`None`) the name of a registered stick in
+/// `[stick.names]`, keeping comments and every other setting as they are.
+fn set_name(path: &Path, uuid: &str, name: Option<&str>) -> Result<()> {
+    let name = name.map(str::trim);
+    if let Some(name) = name {
+        crate::config::validate_stick_name(name)?;
+    }
+    let uuid = uuid.trim().to_ascii_lowercase();
+    let _lock = crate::settings::config_lock(path)?;
+    let mut doc = registration_document(path)?;
+    let registered = doc
+        .get("stick")
+        .and_then(|s| s.get("data_uuids"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .any(|v| v.eq_ignore_ascii_case(&uuid))
+        });
+    if !registered {
+        bail!("{uuid} is not a registered stick; register it first with nestegg stick add");
+    }
+    let stick = doc["stick"]
+        .as_table_like_mut()
+        .context("[stick] is not a table")?;
+    match name {
+        Some(name) => {
+            if stick.get("names").is_none() {
+                stick.insert("names", toml_edit::table());
+            }
+            let names = stick
+                .get_mut("names")
+                .and_then(|n| n.as_table_like_mut())
+                .context("stick.names is not a table")?;
+            names.insert(&uuid, toml_edit::value(name));
+        }
+        None => {
+            if let Some(names) = stick.get_mut("names").and_then(|n| n.as_table_like_mut()) {
+                names.remove(&uuid);
+                if names.is_empty() {
+                    stick.remove("names");
+                }
+            }
+        }
+    }
+    let text = doc.to_string();
+    // The result must be a valid document before it replaces the file.
+    validate_document(&text)?;
+    crate::settings::write_atomically(path, &text)
+}
+
+/// The same strictness as [`registration_document`], for text about to be written.
+fn validate_document(text: &str) -> Result<()> {
+    let doc: toml_edit::DocumentMut = text.parse()?;
+    if doc.contains_key("pbs") || doc.contains_key("backup") || doc.contains_key("backup_id") {
+        Config::parse(text)?;
+    } else {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Registration {
+            stick: Option<StickConfig>,
+        }
+        let r: Registration = toml::from_str(text)?;
+        if let Some(s) = r.stick {
+            s.validate()?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -415,6 +516,46 @@ mod tests {
         .unwrap();
         assert!(registration_document(&path).is_err());
     }
+    #[test]
+    fn names_are_set_changed_and_cleared_without_touching_the_rest() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("config.toml");
+        let old = "# keep this\n[pbs]\nserver='pbs.example.com'\ndatastore='backups'\nauth_id='backup@pbs!desktop'\n[backup]\nencryption=true\n";
+        fs::write(&path, old).unwrap();
+        let uuid = "01234567-89ab-cdef-0123-456789abcdef";
+        // Only registered sticks get a name.
+        assert!(set_name(&path, uuid, Some("Blue")).is_err());
+        register(&path, uuid).unwrap();
+        set_name(&path, &uuid.to_ascii_uppercase(), Some("  Blue stick ")).unwrap();
+        let read = || Config::load(&path).unwrap().stick.unwrap();
+        assert_eq!(read().name_of(uuid), Some("Blue stick"));
+        set_name(&path, uuid, Some("Grey")).unwrap();
+        assert_eq!(read().name_of(uuid), Some("Grey"));
+        // A refused name leaves the file as it was.
+        let before = fs::read(&path).unwrap();
+        assert!(set_name(&path, uuid, Some("bad\u{7}name")).is_err());
+        assert!(set_name(&path, uuid, Some(&"x".repeat(41))).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        set_name(&path, uuid, None).unwrap();
+        assert!(read().names.is_empty());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep this"));
+        assert!(!text.contains("names"), "{text}");
+        // Clearing a stick without a name is fine.
+        set_name(&path, uuid, None).unwrap();
+        // A hand-written [stick] table gets a [stick.names] table.
+        fs::write(
+            &path,
+            format!("[stick]\ndata_uuids = ['{uuid}']\noverdue_after_hours = 48\n"),
+        )
+        .unwrap();
+        set_name(&path, uuid, Some("Office")).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[stick.names]"), "{text}");
+        assert!(text.contains("overdue_after_hours = 48"), "{text}");
+        assert_eq!(read().name_of(uuid), Some("Office"));
+    }
+
     #[test]
     fn registration_only_document() {
         let d = tempfile::tempdir().unwrap();

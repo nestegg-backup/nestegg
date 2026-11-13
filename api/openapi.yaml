@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: nestegg local API
-  version: 0.5.0
+  version: 0.6.0
   summary: Local control API of the nestegg daemon.
   description: |
     Served by `nestegg daemon` on the Unix socket `/run/nestegg/api.sock`
@@ -615,6 +615,9 @@ components:
             properties:
               plugged_in: { type: boolean }
               in_use: { $ref: "#/components/schemas/StickUsage" }
+              name:
+                type: [string, "null"]
+                description: Optional human name from the configuration (`nestegg stick add --name`, `nestegg stick name`), 1 to 40 characters without control characters. Null without a name; absent from older daemons. Display only; requests still select a stick by UUID.
         available_bytes: { type: [integer, "null"], description: Free space as reported for the PBS backup user; cached from space_checked_at. }
         total_bytes: { type: [integer, "null"], description: Datastore filesystem capacity measured with available_bytes; null before first measurement. }
         space_checked_at: { type: [string, "null"], format: date-time, description: Last successful capacity measurement (also refreshed after retention or failure-only GC). }
@@ -634,6 +637,18 @@ components:
           additionalProperties:
             type: string
             enum: [key_copy_missing, password_check_due]
+    RestoredFrom:
+      type: object
+      required: [snapshot, snapshot_time, restored_at, target]
+      description: |
+        Last completed bare-metal restore. Persists across later backups.
+        The restored snapshot counts as a success at snapshot_time for its
+        source target, without claiming that a new backup or verification ran.
+      properties:
+        snapshot: { type: string, examples: ["host/desktop/2026-01-01T00:00:00Z"] }
+        snapshot_time: { type: string, format: date-time }
+        restored_at: { type: string, format: date-time }
+        target: { type: string, enum: [pbs, stick] }
     Status:
       type: object
       required: [machine, pbs, schedule, encryption, health]
@@ -642,6 +657,11 @@ components:
         The pbs object stays present (empty server/datastore in stick-only setups).
         New clients should use targets for independent target health and histories.
       properties:
+        restored_from:
+          description: Null before rescue restore; older daemons may omit this field.
+          oneOf:
+            - $ref: "#/components/schemas/RestoredFrom"
+            - type: "null"
         targets:
           type: object
           description: Only configured targets; old daemons may omit it.
@@ -741,7 +761,22 @@ components:
               name: { type: string, examples: ["home.pxar"] }
               source: { type: string, examples: ["/home"] }
               size_bytes: { type: [integer, "null"] }
-        uploaded_bytes: { type: [integer, "null"], description: Uploaded (new) data; updated after each finished archive during a run. }
+        uploaded_bytes:
+          type: [integer, "null"]
+          description: |
+            New data of this run before compression (the client's "had to
+            backup X"); updated after each finished archive during a run. This
+            is not the amount sent over the network: see transferred_bytes.
+            Clients must not label it "uploaded".
+        transferred_bytes:
+          type: [integer, "null"]
+          description: |
+            What was actually sent to the server (or written to the stick) for
+            the new data, after compression: the sum of the client's
+            "(compressed X)" per archive (decision 0032). Updated after each
+            finished archive during a run. Null or absent in records of older
+            versions, and when the client did not report it for every
+            finished archive. Clients show this as "uploaded" / "written".
         expected_bytes: { type: [integer, "null"], description: Total archive size of the last successful run (progress estimate). }
         processed_bytes: { type: [integer, "null"], description: Total size of the archives finished so far in this run. }
         warnings:
@@ -854,8 +889,8 @@ components:
         started_at: { type: string, format: date-time }
         finished_at: { type: [string, "null"], format: date-time }
         error: { type: [string, "null"] }
-        restored_bytes: { type: integer, description: Bytes restored so far (staging copy). }
-        total_bytes: { type: [integer, "null"], description: Expected total when whole archives are restored. }
+        restored_bytes: { type: integer, description: "Bytes restored so far (staging copy), for the backup server and, since API 0.6.0, for the stick (decision 0029). An older daemon reports stick bytes only at completion." }
+        total_bytes: { type: [integer, "null"], description: Expected total when whole archives are restored, for both sources; null otherwise. Clients show a percentage only with a total. }
         warnings: { type: array, items: { type: string } }
     ConfigView:
       type: object
@@ -882,6 +917,10 @@ components:
           type: array
           description: Registered data partition UUIDs in configuration order; empty without a stick target. Read-only, not secret.
           items: { type: string, format: uuid }
+        stick_names:
+          type: object
+          description: Lower-case registered data UUID to its optional name; sticks without a name are absent. Read-only here (set with `nestegg stick name`); absent from older daemons.
+          additionalProperties: { type: string, minLength: 1, maxLength: 40 }
         automatic_backups: { type: boolean, description: "`nestegg-backup.timer` is enabled." }
         wake_on_lan: { type: boolean, description: Wake-on-LAN is configured and switched on. }
         wake_on_lan_configured: { type: boolean, description: "A `[wake]` section with a MAC address exists; only then can `wake_on_lan` be switched on." }
@@ -1046,7 +1085,8 @@ components:
                   sources: { type: array, items: { type: string } }
                   overdue_after_hours: { type: integer }
                   nestegg_version: { type: string }
-                  uploaded_bytes: { type: [integer, "null"] }
+                  uploaded_bytes: { type: [integer, "null"], description: New data before compression (see Run.uploaded_bytes). }
+                  transferred_bytes: { type: [integer, "null"], description: Compressed amount sent (see Run.transferred_bytes). Absent in reports of older versions. }
                   duration_seconds: { type: integer }
                   incomplete:
                     type: array

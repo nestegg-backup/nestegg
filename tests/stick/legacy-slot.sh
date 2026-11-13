@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Convert ONLY a disposable copy to the exact legacy descriptor, then update it.
+# Unreleased single-FAT layout: refuse all readers/writers, never migrate.
 set -Eeuo pipefail
-here=$(cd "$(dirname "$0")" && pwd)
-bin=$1; iso=$2; source_image=$3; legacy=$4
+bin=$1; iso=$2
 work=$(mktemp -d /tmp/nestegg-legacy-slot.XXXXXX)
 loop=
 cleanup() {
@@ -14,29 +13,27 @@ cleanup() {
     exit "$rc"
 }
 trap cleanup EXIT
-cp --reflink=auto --sparse=always "$source_image" "$legacy"
-loop=$(losetup --find --show --partscan "$legacy")
+trap 'echo "ERROR: legacy refusal test failed at line $LINENO" >&2; tail -12 "$work/"*.log 2>/dev/null || true' ERR
+truncate -s 2G "$work/legacy.img"
+loop=$(losetup --find --show --partscan "$work/legacy.img")
+sgdisk --clear --new=1:2048:+1M --typecode=1:ef02 --new=2:0:+64M --typecode=2:ef00 --new=3:0:0 --typecode=3:8300 "$loop" >/dev/null
+blockdev --rereadpt "$loop"
 udevadm settle --timeout=30 || true
+mkfs.vfat -F32 "${loop}p2" >/dev/null
+mkfs.ext4 -q -F -m 0 -L NESTEGG_DATA "${loop}p3"
 mkdir "$work/esp"
 mount -o nodev,nosuid,noexec "${loop}p2" "$work/esp"
-python3 - "$here/../../crates/nestegg/src/stick/media.sh" "$work/esp" <<'PY'
-import hashlib
-from pathlib import Path
-import re
-import subprocess
-import sys
-source = Path(sys.argv[1]).read_text()
-renderer = source[source.index('render_cfg_legacy() {'):source.index('small_file()')]
-esp = Path(sys.argv[2])
-config = esp / 'live/a/boot.cfg'
-text = config.read_text()
-boot_uuid = re.search(r'boot_uuid=([^\n]+)', (esp / 'nestegg-stick').read_text())[1]
-kernel = re.search(r'^# nestegg-kernel=(.+)$', text, re.M)[1]
-initrd = re.search(r'^# nestegg-initrd=(.+)$', text, re.M)[1]
-output = subprocess.run(['bash', '-c', renderer + '\nboot_uuid=$1\nrender_cfg_legacy a 1 "$2" "$3"', '--', boot_uuid, kernel, initrd], check=True, capture_output=True).stdout
-config.write_bytes(output)
-(config.parent / 'commit.sha256').write_text(hashlib.sha256(output).hexdigest() + '  /live/a/boot.cfg\n')
-PY
+printf 'nestegg-stick-v1\nboot_uuid=%s\ndata_uuid=%s\n' "$(blkid -p -s UUID -o value "${loop}p2")" "$(blkid -p -s UUID -o value "${loop}p3")" > "$work/esp/nestegg-stick"
+sync "$work/esp/nestegg-stick" "$work/esp"
 umount "$work/esp"
 losetup -d "$loop"; loop=
-"$bin" stick update "$legacy" --test-image --image "$iso" > "$work/update.log" 2>&1
+sha256sum "$work/legacy.img" > "$work/before"
+for action in info update add; do
+    args=()
+    [[ $action == info ]] || args=(--image "$iso")
+    if "$bin" stick "$action" "$work/legacy.img" --test-image "${args[@]}" > "$work/$action.log" 2>&1; then exit 1; fi
+    grep -q 'old single-FAT stick layout: create the stick again; this erases all backups' "$work/$action.log"
+done
+sha256sum "$work/legacy.img" > "$work/after"
+cmp "$work/before" "$work/after"
+echo 'PASS v1 info/update/add require recreation and warn about erasing backups; no medium writes'

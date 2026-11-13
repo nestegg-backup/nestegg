@@ -4,6 +4,9 @@
 - Date: 2026-11-11
 - Implements: phase one of [0023](0023-backup-stick.md)
 
+The shared-ESP layout in points 3–4 is superseded by
+[0033](0033-independent-live-slot-partitions.md); its commit ordering remains.
+
 ## Decision
 
 1. Keep the existing rescue ISO boot behavior and add the official

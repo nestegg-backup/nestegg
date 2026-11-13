@@ -743,12 +743,19 @@ data_uuids = ["01234567-89ab-cdef-0123-456789abcdef"]
 overdue_after_hours = 168       # 7 days, independent of the PBS threshold
 minimum_free_bytes = 268435456  # space available to the PBS user, not root
 
+[stick.names]                   # optional, display only (decision 0032)
+"01234567-89ab-cdef-0123-456789abcdef" = "Blue stick"
+
 [stick.retention]
 keep_last = 3
 keep_daily = 7
 keep_weekly = 4
 keep_monthly = 6
 ```
+
+`[stick.names]` may name registered UUIDs only (lower case), with 1 to 40
+characters and no control or invisible formatting characters; set it with
+`nestegg stick add --name` or `nestegg stick name`.
 
 `keep_last` must be positive. Setting a daily, weekly or monthly criterion to
 zero disables that criterion. A stick that is absent has its own availability

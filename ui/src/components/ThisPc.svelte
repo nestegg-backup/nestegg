@@ -272,6 +272,16 @@
           <dt>{t.self.factVerified}</dt>
           <dd>{onlyStick ? t.stick.verifiedYes : t.self.verifiedYes}</dd>
         {/if}
+        {#if status.restored_from}
+          <dt>{t.self.factRestored}</dt>
+          <dd>
+            {t.self.restoredFrom(
+              f.moment(status.restored_from.restored_at, app.now),
+              f.moment(status.restored_from.snapshot_time, app.now),
+              status.restored_from.target === "stick",
+            )}
+          </dd>
+        {/if}
         <dt>{t.self.factEncryption}</dt>
         <dd>
           {#if !status.encryption.enabled}

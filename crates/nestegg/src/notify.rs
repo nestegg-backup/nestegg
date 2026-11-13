@@ -4266,6 +4266,7 @@ mod tests {
         damaged: &[&str],
     ) -> Status {
         Status {
+            restored_from: None,
             targets: Default::default(),
             machine: status::Machine {
                 hostname: "desktop".into(),

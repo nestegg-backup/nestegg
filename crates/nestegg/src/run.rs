@@ -131,7 +131,7 @@ impl RunLock {
             return Ok(None);
         }
         Err(LockBlocked {
-            message: blocked_message(paths),
+            message: blocked_message(paths, read_locks().as_deref()),
         }
         .into())
     }
@@ -163,13 +163,12 @@ fn run_in_progress(paths: &Paths, own_run_id: Option<&str>) -> bool {
 
 /// The message for a run lock that is blocked without a recognisable run,
 /// naming the holders `/proc/locks` lists.
-fn blocked_message(paths: &Paths) -> String {
+fn blocked_message(paths: &Paths, locks: Option<&str>) -> String {
     use std::os::unix::fs::MetadataExt;
     let path = paths.lock_file();
-    let locks = proc_locks();
     let holders = fs::metadata(&path)
         .ok()
-        .zip(locks.as_deref())
+        .zip(locks)
         .map(|(meta, locks)| proc_locks_holders(locks, meta.dev(), meta.ino()))
         .unwrap_or_default();
     let who = if locks.is_none() {
@@ -1347,6 +1346,17 @@ fn pipeline(
         // Live progress for the dashboard after each finished archive.
         rep.run.processed_bytes =
             Some(rep.run.processed_bytes.unwrap_or(0) + stats.total_bytes.unwrap_or(0));
+        // The first finished archive starts both sums; an archive without a
+        // compressed amount makes the transferred sum unknown.
+        let first = rep.run.uploaded_bytes.is_none();
+        rep.run.transferred_bytes = if first {
+            stats.transferred_bytes
+        } else {
+            rep.run
+                .transferred_bytes
+                .zip(stats.transferred_bytes)
+                .map(|(a, b)| a + b)
+        };
         rep.run.uploaded_bytes =
             Some(rep.run.uploaded_bytes.unwrap_or(0) + stats.uploaded_bytes.unwrap_or(0));
         let _ = rep.store.save_current(&rep.run);
@@ -1389,6 +1399,7 @@ fn pipeline(
         .filter_map(|s| s.uploaded_bytes)
         .sum();
     rep.run.uploaded_bytes = (!outcome.archives.is_empty()).then_some(uploaded);
+    rep.run.transferred_bytes = transferred_sum(&outcome.archives);
 
     // 6. Read the snapshot back (decision 0015).
     rep.phase(
@@ -1744,6 +1755,16 @@ fn report_context(
     }
 }
 
+/// What was sent for all archives together, after compression. Unknown
+/// (None) when there are no archives or one of them has no compressed amount:
+/// a partial sum would understate and still look exact.
+fn transferred_sum(archives: &[crate::client::ArchiveStats]) -> Option<u64> {
+    if archives.is_empty() {
+        return None;
+    }
+    archives.iter().map(|s| s.transferred_bytes).sum()
+}
+
 /// Snapshot notes: the first line is shown as the snapshot comment in PBS;
 /// the JSON below is the status report read by the overview of all
 /// machines (`GET /api/v1/machines`). It contains no file names.
@@ -1765,6 +1786,7 @@ pub fn snapshot_notes(run: &Run, duration_seconds: i64, ctx: &ReportContext) -> 
         "trigger": run.trigger,
         "duration_seconds": duration_seconds,
         "uploaded_bytes": run.uploaded_bytes,
+        "transferred_bytes": run.transferred_bytes,
         "archives": run.archives.iter().map(|a| &a.name).collect::<Vec<_>>(),
         "warnings": run.warnings.len(),
         "incomplete": run.incomplete,
@@ -1800,6 +1822,19 @@ pub fn parse_report(notes: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transferred_is_unknown_when_any_archive_lacks_it() {
+        let stats = |t: Option<u64>| crate::client::ArchiveStats {
+            name: "a.pxar".into(),
+            uploaded_bytes: Some(10),
+            transferred_bytes: t,
+            total_bytes: Some(20),
+        };
+        assert_eq!(transferred_sum(&[]), None);
+        assert_eq!(transferred_sum(&[stats(Some(3)), stats(Some(4))]), Some(7));
+        assert_eq!(transferred_sum(&[stats(Some(3)), stats(None)]), None);
+    }
 
     #[test]
     fn every_stick_step_preserves_cancellation_and_device_loss() {
@@ -2057,7 +2092,20 @@ mod tests {
         })
         .unwrap();
         let shared = Flock::lock(file, FlockArg::LockSharedNonblock).unwrap();
-        let err = match RunLock::try_acquire(&paths) {
+        // A readable /proc/locks is not guaranteed to contain this inode
+        // (btrfs uses a different device number; concurrent enumeration is
+        // not a stable snapshot). Inject the diagnostic input, while still
+        // exercising a real shared flock and the exclusive acquisition path.
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(paths.lock_file()).unwrap();
+        let listed = format!(
+            "1: FLOCK ADVISORY READ {} {:02x}:{:02x}:{} 0 EOF\n",
+            std::process::id(),
+            nix::sys::stat::major(meta.dev()),
+            nix::sys::stat::minor(meta.dev()),
+            meta.ino()
+        );
+        let err = match RunLock::try_acquire_with(&paths, None, &|| Some(listed.clone())) {
             Err(e) => e,
             Ok(lock) => panic!("expected an error, got {}", lock.is_some()),
         };
@@ -2067,13 +2115,25 @@ mod tests {
             "{}",
             blocked.message
         );
-        if proc_locks().is_some() {
+        assert!(
+            blocked
+                .message
+                .contains(&format!("pid {}", std::process::id())),
+            "{}",
+            blocked.message
+        );
+        for locks in [Some(""), None] {
+            let err = RunLock::try_acquire_with(&paths, None, &|| locks.map(str::to_owned))
+                .err()
+                .expect("an unlisted shared holder still blocks backups");
+            let message = &err.downcast_ref::<LockBlocked>().unwrap().message;
             assert!(
-                blocked
-                    .message
-                    .contains(&format!("pid {}", std::process::id())),
-                "{}",
-                blocked.message
+                message.contains(if locks.is_none() {
+                    "cannot be read"
+                } else {
+                    "does not show who"
+                }),
+                "{message}"
             );
         }
         // A fresh record of another run: that run is starting, not an error.

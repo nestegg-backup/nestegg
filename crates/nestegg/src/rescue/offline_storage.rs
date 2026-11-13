@@ -839,6 +839,8 @@ impl Sources {
             os_version: get("VERSION_ID"),
             os_name: get("PRETTY_NAME"),
             hostname: text_root(&self.root, "/etc/hostname")?.trim().into(),
+            // Offline disk contents cannot identify their original machine.
+            system_uuid: None,
             root_disk_bytes: Some(self.disk_bytes),
             all_points,
             mounts,

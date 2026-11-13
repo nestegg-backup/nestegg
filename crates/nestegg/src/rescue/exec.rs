@@ -107,6 +107,7 @@ pub struct Job<'a> {
     pub layout: &'a Layout,
     pub client: &'a Client<'a>,
     pub snapshot: &'a str,
+    pub source_target: crate::state::Target,
     /// How to read `system.pxar`, as decided by the key check
     /// ([`super::Protection::restore_key`]).
     pub key: &'a RestoreKey,
@@ -118,6 +119,20 @@ pub struct Job<'a> {
 pub struct Report {
     pub notes: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// What the restored snapshot's signed metadata lists as left out of that
+/// backup (`BackupMetadata::incomplete`). A snapshot without metadata (made
+/// by an older version) has nothing recorded.
+fn snapshot_incomplete(job: &Job) -> Result<Vec<String>> {
+    let scratch = tempfile::tempdir()?;
+    Ok(
+        crate::metadata::fetch(job.client, job.snapshot, scratch.path())?
+            .map(|f| crate::metadata::BackupMetadata::parse(&f.bytes))
+            .transpose()?
+            .map(|meta| meta.incomplete)
+            .unwrap_or_default(),
+    )
 }
 
 fn installed(selections: Option<&str>, package: &str) -> Option<bool> {
@@ -639,6 +654,21 @@ fn execute_inner(job: &Job<'_>, runner: &mut Runner, say: &mut dyn FnMut(&str)) 
         }
     }
 
+    // Looking at the network configuration must never stop a restore: the
+    // boot loader is not installed yet at this point.
+    match super::network::fix_network(
+        &target,
+        Path::new("/sys"),
+        job.layout.system_uuid.as_deref(),
+    ) {
+        Ok(network) => notes.extend(network),
+        Err(e) => warnings.push(format!(
+            "Network: the configuration could not be checked ({e:#}); nothing was changed. \
+             If the restored system has no network, compare 'ip -br link' with the MAC \
+             addresses in its network configuration."
+        )),
+    }
+
     // 8. Boot loader and initramfs inside the restored system.
     say("Installing the boot loader ...");
     bind_mounts(runner, plan.uefi)?;
@@ -656,6 +686,48 @@ fn execute_inner(job: &Job<'_>, runner: &mut Runner, say: &mut dyn FnMut(&str)) 
         runner.chroot(&["grub-mkconfig", "-o", "/boot/grub/grub.cfg"])?;
     }
 
+    let paths = crate::config::Paths {
+        config_file: runner.in_target("/etc/nestegg/config.toml"),
+        credentials_dir: runner.in_target("/etc/nestegg/credentials"),
+        state_dir: runner.in_target("/var/lib/nestegg"),
+        runtime_dir: runner.in_target("/run/nestegg"),
+        systemctl: "systemctl".into(),
+    };
+    // The system is restored and bootable from here on: trouble with the
+    // bookkeeping below is a warning, never a failed restore.
+    // What the restored backup left out stays visible after the restore.
+    let incomplete = match snapshot_incomplete(job) {
+        Ok(list) => list,
+        Err(e) => {
+            warnings.push(format!(
+                "Status: could not read whether the restored backup was complete ({e:#})"
+            ));
+            vec!["the completeness of the restored backup could not be read".into()]
+        }
+    };
+    match crate::state::Store::for_target(&paths, job.source_target).record_restore(
+        job.snapshot,
+        chrono::Utc::now(),
+        &incomplete,
+    ) {
+        Ok(()) => notes.push(format!("Status: restored from {}; its snapshot time is the last successful backup time; cleared stale current run", job.snapshot)),
+        Err(e) => warnings.push(format!(
+            "Status: could not record the restore in the restored system ({e:#}); \
+             `nestegg status` may be out of date until the next backup"
+        )),
+    }
+    // flock locks are kernel state and cannot survive a restore. Remove the
+    // captured runtime files too; no process uses this offline target tree.
+    for file in [paths.lock_file(), paths.state_dir.join(".current.lock")] {
+        match fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => warnings.push(format!(
+                "Status: could not remove the stale {} ({e})",
+                file.display()
+            )),
+            _ => {}
+        }
+    }
+
     // 9. Report inside the restored system.
     let report = format!(
         "Restored by the nestegg rescue system on {}\nSnapshot: {}\n\n{}\n{}\n",
@@ -670,10 +742,15 @@ fn execute_inner(job: &Job<'_>, runner: &mut Runner, say: &mut dyn FnMut(&str)) 
             .join("\n")
     );
     let report_path = runner.in_target("/var/lib/nestegg/rescue-report.txt");
-    if let Some(parent) = report_path.parent() {
-        let _ = fs::create_dir_all(parent);
+    let written = report_path
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| fs::write(&report_path, report));
+    if let Err(e) = written {
+        warnings.push(format!(
+            "the report could not be written into the restored system ({e})"
+        ));
     }
-    let _ = fs::write(&report_path, report);
     Ok(Report { notes, warnings })
 }
 

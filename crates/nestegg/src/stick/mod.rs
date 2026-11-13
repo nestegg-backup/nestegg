@@ -50,22 +50,27 @@ impl Slot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionPlan {
     pub esp_mib: u64,
+    pub slot_mib: u64,
     pub data_start_mib: u64,
 }
 impl PartitionPlan {
     pub fn new(disk_bytes: u64, live_bytes: u64) -> Result<Self> {
-        // Two complete slots plus 256 MiB for GRUB and filesystem overhead.
-        let slot_mib = live_bytes
+        // Each independent FAT slot has 50% image headroom plus 128 MiB,
+        // with a 2 GiB floor. The ESP contains only GRUB and never updates.
+        let image_mib = live_bytes
             .checked_add((1 << 20) - 1)
             .context("image too large")?
             >> 20;
-        let esp_mib = slot_mib
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(256))
+        let slot_mib = image_mib
+            .checked_add(image_mib / 2)
+            .and_then(|n| n.checked_add(128))
             .context("image too large")?
-            .max(1024);
-        // FAT32 cannot hold an individual squashfs >= 4 GiB (checked separately).
-        let data_start_mib = esp_mib + 2;
+            .max(2048);
+        let esp_mib = 64;
+        let data_start_mib = slot_mib
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(esp_mib + 2))
+            .context("image too large")?;
         // PBS preallocates 65,536 chunk directories. A 1 GiB ext4 filesystem
         // with the default inode ratio cannot even hold that directory tree.
         if disk_bytes >> 20 < data_start_mib + 2049 {
@@ -73,6 +78,7 @@ impl PartitionPlan {
         }
         Ok(Self {
             esp_mib,
+            slot_mib,
             data_start_mib,
         })
     }
@@ -385,12 +391,13 @@ mod tests {
     #[test]
     fn partition_capacity_and_alignment() {
         let p = PartitionPlan::new(8 << 30, 900 << 20).unwrap();
-        assert_eq!(p.esp_mib, 2056);
-        assert_eq!(p.data_start_mib, 2058);
+        assert_eq!(p.esp_mib, 64);
+        assert_eq!(p.slot_mib, 2048);
+        assert_eq!(p.data_start_mib, 4162);
         assert!(PartitionPlan::new(2 << 30, 900 << 20).is_err());
         assert!(PartitionPlan::new(u64::MAX, u64::MAX).is_err());
         assert!(PartitionPlan::new(3 << 30, 100 << 20).is_err());
-        assert!(PartitionPlan::new(4 << 30, 100 << 20).is_ok());
+        assert!(PartitionPlan::new(7 << 30, 100 << 20).is_ok());
     }
     #[test]
     fn switches_only_to_inactive_slot() {

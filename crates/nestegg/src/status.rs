@@ -16,6 +16,7 @@ pub const NOTIFY_UNIT: &str = "nestegg-notify.service";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Status {
+    pub restored_from: Option<crate::state::RestoredFrom>,
     pub targets: std::collections::BTreeMap<crate::state::Target, TargetStatus>,
     pub machine: Machine,
     pub pbs: PbsStatus,
@@ -57,6 +58,8 @@ pub struct TargetStatus {
 pub struct StickStatus {
     pub plugged_in: bool,
     pub in_use: Option<crate::stick::target::Usage>,
+    /// The name from `[stick.names]`, if the stick has one.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -286,6 +289,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
                                 StickStatus {
                                     plugged_in: crate::stick::target::present(uuid),
                                     in_use: crate::stick::target::in_use(paths, uuid),
+                                    name: stick.name_of(uuid).map(str::to_owned),
                                 },
                             )
                         })
@@ -333,6 +337,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
         state
     };
     Ok(Status {
+        restored_from: state.restored_from.clone(),
         targets,
         machine: Machine {
             hostname: crate::config::hostname(),
@@ -425,6 +430,7 @@ pub fn config_view(config: &Config, timer_enabled: bool) -> serde_json::Value {
         "overdue_after_hours": config.overdue_after_hours,
         "stick_overdue_after_hours": config.stick.as_ref().map(|s| s.overdue_after_hours),
         "stick_data_uuids": config.stick.as_ref().map(|s| s.data_uuids.clone()).unwrap_or_default(),
+        "stick_names": config.stick.as_ref().map(|s| s.names.clone()).unwrap_or_default(),
         "automatic_backups": timer_enabled,
         "wake_on_lan": config.active_wake().is_some(),
         "wake_on_lan_configured": wake_configured,

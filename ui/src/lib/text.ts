@@ -2,10 +2,10 @@
 // can be tested with both languages.
 
 import type { Messages } from "../i18n";
-import { ageOf, errorKind, hasPbs, isUnknownRun, knownErrorKind, machineKind, otherWarnings, runEnd, runState, runTarget, runTrigger, selfKind, setupGuide, stickOnly, stickTone, stickView, succeededKind, type MachineKind, type SelfKind, type ServerBackups, type StickKind, type StickView } from "./derive";
+import { ageOf, errorKind, registeredSticks, shortUuid, stickName, hasPbs, isUnknownRun, knownErrorKind, machineKind, otherWarnings, runEnd, runState, runTarget, runTrigger, selfKind, setupGuide, stickOnly, stickTone, stickView, succeededKind, type MachineKind, type SelfKind, type ServerBackups, type StickKind, type StickView } from "./derive";
 import type { Reach } from "./check";
 import type { Formatter } from "./format";
-import type { Machine, Run, Status, TargetStatus } from "./types";
+import type { ConfigView, Machine, Run, Status, TargetStatus } from "./types";
 
 /** The newest run was cancelled and no success came after it. */
 function cancelledAfter(last: Run | null, success: Run | null): Run | null {
@@ -446,4 +446,9 @@ export function stickProblemText(error: { reason: string | null } | null, t: Mes
   const reasons = t.restore.stickReasons;
   return error?.reason && Object.hasOwn(reasons, error.reason)
     ? reasons[error.reason as keyof typeof reasons] : t.restore.stickUnavailable;
+}
+
+/** A registered stick for display: its name, else "Stick" and the start of its UUID. */
+export function stickLabel(uuid: string, ts: TargetStatus | null | undefined, config: ConfigView | null | undefined, t: Messages): string {
+  return stickName(uuid, ts, config) ?? t.stick.unnamed(shortUuid(uuid, [...registeredSticks(ts, config), ...(ts?.plugged_in_uuids ?? [])]));
 }

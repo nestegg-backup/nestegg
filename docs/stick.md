@@ -41,10 +41,17 @@ swap, active encryption, LVM and RAID devices are refused by the rescue disk
 guard, including the disk holding the running system.
 
 The integrity-checked ISO is copied into the root-only desktop cache before it is mounted. Creation makes a GPT
-with a BIOS boot partition, a FAT32 EFI system partition containing GRUB and two
-live slots, and an ext4 `NESTEGG_DATA` partition with no reserved-block percentage.
-The root-owned `nestegg/` mount anchor contains the PBS-owned `store/` datastore. Both GRUB and live-boot use
-the boot partition's UUID, so booting does not select another attached live disk.
+with a 1 MiB BIOS boot partition, a 64 MiB FAT32 EFI system partition (ESP)
+containing only GRUB, two separate FAT32 live-slot partitions (`NESTEGG_A` and
+`NESTEGG_B`), and an ext4 `NESTEGG_DATA` partition with no reserved-block percentage.
+Each slot reserves at least 2 GiB, or 150% of the release ISO size plus 128 MiB
+if larger; data takes the remaining space (at least 2 GiB). Too-small disks are
+refused before partitioning.
+The root-owned `nestegg/` mount anchor contains the PBS-owned `store/` datastore.
+GRUB finds each slot by its own filesystem UUID; live-boot is pinned to the
+selected slot's UUID and `/live/a` or `/live/b` path, so another attached live
+disk is never selected. `/run/live/medium` is the selected slot partition,
+with its own `nestegg-stick` marker identifying the sibling data partition.
 The desktop's own PBS squashfs is installed under `/var/lib/nestegg/stick/`.
 Creation does not register the disk or start a backup.
 
@@ -60,15 +67,23 @@ as a backup stick.
 ## Register and inspect
 
 ```sh
-sudo nestegg stick add /dev/sdX --image /var/cache/nestegg/releases/rescue.iso
+sudo nestegg stick add /dev/sdX --image /var/cache/nestegg/releases/rescue.iso --name "Blue stick"
 sudo nestegg stick info /dev/sdX
 ```
+
+`--name` is optional. The web UI and `nestegg status` show the name and keep
+the UUID as detail; without one they show "Stick" and the start of the UUID.
+Change or remove it later with
+`sudo nestegg stick name --uuid <UUID> "Office stick"` or `--clear`. A name
+has 1 to 40 characters and no control or invisible formatting characters
+(decision 0032).
 
 `add` records the data partition's UUID in `[stick].data_uuids` in
 `/etc/nestegg/config.toml`. It installs the desktop-trusted PBS image **from the
 verified ISO**, never from the stick, and preserves existing settings and
 comments. Repeating registration does not duplicate the UUID. `info` reports the
-boot/data UUIDs, active slot and live filesystem hash, without modifying the stick.
+ESP/data UUIDs, active slot, live filesystem hash and `inactive_slot_damaged`,
+without modifying the stick.
 The stick's identifying files are parsed as data, never executed as root.
 
 Cloned data UUIDs on multiple devices are refused rather than resolved through
@@ -92,16 +107,30 @@ slot, compares the copied squashfs/kernel/initrd, and flushes the payload. It fs
 publishes that slot's GRUB configuration checksum **last**. A fixed GRUB
 dispatcher checks the two configurations and chooses the highest committed
 generation, with a second menu entry for the other committed slot; the previous active slot and configuration remain available while
-the replacement is being written. No partitioning, formatting, datastore mount
-or backup deletion occurs during update. The boot partition is mounted read-only until the marker, descriptors and
-payload checks pass. A free-space check includes the reclaimable inactive slot
-before remounting read-write; insufficient space leaves both slots untouched.
+the replacement is being written. No partitioning, datastore mount
+or backup deletion occurs during update. Formatting is confined to a damaged
+inactive slot, as described below. The ESP is initially mounted read-only and both slot mounts are attempted
+read-only. Only the inactive slot is opened for writing after identity, descriptor, payload and
+free-space checks pass. The active slot and ESP receive no writes, including
+their FAT/FSInfo metadata; a torn inactive FAT cannot damage their filesystems.
+The old inactive commit is removed and fsynced before replacing its payload.
+Insufficient space leaves both slots untouched.
+
+If the inactive filesystem or its root marker is damaged, `info` and `add`
+still work when the ESP marker and active slot validate. They report
+`inactive_slot_damaged: true` and explain the repair command. Run the same
+`stick update` command above: it reformats only the inactive partition with
+its recorded volume serial, restores its marker, then writes and commits the
+new system normally. The active slot and ESP stay byte-identical; the GPT,
+data partition and backups are preserved. Do **not** use `stick create` for
+this repair, since recreation erases backups. If neither slot is valid or
+the ESP/data identity is invalid, operations still refuse.
 
 If an update is interrupted, reconnect the disk and rerun the command. An
 incomplete inactive slot is replaced. Do not unplug while a command is still
 running. Flush ordering cannot compensate for broken device firmware, a corrupt
-FAT filesystem (both slots share the same FAT metadata) or flash that loses already acknowledged writes; physical
-power-loss and USB firmware behavior remain the hardware gate in phase six.
+flash controller that damages other partitions or flash that loses already
+acknowledged writes; physical power-loss and USB firmware behavior remain the hardware gate in phase six.
 Do not run a filesystem repair while the stick is mounted or in use by PBS.
 
 ## Local PBS launcher
@@ -130,9 +159,10 @@ exit and release mounts. Startup waits for the API authentication keys and
 socket before starting the proxy.
 These namespaces isolate networking; trusted PBS code still runs with privilege.
 The data root and `nestegg/` must remain root-owned and not group/other-writable.
-PBS owns only `nestegg/store/`. Older prototype sticks with PBS-owned anchors or
-without payload manifests require explicit migration or recreation; this writer
-does not silently alter existing datastore ownership.
+PBS owns only `nestegg/store/`. The unreleased single-FAT layout is refused by
+`update`, `info` and `add`: create the stick again. **Recreation erases all its
+backups**; save needed backups elsewhere first. There is no migration or legacy
+descriptor compatibility. This writer does not alter existing datastore ownership.
 
 ## Back up from the desktop
 
@@ -217,11 +247,13 @@ sudo tests/stick/desktop-vm.sh target/release/nestegg target/nestegg-rescue-amd6
 The test allocates a sparse image and its own loop devices, creates and registers
 it through the real CLI, performs an encrypted PBS backup/restore and restart,
 boots it with SeaBIOS and OVMF alongside a competing rescue ISO, updates it,
-interrupts another update with SIGTERM after half
-the squashfs copy, boots again, and retries the update. It compares the GPT and
+interrupts updates with SIGTERM during the squashfs copy and at payload,
+descriptor and commit fsync boundaries, boots again, and retries the update.
+Whole-partition SHA-256 comparisons prove the previous active slot and ESP stay
+byte-identical after successful and interrupted updates. It compares the GPT and
 retained snapshot files, checks the live service masks and cleans up its own
 processes, mounts and loops. It needs KVM, QEMU, OVMF, Python 3 and squashfs-tools.
-It also tests descriptor/payload corruption, cloned UUIDs, full ESP, real CLI
+It also tests descriptor/payload corruption, cloned UUIDs, full inactive slot, real CLI
 mount/holder refusal, early-copy interruption and fsync ordering. It uses no real USB device and proves no physical endurance or power-loss claim.
 
 

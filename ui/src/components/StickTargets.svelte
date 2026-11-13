@@ -4,8 +4,8 @@
   import { restore } from "../lib/restore.svelte";
   import { href } from "../lib/router.svelte";
   import { reveal } from "../lib/reveal";
-  import { canBackUpToStick, hasPbs, selfKind, selfTone, serverBackups, stickOnly, stickTone, stickFillPercent } from "../lib/derive";
-  import { selfRowText, stickLine } from "../lib/text";
+  import { canBackUpToStick, hasPbs, registeredSticks, selfKind, selfTone, serverBackups, stickName, stickOnly, stickTone, stickFillPercent } from "../lib/derive";
+  import { selfRowText, stickLabel, stickLine } from "../lib/text";
   import { f, t } from "../lib/locale";
   import type { Status, TargetStatus } from "../lib/types";
 
@@ -31,6 +31,18 @@
   const lastSuccess = $derived(stick.last_success?.started_at ?? null);
   const damaged = $derived(line.view.damaged);
   const fill = $derived(stickFillPercent(stick));
+  // Which sticks are registered, by name: only worth a line with several sticks or a given name.
+  const registered = $derived(registeredSticks(stick, app.config.value));
+  const sticksFact = $derived(
+    registered.length > 1 || registered.some((u) => stickName(u, stick, app.config.value))
+      ? registered
+          .map((u) => {
+            const label = stickLabel(u, stick, app.config.value, t);
+            return stick.sticks?.[u]?.plugged_in ? `${label} (${t.stick.pluggedMark})` : label;
+          })
+          .join(" · ")
+      : null,
+  );
 </script>
 
 <section class="targets" aria-labelledby="h-targets">
@@ -61,6 +73,7 @@
           {#if stick.available_bytes != null}<span>{[t.stick.free(f.size(stick.available_bytes)), fill != null ? t.stick.filled(fill) : null].filter(Boolean).join(" · ")} ({t.stick.freeNote})</span>{/if}
           {#if stick.full_verified_at}<span>{t.stick.fullCheck(f.dayMonth(stick.full_verified_at))}</span>{/if}
           <span>{t.stick.overdueAfter(stick.overdue_after_hours)}</span>
+          {#if sticksFact}<span>{t.stick.registered}: {sticksFact}</span>{/if}
         </p>
         {#if damaged}<p class="h bad">{t.stick.damagedSnapshots(damaged)}</p>{/if}
         {#if app.stickStartError && !stickOnly(status)}

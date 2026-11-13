@@ -160,6 +160,9 @@ check "one snapshot listed" bash -c "[[ \$(grep -c '\"snapshot\"' <<<'$snaps') =
 check "snapshot is encrypted" grep -q '"encrypted": true' <<<"$snaps"
 check "snapshot has nestegg notes" grep -q '"comment": "nestegg' <<<"$snaps"
 check "uploaded bytes recorded" bash -c "docker exec $client nestegg status --json | grep -Eq '\"uploaded_bytes\": [1-9]'"
+# The real client prints "(compressed …)": that is what went over the network (decision 0032).
+check "transferred bytes recorded" bash -c "docker exec $client nestegg status --json | grep -Eq '\"transferred_bytes\": [1-9]'"
+check "history shows the compressed amount as uploaded" bash -c "docker exec $client nestegg history | grep -Eq '^ok .*, uploaded [0-9.]+ (B|KiB|MiB|GiB)'"
 check "archive sizes recorded" bash -c "docker exec $client nestegg status --json | grep -Eq '\"size_bytes\": [1-9]'"
 check "secret not in run logs" exits_with 1 on_client grep -rqF "$token_secret" /var/lib/nestegg
 snapshot="$(sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' <<<"$snaps" | head -1)"

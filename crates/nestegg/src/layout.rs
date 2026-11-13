@@ -23,6 +23,28 @@ pub const SYSTEM_ARCHIVE: &str = "system";
 /// made; the run records it as a reason why the backup is incomplete.
 pub const SYSTEM_SKIPPED: &str = "full system backup skipped";
 
+/// Ignore missing, malformed and firmware placeholder UUIDs. The root is
+/// injected so rescue tests never depend on the host's DMI identity.
+pub fn system_uuid(dmi: &Path) -> Option<String> {
+    let value = std::fs::read_to_string(dmi.join("product_uuid")).ok()?;
+    normalized_system_uuid(&value)
+}
+
+pub fn normalized_system_uuid(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    (value.len() == 36
+        && value.bytes().enumerate().all(|(i, c)| {
+            if [8, 13, 18, 23].contains(&i) {
+                c == b'-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+        && value.bytes().any(|c| c != b'0' && c != b'-')
+        && value.bytes().any(|c| c != b'f' && c != b'-'))
+    .then_some(value)
+}
+
 /// File system types the rescue system can recreate.
 pub const RECREATABLE_FS: &[&str] = &["ext4", "ext3", "ext2", "btrfs", "xfs", "vfat"];
 
@@ -69,6 +91,9 @@ pub struct Layout {
     pub os_version: String,
     pub os_name: String,
     pub hostname: String,
+    /// DMI product UUID, when available; absent in older inventories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_uuid: Option<String>,
     /// Size of the disk that holds `/`, if known.
     pub root_disk_bytes: Option<u64>,
     pub mounts: Vec<MountRecord>,
@@ -791,6 +816,7 @@ pub fn capture() -> Result<Layout> {
         os_version: get("VERSION_ID"),
         os_name: get("PRETTY_NAME"),
         hostname: crate::config::hostname(),
+        system_uuid: system_uuid(Path::new("/sys/class/dmi/id")),
         root_disk_bytes,
         mounts: dedup,
         swap,
@@ -820,6 +846,33 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn system_identity_is_optional_and_rejects_firmware_placeholders() {
+        let mut old = serde_json::to_value(btrfs_layout()).unwrap();
+        old.as_object_mut().unwrap().remove("system_uuid");
+        let layout: Layout = serde_json::from_value(old).unwrap();
+        assert_eq!(layout.system_uuid, None);
+        let dmi = tempfile::tempdir().unwrap();
+        for value in [
+            "",
+            "unknown",
+            "00000000-0000-0000-0000-000000000000",
+            "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF",
+        ] {
+            std::fs::write(dmi.path().join("product_uuid"), value).unwrap();
+            assert_eq!(system_uuid(dmi.path()), None);
+        }
+        std::fs::write(
+            dmi.path().join("product_uuid"),
+            "12345678-1234-4321-9876-123456789ABC\n",
+        )
+        .unwrap();
+        assert_eq!(
+            system_uuid(dmi.path()).as_deref(),
+            Some("12345678-1234-4321-9876-123456789abc")
+        );
+    }
+
     pub fn btrfs_layout() -> Layout {
         Layout {
             version: 1,
@@ -829,6 +882,7 @@ pub(crate) mod tests {
             os_version: "22.2".into(),
             os_name: "Linux Mint 22.2".into(),
             hostname: "desktop".into(),
+            system_uuid: None,
             root_disk_bytes: Some(500 << 30),
             mounts: vec![
                 rec("/", "btrfs", "/dev/nvme0n1p2", "/@", "1111"),

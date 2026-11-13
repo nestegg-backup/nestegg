@@ -212,8 +212,16 @@ pub struct Run {
     pub snapshot: Option<String>,
     #[serde(default)]
     pub archives: Vec<ArchiveInfo>,
+    /// New data of this run before compression (the client's "had to backup
+    /// X"). Not the amount sent: see `transferred_bytes`.
     #[serde(default)]
     pub uploaded_bytes: Option<u64>,
+    /// What was actually sent to the server (or written to the stick) for the
+    /// new data, after compression: the sum of the client's "(compressed X)".
+    /// None in records of older versions and when the client did not report
+    /// it for every finished archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transferred_bytes: Option<u64>,
     /// Total size of the archives of the last successful run (estimate for
     /// a progress bar).
     #[serde(default)]
@@ -259,6 +267,7 @@ impl Run {
             snapshot: None,
             archives: Vec::new(),
             uploaded_bytes: None,
+            transferred_bytes: None,
             expected_bytes: None,
             processed_bytes: None,
             warnings: Vec::new(),
@@ -297,8 +306,22 @@ pub fn is_valid_run_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// A successful rescue restore, not a newly uploaded or verified backup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RestoredFrom {
+    pub snapshot: String,
+    #[serde(with = "rfc3339")]
+    pub snapshot_time: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub restored_at: DateTime<Utc>,
+    pub target: Target,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct State {
+    /// Rescue provenance, independent of subsequent backup runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from: Option<RestoredFrom>,
     #[serde(default)]
     pub stick: TargetState,
     /// Per-medium verification and password proof. A rotation stick must earn its own proof.
@@ -769,6 +792,60 @@ impl Store {
         combined.stick = TargetState::from_state(state);
         combined.stick_media = state.stick_media.clone();
         write_json_atomic(&self.paths.state_file(), &combined)
+    }
+
+    /// Called only on the offline restored tree, before its first boot.
+    /// The snapshot exists and was restored, but its upload completion record
+    /// could not be part of that snapshot. Do not claim read-back verification.
+    /// `incomplete` is what that backup left out (from its signed metadata):
+    /// a restore does not make an incomplete backup complete.
+    pub fn record_restore(
+        &self,
+        snapshot: &str,
+        restored_at: DateTime<Utc>,
+        incomplete: &[String],
+    ) -> Result<()> {
+        let time = snapshot
+            .rsplit('/')
+            .next()
+            .context("snapshot has no time")?;
+        let snapshot_time = DateTime::parse_from_rfc3339(time)
+            .context("snapshot time is not RFC 3339")?
+            .with_timezone(&Utc);
+        let mut run = Run::new(Trigger::Unknown, snapshot_time);
+        run.id = format!(
+            "{}-restore-{}",
+            snapshot_time.format("%Y%m%dT%H%M%SZ"),
+            self.target.as_str()
+        );
+        run.target = self.target;
+        run.snapshot = Some(snapshot.to_owned());
+        run.incomplete = incomplete.to_vec();
+        run.warnings = incomplete.to_vec();
+        run.finish(RunState::Succeeded, snapshot_time);
+        // Rescue must not prune captured history.
+        self.record_finished(&run, usize::MAX)?;
+        let mut state: State = read_json_or_default(&self.paths.state_file())?;
+        state.restored_from = Some(RestoredFrom {
+            snapshot: snapshot.to_owned(),
+            snapshot_time,
+            restored_at,
+            target: self.target,
+        });
+        // A failed run captured in the image must not delay the next backup.
+        match self.target {
+            Target::Pbs => {
+                state.failed_config = None;
+                state.readback_unavailable_in_a_row = 0;
+            }
+            Target::Stick => {
+                state.stick.failed_config = None;
+                state.stick.readback_unavailable_in_a_row = 0;
+            }
+        }
+        write_json_atomic(&self.paths.state_file(), &state)?;
+        self.clear_current()?;
+        Ok(())
     }
 
     pub fn load_current(&self) -> Result<Option<Run>> {
@@ -1645,5 +1722,123 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod rescue_tests {
+    use super::*;
+    #[test]
+    fn restoring_an_incomplete_backup_does_not_report_full_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: dir.path().join("config.toml"),
+            credentials_dir: dir.path().join("credentials"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+            systemctl: "systemctl".into(),
+        };
+        let store = Store::for_target(&paths, Target::Pbs);
+        let time = Utc::now() - Duration::hours(2);
+        let snapshot = format!("host/desktop/{}", format_time(time));
+        let missing = vec!["source data: /srv/data was not mounted".to_string()];
+        store
+            .record_restore(&snapshot, Utc::now(), &missing)
+            .unwrap();
+        let state = store.load_state().unwrap();
+        assert_eq!(state.last_success.as_ref().unwrap().incomplete, missing);
+        assert_eq!(
+            health(true, &state, None, 36, Utc::now()),
+            Health::Incomplete
+        );
+        // A complete backup stays fine.
+        store.record_restore(&snapshot, Utc::now(), &[]).unwrap();
+        let state = store.load_state().unwrap();
+        assert_eq!(health(true, &state, None, 36, Utc::now()), Health::Ok);
+    }
+    #[test]
+    fn restore_records_provenance_and_ages_from_snapshot_not_restore_time() {
+        for target in [Target::Pbs, Target::Stick] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths {
+                config_file: dir.path().join("config.toml"),
+                credentials_dir: dir.path().join("credentials"),
+                state_dir: dir.path().join("state"),
+                runtime_dir: dir.path().join("run"),
+                systemctl: "systemctl".into(),
+            };
+            let store = Store::for_target(&paths, target);
+            let now = Utc::now();
+            let time = now - Duration::hours(48);
+            let snapshot = format!("host/desktop/{}", format_time(time));
+            store.save_current(&Run::new(Trigger::Cli, now)).unwrap();
+            let initial = State {
+                consecutive_failures: 4,
+                key_digest: Some("preserved".into()),
+                key_exported_digest: Some("preserved".into()),
+                stick: TargetState {
+                    consecutive_failures: 3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            Store::new(&paths).save_state(&initial).unwrap();
+            store.record_restore(&snapshot, now, &[]).unwrap();
+            assert!(store.load_current().unwrap().is_none());
+            let state = store.load_state().unwrap();
+            let success = state.last_success.as_ref().unwrap();
+            assert_eq!(success.target, target);
+            assert_eq!(success.snapshot.as_deref(), Some(snapshot.as_str()));
+            assert!(!success.verified);
+            assert_eq!(state.consecutive_failures, 0);
+            let combined = Store::new(&paths).load_state().unwrap();
+            assert!(combined.key_exported());
+            assert_eq!(
+                if target == Target::Pbs {
+                    combined.stick.consecutive_failures
+                } else {
+                    combined.consecutive_failures
+                },
+                if target == Target::Pbs { 3 } else { 4 }
+            );
+            assert_eq!(state.restored_from.as_ref().unwrap().target, target);
+            assert_eq!(health(true, &state, None, 36, now), Health::Overdue);
+            assert!(is_due(&state, 24, now));
+            let time = success.finished_at.unwrap();
+            assert_eq!(
+                health(true, &state, None, 36, time + Duration::hours(1)),
+                Health::Ok
+            );
+            let status = crate::status::build(&paths, None, false).unwrap();
+            let json = serde_json::to_value(status).unwrap();
+            assert_eq!(json["restored_from"]["snapshot"], snapshot);
+            assert!(json["current_run"].is_null());
+            let mut later = Run::new(Trigger::Cli, now);
+            later.target = target;
+            later.finish(RunState::Succeeded, now);
+            store.record_finished(&later, 100).unwrap();
+            assert_eq!(
+                store.load_state().unwrap().restored_from,
+                state.restored_from
+            );
+        }
+    }
+    #[test]
+    fn old_state_has_no_provenance_and_bad_snapshot_time_does_not_change_it() {
+        let state: State = serde_json::from_str("{}").unwrap();
+        assert!(state.restored_from.is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            state_dir: dir.path().into(),
+            ..Paths::from_env()
+        };
+        let store = Store::new(&paths);
+        store.save_state(&state).unwrap();
+        assert!(
+            store
+                .record_restore("host/desktop/not-a-time", Utc::now(), &[])
+                .is_err()
+        );
+        assert_eq!(store.load_state().unwrap(), state);
     }
 }

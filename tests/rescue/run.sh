@@ -40,6 +40,10 @@ case "$variant" in
   *) echo "unknown variant $variant"; exit 2 ;;
 esac
 
+# Documentation MACs only. Rescue and the restored boot use different
+# hardware from the source, consistently across both boots.
+source_mac=00:00:5e:00:53:01
+restore_mac="${source_mac%?}2"
 net="nestegg-rescue-$$"
 pbs="nestegg-rescue-pbs-$$"
 client="unused"
@@ -71,8 +75,12 @@ firmware() { # $1 = name of a fresh NVRAM copy
 }
 qemu() { # $1 = time limit in seconds, rest = qemu arguments
   local limit="$1"; shift
+  local system_uuid=12345678-1234-4321-9876-123456789abc
+  if [[ ${NIC_MAC:-$source_mac} == "$restore_mac" ]]; then
+    system_uuid=87654321-1234-4321-9876-123456789abc
+  fi
   timeout "$limit" qemu-system-x86_64 -enable-kvm -cpu host -m 2048 -smp 2 -display none -monitor none \
-    -netdev user,id=n0 -device virtio-net-pci,netdev=n0 "$@"
+    -uuid "$system_uuid" -netdev user,id=n0 -device "virtio-net-pci,netdev=n0,mac=${NIC_MAC:-$source_mac}" "$@"
 }
 
 # Later stages make no sense once an earlier one failed.
@@ -87,7 +95,7 @@ echo "PBS at $pbs_ip"
 echo "== building the source system ($source_variant)"
 cp "$bin" "$work/nestegg"
 docker run --rm --privileged -v /dev:/dev -v "$work:/work" -v "$here:/t:ro" \
-  -e VARIANT="$source_variant" -e IMAGE=/work/source.img -e PBS_IP="$pbs_ip" -e FP="$fp" \
+  -e SOURCE_MAC="$source_mac" -e VARIANT="$source_variant" -e IMAGE=/work/source.img -e PBS_IP="$pbs_ip" -e FP="$fp" \
   -e TOKEN_SECRET="$token_secret" "$builder" bash /t/make-source.sh
 
 echo "== source VM: first start runs the backup"
@@ -95,6 +103,7 @@ echo "== source VM: first start runs the backup"
 qemu 1200 $(firmware src) -drive "file=$work/source.img,if=virtio,format=raw" \
   -serial "file:$work/source-console.log" || true
 check "source system backed up" grep -q E2E-BACKUP-OK "$work/source-console.log"
+check "source DMI identity recorded" grep -q '"system_uuid": "12345678-1234-4321-9876-123456789abc"' "$work/source-console.log"
 check "layout recorded" grep -q '"bootloader": "grub"' "$work/source-console.log"
 snaps="$(docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$pbs" \
   proxmox-backup-client snapshot list --ns desktops --repository admin@pbs@127.0.0.1:store1 --output-format json)"
@@ -428,7 +437,7 @@ else
   } > "$work/rescue.script"
 fi
 # shellcheck disable=SC2046
-qemu 3600 $(firmware rescue) -cdrom "$iso" -boot d \
+NIC_MAC="$restore_mac" qemu 3600 $(firmware rescue) -cdrom "$iso" -boot d \
   -drive "file=$work/target.img,if=virtio,format=raw" \
   -drive "file=$work/media.img,if=virtio,format=raw" \
   -serial "unix:$work/rescue.sock,server=on,wait=off" &
@@ -524,13 +533,23 @@ if [[ $luks == 1 ]]; then
 fi
 echo "expect E2E-DONE 900" >> "$work/boot.script"
 # shellcheck disable=SC2046
-qemu 1200 $(firmware restored) -drive "file=$work/target.img,if=virtio,format=raw" \
+NIC_MAC="$restore_mac" qemu 1200 $(firmware restored) -drive "file=$work/target.img,if=virtio,format=raw" \
   -serial "unix:$work/boot.sock,server=on,wait=off" &
 qemu_pids+=($!)
 python3 "$here/console.py" "$work/boot.sock" "$work/boot-console.log" "$work/boot.script" || true
 wait "${qemu_pids[-1]}" || true
 log="$work/boot-console.log"
 val() { grep -a "^$1 " "$log" | tail -1 | cut -d' ' -f2- | tr -d '\r'; }
+check "restored snapshot is the last successful backup, with no phantom running backup" \
+  grep -aq 'E2E-STATUS-RESTORED ok' "$log"
+check "restore provenance names the selected snapshot" [ "$(val E2E-RESTORED-FROM)" == "$real_snap" ]
+check "restored system obtained a network address on different hardware" grep -aq 'E2E-NETWORK-OK' "$log"
+if [[ $variant == ubuntu-ext4-bios-luks ]]; then
+  check "netplan MAC pin repaired and backup retained" grep -aq 'E2E-NETWORK-FIXUP ok' "$log"
+  check "wizard/CLI summary reports network repair" grep -aq 'rewrote absent wired MAC' "$rlog"
+else
+  check "ambiguous udev MAC pin reported for manual repair" grep -aq '70-persistent-net.rules: MAC .*absent on this machine; unchanged' "$rlog"
+fi
 check "restored system booted" grep -aq E2E-RESTORED-BOOT "$log"
 check "user data intact (sha256)" [ "$(val E2E-SHA)" == "$(cat "$work/data.sha256")" ]
 check "owner preserved" [ "$(val E2E-OWNER)" == alice ]
