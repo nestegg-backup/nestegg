@@ -76,7 +76,10 @@ on_client nestegg key create >/dev/null
 on_client nestegg key export /root/key.json >/dev/null
 # The old package may still confirm without proof (no --file option); call
 # each package with the syntax it understands.
-if on_client nestegg key confirm-exported --help | grep -q -- '--file'; then
+# Read the help first: with pipefail, `grep -q` leaving early can make the
+# left side fail (SIGPIPE) and send a new package down the old branch.
+confirm_help=$(on_client nestegg key confirm-exported --help)
+if grep -q -- '--file' <<<"$confirm_help"; then
   on_client nestegg key confirm-exported --file /root/key.json --accept-local-copy >/dev/null
 else
   on_client nestegg key confirm-exported >/dev/null
