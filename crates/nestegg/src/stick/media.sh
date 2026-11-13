@@ -2,17 +2,17 @@
 # Embedded helper; invoked in a private mount namespace, never from the stick.
 set -euo pipefail
 umask 022
-action=$1; disk=$2; image=$3; cache=$4; work=$5; esp_mib=$6
+action=$1; disk=$2; image=$3; cache=$4; work=$5; slot_mib=$6
 cache_tmp=
 mount --make-rprivate /
 exec 3>&1
 exec 1>&2
-mkdir "$work/iso" "$work/root" "$work/esp" "$work/data"
+mkdir "$work/iso" "$work/root" "$work/esp" "$work/data" "$work/slot_a" "$work/slot_b"
 cleanup() {
     local status=$? failed=0 point
     trap - EXIT; trap '' INT TERM
     [[ -z $cache_tmp ]] || rm -f -- "$cache_tmp"
-    for point in data esp root iso; do
+    for point in data slot_b slot_a esp root iso; do
         if mountpoint -q "$work/$point"; then umount "$work/$point" || failed=1; fi
     done
     if ((failed)); then echo 'ERROR: media helper could not unmount its private mounts' >&2; exit 1; fi
@@ -22,7 +22,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 part() { if [[ $disk =~ [0-9]$ ]]; then printf '%sp%s' "$disk" "$1"; else printf '%s%s' "$disk" "$1"; fi; }
-boot=$(part 2); data=$(part 3)
+boot=$(part 2); slot_a=$(part 3); slot_b=$(part 4); data=$(part 5)
 fail() { echo "ERROR: $*" >&2; exit 1; }
 # GNU sync with operands uses fsync (including device cache flushes), not syncfs.
 flush_tree() {
@@ -30,6 +30,8 @@ flush_tree() {
 }
 render_cfg() {
     local slot=$1 generation=$2 kernel=$3 initrd=$4
+    local uuid_name=slot_${slot}_uuid
+    local slot_uuid=${!uuid_name}
     cat <<CFG
 # nestegg-slot=$slot
 # nestegg-generation=$generation
@@ -41,8 +43,8 @@ function nestegg_boot_$slot {
     set nestegg_selected=1
   fi
   menuentry 'nestegg rescue (slot $slot)' --id=nestegg-$slot {
-    search --no-floppy --fs-uuid --set=root $boot_uuid
-    linux /live/$slot/$kernel boot=live components live-media=/dev/disk/by-uuid/$boot_uuid live-media-path=/live/$slot hostname=nestegg-rescue locales=en_US.UTF-8 console=tty0 console=ttyS0,115200n8
+    search --no-floppy --fs-uuid --set=root $slot_uuid
+    linux /live/$slot/$kernel boot=live components live-media=/dev/disk/by-uuid/$slot_uuid live-media-path=/live/$slot hostname=nestegg-rescue locales=en_US.UTF-8 console=tty0 console=ttyS0,115200n8
     initrd /live/$slot/$initrd
   }
 }
@@ -51,27 +53,10 @@ if hashsum --hash sha256 --check /live/$slot/payload.sha256; then
 fi
 CFG
 }
-# Recognition only: never rewrite a committed legacy slot in place. Its old
-# parser could add a menu entry while loading; new entries select by stable ID
-# so an update still boots the newly committed generation first.
-render_cfg_legacy() {
-    local slot=$1 generation=$2 kernel=$3 initrd=$4
-    cat <<CFG
-# nestegg-slot=$slot
-# nestegg-generation=$generation
-# nestegg-kernel=$kernel
-# nestegg-initrd=$initrd
-if hashsum --hash sha256 --check /live/$slot/payload.sha256; then
-function nestegg_boot_$slot {
-  menuentry 'nestegg rescue (slot $slot)' {
-    search --no-floppy --fs-uuid --set=root $boot_uuid
-    linux /live/$slot/$kernel boot=live components live-media=/dev/disk/by-uuid/$boot_uuid live-media-path=/live/$slot hostname=nestegg-rescue locales=en_US.UTF-8 console=tty0 console=ttyS0,115200n8
-    initrd /live/$slot/$initrd
-  }
-}
-set nestegg_${slot}_generation=$generation
-fi
-CFG
+slot_device() { if [[ $1 == a ]]; then printf '%s' "$slot_a"; else printf '%s' "$slot_b"; fi; }
+slot_marker() { printf 'nestegg-slot-v2\nslot_uuid=%s\ndata_uuid=%s\n' "$1" "$data_uuid"; }
+stick_marker() {
+    printf 'nestegg-stick-v2\nboot_uuid=%s\nslot_a_uuid=%s\nslot_b_uuid=%s\ndata_uuid=%s\n' "$boot_uuid" "$slot_a_uuid" "$slot_b_uuid" "$data_uuid"
 }
 small_file() { [[ -f $1 && -s $1 && $(stat -c %s "$1") -le $2 ]] || fail 'missing or oversized stick metadata'; }
 if [[ $action == create ]]; then
@@ -115,14 +100,18 @@ if [[ $action == create ]]; then
     [[ $(blockdev --getro "$disk") == 0 ]] || fail 'target became read-only'
     sgdisk --zap-all "$disk" >/dev/null
     sgdisk --clear --new=1:2048:+1M --typecode=1:ef02 --change-name=1:BIOS \
-      --new=2:0:+"${esp_mib}M" --typecode=2:ef00 --change-name=2:ESP \
-      --new=3:0:0 --typecode=3:8300 --change-name=3:NESTEGG_DATA "$disk" >/dev/null
+      --new=2:0:+64M --typecode=2:ef00 --change-name=2:ESP \
+      --new=3:0:+"${slot_mib}M" --typecode=3:0700 --change-name=3:NESTEGG_A \
+      --new=4:0:+"${slot_mib}M" --typecode=4:0700 --change-name=4:NESTEGG_B \
+      --new=5:0:0 --typecode=5:8300 --change-name=5:NESTEGG_DATA "$disk" >/dev/null
     blockdev --rereadpt "$disk"
     # Device nodes come from devtmpfs; waiting for udev here would deadlock
     # against the writer's advisory lock that deliberately delays its probes.
-    for ((i=0;i<100;i++)); do [[ -b $boot && -b $data ]] && break; sleep .1; done
-    [[ -b $boot && -b $data ]] || fail 'partition nodes did not appear'
+    for ((i=0;i<100;i++)); do [[ -b $boot && -b $slot_a && -b $slot_b && -b $data ]] && break; sleep .1; done
+    [[ -b $boot && -b $slot_a && -b $slot_b && -b $data ]] || fail 'partition nodes did not appear'
     mkfs.vfat -F32 -n NESTEGGBOOT "$boot" >/dev/null
+    mkfs.vfat -F32 -n NESTEGG_A "$slot_a" >/dev/null
+    mkfs.vfat -F32 -n NESTEGG_B "$slot_b" >/dev/null
     mkfs.ext4 -q -F -m 0 -L NESTEGG_DATA "$data"
     mount -o nodev,nosuid,noexec "$data" "$work/data"
     mkdir "$work/data/nestegg"
@@ -131,27 +120,48 @@ if [[ $action == create ]]; then
     boot_uuid=$(blkid -p -s UUID -o value "$boot")
     data_uuid=$(blkid -p -s UUID -o value "$data")
     mount -o nodev,nosuid,noexec "$boot" "$work/esp"
-    mkdir -p "$work/esp/live/a" "$work/esp/live/b"
-    printf 'nestegg-stick-v1\nboot_uuid=%s\ndata_uuid=%s\n' "$boot_uuid" "$data_uuid" > "$work/esp/nestegg-stick"
+    slot_a_uuid=$(blkid -p -s UUID -o value "$slot_a")
+    slot_b_uuid=$(blkid -p -s UUID -o value "$slot_b")
+    stick_marker > "$work/esp/nestegg-stick"
+    for candidate in a b; do
+        mount -o nodev,nosuid,noexec "$(slot_device "$candidate")" "$work/slot_$candidate"
+        uuid=$(blkid -p -s UUID -o value "$(slot_device "$candidate")")
+        slot_marker "$uuid" > "$work/slot_$candidate/nestegg-stick"
+        sync "$work/slot_$candidate/nestegg-stick" "$work/slot_$candidate"
+    done
     slot=a
     generation=1
     grub-install --target=i386-pc --directory="$work/root/usr/lib/grub/i386-pc" --boot-directory="$work/esp/boot" --recheck "$disk"
     grub-install --target=x86_64-efi --directory="$work/root/usr/lib/grub/x86_64-efi" --efi-directory="$work/esp" --boot-directory="$work/esp/boot" --removable --no-nvram
 else
-    [[ $(blkid -p -s TYPE -o value "$boot") == vfat && $(blkid -p -s TYPE -o value "$data") == ext4 && $(blkid -p -s LABEL -o value "$data") == NESTEGG_DATA ]] || fail 'not a nestegg GPT stick'
-    [[ $(blkid -p -s PTTYPE -o value "$disk") == gpt ]] || fail 'not a GPT stick'
+    [[ $(blkid -p -s TYPE -o value "$boot") == vfat && $(blkid -p -s PTTYPE -o value "$disk") == gpt ]] || fail 'not a nestegg GPT stick'
     mount -o ro,nodev,nosuid,noexec "$boot" "$work/esp"
     small_file "$work/esp/nestegg-stick" 512
-    [[ $(head -n1 "$work/esp/nestegg-stick") == nestegg-stick-v1 ]] || fail 'unknown stick format'
-    boot_uuid=$(sed -n 's/^boot_uuid=\([0-9A-Fa-f-]*\)$/\1/p' "$work/esp/nestegg-stick")
-    data_uuid=$(sed -n 's/^data_uuid=\([0-9A-Fa-f-]*\)$/\1/p' "$work/esp/nestegg-stick")
-    [[ $boot_uuid == "$(blkid -p -s UUID -o value "$boot")" && $data_uuid == "$(blkid -p -s UUID -o value "$data")" ]] || fail 'stick UUIDs do not match partitions'
-    cmp -s "$work/esp/nestegg-stick" <(printf 'nestegg-stick-v1\nboot_uuid=%s\ndata_uuid=%s\n' "$boot_uuid" "$data_uuid") || fail 'invalid stick marker'
+    if [[ $(head -n1 "$work/esp/nestegg-stick") == nestegg-stick-v1 ]]; then
+        fail 'old single-FAT stick layout: create the stick again; this erases all backups on it (save them elsewhere first)'
+    fi
+    [[ $(head -n1 "$work/esp/nestegg-stick") == nestegg-stick-v2 ]] || fail 'unknown stick format'
+    for name in boot slot_a slot_b data; do
+        device=${!name}
+        uuid=$(blkid -p -s UUID -o value "$device")
+        [[ $uuid =~ ^[0-9A-Fa-f-]+$ ]] || fail 'invalid partition UUID'
+        printf -v "${name}_uuid" '%s' "$uuid"
+    done
+    [[ $boot_uuid != "$slot_a_uuid" && $boot_uuid != "$slot_b_uuid" && $slot_a_uuid != "$slot_b_uuid" ]] || fail 'duplicate live/boot UUIDs'
+    [[ $(blkid -p -s TYPE -o value "$data") == ext4 && $(blkid -p -s LABEL -o value "$data") == NESTEGG_DATA ]] || fail 'not a nestegg data partition'
+    cmp -s "$work/esp/nestegg-stick" <(stick_marker) || fail 'invalid stick marker or partition UUIDs'
+    for candidate in a b; do
+        device=$(slot_device "$candidate")
+        [[ $(blkid -p -s TYPE -o value "$device") == vfat ]] || fail 'not a nestegg live partition'
+        mount -o ro,nodev,nosuid,noexec "$device" "$work/slot_$candidate"
+        uuid=$(blkid -p -s UUID -o value "$device")
+        cmp -s "$work/slot_$candidate/nestegg-stick" <(slot_marker "$uuid") || fail 'invalid slot marker'
+    done
     # Inspect committed descriptors as data, never source medium code as root.
     slot=; generation=0
     for candidate in a b; do
-        cfg=$work/esp/live/$candidate/boot.cfg
-        commit=$work/esp/live/$candidate/commit.sha256
+        cfg=$work/slot_$candidate/live/$candidate/boot.cfg
+        commit=$work/slot_$candidate/live/$candidate/commit.sha256
         [[ -f $cfg && -f $commit ]] || continue
         [[ -s $cfg && $(stat -c %s "$cfg") -le 4096 && -s $commit && $(stat -c %s "$commit") -le 256 ]] || continue
         expected=$(cat "$commit")
@@ -162,9 +172,8 @@ else
         candidate_kernel=$(sed -n 's/^# nestegg-kernel=//p' "$cfg")
         candidate_initrd=$(sed -n 's/^# nestegg-initrd=//p' "$cfg")
         [[ $candidate_kernel =~ ^vmlinuz[a-zA-Z0-9._+-]*$ && $candidate_initrd =~ ^initrd[a-zA-Z0-9._+-]*$ ]] || continue
-        if ! cmp -s "$cfg" <(render_cfg "$candidate" "$candidate_generation" "$candidate_kernel" "$candidate_initrd") &&
-           ! cmp -s "$cfg" <(render_cfg_legacy "$candidate" "$candidate_generation" "$candidate_kernel" "$candidate_initrd"); then continue; fi
-        payload=$work/esp/live/$candidate
+        if ! cmp -s "$cfg" <(render_cfg "$candidate" "$candidate_generation" "$candidate_kernel" "$candidate_initrd"); then continue; fi
+        payload=$work/slot_$candidate/live/$candidate
         [[ -f $payload/payload.sha256 && $(stat -c %s "$payload/payload.sha256") -le 1024 ]] || continue
         # Validate exact names before passing this untrusted list to sha256sum.
         manifest=$(cd "$payload" && sha256sum filesystem.squashfs "$candidate_kernel" "$candidate_initrd" | sed "s#  #  /live/$candidate/#") || continue
@@ -176,24 +185,31 @@ else
         ((generation < 999999999)) || fail 'slot generation exhausted'
         generation=$((generation + 1))
         if [[ $slot == a ]]; then slot=b; else slot=a; fi
+        target=$work/slot_$slot
         # Count available bytes plus the replaceable inactive directory. Include
         # allocation rounding for every file and metadata/GRUB overhead.
-        cluster=$(stat -f -c %S "$work/esp")
+        cluster=$(stat -f -c %S "$target")
         needed=16777216
         while IFS= read -r -d '' file; do
             size=$(stat -c %s "$file")
             needed=$((needed + (size / cluster + 1) * cluster))
         done < <(find -L "$live" -type f -print0)
-        available=$(( $(stat -f -c %a "$work/esp") * cluster ))
+        available=$(( $(stat -f -c %a "$target") * cluster ))
         reclaim=0
-        if [[ -d $work/esp/live/$slot ]]; then reclaim=$(du -s -B1 "$work/esp/live/$slot" | cut -f1); fi
+        if [[ -d $target/live/$slot ]]; then reclaim=$(du -s -B1 "$target/live/$slot" | cut -f1); fi
         ((needed <= available + reclaim)) || fail 'not enough free space for replacement live slot'
-        mount -o remount,rw,nodev,nosuid,noexec "$work/esp"
+        mount -o remount,rw,nodev,nosuid,noexec "$target"
     elif [[ $action != info && $action != add ]]; then fail 'unknown operation'; fi
 fi
 [[ $boot_uuid =~ ^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$ && $data_uuid =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || fail 'invalid UUID'
 if [[ $action == create || $action == update ]]; then
-    dest=$work/esp/live/$slot
+    target=$work/slot_$slot
+    dest=$target/live/$slot
+    # Invalidate a previous inactive commit durably before replacing its bytes.
+    if [[ -d $dest ]]; then
+        rm -f -- "$dest/commit.sha256"
+        sync "$dest"
+    fi
     # Work only below the inactive slot. Never interpret medium text as code.
     rm -rf -- "$dest"
     mkdir -p "$dest"
@@ -209,7 +225,7 @@ if [[ $action == create || $action == update ]]; then
     cmp "$live/$initrd" "$dest/$initrd"
     (cd "$dest" && sha256sum filesystem.squashfs "$kernel" "$initrd" | sed "s#  #  /live/$slot/#") > "$dest/payload.sha256"
     flush_tree "$dest"
-    sync "$work/esp/live" "$work/esp"
+    sync "$target/live" "$target"
     # Immutable dispatcher: updates never overwrite the working boot selector.
     # Both slot descriptors are independently checked; the newest committed one
     # wins. A torn or missing new descriptor leaves the other slot available.
@@ -224,11 +240,13 @@ insmod hashsum
 insmod gcry_sha256
 set nestegg_a_generation=0
 set nestegg_b_generation=0
+search --no-floppy --fs-uuid --set=root $slot_a_uuid
 if [ -f /live/a/commit.sha256 ]; then
   if hashsum --hash sha256 --check /live/a/commit.sha256; then
     source /live/a/boot.cfg
   fi
 fi
+search --no-floppy --fs-uuid --set=root $slot_b_uuid
 if [ -f /live/b/commit.sha256 ]; then
   if hashsum --hash sha256 --check /live/b/commit.sha256; then
     source /live/b/boot.cfg
@@ -253,14 +271,14 @@ CFG
     cfg=$dest/boot.cfg
     render_cfg "$slot" "$generation" "$kernel" "$initrd" > "$cfg"
     sync "$cfg" "$dest"
-    sync "$work/esp"
+    sync "$target"
     # Publish ONLY after the entire payload and boot descriptor are durable.
     # The previous active descriptor is never replaced or renamed by update.
     cfg_hash=$(sha256sum "$cfg" | cut -d' ' -f1)
     printf '%s  /live/%s/boot.cfg\n' "$cfg_hash" "$slot" > "$dest/commit.sha256"
-    sync "$dest/commit.sha256" "$dest" "$work/esp/live" "$work/esp"
+    sync "$dest/commit.sha256" "$dest" "$target/live" "$target"
 else
-    image_hash=$(sha256sum "$work/esp/live/$slot/filesystem.squashfs" | cut -d' ' -f1)
+    image_hash=$(sha256sum "$work/slot_$slot/live/$slot/filesystem.squashfs" | cut -d' ' -f1)
 fi
 [[ $image_hash =~ ^[0-9a-f]{64}$ ]] || fail 'invalid image hash'
 printf '{"data_uuid":"%s","boot_uuid":"%s","active_slot":"%s","image_sha256":"%s"}\n' "$data_uuid" "$boot_uuid" "$slot" "$image_hash" >&3

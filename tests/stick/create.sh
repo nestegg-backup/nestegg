@@ -101,7 +101,7 @@ attach() { loop=$(losetup --find --show --partscan "$stick"); udevadm settle --t
 detach() { losetup -d "$loop"; loop=; udevadm settle --timeout=30 || true; }
 attach
 sfdisk --dump "$loop" | sed "s#$loop#DISK#g" >"$work/layout-before"
-mount -o nodev,nosuid,noexec "${loop}p3" "$work/data"
+mount -o nodev,nosuid,noexec "${loop}p5" "$work/data"
 printf 'data survives both updates\n' >"$work/data/retained.txt"
 # Extract only the official client from the desktop-trusted image for host tests.
 unsquashfs -no-progress -d "$work/client" "$work/state/stick/pbs.squashfs" usr/bin/proxmox-backup-client >"$work/extract.log" 2>&1
@@ -114,7 +114,7 @@ umount "$work/data"
 detach
 cat >"$work/steps" <<'STEPS'
 expect root@.*# 240
-send test "$(findmnt -rn -o SOURCE /run/live/medium)" = /dev/vda2 && grep -qw 'live-media-path=/live/ACTIVE' /proc/cmdline && test -s /run/live/medium/live/ACTIVE/filesystem.squashfs && printf 'STICK-%s\n' BOOT-OK
+send test "$(findmnt -rn -o SOURCE /run/live/medium)" = /dev/vdaPART && grep -qw 'live-media-path=/live/ACTIVE' /proc/cmdline && test -s /run/live/medium/live/ACTIVE/filesystem.squashfs && printf 'STICK-%s\n' BOOT-OK
 expect STICK-BOOT-OK 30
 send for u in proxmox-backup.service proxmox-backup-proxy.service ssh.service ssh.socket exim4.service; do test "$(systemctl is-enabled "$u" 2>/dev/null)" = masked || exit 1; done; test -z "$(ss -H -lnt 'sport = :8007 or sport = :22 or sport = :25')" && printf 'LIVE-%s\n' MASKS-OK
 expect LIVE-MASKS-OK 30
@@ -122,7 +122,15 @@ send poweroff -f
 STEPS
 boot() {
     local label=$1 active=$2; shift 2
-    sed "s/ACTIVE/$active/g" "$work/steps" >"$work/steps-$label"
+    local partition=3
+    [[ $active != b ]] || partition=4
+    : > "$work/steps-$label"
+    if [[ $label == manual-* ]]; then
+        # The newest slot is b. Pick the second entry (a) in GRUB itself.
+        printf '\033[B' > "$work/menu-down"
+        printf 'expect nestegg rescue .slot b 60\nsendfile %s\n' "$work/menu-down" >> "$work/steps-$label"
+    fi
+    sed "s/ACTIVE/$active/g; s/PART/$partition/g" "$work/steps" >>"$work/steps-$label"
     qemu-system-x86_64 -enable-kvm -cpu host -m 2048 -smp 2 -display none -monitor none -nic none \
       -boot strict=on -cdrom "$iso" -drive "file=$stick,format=raw,if=none,id=stick" -device virtio-blk-pci,drive=stick,bootindex=1 -serial "unix:$work/console.sock,server=on,wait=on" "$@" >"$work/qemu-$label.log" 2>&1 &
     qemu_pid=$!
@@ -140,21 +148,23 @@ both() {
     boot "$label-uefi" "$active" -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd -drive "if=pflash,format=raw,file=$work/vars.fd"
 }
 both created a
-# A committed old-format slot remains recognisable; updating it must actually
-# boot the new slot, including when the old parser added an earlier menu entry.
-"$here/legacy-slot.sh" "$bin" "$iso" "$stick" "$work/legacy.img"
-original_stick=$stick
-stick=$work/legacy.img
-both legacy-upgraded b
-stick=$original_stick
-rm "$work/legacy.img"
+# Unreleased v1 media are refused explicitly, with no migration.
+"$here/legacy-slot.sh" "$bin" "$iso"
+partition_hashes() {
+    local active=$1 part=3
+    [[ $active != b ]] || part=4
+    attach
+    sha256sum "${loop}p2" "${loop}p$part" | cut -d' ' -f1
+    detach
+}
+partition_hashes a > "$work/immutable-before"
 # Observe actual fsync barriers in the real helper; do not replace their work.
 cat > "$work/tools/sync" <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail
 for path in "$@"; do
     [[ $path != -* ]] || { echo 'syncfs/option is forbidden' >&2; exit 1; }
-    if [[ $path == */esp/live/b/* ]]; then
+    if [[ $path == */slot_b/live/b/* ]]; then
         dir=${path%/*}
         printf '%s %s %s\n' "${path##*/}" "$([[ -f $dir/boot.cfg ]] && echo cfg || echo no-cfg)" "$([[ -f $dir/commit.sha256 ]] && echo commit || echo no-commit)" >> "$NESTEGG_TEST_SYNC_LOG"
     fi
@@ -163,6 +173,9 @@ exec /usr/bin/sync "$@"
 WRAPPER
 chmod +x "$work/tools/sync"
 PATH="$work/tools:$PATH" NESTEGG_TEST_SYNC_LOG="$work/sync-order" "$bin" stick update "$stick" --test-image --image "$iso" >"$work/update.log" 2>&1
+partition_hashes a > "$work/immutable-after"
+cmp "$work/immutable-before" "$work/immutable-after"
+echo 'PASS successful update: whole active partition and ESP SHA-256 unchanged'
 python3 - "$work/sync-order" <<'CHECK'
 import sys
 rows = [line.split() for line in open(sys.argv[1])]
@@ -180,6 +193,7 @@ rm "$work/tools/sync"
 "$bin" stick info "$stick" --test-image >"$work/info-b.json"
 grep -q '"active_slot": "b"' "$work/info-b.json"
 both updated b
+both manual-fallback a
 # shellcheck source=tests/stick/adversarial.sh
 source "$here/adversarial.sh"
 # Stop the REAL update helper after copying HALF of the inactive squashfs. PATH
@@ -189,7 +203,7 @@ cat >"$work/tools/cp" <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail
 last=${!#}
-if [[ $last == */esp/live/a/ ]]; then
+if [[ $last == */slot_a/live/a/ ]]; then
     src=${@: -2:1}
     bytes=$(stat -c %s "$src/filesystem.squashfs")
     dd if="$src/filesystem.squashfs" of="$last/filesystem.squashfs" bs=1M count=$((bytes / 2097152)) status=none
@@ -199,6 +213,7 @@ fi
 exec /usr/bin/cp "$@"
 WRAPPER
 chmod +x "$work/tools/cp"
+partition_hashes b > "$work/interrupted-immutable-before"
 PATH="$work/tools:$PATH" NESTEGG_TEST_HALF_COPY="$work/half-copied" "$bin" stick update "$stick" --test-image --image "$iso" >"$work/interrupted.log" 2>&1 &
 update_pid=$!
 for ((i=0;i<600;i++)); do [[ -f $work/half-copied ]] && break; kill -0 "$update_pid"; sleep .1; done
@@ -209,17 +224,26 @@ update_pid=
 "$bin" stick info "$stick" --test-image >"$work/info-interrupted.json"
 cmp "$work/info-b.json" "$work/info-interrupted.json"
 both interrupted b
+partition_hashes b > "$work/interrupted-immutable-after"
+cmp "$work/interrupted-immutable-before" "$work/interrupted-immutable-after"
+echo 'PASS half-copy interruption: whole active partition and ESP SHA-256 unchanged'
+rm "$work/tools/cp"
+# shellcheck source=tests/stick/interrupted.sh
+source "$here/interrupted.sh"
 attach
 sfdisk --dump "$loop" | sed "s#$loop#DISK#g" >"$work/layout-after"
 cmp "$work/layout-before" "$work/layout-after"
-mount -o nodev,nosuid,noexec "${loop}p3" "$work/data"
+mount -o nodev,nosuid,noexec "${loop}p5" "$work/data"
 grep -qx 'data survives both updates' "$work/data/retained.txt"
 find "$work/data/nestegg" -type f -print0 | sort -z | xargs -0 sha256sum | sed "s#$work/data/##g" >"$work/snapshots-after"
 cmp "$work/snapshots-before" "$work/snapshots-after"
 umount "$work/data"
 detach
 # Repair the incomplete INACTIVE slot with a subsequent normal update.
+partition_hashes b > "$work/retry-before"
 "$bin" stick update "$stick" --test-image --image "$iso" >"$work/retry.log" 2>&1
+partition_hashes b > "$work/retry-after"
+cmp "$work/retry-before" "$work/retry-after"
 both retried a
 # Only after all preservation checks: deliberately recreate the owned image.
 # This exercises the second ERASE confirmation and replacing an existing ext4.
@@ -227,9 +251,9 @@ python3 "$here/confirm.py" "$bin" stick create "$stick" --test-image --image "$i
 "$bin" stick info "$stick" --test-image >"$work/info-recreated.json"
 grep -q '"active_slot": "a"' "$work/info-recreated.json"
 attach
-mount -o nodev,nosuid,noexec "${loop}p3" "$work/data"
+mount -o nodev,nosuid,noexec "${loop}p5" "$work/data"
 [[ -d $work/data/nestegg && ! -e $work/data/retained.txt && ! -e $work/data/nestegg/store ]]
-dumpe2fs -h "${loop}p3" 2>/dev/null | grep -Eq '^Reserved block count:[[:space:]]+0$'
+dumpe2fs -h "${loop}p5" 2>/dev/null | grep -Eq '^Reserved block count:[[:space:]]+0$'
 umount "$work/data"
 detach
 echo 'PASS create/add/info/update, half-written update, retry, retained encrypted snapshots, nonempty recreation, BIOS and UEFI; no physical USB device used'
