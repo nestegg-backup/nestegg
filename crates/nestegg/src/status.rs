@@ -16,6 +16,7 @@ pub const NOTIFY_UNIT: &str = "nestegg-notify.service";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Status {
+    pub restored_from: Option<crate::state::RestoredFrom>,
     pub targets: std::collections::BTreeMap<crate::state::Target, TargetStatus>,
     pub machine: Machine,
     pub pbs: PbsStatus,
@@ -333,6 +334,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
         state
     };
     Ok(Status {
+        restored_from: state.restored_from.clone(),
         targets,
         machine: Machine {
             hostname: crate::config::hostname(),

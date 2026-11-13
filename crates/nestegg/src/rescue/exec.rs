@@ -107,6 +107,7 @@ pub struct Job<'a> {
     pub layout: &'a Layout,
     pub client: &'a Client<'a>,
     pub snapshot: &'a str,
+    pub source_target: crate::state::Target,
     /// How to read `system.pxar`, as decided by the key check
     /// ([`super::Protection::restore_key`]).
     pub key: &'a RestoreKey,
@@ -639,6 +640,9 @@ fn execute_inner(job: &Job<'_>, runner: &mut Runner, say: &mut dyn FnMut(&str)) 
         }
     }
 
+    let network = super::network::fix_network(&target, Path::new("/sys/class/net"))?;
+    notes.extend(network);
+
     // 8. Boot loader and initramfs inside the restored system.
     say("Installing the boot loader ...");
     bind_mounts(runner, plan.uefi)?;
@@ -656,6 +660,25 @@ fn execute_inner(job: &Job<'_>, runner: &mut Runner, say: &mut dyn FnMut(&str)) 
         runner.chroot(&["grub-mkconfig", "-o", "/boot/grub/grub.cfg"])?;
     }
 
+    let paths = crate::config::Paths {
+        config_file: runner.in_target("/etc/nestegg/config.toml"),
+        credentials_dir: runner.in_target("/etc/nestegg/credentials"),
+        state_dir: runner.in_target("/var/lib/nestegg"),
+        runtime_dir: runner.in_target("/run/nestegg"),
+        systemctl: "systemctl".into(),
+    };
+    crate::state::Store::for_target(&paths, job.source_target)
+        .record_restore(job.snapshot, chrono::Utc::now())?;
+    // flock locks are kernel state and cannot survive a restore. Remove the
+    // captured runtime files too; no process uses this offline target tree.
+    for file in [paths.lock_file(), paths.state_dir.join(".current.lock")] {
+        match fs::remove_file(file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
+    notes.push(format!("Status: restored from {}; its snapshot time is the last successful backup time; cleared stale current run", job.snapshot));
+
     // 9. Report inside the restored system.
     let report = format!(
         "Restored by the nestegg rescue system on {}\nSnapshot: {}\n\n{}\n{}\n",
@@ -671,9 +694,9 @@ fn execute_inner(job: &Job<'_>, runner: &mut Runner, say: &mut dyn FnMut(&str)) 
     );
     let report_path = runner.in_target("/var/lib/nestegg/rescue-report.txt");
     if let Some(parent) = report_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
-    let _ = fs::write(&report_path, report);
+    fs::write(&report_path, report).context("cannot write rescue report")?;
     Ok(Report { notes, warnings })
 }
 

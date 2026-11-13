@@ -1665,6 +1665,14 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
     if let Some(run) = &status.current_run {
         println!("Running:      {} ({:?})", run.id, run.state);
     }
+    if let Some(restored) = &status.restored_from {
+        println!(
+            "Restored from: {} (snapshot {}, restored {})",
+            restored.snapshot,
+            format_time(restored.snapshot_time),
+            format_time(restored.restored_at)
+        );
+    }
     println!("Last success: {}", describe(status.last_success.as_ref()));
     if let Some(success) = &status.last_success {
         for (i, reason) in success.incomplete.iter().enumerate() {

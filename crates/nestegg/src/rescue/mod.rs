@@ -11,6 +11,7 @@ pub mod desktop_api;
 pub mod exec;
 pub mod fixup;
 pub mod guard;
+pub mod network;
 pub mod offline;
 pub mod offline_inventory;
 pub mod offline_storage;
