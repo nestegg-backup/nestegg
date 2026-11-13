@@ -656,7 +656,11 @@ fn execute_inner(job: &Job<'_>, runner: &mut Runner, say: &mut dyn FnMut(&str)) 
 
     // Looking at the network configuration must never stop a restore: the
     // boot loader is not installed yet at this point.
-    match super::network::fix_network(&target, Path::new("/sys/class/net")) {
+    match super::network::fix_network(
+        &target,
+        Path::new("/sys"),
+        job.layout.system_uuid.as_deref(),
+    ) {
         Ok(network) => notes.extend(network),
         Err(e) => warnings.push(format!(
             "Network: the configuration could not be checked ({e:#}); nothing was changed. \

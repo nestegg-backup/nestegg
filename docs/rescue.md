@@ -110,6 +110,17 @@ selectors, that MAC is absent here, other selectors are clearly Wi-Fi, and
 there is exactly one physical wired NIC. Literal block-style netplan
 `ethernets`/`match` selectors, Ethernet NetworkManager profiles and `.link`
 matches explicitly restricted to `Type=ether` are supported for repair.
+Automatic rewrites are also refused if the rescue kernel sees an unbound
+PCI network-class device or a recognisable unbound USB network interface
+(Ethernet/NCM/MBIM/RNDIS): missing drivers or firmware can hide the original
+NIC. New backups record an optional DMI product UUID in the inventory's
+`layout.json` (`system_uuid`). If it matches rescue's current machine, pins
+stay unchanged because a dock or adapter may simply be unplugged. Invalid,
+all-zero/all-ones or unavailable UUIDs are ignored. Older snapshots without
+this field still use the previous mapping rule plus the unbound-device check.
+Generic vendor-specific USB functions cannot always be recognised. The report
+explains either refusal and gives the manual fix; restore continues.
+
 Only MAC selector bytes change: Wi-Fi passwords and other settings are preserved.
 
 Other cases are detection-only, including complex YAML, Wi-Fi, multiple

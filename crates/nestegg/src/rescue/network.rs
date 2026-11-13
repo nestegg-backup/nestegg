@@ -270,11 +270,41 @@ fn hardware(sys: &Path) -> Result<(BTreeSet<String>, Vec<String>)> {
     Ok((present, wired))
 }
 
-pub fn fix_network(root: &Path, sys: &Path) -> Result<Vec<String>> {
+/// Check bus devices too: an unbound NIC never appears in class/net. USB
+/// Ethernet/NCM/MBIM and RNDIS interface descriptors reliably identify network
+/// functions; generic vendor-specific interfaces cannot be classified here.
+fn unbound_network_device(sys: &Path) -> Result<bool> {
+    for bus in ["pci", "usb"] {
+        let entries = match fs::read_dir(sys.join(format!("bus/{bus}/devices"))) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let p = entry?.path();
+            let read = |name: &str| fs::read_to_string(p.join(name)).unwrap_or_default();
+            let network = if bus == "pci" {
+                read("class").trim().starts_with("0x02")
+            } else {
+                let class = read("bInterfaceClass");
+                let subclass = read("bInterfaceSubClass");
+                let protocol = read("bInterfaceProtocol");
+                (class.trim() == "02" && matches!(subclass.trim(), "06" | "0d" | "0e"))
+                    || (class.trim() == "e0" && subclass.trim() == "01" && protocol.trim() == "03")
+            };
+            if network && !p.join("driver").exists() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub fn fix_network(root: &Path, sys: &Path, recorded_uuid: Option<&str>) -> Result<Vec<String>> {
     let root = root.canonicalize()?;
     let mut notes = Vec::new();
     let manual = "Manual fix: compare 'ip -br link' on the restored system with the MAC match and interface name in this file; update the MAC selector (and any set-name/name reference) for the intended NIC, then apply the network configuration or reboot.";
-    let (present, wired, hardware_known) = match hardware(sys) {
+    let (present, wired, hardware_known) = match hardware(&sys.join("class/net")) {
         Ok((present, wired)) => (present, wired, true),
         Err(_) => {
             notes.push("Network: hardware enumeration failed; no configuration changed. Check MAC selectors manually using ip -br link.".into());
@@ -283,6 +313,30 @@ pub fn fix_network(root: &Path, sys: &Path) -> Result<Vec<String>> {
     };
     let mut configs = Vec::new();
     let mut safe = hardware_known;
+    match unbound_network_device(sys) {
+        Ok(false) => {}
+        result => {
+            safe = false;
+            let reason = if result.is_ok() {
+                "a network-class device has no bound driver (missing driver or firmware)"
+            } else {
+                "network bus enumeration failed"
+            };
+            notes.push(format!(
+                "Network: {reason}; no configuration changed. {manual}"
+            ));
+        }
+    }
+    if recorded_uuid
+        .and_then(crate::layout::normalized_system_uuid)
+        .is_some_and(|old| {
+            crate::layout::system_uuid(&sys.join("class/dmi/id"))
+                .is_some_and(|current| current == old)
+        })
+    {
+        safe = false;
+        notes.push(format!("Network: DMI system UUID matches the backed-up machine; an absent NIC may be unplugged or unavailable in rescue. No configuration changed. {manual}"));
+    }
     let (found, linked) = files(&root)?;
     for link in linked {
         notes.push(format!(
@@ -431,7 +485,7 @@ mod tests {
         (d, root, sys)
     }
     fn nic(sys: &Path, name: &str, address: &str, wifi: bool) {
-        let p = sys.join(name);
+        let p = sys.join("class/net").join(name);
         fs::create_dir_all(p.join("device")).unwrap();
         fs::write(p.join("address"), address).unwrap();
         fs::write(p.join("type"), "1\n").unwrap();
@@ -451,13 +505,80 @@ mod tests {
         )
     }
     #[test]
+    fn unbound_pci_and_usb_network_devices_refuse_rewriting() {
+        for (bus, class, subclass, protocol) in [
+            ("pci", "0x020000", "", ""),
+            ("usb", "02", "06", "00"), // CDC Ethernet
+            ("usb", "02", "0d", "00"), // CDC NCM
+            ("usb", "02", "0e", "00"), // CDC MBIM
+            ("usb", "e0", "01", "03"), // RNDIS
+        ] {
+            let (_d, root, sys) = fixture();
+            let device = sys.join(format!("bus/{bus}/devices/nic"));
+            fs::create_dir_all(&device).unwrap();
+            if bus == "pci" {
+                fs::write(device.join("class"), class).unwrap();
+            } else {
+                fs::write(device.join("bInterfaceClass"), class).unwrap();
+                fs::write(device.join("bInterfaceSubClass"), subclass).unwrap();
+                fs::write(device.join("bInterfaceProtocol"), protocol).unwrap();
+            }
+            let text = netplan();
+            let path = config(&root, "etc/netplan/50-test.yaml", &text);
+            let notes = fix_network(&root, &sys, None).unwrap().join("\n");
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+            assert!(notes.contains("no bound driver") && notes.contains("Manual fix:"));
+            // A bound driver removes this refusal; legacy inventories still work.
+            fs::create_dir(device.join("driver")).unwrap();
+            fix_network(&root, &sys, None).unwrap();
+            assert!(fs::read_to_string(path).unwrap().contains(&new_mac()));
+        }
+    }
+
+    #[test]
+    fn unrelated_unbound_bus_devices_do_not_prevent_rewriting() {
+        let (_d, root, sys) = fixture();
+        let pci = sys.join("bus/pci/devices/storage");
+        let usb = sys.join("bus/usb/devices/serial");
+        fs::create_dir_all(&pci).unwrap();
+        fs::create_dir_all(&usb).unwrap();
+        fs::write(pci.join("class"), "0x010000").unwrap();
+        fs::write(usb.join("bInterfaceClass"), "02").unwrap();
+        fs::write(usb.join("bInterfaceSubClass"), "02").unwrap();
+        let path = config(&root, "etc/netplan/50-test.yaml", &netplan());
+        fix_network(&root, &sys, None).unwrap();
+        assert!(fs::read_to_string(path).unwrap().contains(&new_mac()));
+    }
+
+    #[test]
+    fn same_machine_refuses_but_replacement_machine_rewrites() {
+        let (_d, root, sys) = fixture();
+        let uuid = "12345678-1234-4321-9876-123456789abc";
+        let dmi = sys.join("class/dmi/id");
+        fs::create_dir_all(&dmi).unwrap();
+        fs::write(dmi.join("product_uuid"), uuid.to_uppercase() + "\n").unwrap();
+        let text = netplan();
+        let path = config(&root, "etc/netplan/50-test.yaml", &text);
+        let notes = fix_network(&root, &sys, Some(uuid)).unwrap().join("\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        assert!(notes.contains("matches the backed-up machine") && notes.contains("Manual fix:"));
+        fs::write(
+            dmi.join("product_uuid"),
+            "87654321-1234-4321-9876-123456789abc",
+        )
+        .unwrap();
+        fix_network(&root, &sys, Some(uuid)).unwrap();
+        assert!(fs::read_to_string(path).unwrap().contains(&new_mac()));
+    }
+
+    #[test]
     fn netplan_rewrites_only_the_selector_and_keeps_a_private_adjacent_backup() {
         use std::os::unix::fs::PermissionsExt;
         let (_d, root, sys) = fixture();
         let text = netplan();
         let p = config(&root, "etc/netplan/50-cloud-init.yaml", &text);
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
-        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        let notes = fix_network(&root, &sys, None).unwrap().join("\n");
         assert_eq!(
             fs::read_to_string(&p).unwrap(),
             text.replace(OLD, &new_mac())
@@ -470,7 +591,7 @@ mod tests {
         );
         assert!(notes.contains("rewrote absent wired MAC"));
         assert!(notes.contains("Manual fix:") && notes.contains("cloud-init may regenerate"));
-        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        let notes = fix_network(&root, &sys, None).unwrap().join("\n");
         assert!(notes.contains("present on this machine"));
     }
     #[test]
@@ -487,7 +608,7 @@ mod tests {
             nm.join("wired.nmconnection"),
         )
         .unwrap();
-        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        let notes = fix_network(&root, &sys, None).unwrap().join("\n");
         assert!(
             notes.contains("wired.nmconnection is a symbolic link; unchanged"),
             "{notes}"
@@ -505,7 +626,7 @@ mod tests {
         fs::write(outside.join("50-cloud-init.yaml"), &text).unwrap();
         fs::create_dir_all(root.join("etc")).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("etc/netplan")).unwrap();
-        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        let notes = fix_network(&root, &sys, None).unwrap().join("\n");
         assert!(notes.contains("etc/netplan is a symbolic link"), "{notes}");
         assert_eq!(
             fs::read_to_string(outside.join("50-cloud-init.yaml")).unwrap(),
@@ -525,7 +646,7 @@ mod tests {
         let links = root.join("etc/systemd/network");
         fs::create_dir_all(&links).unwrap();
         std::os::unix::fs::symlink("/dev/null", links.join("99-default.link")).unwrap();
-        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        let notes = fix_network(&root, &sys, None).unwrap().join("\n");
         assert!(!notes.contains("99-default.link"), "{notes}");
         // The mask does not make the single wired pin ambiguous.
         assert!(
@@ -549,7 +670,7 @@ mod tests {
         for (path, text) in &configs {
             config(&root, path, text);
         }
-        fix_network(&root, &sys).unwrap();
+        fix_network(&root, &sys, None).unwrap();
         for (path, text) in configs {
             assert_eq!(
                 fs::read_to_string(root.join(path)).unwrap(),
@@ -572,7 +693,7 @@ mod tests {
                 ));
             }
             let p = config(&root, "etc/netplan/50-test.yaml", &text);
-            let notes = fix_network(&root, &sys).unwrap().join("\n");
+            let notes = fix_network(&root, &sys, None).unwrap().join("\n");
             assert_eq!(fs::read_to_string(p).unwrap(), text);
             assert!(notes.contains("unchanged") && notes.contains("Manual fix:"));
         }
@@ -613,7 +734,7 @@ mod tests {
         ] {
             let (_d, root, sys) = fixture();
             let p = config(&root, path, &text);
-            let notes = fix_network(&root, &sys).unwrap().join("\n");
+            let notes = fix_network(&root, &sys, None).unwrap().join("\n");
             assert_eq!(fs::read_to_string(p).unwrap(), text);
             assert!(
                 notes.contains("absent on this machine") || notes.contains("complex YAML"),
@@ -631,7 +752,7 @@ mod tests {
             nic(&sys, "nic0", if wifi { &new } else { OLD }, wifi);
             let text = netplan();
             let p = config(&root, "etc/netplan/50-test.yaml", &text);
-            let notes = fix_network(&root, &sys).unwrap().join("\n");
+            let notes = fix_network(&root, &sys, None).unwrap().join("\n");
             assert_eq!(fs::read_to_string(p).unwrap(), text);
             assert!(notes.contains("unchanged"));
         }
@@ -644,7 +765,7 @@ mod tests {
                 "  wifis:\n    wlan0:\n      access-points:\n        example:\n          password: '{OLD}'\n"
             );
         let p = config(&root, "etc/netplan/50-test.yaml", &text);
-        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        let notes = fix_network(&root, &sys, None).unwrap().join("\n");
         let changed = fs::read_to_string(p).unwrap();
         assert!(changed.contains(&format!("macaddress: '{}'", new_mac())));
         assert!(changed.contains(&format!("password: '{OLD}'")));
@@ -657,7 +778,7 @@ mod tests {
             "network:\n  wifis:\n    wlan0:\n      password: '\nnetwork:\n  ethernets:\n    fake:\n      match:\n        macaddress: {OLD}\n'\n"
         );
         let p = config(&root, "etc/netplan/50-test.yaml", &text);
-        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        let notes = fix_network(&root, &sys, None).unwrap().join("\n");
         assert_eq!(fs::read_to_string(p).unwrap(), text);
         assert!(notes.contains("complex YAML"));
         assert!(!notes.contains(OLD));
@@ -672,7 +793,7 @@ mod tests {
             "etc/netplan/.50-test.yaml.nestegg-rescue.bak",
             "earlier backup",
         );
-        fix_network(&root, &sys).unwrap();
+        fix_network(&root, &sys, None).unwrap();
         assert_eq!(
             fs::read_to_string(&p).unwrap(),
             text.replace(OLD, &new_mac())
@@ -700,7 +821,7 @@ mod tests {
             "etc/NetworkManager/system-connections/wifi",
             &wifi_text,
         );
-        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        let notes = fix_network(&root, &sys, None).unwrap().join("\n");
         assert_eq!(
             fs::read_to_string(wired).unwrap(),
             text.replace(OLD, &new_mac())

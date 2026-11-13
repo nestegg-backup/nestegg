@@ -64,3 +64,23 @@ implementation or UI change is needed.
 - The restored success carries what the snapshot's signed metadata lists as
   left out of that backup. Restoring an incomplete backup shows "incomplete",
   not full protection; when the metadata cannot be read, that is said too.
+
+- Network rewrites also stop when a PCI network-class device has no bound
+  driver, or a recognisable USB Ethernet/NCM/MBIM/RNDIS interface is unbound.
+  A missing driver/firmware must not look like a replaced NIC. Vendor-specific
+  USB functions cannot always be classified; no claim is made for those.
+- `inventory.pxar/layout.json` now carries optional `system_uuid`, the valid
+  non-placeholder DMI product UUID captured on the backed-up running system.
+  A match with rescue's DMI UUID prevents rewrites: a dock may be unplugged
+  on the same machine. Older inventories without this field retain the
+  previous rule plus the unbound-device refusal. Offline disk inventories
+  cannot infer the source machine's DMI identity and leave it absent.
+  Both refusals report the reason and manual fix, without blocking restore.
+  Sysfs/DMI roots and the recorded identity are injected in unit tests.
+
+- Verification: the injected sysfs/DMI unit tests cover both refusal paths,
+  recognised USB interface classes, unrelated unbound devices, replacement
+  hardware, old inventories and firmware UUID placeholders. The disposable
+  `tests/rescue/run.sh` Debian Btrfs/UEFI scenario passed all 30 checks with
+  explicit different source/rescue DMI UUIDs and MACs, including inventory
+  capture, the reported rewrite and restored-system networking after boot.

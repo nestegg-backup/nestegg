@@ -75,8 +75,12 @@ firmware() { # $1 = name of a fresh NVRAM copy
 }
 qemu() { # $1 = time limit in seconds, rest = qemu arguments
   local limit="$1"; shift
+  local system_uuid=12345678-1234-4321-9876-123456789abc
+  if [[ ${NIC_MAC:-$source_mac} == "$restore_mac" ]]; then
+    system_uuid=87654321-1234-4321-9876-123456789abc
+  fi
   timeout "$limit" qemu-system-x86_64 -enable-kvm -cpu host -m 2048 -smp 2 -display none -monitor none \
-    -netdev user,id=n0 -device "virtio-net-pci,netdev=n0,mac=${NIC_MAC:-$source_mac}" "$@"
+    -uuid "$system_uuid" -netdev user,id=n0 -device "virtio-net-pci,netdev=n0,mac=${NIC_MAC:-$source_mac}" "$@"
 }
 
 # Later stages make no sense once an earlier one failed.
@@ -99,6 +103,7 @@ echo "== source VM: first start runs the backup"
 qemu 1200 $(firmware src) -drive "file=$work/source.img,if=virtio,format=raw" \
   -serial "file:$work/source-console.log" || true
 check "source system backed up" grep -q E2E-BACKUP-OK "$work/source-console.log"
+check "source DMI identity recorded" grep -q '"system_uuid": "12345678-1234-4321-9876-123456789abc"' "$work/source-console.log"
 check "layout recorded" grep -q '"bootloader": "grub"' "$work/source-console.log"
 snaps="$(docker exec -e PBS_PASSWORD="$admin_pw" -e PBS_FINGERPRINT="$fp" "$pbs" \
   proxmox-backup-client snapshot list --ns desktops --repository admin@pbs@127.0.0.1:store1 --output-format json)"
