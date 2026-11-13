@@ -77,6 +77,32 @@ Goal: a desktop backs itself up to a PBS reliably, controlled from the terminal.
   the tests in containers and VMs; phase 6 (a real desktop with a real USB
   drive) is still open.
 
+## Later – Other Linux distributions (considered, not started)
+
+A code and documentation review (2026-11-13; nothing was run on a
+non-Debian system, so all of this is unverified) found:
+
+- The normal backup (timer, Wake-on-LAN, encryption, web UI, backup to the
+  stick from the desktop) depends on systemd, udev and `systemd-creds` and
+  the static `proxmox-backup-client`, not on Debian. Missing for Fedora,
+  openSUSE and Arch: package inventories (rpm/dnf, pacman; today only
+  dpkg/apt, Flatpak and Snap are recorded), an `.rpm` and an Arch package
+  with the install scripts, installation docs, tests on those systems, and
+  SELinux behaviour on restore.
+- The rescue stick and the offline backup from the booted stick are built
+  for Debian-like systems and refuse others before anything is erased
+  (they need the Debian package list; GRUB with `update-grub`). Fedora
+  needs `grub2-*`, BLS entries and an SELinux relabel after a restore; Arch
+  uses mkinitcpio and often systemd-boot.
+
+Suggested order, after the backup stick has passed on real hardware
+(phase 6 of decision 0023): first the normal backup on Fedora (package
+lists, `.rpm`, tests), then the rescue stick for Fedora.
+
+Windows and macOS are not planned: nestegg is a Linux system service
+built on Linux mechanisms, and it must not reimplement the PBS protocol;
+whether an official client exists for those systems has not been checked.
+
 ## Not planned
 
 - An allowed time window for backups and the desktop keyring as a credential
