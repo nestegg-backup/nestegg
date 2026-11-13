@@ -26,6 +26,10 @@ impl SourceDirectory {
     }
 
     fn open_resolved(path: &Path) -> Result<Self> {
+        Self::from_directory(Self::open_without_symlinks(path)?)
+    }
+
+    fn open_without_symlinks(path: &Path) -> Result<File> {
         let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
         let mut fd = open("/", flags, Mode::empty())?;
         for component in path.components() {
@@ -39,18 +43,33 @@ impl SourceDirectory {
                 _ => bail!("backup source must not contain parent traversal"),
             }
         }
-        let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        Ok(File::from(fd))
+    }
+
+    fn from_directory(directory: File) -> Result<Self> {
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))
             .context("cannot derive source path from directory handle")?;
-        if !path.is_absolute() || nix::sys::stat::fstat(&fd)?.st_nlink == 0 {
+        if !path.is_absolute() || nix::sys::stat::fstat(&directory)?.st_nlink == 0 {
             bail!("source directory was removed while opening it");
         }
         if path.to_str().is_none() {
             bail!("source path from directory handle is not valid UTF-8");
         }
-        Ok(Self {
-            directory: File::from(fd),
-            path,
-        })
+        Self::verify_path(&directory, &path)?;
+        Ok(Self { directory, path })
+    }
+
+    fn verify_path(directory: &File, path: &Path) -> Result<()> {
+        // A detached mount can give /proc/self/fd a misleading absolute path.
+        // Re-open only to verify its identity; the client still uses directory.
+        let reopened = Self::open_without_symlinks(path)
+            .context("cannot verify source path from directory handle")?;
+        let pinned = nix::sys::stat::fstat(directory)?;
+        let resolved = nix::sys::stat::fstat(&reopened)?;
+        if (pinned.st_dev, pinned.st_ino) != (resolved.st_dev, resolved.st_ino) {
+            bail!("source path no longer identifies the opened directory");
+        }
+        Ok(())
     }
 }
 
@@ -117,6 +136,69 @@ mod tests {
             symlink(&outside, &source).unwrap();
             assert!(SourceDirectory::open_resolved(&canonical).is_err());
         }
+    }
+
+    #[test]
+    fn recorded_path_must_identify_the_same_directory_without_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Documents");
+        let other = dir.path().join("other");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let directory = SourceDirectory::open_without_symlinks(&source).unwrap();
+        SourceDirectory::verify_path(&directory, &source).unwrap();
+        let error = SourceDirectory::verify_path(&directory, &other).unwrap_err();
+        assert!(
+            error.to_string().contains("no longer identifies"),
+            "{error:#}"
+        );
+        std::fs::rename(&source, dir.path().join("moved")).unwrap();
+        assert!(SourceDirectory::verify_path(&directory, &source).is_err());
+        symlink(dir.path().join("moved"), &source).unwrap();
+        assert!(SourceDirectory::verify_path(&directory, &source).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires root and a private mount namespace (unshare)"]
+    fn detached_mount_path_is_refused() {
+        use std::process::Command;
+        const TEST: &str = "source::tests::detached_mount_path_is_refused";
+        if std::env::var_os("NESTEGG_TEST_PRIVATE_MOUNT_NS").is_none() {
+            let status = Command::new("unshare")
+                .args(["--mount", "--propagation", "private"])
+                .arg(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--ignored", "--nocapture"])
+                .env("NESTEGG_TEST_PRIVATE_MOUNT_NS", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let source = dir.path().join("Documents");
+        std::fs::create_dir(&source).unwrap();
+        let directory = SourceDirectory::open_without_symlinks(&source).unwrap();
+        assert!(
+            Command::new("umount")
+                .arg("-l")
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let recorded =
+            std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd())).unwrap();
+        assert_eq!(recorded, Path::new("/Documents"));
+        let error = SourceDirectory::from_directory(directory).unwrap_err();
+        assert!(format!("{error:#}").contains("source path"), "{error:#}");
     }
 
     #[test]

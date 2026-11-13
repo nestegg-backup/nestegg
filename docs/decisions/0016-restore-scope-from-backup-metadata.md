@@ -190,7 +190,11 @@ symlinks in the configuration as before, then opened component by component
 from `/` with `O_NOFOLLOW | O_DIRECTORY`. Missing sources and symlinks introduced
 after canonicalization fail closed (optional sources are skipped as incomplete).
 There is no raw-path fallback. The recorded path comes from the opened
-handle's `/proc/self/fd` link. The client inherits a duplicate of that same
+handle's `/proc/self/fd` link. Before recording it, the path is re-opened
+without symlinks and its device and inode must match the original handle.
+This rejects misleading paths from detached mounts (for example after a
+lazy unmount); any failure skips an optional source as incomplete or fails a
+required source. The client inherits a duplicate of the original
 handle and reads `/proc/self/fd/N`, including for `system.pxar` (`/`). It
 never receives the configured path for a second lookup. Renaming a source
 and replacing it with a symlink after recording therefore cannot change
