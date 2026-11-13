@@ -1065,7 +1065,11 @@ fn pipeline(
             .as_ref()
             .err()
             .map(|error| {
-                if error.downcast_ref::<nix::errno::Errno>() == Some(&nix::errno::Errno::ENOENT) {
+                if error.downcast_ref::<nix::errno::Errno>() == Some(&nix::errno::Errno::ENOENT)
+                    || error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
                     "does not exist".to_string()
                 } else {
                     format!("cannot be opened without symlinks ({error:#})")
@@ -1206,8 +1210,11 @@ fn pipeline(
     if config.backup.inventory {
         rep.phase(RunState::Inventory, "writing system inventory");
         let dir: PathBuf = paths.inventory_dir();
-        match crate::inventory::generate(&dir) {
-            Ok(report) => {
+        match crate::inventory::generate(&dir).and_then(|report| {
+            let opened = crate::source::SourceDirectory::open(&dir)?;
+            Ok((report, opened))
+        }) {
+            Ok((report, opened)) => {
                 rep.line(&format!(
                     "inventory: {} files written, {} skipped",
                     report.written.len(),
@@ -1225,7 +1232,6 @@ fn pipeline(
                         crate::layout::LAYOUT_FILE
                     ));
                 }
-                let opened = crate::source::SourceDirectory::open(&dir)?;
                 source_handles.insert("inventory".into(), opened);
                 archives.push(ArchiveSpec {
                     name: "inventory".into(),

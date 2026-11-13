@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use nix::fcntl::{OFlag, open, openat};
 use nix::sys::stat::Mode;
 
-/// The path is derived from this handle, never resolved a second time.
+/// The recorded path is derived from this handle; the client inherits the handle.
 #[derive(Debug)]
 pub struct SourceDirectory {
     pub directory: File,
@@ -19,6 +19,13 @@ impl SourceDirectory {
         if !path.is_absolute() {
             bail!("backup source must be absolute");
         }
+        // Configuration may name symlinks, as before. Once resolved, refuse
+        // any symlink introduced before or during the component-wise open.
+        let canonical = std::fs::canonicalize(path).context("cannot resolve backup source")?;
+        Self::open_resolved(&canonical)
+    }
+
+    fn open_resolved(path: &Path) -> Result<Self> {
         let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
         let mut fd = open("/", flags, Mode::empty())?;
         for component in path.components() {
@@ -73,8 +80,43 @@ mod tests {
         let output = cmd.output().unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "report\n");
-        assert!(SourceDirectory::open(&source).is_err());
+        assert_eq!(SourceDirectory::open(&source).unwrap().path, outside);
         assert!(SourceDirectory::open(&source.join("subdirectory")).is_err());
+    }
+
+    #[test]
+    fn configured_symlinks_in_leaf_and_parent_components_are_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let actual = dir.path().join("actual");
+        std::fs::create_dir_all(actual.join("Documents")).unwrap();
+        let link = dir.path().join("configured");
+        symlink(&actual, &link).unwrap();
+        for suffix in ["", "Documents"] {
+            assert_eq!(
+                SourceDirectory::open(&link.join(suffix)).unwrap().path,
+                actual.join(suffix)
+            );
+        }
+    }
+
+    #[test]
+    fn symlink_introduced_after_canonicalization_is_refused() {
+        for leaf in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source");
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(source.join("Documents")).unwrap();
+            std::fs::create_dir_all(outside.join("Documents")).unwrap();
+            let path = if leaf {
+                source.clone()
+            } else {
+                source.join("Documents")
+            };
+            let canonical = std::fs::canonicalize(path).unwrap();
+            std::fs::rename(&source, dir.path().join("moved")).unwrap();
+            symlink(&outside, &source).unwrap();
+            assert!(SourceDirectory::open_resolved(&canonical).is_err());
+        }
     }
 
     #[test]
@@ -86,10 +128,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_relative_and_traversing_sources_and_accepts_root() {
+    fn rejects_missing_and_relative_sources_and_accepts_root() {
         assert!(SourceDirectory::open(Path::new("/this-source-does-not-exist")).is_err());
         assert!(SourceDirectory::open(Path::new("home/alice")).is_err());
-        assert!(SourceDirectory::open(Path::new("/home/../etc")).is_err());
+        assert_eq!(
+            SourceDirectory::open(Path::new("/etc/../etc"))
+                .unwrap()
+                .path,
+            Path::new("/etc")
+        );
         assert_eq!(
             SourceDirectory::open(Path::new("/")).unwrap().path,
             Path::new("/")

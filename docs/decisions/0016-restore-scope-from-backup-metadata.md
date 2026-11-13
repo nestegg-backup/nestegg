@@ -185,9 +185,10 @@ English. A missing source proof is not described as missing user files.
 
 ## Update 2026-11-13: bind recorded sources to directory handles
 
-Before metadata is written, every configured source is opened component by
-component from `/` with `O_NOFOLLOW | O_DIRECTORY`. Missing sources and
-symlink components fail closed (optional sources are skipped as incomplete).
+Before metadata is written, every configured source is canonicalized, accepting
+symlinks in the configuration as before, then opened component by component
+from `/` with `O_NOFOLLOW | O_DIRECTORY`. Missing sources and symlinks introduced
+after canonicalization fail closed (optional sources are skipped as incomplete).
 There is no raw-path fallback. The recorded path comes from the opened
 handle's `/proc/self/fd` link. The client inherits a duplicate of that same
 handle and reads `/proc/self/fd/N`, including for `system.pxar` (`/`). It
