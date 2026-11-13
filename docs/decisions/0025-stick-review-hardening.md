@@ -68,9 +68,9 @@ write access there. Create `store/` with 0755: PBS requires that exact root
 mode during reuse (and 0750 for `.chunks`), rather than a stricter 0750 root.
 The [official chunk-store checks](https://git.proxmox.com/?p=proxmox-backup.git;a=blob;f=pbs-datastore/src/chunk_store.rs;hb=HEAD)
 define these modes; restart/restore acceptance exercises them.
-The launcher refuses older prototype anchors owned by PBS;
-it does not silently migrate or chmod existing datastore trees. Preserve old
-media and migrate explicitly, or recreate disposable phase-one test media.
+The launcher refuses prototype anchors owned by PBS; it does not silently
+migrate or chmod existing datastore trees. Unreleased shared-FAT media now
+require recreation under 0033; save needed backups elsewhere first.
 
 ## Durability, format validation and residual risk (findings 1, 7, 9–11)
 
@@ -86,17 +86,18 @@ The helper reports a freshly computed active squashfs hash, not the stick's
 unverified `.nestegg-sha256`. Neither checksums nor GRUB authenticate an attacker-
 controlled boot medium.
 
-Keep the current shared ESP for this focused phase-one repair. Separate slot
-partitions would change the partition format, live-boot device selection and
-migration of existing media; that deserves a new format decision and acceptance
-suite. A torn shared FAT sector can still damage the active slot or dispatcher.
-Manual fallback helps payload/descriptor failures, not damaged shared metadata.
-No physical power-loss or controller reliability guarantee is made.
+**Finding 7 resolved by [0033](0033-independent-live-slot-partitions.md):**
+the two live slots now have independent FAT32 partitions and the ESP is never
+written during update. Whole-partition checksum tests cover successful updates
+and interruptions. An inactive FAT/FSInfo write cannot corrupt active-slot or
+ESP filesystem metadata. Physical controller failures crossing partition
+boundaries and loss of acknowledged writes remain hardware risks.
 
-Read the ESP only until format/payload validation and a conservative free-space
-check succeed. Include the reclaimable inactive slot and allocation rounding;
-remount read-write only after those checks. Find registered devices through the
-complete lsblk tree so cloned UUIDs cannot be hidden by a by-uuid symlink.
+Read the ESP and both slots only until format/payload validation and a
+conservative free-space check succeed. Include the reclaimable inactive slot
+and allocation rounding; remount only the inactive slot read-write after those
+checks. Find registered devices through the complete lsblk tree so cloned UUIDs
+cannot be hidden by a by-uuid symlink.
 
 A separate `tests/stick/durability.sh` uses dm-log-writes and an externally built
 upstream replay tool pinned to commit

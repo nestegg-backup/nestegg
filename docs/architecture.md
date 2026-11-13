@@ -60,11 +60,17 @@ directories. See [decision 0007](decisions/0007-systemd-unit-sandboxing.md);
 ## Backup-stick preparation and desktop target
 
 `stick create/update/info/add` runs as root, reusing the rescue disk guard.
-A private mount helper writes a GPT with BIOS/UEFI GRUB, two UUID-pinned live
-slots and an ext4 `nestegg/` datastore. A fixed dispatcher chooses the newest
-checksum-committed slot; update publishes its commit after flushing the complete
-inactive payload. Backups and the partition table are not rewritten by update.
-See [stick preparation](stick.md) and [decision 0024](decisions/0024-stick-writing-and-launcher.md).
+A private mount helper writes a GPT with BIOS/UEFI GRUB on a 64 MiB ESP,
+two separate FAT32 live partitions of at least 2 GiB each, and the remaining
+ext4 `NESTEGG_DATA` partition (`nestegg/store/`, `mkfs.ext4 -m 0`). A fixed
+GRUB dispatcher reads each slot by UUID and chooses the newest checksum-committed
+generation, offering the other as a fallback. Update writes only the inactive
+partition, flushing payload and descriptor before publishing its commit last.
+The active partition, ESP, backups and partition table receive no writes.
+Live-boot mounts the selected slot at `/run/live/medium`; its root marker binds
+the booted squashfs to the sibling data partition. The unreleased shared-FAT
+format requires destructive recreation, with an explicit backup-loss warning.
+See [stick preparation](stick.md) and [decision 0033](decisions/0033-independent-live-slot-partitions.md).
 
 `stick::launcher::LocalPbs` is shared by later desktop and wizard work. The
 caller supplies its trusted desktop squashfs, a mounted ext4 partition and a

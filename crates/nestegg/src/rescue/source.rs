@@ -38,24 +38,24 @@ fn boot_arguments(cmdline: &str) -> Result<(&str, &str)> {
                 .bytes()
                 .enumerate()
                 .all(|(i, c)| i == 4 || c.is_ascii_hexdigit()),
-        "invalid boot ESP UUID"
+        "invalid live slot UUID"
     );
     let slot = value("live-media-path=")?;
     ensure!(matches!(slot, "/live/a" | "/live/b"), "invalid live slot");
     Ok((uuid, slot))
 }
 
-fn marker_data(marker: &str, boot_uuid: &str) -> Result<String> {
+fn marker_data(marker: &str, slot_uuid: &str) -> Result<String> {
     let lines: Vec<_> = marker.lines().collect();
     ensure!(
-        lines.len() == 3 && lines[0] == "nestegg-stick-v1",
+        lines.len() == 3 && lines[0] == "nestegg-slot-v2",
         "invalid stick marker"
     );
     ensure!(
         lines[1]
-            .strip_prefix("boot_uuid=")
-            .is_some_and(|u| u.eq_ignore_ascii_case(boot_uuid)),
-        "marker does not identify the booted ESP"
+            .strip_prefix("slot_uuid=")
+            .is_some_and(|u| u.eq_ignore_ascii_case(slot_uuid)),
+        "marker does not identify the booted live partition"
     );
     let data = lines[2]
         .strip_prefix("data_uuid=")
@@ -69,7 +69,7 @@ fn check_data_partition(
     boot: &Path,
     data_uuid: &str,
 ) -> Result<()> {
-    let esp = devs
+    let live = devs
         .iter()
         .find(|d| Path::new(&d.path) == boot)
         .context("boot device missing")?;
@@ -87,7 +87,7 @@ fn check_data_partition(
         data.kind == "part"
             && data.fstype.as_deref() == Some("ext4")
             && data.pkname.is_some()
-            && data.pkname == esp.pkname,
+            && data.pkname == live.pkname,
         "data partition is not on the booted medium"
     );
     Ok(())
@@ -116,7 +116,7 @@ impl BootMedium {
                     .unwrap_or_default()
                     .split(',')
                     .any(|o| o == "ro"),
-            "live medium must be the read-only ESP named at boot"
+            "live medium must be the read-only slot partition named at boot"
         );
         let boot = fs::canonicalize(m["source"].as_str().context("missing boot device")?)?;
         let marker = fs::read_to_string(Path::new(MEDIUM).join("nestegg-stick"))?;
@@ -174,7 +174,7 @@ pub fn live_paths() -> Paths {
 }
 
 /// IMAGE_PATH in a booted image is the squashfs that live-boot has already
-/// mounted. Check its loop backing file too: a mounted foreign ESP is not
+/// mounted. Check its loop backing file too: a mounted foreign live partition is not
 /// enough to make an image executable. This entry point is unavailable on a
 /// desktop, and never changes the desktop launcher's fixed-cache policy.
 pub(crate) fn boot_image() -> Result<File> {
@@ -238,8 +238,8 @@ mod tests {
         }
     }
     #[test]
-    fn marker_must_match_esp_and_have_exact_fields() {
-        let m = "nestegg-stick-v1\nboot_uuid=1234-ABCD\ndata_uuid=01234567-89ab-cdef-0123-456789abcdef\n";
+    fn marker_must_match_slot_and_have_exact_fields() {
+        let m = "nestegg-slot-v2\nslot_uuid=1234-ABCD\ndata_uuid=01234567-89ab-cdef-0123-456789abcdef\n";
         assert!(marker_data(m, "1234-abcd").is_ok());
         assert!(marker_data(m, "0000-0000").is_err());
         assert!(marker_data(&format!("{m}extra=x\n"), "1234-ABCD").is_err());
@@ -252,17 +252,17 @@ mod tests {
         );
     }
     #[test]
-    fn data_must_be_the_unique_ext4_sibling_of_the_booted_esp() {
+    fn data_must_be_the_unique_ext4_sibling_of_the_booted_slot() {
         use crate::layout::BlockDev;
         let uuid = "01234567-89ab-cdef-0123-456789abcdef";
         let boot = BlockDev {
-            path: "/dev/vda2".into(),
+            path: "/dev/vda3".into(),
             pkname: Some("vda".into()),
             kind: "part".into(),
             ..Default::default()
         };
         let data = BlockDev {
-            path: "/dev/vda3".into(),
+            path: "/dev/vda5".into(),
             pkname: Some("vda".into()),
             kind: "part".into(),
             fstype: Some("ext4".into()),
@@ -270,24 +270,24 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            check_data_partition(&[boot.clone(), data.clone()], Path::new("/dev/vda2"), uuid)
+            check_data_partition(&[boot.clone(), data.clone()], Path::new("/dev/vda3"), uuid)
                 .is_ok()
         );
         let mut wrong = data.clone();
         wrong.pkname = Some("vdb".into());
         assert!(
-            check_data_partition(&[boot.clone(), wrong], Path::new("/dev/vda2"), uuid).is_err()
+            check_data_partition(&[boot.clone(), wrong], Path::new("/dev/vda3"), uuid).is_err()
         );
         assert!(
             check_data_partition(
                 &[boot.clone(), data.clone(), data.clone()],
-                Path::new("/dev/vda2"),
+                Path::new("/dev/vda3"),
                 uuid
             )
             .is_err()
         );
         let mut wrong = data;
         wrong.fstype = Some("btrfs".into());
-        assert!(check_data_partition(&[boot, wrong], Path::new("/dev/vda2"), uuid).is_err());
+        assert!(check_data_partition(&[boot, wrong], Path::new("/dev/vda3"), uuid).is_err());
     }
 }

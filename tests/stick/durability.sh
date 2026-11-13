@@ -20,7 +20,7 @@ cleanup() {
     local status=$? failed=0 item
     trap - EXIT; trap '' INT TERM
     if mountpoint -q "$work/esp"; then umount "$work/esp" || failed=1; fi
-    for item in "${prefix}-disk2" "${prefix}-disk3" "${prefix}-disk"; do
+    for item in "${prefix}-disk2" "${prefix}-disk3" "${prefix}-disk4" "${prefix}-disk5" "${prefix}-disk"; do
         if dmsetup info "$item" >/dev/null 2>&1; then dmsetup remove "$item" || failed=1; fi
     done
     for item in "$cut_loop" "$journal" "$payload" "$origin"; do
@@ -48,7 +48,7 @@ truncate -s 8G "$work/stick.img"
 python3 "$here/confirm.py" "$bin" stick create "$work/stick.img" --test-image --image "$iso" > "$work/create.log" 2>&1
 "$bin" stick update "$work/stick.img" --test-image --image "$iso" > "$work/update.log" 2>&1
 origin=$(losetup --find --show --partscan "$work/stick.img")
-mount -o nodev,nosuid,noexec "${origin}p2" "$work/esp"
+mount -o nodev,nosuid,noexec "${origin}p3" "$work/esp"
 # Model a prior interrupted inactive write. New payload bytes MUST be durable;
 # a same-release update over identical old bytes would hide reordering bugs.
 rm "$work/esp/live/a/commit.sha256"
@@ -57,27 +57,33 @@ dd if=/dev/zero of="$work/esp/live/a/filesystem.squashfs" bs=1M count=$(((old_si
 truncate -s "$old_size" "$work/esp/live/a/filesystem.squashfs"
 sync "$work/esp/live/a/filesystem.squashfs" "$work/esp/live/a"
 umount "$work/esp"
-dd if="${origin}p2" of="$work/baseline.img" bs=4M conv=sparse status=none
+dd if="${origin}p3" of="$work/baseline.img" bs=4M conv=sparse status=none
 cp --reflink=auto --sparse=always "$work/baseline.img" "$work/payload.img"
 truncate -s 2G "$work/journal.img"
 payload=$(losetup --find --show "$work/payload.img")
 journal=$(losetup --find --show "$work/journal.img")
 sectors=$(blockdev --getsz "$origin")
 esp_sectors=$(blockdev --getsz "$payload")
-data_start=$(lsblk -nr -o START "${origin}p3")
-data_sectors=$(blockdev --getsz "${origin}p3")
+data_start=$(lsblk -nr -o START "${origin}p5")
+data_sectors=$(blockdev --getsz "${origin}p5")
+sha256sum "${origin}p2" "${origin}p4" > "$work/immutable-before"
 dmsetup create "${prefix}-disk" --table "0 $sectors linear $origin 0"
-dmsetup create "${prefix}-disk2" --table "0 $esp_sectors log-writes $payload $journal"
-dmsetup create "${prefix}-disk3" --table "0 $data_sectors linear $origin $data_start"
+for part in 2 4; do
+    start=$(lsblk -nr -o START "${origin}p$part")
+    length=$(blockdev --getsz "${origin}p$part")
+    dmsetup create --readonly "${prefix}-disk$part" --table "0 $length linear $origin $start"
+done
+dmsetup create "${prefix}-disk3" --table "0 $esp_sectors log-writes $payload $journal"
+dmsetup create "${prefix}-disk5" --table "0 $data_sectors linear $origin $data_start"
 # Negative control on the actual vfat/logged device: syncfs writes dirty data
 # but must not satisfy the file-fsync device-flush assertion used below.
-mount -o nodev,nosuid,noexec "/dev/mapper/${prefix}-disk2" "$work/esp"
+mount -o nodev,nosuid,noexec "/dev/mapper/${prefix}-disk3" "$work/esp"
 printf 'flush control\n' > "$work/esp/flush-control"
-dmsetup message "${prefix}-disk2" 0 'mark syncfs-before'
+dmsetup message "${prefix}-disk3" 0 'mark syncfs-before'
 sync -f "$work/esp/flush-control"
-dmsetup message "${prefix}-disk2" 0 'mark syncfs-after'
+dmsetup message "${prefix}-disk3" 0 'mark syncfs-after'
 sync "$work/esp/flush-control"
-dmsetup message "${prefix}-disk2" 0 'mark control-fsynced'
+dmsetup message "${prefix}-disk3" 0 'mark control-fsynced'
 rm "$work/esp/flush-control"
 sync "$work/esp"
 umount "$work/esp"
@@ -85,7 +91,7 @@ cat > "$work/tools/sync" <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$*" in
-  *"/esp"*)
+  *"/slot_a"*)
     n=$(cat "$NESTEGG_REPLAY_COUNTER"); n=$((n+1)); echo "$n" > "$NESTEGG_REPLAY_COUNTER"
     printf '%s %s\n' "$n" "${1##*/}" >> "$NESTEGG_REPLAY_LABELS"
     dmsetup message "$NESTEGG_REPLAY_MAP" 0 "mark before-$n"
@@ -98,11 +104,13 @@ WRAPPER
 chmod +x "$work/tools/sync"
 echo 0 > "$work/counter"
 mkdir "$work/operation"
-PATH="$work/tools:$PATH" NESTEGG_REPLAY_LABELS="$work/labels" NESTEGG_REPLAY_COUNTER="$work/counter" NESTEGG_REPLAY_MAP="${prefix}-disk2" \
+PATH="$work/tools:$PATH" NESTEGG_REPLAY_LABELS="$work/labels" NESTEGG_REPLAY_COUNTER="$work/counter" NESTEGG_REPLAY_MAP="${prefix}-disk3" \
     unshare --mount --propagation private bash "$repo/crates/nestegg/src/stick/media.sh" update \
     "/dev/mapper/${prefix}-disk" "$iso" "$work/state/stick" "$work/operation" 0 > "$work/result.json" 2> "$work/operation.log"
-dmsetup message "${prefix}-disk2" 0 'mark done'
-dmsetup remove "${prefix}-disk2"
+dmsetup message "${prefix}-disk3" 0 'mark done'
+dmsetup remove "${prefix}-disk3"
+sha256sum "${origin}p2" "${origin}p4" > "$work/immutable-after"
+cmp "$work/immutable-before" "$work/immutable-after"
 legacy_before=$("$replay" --log "$work/journal.img" --find --end-mark syncfs-before)
 legacy_after=$("$replay" --log "$work/journal.img" --find --end-mark syncfs-after)
 control_after=$("$replay" --log "$work/journal.img" --find --end-mark control-fsynced)
@@ -144,18 +152,17 @@ while read -r limit; do
     cut_loop=$(losetup --find --show "$work/cut.img")
     "$replay" --log "$work/journal.img" --replay "$cut_loop" --limit "$limit" --no-discard
     mount -o ro,nodev,nosuid,noexec "$cut_loop" "$work/esp"
-    # Previous slot: descriptor AND payload stay valid at every cut.
-    for slot in b a; do
-        dest=$work/esp/live/$slot
-        if [[ ! -f $dest/commit.sha256 ]]; then [[ $slot == a ]]; continue; fi
-        expected="$(sha256sum "$dest/boot.cfg" | cut -d' ' -f1)  /live/$slot/boot.cfg"
-        if [[ $(cat "$dest/commit.sha256") != "$expected" ]]; then [[ $slot == a ]]; continue; fi
+    # The active partition is independent and checked above. Any newly
+    # published inactive descriptor must still have its entire durable payload.
+    dest=$work/esp/live/a
+    if [[ -f $dest/commit.sha256 && -f $dest/boot.cfg ]] &&
+       [[ $(cat "$dest/commit.sha256") == "$(sha256sum "$dest/boot.cfg" | cut -d' ' -f1)  /live/a/boot.cfg" ]]; then
         kernel=$(sed -n 's/^# nestegg-kernel=//p' "$dest/boot.cfg")
         initrd=$(sed -n 's/^# nestegg-initrd=//p' "$dest/boot.cfg")
-        actual=$(cd "$dest" && sha256sum filesystem.squashfs "$kernel" "$initrd" | sed "s#  #  /live/$slot/#")
-        [[ $(cat "$dest/payload.sha256") == "$actual" ]] || { echo "ERROR: committed incomplete slot $slot at entry $limit" >&2; exit 1; }
-        [[ $slot != a ]] || published=$((published+1))
-    done
+        actual=$(cd "$dest" && sha256sum filesystem.squashfs "$kernel" "$initrd" | sed 's#  #  /live/a/#')
+        [[ $(cat "$dest/payload.sha256") == "$actual" ]] || { echo "ERROR: committed incomplete slot a at entry $limit" >&2; exit 1; }
+        published=$((published+1))
+    fi
     umount "$work/esp"
     losetup -d "$cut_loop"; cut_loop=
     count=$((count+1))

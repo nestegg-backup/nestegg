@@ -13,7 +13,7 @@ end = source.index('small_file()', start)
 renderer = source[start:end]
 with tempfile.TemporaryDirectory(prefix='nestegg-grub-config-') as directory:
     for slot, generation in [('a', 1), ('b', 2)]:
-        script = renderer + '\nboot_uuid=1234-ABCD\nrender_cfg ' + slot + ' ' + str(generation) + ' vmlinuz initrd.img\n'
+        script = renderer + '\nslot_a_uuid=1234-ABCD\nslot_b_uuid=5678-ABCD\nrender_cfg ' + slot + ' ' + str(generation) + ' vmlinuz initrd.img\n'
         output = subprocess.run(['bash', '-c', script], check=True, capture_output=True).stdout
         config = Path(directory) / (slot + '.cfg')
         config.write_bytes(output)

@@ -49,7 +49,7 @@ pub enum StickCmd {
         #[arg(long, hide = true)]
         test_image: bool,
     },
-    /// Write the inactive live slot and switch boot configuration last.
+    /// Write only the inactive live partition; publish its checksum commit last.
     Update {
         /// Whole disk; omitted only when exactly one registered disk is present.
         disk: Option<PathBuf>,

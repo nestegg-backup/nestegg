@@ -105,11 +105,12 @@ and decrypted restore; verify alone does not repair a filesystem.
    package pulls in are masked; the wizard starts the PBS the same way.
 4. **nestegg writes the stick itself**: `nestegg stick create /dev/sdX` with
    the target disk guard of 0010 and a typed confirmation (GPT: BIOS boot
-   partition, ESP with GRUB and two `/live` slots, ext4 data partition
+   partition, ESP with GRUB, two independent FAT32 live-slot partitions
+   (0033), ext4 data partition
    `NESTEGG_DATA` made with `mkfs.ext4 -m 0`). The boot entry names its own
    medium (`live-media=` / UUID), so a second live stick is never picked.
    `nestegg stick update` writes the new live system into the free slot and
-   switches the GRUB configuration last, so a power cut or a pulled stick
+   publishes its checksum commit last (GRUB reads both slot generations), so a power cut or a pulled stick
    leaves the old system bootable. Backups are kept. An ISO written with
    `dd` or Ventoy remains the plain rescue stick of 0006 (restore from a PBS
    only). USB SSDs and external disks work the same; the documentation

@@ -362,6 +362,7 @@ pub(super) fn operate(
     let current = inspect(Path::new(&disk.path), disk.owned_loop)?;
     same_identity(&disk.identity, &current.identity)?;
     let plan = image
+        .filter(|_| action == "create")
         .map(|i| PartitionPlan::new(disk.size_bytes, i.size))
         .transpose()?;
     let work = tempfile::Builder::new()
@@ -386,7 +387,7 @@ pub(super) fn operate(
     )
     .arg(cache)
     .arg(work.path())
-    .arg(plan.map(|p| p.esp_mib).unwrap_or(0).to_string())
+    .arg(plan.map(|p| p.slot_mib).unwrap_or(0).to_string())
     .stdout(Stdio::piped())
     .stderr(Stdio::inherit())
     .stdin(Stdio::null());

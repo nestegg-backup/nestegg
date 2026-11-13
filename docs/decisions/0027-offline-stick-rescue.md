@@ -8,7 +8,7 @@
 ## Decision
 
 1. Identify the booted backup medium through the kernel's UUID-pinned
-   `live-media` and `/live/a` or `/live/b` argument, the read-only mounted ESP,
+   `live-media` and `/live/a` or `/live/b` argument, the read-only mounted slot partition (0033),
    its exact versioned marker, and its sibling ext4 data partition. Reject
    duplicate data UUIDs and a data partition on another disk. A volume label
    alone is never an identity. An ordinary rescue ISO retains its PBS flow.
