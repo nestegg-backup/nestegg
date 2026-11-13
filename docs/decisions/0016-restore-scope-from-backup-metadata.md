@@ -225,6 +225,12 @@ shared desktop API acceptance can therefore exercise the real signed,
 handle-bound below-home source in both VM fixtures; an archive absent from
 the metadata remains refused with `restore_no_home`.
 
+Offline backup releases its pinned source handles after the client has
+finished uploading. Keeping them until function exit would make the
+explicit source unmount fail with `target is busy`, even after successful
+read-back verification. The handles remain pinned throughout the upload;
+read-back and maintenance no longer need the source descriptors.
+
 ## Alternatives rejected
 
 - **Keep using notes, sign them with a key on this computer:** another key

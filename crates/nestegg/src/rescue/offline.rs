@@ -463,6 +463,9 @@ fn perform(session: &Session, sources: Sources, id: &str, force_id: bool) -> Res
     client
         .backup(&spec, &source_handles, &mut std::io::stderr(), &mut |_| {})
         .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    // The client has finished reading. Release its pinned roots before
+    // sources.close() unmounts the offline file systems.
+    drop(source_handles);
     sources.check_snapshots()?;
     let verify_dir = scratch.path().join("read-back");
     fs::create_dir(&verify_dir)?;
