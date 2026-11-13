@@ -43,6 +43,7 @@ on_client bash -c '
   chown -R bob:bob /home/bob && chmod 700 /home/bob
   mkdir -p /home/alice/Documents /home/alice/.cache/big /home/alice/project/node_modules/x
   echo "quarterly report" > /home/alice/Documents/report.txt
+  echo "user data in a nested directory" > /home/alice/Documents/.pxarexclude-cli
   echo "brackets" > "/home/alice/Documents/[ab].txt"
   echo "plain a" > /home/alice/Documents/a.txt
   head -c 3000000 /dev/urandom > /home/alice/Documents/photo.bin
@@ -74,6 +75,8 @@ echo "== setup with the nestegg CLI"
 # separately below).
 on_client nestegg init --server pbs.e2e.test --datastore store1 --namespace desktops \
   --auth-id 'backup@pbs!desktop' --fingerprint "$fp" --backup-id e2e-desktop --no-system >/dev/null
+# A source below the caller's home: its archive root is Documents, not /home.
+on_client bash -c 'printf "\n[[backup.sources]]\narchive = \"docs\"\npath = \"/home/alice/Documents\"\n" >> /etc/nestegg/config.toml'
 docker exec -i "$client" nestegg credentials set-password --allow-plain <<<"$token_secret" >/dev/null
 on_client nestegg key create --allow-plain >/dev/null
 check "backup refused while key not exported" \
@@ -167,6 +170,8 @@ check "inventory archive uploaded" grep -q 'inventory.pxar' <<<"$admin_list"
 
 echo "== restore"
 on_client nestegg restore "$snapshot" home.pxar /root/restore-home >/dev/null 2>&1
+check "CLI whole restore omits the synthetic exclude record" absent_in /root/restore-home .pxarexclude-cli
+check "CLI keeps a nested file with the same name" on_client cmp /home/alice/Documents/.pxarexclude-cli /root/restore-home/alice/Documents/.pxarexclude-cli
 check "restored file content matches" on_client cmp /home/alice/Documents/photo.bin /root/restore-home/alice/Documents/photo.bin
 check "symlink restored" bash -c "[[ \$(docker exec $client readlink /root/restore-home/alice/link-to-report) == Documents/report.txt ]]"
 check "owner and mode restored" bash -c "[[ \$(docker exec $client stat -c '%U %a' /root/restore-home/alice/Documents/report.txt) == 'alice 640' ]]"
@@ -426,6 +431,34 @@ check "restore job is visible to its owner" responds 200 '"state":"succeeded"' a
 check "restore job of another user is not visible" responds 404 '"message":"unknown restore"' bob "http://localhost/api/v1/restores/$glob_id"
 check "machines lists this PC with its report" bash -c "$API http://localhost/api/v1/machines | grep -q '\"hostname\":'"
 
+echo "== an archive sourced below the caller's home"
+# Today's configuration is deliberately different: only snapshot metadata counts.
+on_client sed -i 's#path = "/home/alice/Documents"#path = "/etc"#' /etc/nestegg/config.toml
+check "docs archive root maps directly to Documents" \
+  bash -c "$API 'http://localhost/api/v1/snapshots/$ltime/browse?archive=docs.pxar&path=/' | grep -q '\"name\":\"report.txt\"'"
+check "docs archive traversal is refused" \
+  responds 400 "paths must not contain" alice "http://localhost/api/v1/snapshots/$ltime/browse?archive=docs.pxar&path=/../etc"
+for selection in '[]' '["/report.txt"]'; do
+  if [[ $selection == '[]' ]]; then target=/home/alice/api-docs-full; else target=/home/alice/api-docs-file; fi
+  response="$($API -X POST -H 'Content-Type: application/json' \
+    -d "{\"snapshot_time\":\"$ltime\",\"archive\":\"docs.pxar\",\"paths\":$selection,\"target_dir\":\"$target\"}" http://localhost/api/v1/restores)"
+  id="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$response")"
+  check "docs restore accepted ($selection)" test -n "$id"
+  for _ in $(seq 1 60); do
+    state="$($API "http://localhost/api/v1/restores/$id" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+    [[ $state != running ]] && break
+    sleep 1
+  done
+  check "docs restore succeeded ($selection)" test "$state" = succeeded
+  check "docs restore maps the root ($selection)" on_client cmp /home/alice/Documents/report.txt "$target/report.txt"
+  check "docs restore runs as the caller ($selection)" no_output on_client find "$target" ! -user alice
+  check "docs restore omits the synthetic record ($selection)" absent_in "$target" .pxarexclude-cli
+done
+check "selected docs restore contains only that file" \
+  bash -c "[[ \$(docker exec $client ls -A /home/alice/api-docs-file) == report.txt ]]"
+
+on_client bash -c 'sed -i "/^archive = \"docs\"$/{n;s#path = \"/etc\"#path = \"/home/alice/Documents\"#;}" /etc/nestegg/config.toml'
+
 echo "== non-root permissions come from the backup metadata, not the notes (decision 0016)"
 as_backup_token() {
   docker exec -e PBS_PASSWORD="$token_secret" -e PBS_FINGERPRINT="$fp" "$client" \
@@ -450,7 +483,7 @@ check "forged notes do not allow restoring etc.pxar" \
 
 # A snapshot without metadata blob, as older versions made them (made with
 # the current key: nestegg-key-3.json since the last `key create` above).
-as_backup_token backup home.pxar:/home --backup-type host --backup-id e2e-desktop \
+as_backup_token backup home.pxar:/home docs.pxar:/home/alice/Documents --backup-type host --backup-id e2e-desktop \
   --keyfile /root/nestegg-key-3.json >/dev/null 2>&1
 raw_snapshot="$(on_client nestegg snapshots --json | sed -n 's/.*"snapshot": "\([^"]*\)".*/\1/p' | head -1)"
 raw_time="${raw_snapshot##*/}"
@@ -464,6 +497,8 @@ check "no metadata and no local record: root may still browse" \
 on_client bash -c "f=\$(ls -t /var/lib/nestegg/runs/*.json | head -1) && sed -e 's#\"snapshot\": \"[^\"]*\"#\"snapshot\": \"$raw_snapshot\"#' -e 's#\"id\": \"[^\"]*\"#\"id\": \"20000101T000000Z-cli-0000\"#' \"\$f\" > /var/lib/nestegg/runs/20000101T000000Z-cli-0000.json"
 check "no metadata: the local run record is used" \
   bash -c "[[ \$($API 'http://localhost/api/v1/snapshots/$raw_time/browse?archive=home.pxar&path=/' | grep -o '\"name\":\"[^\"]*\"' | sort -u | tr -d '\n') == '\"name\":\"alice\"' ]]"
+check "legacy non-canonical source below home stays closed" \
+  responds 403 'canonical source metadata' alice "http://localhost/api/v1/snapshots/$raw_time/browse?archive=docs.pxar&path=/"
 on_client rm -f /var/lib/nestegg/runs/20000101T000000Z-cli-0000.json
 
 check "pbs info: reachable" bash -c "$API http://localhost/api/v1/pbs | grep -q '\"reachable\":true'"

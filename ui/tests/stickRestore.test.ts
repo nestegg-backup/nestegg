@@ -3,10 +3,11 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiFailure, api } from "../src/lib/api";
-import { isStickProblem, restore, restoreRequest, stickNotSupported, type TreeNode } from "../src/lib/restore.svelte";
+import { browseFailureText, isStickProblem, restore, restoreRequest, stickNotSupported, type TreeNode } from "../src/lib/restore.svelte";
 import { stickLine } from "../src/lib/text";
 import { createFormatter } from "../src/lib/format";
 import de from "../src/i18n/de";
+import en from "../src/i18n/en";
 import { World } from "../mock/world";
 import type { Restore, Snapshot, Status, TargetStatus } from "../src/lib/types";
 
@@ -309,6 +310,58 @@ describe("translated stick reasons", () => {
         expect(text).not.toBe(messages.restore.stickUnavailable);
       }
       expect(stickProblemText({ reason: "newer_reason" }, messages)).toBe(messages.restore.stickUnavailable);
+    }
+  });
+});
+
+
+describe("browse permission failures", () => {
+  it.each([
+    ["pbs", true], ["pbs", false], ["stick", true], ["stick", false],
+  ] as const)("keeps the reason for %s (first folder: %s) and clears it on retry", async (source, first) => {
+    const w = new World("both", "full");
+    serve(w);
+    const snapshot = (source === "stick" ? w.stickSnapshots()[0] : w.snapshots[0]) as Snapshot;
+    restore.setSource(source);
+    restore.pick(snapshot.time);
+    const reason = "this archive does not contain your home directory";
+    const refuse = () => vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ code: "forbidden", message: reason }), { status: 403 }));
+    if (first) refuse();
+    await restore.prepare(snapshot, null);
+    const node = first ? restore.roots[0]! : restore.roots.find((r) => r.archive === "home.pxar")!;
+    if (!first) {
+      node.open = false;
+      node.children = null;
+      refuse();
+      await restore.toggle(node);
+    } else {
+      expect(restore.browse).toBe("error");
+      expect(restore.browseError?.message).toBe(reason);
+    }
+    expect(node.failed).toBe(true);
+    expect(node.error?.status).toBe(403);
+    expect(node.error?.message).toBe(reason);
+    for (const t of [de, en]) {
+      expect(browseFailureText(node.error, t)).toBe(t.restore.dirNoHome);
+      expect(browseFailureText(node.error, t)).toContain("sudo nestegg restore");
+    }
+    serve(w);
+    await restore.toggle(node);
+    expect(node.failed).toBe(false);
+    expect(node.error).toBeNull();
+    expect((node as TreeNode).children?.length).toBeGreaterThan(0);
+  });
+
+  it("distinguishes absent source proof, out-of-home paths, other refusals and ordinary failures in both languages", () => {
+    for (const t of [de, en]) {
+      const failure = (message: string, status = 403) => new ApiFailure("other", status, "forbidden", message);
+      for (const reason of ["this snapshot has no signed source metadata", "invalid snapshot source metadata", "ask an administrator to restore it"]) {
+        expect(browseFailureText(failure(reason), t)).toBe(t.restore.dirNoMetadata);
+      }
+      expect(browseFailureText(failure("you can only browse your home directory"), t)).toBe(t.restore.dirOutsideHome);
+      expect(browseFailureText(failure("a new refusal"), t)).toContain("a new refusal");
+      expect(browseFailureText(failure("unreachable", 503), t)).toBe(t.restore.dirFailed);
+      expect(browseFailureText(null, t)).toBe(t.restore.dirFailed);
     }
   });
 });

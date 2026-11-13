@@ -289,7 +289,9 @@ See [rescue.md](rescue.md) for supported layouts and automation commands.
 On the desktop, the file-restore API accepts `target=stick` (and optionally
 `stick_uuid`) for listing/browsing snapshots and in the restore request body.
 It uses this computer's configured key and the desktop's trusted PBS image.
-Non-root users retain their home-directory restriction. The UI integration is
+Non-root users retain their home-directory restriction. Archives whose signed
+source is the home itself or a directory below it can be browsed and restored
+from their archive root (e.g. `/home/alice/Documents` maps to `/`). The UI integration is
 separate; see [api/openapi.yaml](../api/openapi.yaml) for the contract.
 
 ### Offline computer identity

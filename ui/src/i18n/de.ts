@@ -768,6 +768,10 @@ const de = {
     dirLoading: "Wird geladen …",
     dirEmpty: "Leerer Ordner",
     dirFailed: "Dieser Ordner ließ sich nicht öffnen.",
+    dirNoHome: "Dieses Archiv enthält keine Dateien aus deinem persönlichen Ordner. Nur ein Administrator kann es mit sudo nestegg restore wiederherstellen.",
+    dirNoMetadata: "Für diese Sicherung lässt sich nicht sicher feststellen, welche Dateien dir gehören. Bitte einen Administrator, sie mit sudo nestegg restore wiederherzustellen.",
+    dirOutsideHome: "Du kannst nur Dateien aus deinem persönlichen Ordner öffnen und wiederherstellen.",
+    dirForbidden: (reason: string) => `Du darfst diesen Ordner nicht öffnen. Meldung: ${reason}. Bitte einen Administrator um Hilfe (sudo nestegg restore).`,
     manyAreas: (names: string) => `Jeder Bereich kommt in einen eigenen Unterordner des neuen Ordners (${names}).`,
     damaged: "beschädigt",
     damagedSnapshot:

@@ -849,6 +849,36 @@ fn snapshot_of(config: &Config, time: &str) -> ApiResult<String> {
     ))
 }
 
+/// Metadata records canonical paths; legacy run records retain configured paths.
+#[derive(Debug, PartialEq)]
+enum SnapshotSource {
+    Metadata(PathBuf),
+    LocalRecord(PathBuf),
+}
+
+impl SnapshotSource {
+    fn scope(&self, user: &crate::identity::UserIdentity) -> ApiResult<crate::restore::UserScope> {
+        let no_home = || forbidden("this archive does not contain your home directory");
+        let source = match self {
+            Self::Metadata(path) => path,
+            Self::LocalRecord(path) => {
+                // A configured source below home could have been a symlink to
+                // system files. Without canonical snapshot metadata, preserve
+                // the old ancestor/home-only mapping; today's links prove nothing.
+                let home = std::fs::canonicalize(&user.home).map_err(|_| no_home())?;
+                if path != &home && path.starts_with(&home) {
+                    return Err(forbidden(
+                        "this archive needs canonical source metadata; ask an administrator \
+                         to restore it with sudo nestegg restore",
+                    ));
+                }
+                path
+            }
+        };
+        crate::restore::user_scope(source, &user.home, user.uid).ok_or_else(no_home)
+    }
+}
+
 /// Source path of `archive` in `snapshot`, for deciding what an
 /// unprivileged user may see (decision 0016). It comes from the snapshot's
 /// metadata blob or, for snapshots of older versions, from the local run
@@ -859,7 +889,7 @@ fn snapshot_source(
     config: &Config,
     snapshot: &str,
     archive: &str,
-) -> ApiResult<PathBuf> {
+) -> ApiResult<SnapshotSource> {
     let not_in_archive = || forbidden("this archive does not contain your home directory");
     let key = MetaKey::new(config, snapshot);
     let cached = app
@@ -884,7 +914,7 @@ fn snapshot_source(
     if let Some(meta) = meta {
         return meta
             .source_of(archive)
-            .map(PathBuf::from)
+            .map(|path| SnapshotSource::Metadata(PathBuf::from(path)))
             .ok_or_else(not_in_archive);
     }
     let record = Store::new(&app.paths)
@@ -895,7 +925,7 @@ fn snapshot_source(
             .archives
             .iter()
             .find(|a| a.name == archive)
-            .map(|a| PathBuf::from(&a.source))
+            .map(|a| SnapshotSource::LocalRecord(PathBuf::from(&a.source)))
             .ok_or_else(not_in_archive),
         None => Err(forbidden(format!(
             "this snapshot has no backup metadata (made by an older nestegg version) and \
@@ -992,8 +1022,7 @@ fn user_scope_for(
     user: &crate::identity::UserIdentity,
 ) -> ApiResult<crate::restore::UserScope> {
     let source = snapshot_source(app, config, snapshot, archive)?;
-    crate::restore::user_scope(&source, &user.home, user.uid)
-        .ok_or_else(|| forbidden("this archive does not contain your home directory"))
+    source.scope(user)
 }
 
 fn check_archive_name(archive: &str) -> ApiResult<()> {
@@ -2093,6 +2122,61 @@ mod tests {
     }
 
     #[test]
+    fn only_canonical_snapshot_metadata_grants_sources_below_home() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("alice");
+        std::fs::create_dir(&home).unwrap();
+        let meta = std::fs::metadata(&home).unwrap();
+        let user = crate::identity::UserIdentity {
+            uid: meta.uid(),
+            gid: meta.gid(),
+            groups: vec![],
+            home: home.clone(),
+        };
+        let source = home.join("Documents");
+        assert_eq!(
+            SnapshotSource::Metadata(source.clone())
+                .scope(&user)
+                .ok()
+                .expect("the source grants a scope")
+                .prefix,
+            "/"
+        );
+        let refusal = SnapshotSource::LocalRecord(source)
+            .scope(&user)
+            .unwrap_err();
+        assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+        assert!(refusal.message.contains("canonical source metadata"));
+        assert_eq!(
+            SnapshotSource::LocalRecord(home.clone())
+                .scope(&user)
+                .ok()
+                .expect("the source grants a scope")
+                .prefix,
+            "/"
+        );
+        assert_eq!(
+            SnapshotSource::LocalRecord(dir.path().into())
+                .scope(&user)
+                .ok()
+                .expect("the source grants a scope")
+                .prefix,
+            "/alice"
+        );
+        // Neither missing nor changed links on today's machine may widen the
+        // legacy mapping. In particular, a home-owned link to /etc stays closed.
+        let link = home.join("link");
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        assert!(SnapshotSource::LocalRecord(link).scope(&user).is_err());
+        assert!(
+            SnapshotSource::Metadata(PathBuf::from("/etc"))
+                .scope(&user)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn scope_comes_from_metadata_then_local_record_never_notes() {
         let dir = tempfile::tempdir().unwrap();
         let app = app(dir.path());
@@ -2128,7 +2212,7 @@ mod tests {
         store.record_run_only(&run).unwrap();
         assert_eq!(
             snapshot_source(&app, &config, SNAPSHOT, "home.pxar").ok(),
-            Some(PathBuf::from("/home"))
+            Some(SnapshotSource::Metadata(PathBuf::from("/home")))
         );
         let err = snapshot_source(&app, &config, SNAPSHOT, "etc.pxar").unwrap_err();
         assert_eq!(err.status, StatusCode::FORBIDDEN);
@@ -2140,7 +2224,7 @@ mod tests {
             .insert(MetaKey::new(&config, SNAPSHOT), None);
         assert_eq!(
             snapshot_source(&app, &config, SNAPSHOT, "etc.pxar").ok(),
-            Some(PathBuf::from("/etc"))
+            Some(SnapshotSource::LocalRecord(PathBuf::from("/etc")))
         );
         assert_eq!(
             snapshot_source(&app, &config, SNAPSHOT, "home.pxar")

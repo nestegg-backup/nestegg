@@ -455,6 +455,22 @@ pub fn size_for_archive(json: &str, archive: &str) -> Option<u64> {
     (!sizes.is_empty()).then(|| sizes.iter().sum())
 }
 
+/// Keep the client's synthetic exclude record out of extracted file trees.
+/// A nonempty match list disables the client's default "include everything",
+/// so whole-archive restores need an explicit include before the exclusion.
+fn restore_patterns(archive: &str, target: &Path, selected: &[String]) -> Vec<String> {
+    let mut patterns = selected.to_vec();
+    let archive = archive.strip_suffix(".didx").unwrap_or(archive);
+    if target != Path::new("-") && (archive.ends_with(".pxar") || archive.ends_with(".mpxar")) {
+        if patterns.is_empty() {
+            patterns.push("/**".into());
+        }
+        // Last match wins. Anchor at the root; nested files are user data.
+        patterns.push("!/.pxarexclude-cli".into());
+    }
+    patterns
+}
+
 /// Crypt modes of every file that belongs to `archive` (e.g. `home.pxar`;
 /// a split archive has two: `home.mpxar` and `home.ppxar`) in the JSON of
 /// `snapshot files` or the `files` of a manifest.
@@ -1206,8 +1222,8 @@ impl<'a> Client<'a> {
         let mut cmd = self.command(&mut fds)?;
         cmd.args(["restore", request.snapshot, request.archive])
             .arg(request.target);
-        for p in request.patterns {
-            cmd.args(["--pattern", p]);
+        for p in restore_patterns(request.archive, request.target, request.patterns) {
+            cmd.args(["--pattern", &p]);
         }
         cmd.args(extra);
         if let Some(key) = &key {
@@ -1545,6 +1561,52 @@ pub fn parse_time(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_patterns_skip_only_the_root_client_record_without_widening_selection() {
+        use pathpatterns::{MatchEntry, MatchList, MatchType, PatternFlag};
+        for selected in [vec![], vec!["/alice".into(), "/alice/**".into()]] {
+            let patterns = restore_patterns("home.pxar", Path::new("/restore"), &selected);
+            let entries: Vec<_> = patterns
+                .iter()
+                .map(|p| {
+                    MatchEntry::parse_pattern(p, PatternFlag::PATH_NAME, MatchType::Include)
+                        .unwrap()
+                })
+                .collect();
+            let matches = |path: &str| entries.matches(path.as_bytes(), Some(nix::libc::S_IFREG));
+            assert_eq!(matches("/.pxarexclude-cli"), Some(MatchType::Exclude));
+            assert_eq!(matches("/alice/report.txt"), Some(MatchType::Include));
+            assert_eq!(matches("/alice/.pxarexclude-cli"), Some(MatchType::Include));
+            assert_eq!(
+                matches("/bob/private.txt"),
+                if selected.is_empty() {
+                    Some(MatchType::Include)
+                } else {
+                    None
+                }
+            );
+        }
+        for archive in ["nestegg-meta.conf", "index.json", "disk.img"] {
+            assert!(restore_patterns(archive, Path::new("/restore"), &[]).is_empty());
+        }
+        assert!(restore_patterns("home.pxar", Path::new("-"), &[]).is_empty());
+        assert_eq!(
+            restore_patterns("home.mpxar", Path::new("/restore"), &[]),
+            ["/**", "!/.pxarexclude-cli"]
+        );
+        // Even an explicit selection of the synthetic record cannot re-include it.
+        assert_eq!(
+            restore_patterns(
+                "home.pxar",
+                Path::new("/restore"),
+                &["/.pxarexclude-cli".into()]
+            )
+            .last()
+            .unwrap(),
+            "!/.pxarexclude-cli"
+        );
+    }
 
     #[test]
     fn capacity_uses_backup_user_availability_and_optional_total() {

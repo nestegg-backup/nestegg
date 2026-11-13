@@ -68,6 +68,9 @@ groupadd -f nestegg
 useradd -m -G nestegg alice
 printf 'hello from alice\n' > /home/alice/notes.txt
 chown alice:alice /home/alice/notes.txt
+mkdir /home/alice/Documents
+printf 'document from alice\n' > /home/alice/Documents/report.txt
+chown -R alice:alice /home/alice/Documents
 mkdir /run/desktop-api-gate
 chown alice:alice /run/desktop-api-gate
 export NESTEGG_TEST_BROWSE_GATE=/run/desktop-api-gate
@@ -78,7 +81,7 @@ import json, pathlib, sys
 excludes = [str(p) for p in pathlib.Path('/').iterdir() if p.name != 'home']
 print('backup_id = "desktop"\n[stick]\ndata_uuids = ' + json.dumps([sys.argv[1]]))
 print('minimum_free_bytes = 1048576\n[backup]\nsystem = false\ninventory = false')
-print('sources = [{archive="system", path="/"}]\nexcludes = ' + json.dumps(excludes))
+print('sources = [{archive="system", path="/"}, {archive="docs", path="/home/alice/Documents"}]\nexcludes = ' + json.dumps(excludes))
 print('[notify]\ndesktop = false')
 PY
 export NESTEGG_CONFIG="$work/config.toml" NESTEGG_RUNTIME_DIR=/run/desktop-api NESTEGG_STATE_DIR=/var/lib/nestegg NESTEGG_CREDENTIALS_DIR=/run/api-credentials NESTEGG_PBS_CLIENT=/usr/local/bin/client-api-fixture NESTEGG_SYSTEMD_CREDS="$work/no-creds" NESTEGG_SYSTEMCTL="$work/no-systemctl"

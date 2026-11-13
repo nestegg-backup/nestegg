@@ -2,6 +2,7 @@
 // moving between the steps.
 
 import { api, ApiFailure } from "./api";
+import type { Messages } from "../i18n";
 import { isInventoryArchive, restorableArchives } from "./derive";
 import type { ConfigView, DirEntry, Restore, RestoreRequest, Snapshot, Target } from "./types";
 
@@ -22,6 +23,7 @@ export interface TreeNode {
   children: TreeNode[] | null;
   loading: boolean;
   failed: boolean;
+  error: ApiFailure | null;
   open: boolean;
 }
 
@@ -29,6 +31,15 @@ export interface Selection {
   archive: string;
   path: string;
   size: number | null;
+}
+
+/** Explain refusals without claiming that missing permission metadata means missing files. */
+export function browseFailureText(error: ApiFailure | null, t: Messages): string {
+  if (error?.status !== 403) return t.restore.dirFailed;
+  if (error.message === "this archive does not contain your home directory") return t.restore.dirNoHome;
+  if (/metadata|ask an administrator|archive is absent/.test(error.message)) return t.restore.dirNoMetadata;
+  if (/outside your home|only browse your home/.test(error.message)) return t.restore.dirOutsideHome;
+  return t.restore.dirForbidden(error.message);
 }
 
 export function childPath(parent: string, name: string): string {
@@ -259,6 +270,7 @@ class RestoreState {
       children: null,
       loading: false,
       failed: false,
+      error: null,
       open: false,
     }));
     const first = this.roots[0];
@@ -275,6 +287,7 @@ class RestoreState {
     if (node.children || node.loading) return;
     node.loading = true;
     node.failed = false;
+    node.error = null;
     const generation = this.#generation;
     try {
       const entries = await api.browse(this.rootsFor!, node.archive, node.path, this.source, this.stickUuid);
@@ -290,12 +303,14 @@ class RestoreState {
         children: null,
         loading: false,
         failed: false,
+        error: null,
         open: false,
       }));
       if (this.browse === "unknown") this.browse = "ok";
     } catch (e) {
       if (generation !== this.#generation) return;
       node.failed = true;
+      node.error = e instanceof ApiFailure ? e : null;
       node.open = false;
       if (this.source === "stick" && isStickProblem(e)) this.stickProblem = e;
       if (e instanceof ApiFailure && e.kind === "not_implemented") this.browse = "not_implemented";

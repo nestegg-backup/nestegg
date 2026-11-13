@@ -155,6 +155,32 @@ was switched on), so they are not refused outright, but the restore now says so:
   the daemon's restore job fails with that message. An archive that is listed
   without a crypt mode (an older server) gets its own message in the CLI too.
 
+## Update 2026-11-13: archives sourced below a user's home
+
+A recorded source may also be the home itself or any directory below it.
+For example, source `/home/alice/Documents` grants alice the entire
+`docs.pxar` archive: `/report.txt` in the archive means
+`/home/alice/Documents/report.txt` at backup time. Browsing starts at `/`,
+and a whole-archive restore copies its contents directly into the new
+target, without adding a `home/alice/Documents` prefix.
+
+This mapping is shared by PBS and desktop stick browsing/restoring. The
+source still comes only from trusted snapshot metadata, never the request,
+current configuration or mutable notes. The PBS legacy run-record fallback
+keeps its previous ancestor/home-only mapping: configured paths below the
+home could have been symlinks to system files at backup time. Only the
+canonical path in snapshot metadata can grant this new descendant scope.
+Comparisons use path components, require an absolute source and refuse `..`; `/home/alicex` and other users' homes do not qualify.
+The source need not exist today. Home ownership checks, normalized archive
+paths, signature verification and copying as the caller remain in force.
+Archives sourced above the home still expose only the branch towards the
+home, and archives outside it remain refused.
+
+The UI keeps the refusal for each folder. It distinguishes archives without
+home files from snapshots whose source cannot be established safely and
+explains the administrator's `sudo nestegg restore` route in German and
+English. A missing source proof is not described as missing user files.
+
 ## Alternatives rejected
 
 - **Keep using notes, sign them with a key on this computer:** another key

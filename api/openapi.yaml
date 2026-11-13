@@ -339,8 +339,10 @@ paths:
         The first call for a snapshot reads its catalog from the PBS (needs
         the PBS to be reachable); later calls use a local cache. Users other
         than root see only their own home directory (ancestors show only the
-        branch towards it). With target=stick the catalog is read in a private
-        worker, not retained across media attachments. Non-root callers require
+        branch towards it). A canonical source inside the caller's home,
+        recorded in the snapshot metadata, grants the archive root (e.g.
+        /home/alice/Documents maps to / in docs.pxar). With target=stick the
+        catalog is read in a private worker, not retained across media attachments. Non-root callers require
         signed snapshot metadata; all home-directory restrictions still apply.
       parameters:
         - $ref: "#/components/parameters/RestoreTarget"
@@ -399,7 +401,12 @@ paths:
         in the snapshot's metadata blob (`nestegg-meta.conf`) or, for
         snapshots of older versions, in the local run record of that
         snapshot; never the snapshot notes (decision 0016). Snapshots
-        with neither can only be restored by root (403 `forbidden`). Paths are matched
+        with neither can only be restored by root (403 `forbidden`). Sources
+        below the home require canonical snapshot metadata; legacy local records
+        retain the ancestor/home-only mapping. Such descendant archives restore
+        directly from their root into the target, without adding the source path.
+        The client's synthetic /.pxarexclude-cli record is excluded during extraction;
+        nested files of that name are preserved. Paths are matched
         literally (no globbing). Some problems (e.g. no matching files)
         only show up in the job's `error`.
       requestBody:
@@ -820,7 +827,7 @@ components:
         archive: { type: string, examples: ["home.pxar"] }
         paths:
           type: array
-          description: "Paths inside the archive (with everything below them); empty restores the whole archive (for non-root callers: their whole home directory)."
+          description: "Paths inside the archive (with everything below them); empty restores the whole archive (for non-root callers: only the part inside their home, including a whole archive sourced below it)."
           items: { type: string, examples: ["/alice/Documents/report.odt"] }
         archives:
           type: array

@@ -362,12 +362,15 @@ pub fn execute_with_client(
 /// that corresponds to their home directory.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserScope {
-    /// Archive-internal path of the home directory, e.g. `/alice`.
+    /// Archive-internal path of the allowed subtree, e.g. `/alice`.
+    /// `/` also covers an archive sourced from a directory below the home.
     pub prefix: String,
 }
 
 /// Map a user's home directory onto an archive: `home = /home/alice` and
-/// the archive's source path `/home` give `/alice`. `source_path` must
+/// the archive's source path `/home` give `/alice`. A source inside the
+/// home (e.g. `/home/alice/Documents`) grants the archive root `/`.
+/// `source_path` must
 /// describe the snapshot itself, not the current configuration (which may
 /// have changed since), and must come from a source the user cannot
 /// change: the snapshot's metadata blob or the local run record, never the
@@ -412,12 +415,19 @@ pub fn user_scope(source_path: &Path, home: &Path, uid: u32) -> Option<UserScope
             return None;
         }
     }
-    let source_path = source_path.to_path_buf();
-    let rel = home.strip_prefix(&source_path).ok()?;
-    if rel.as_os_str().is_empty() {
-        // The archive is the home directory itself (e.g. source `/home/alice`).
+    // Compare the recorded path lexically: the source may no longer exist.
+    // Never resolve it against today's file system or accept traversal.
+    if !source_path.is_absolute()
+        || source_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    if source_path.starts_with(&home) {
         return Some(UserScope { prefix: "/".into() });
     }
+    let rel = home.strip_prefix(source_path).ok()?;
     Some(UserScope {
         prefix: format!("/{}", rel.to_str()?),
     })
@@ -625,6 +635,38 @@ mod tests {
                 user_scope(Path::new("/"), Path::new(home), 0).is_none(),
                 "{home}"
             );
+        }
+    }
+
+    #[test]
+    fn archives_sourced_inside_home_start_at_the_archive_root() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("alice");
+        std::fs::create_dir(&home).unwrap();
+        let uid = std::fs::metadata(&home).unwrap().uid();
+        // No current source directory is needed: metadata describes the past.
+        for source in [
+            home.clone(),
+            home.join("Documents"),
+            home.join("Documents/work"),
+        ] {
+            let scope = user_scope(&source, &home, uid).unwrap();
+            assert_eq!(scope.prefix, "/");
+            assert!(scope.contains("/"));
+            assert!(scope.contains("/report.txt"));
+            assert!(!scope.is_ancestor("/"));
+            assert!(patterns_for(&[scope.prefix]).is_empty());
+            assert!(user_scope(&source, &home, uid + 1).is_none());
+        }
+        for source in [
+            root.path().join("alicex/Documents"),
+            root.path().join("bob/Documents"),
+            home.join("../bob"),
+            home.join("Documents/../../bob"),
+            PathBuf::from("relative"),
+        ] {
+            assert!(user_scope(&source, &home, uid).is_none(), "{source:?}");
         }
     }
 
