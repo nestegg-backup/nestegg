@@ -499,6 +499,31 @@ mod tests {
     }
 
     #[test]
+    fn stick_metadata_without_binding_cannot_grant_a_below_home_source() {
+        let home = tempfile::tempdir().unwrap();
+        let user = user(home.path());
+        // The source need not exist on this computer at restore time.
+        let source = home.path().join("Documents");
+        let mut meta = metadata();
+        meta.archive_sources
+            .insert("docs.pxar".into(), source.to_str().unwrap().into());
+        assert!(meta.bound_sources.is_empty());
+        let error = metadata_scope(&meta, "docs.pxar", &user).unwrap_err();
+        let envelope = error_envelope(&error);
+        assert_eq!(envelope["error"]["code"], "forbidden");
+        assert_eq!(envelope["error"]["reason"], "restore_source_unverified");
+        // A binding for another archive must not authorize this one either.
+        meta.bound_sources.insert("home.pxar".into());
+        assert!(metadata_scope(&meta, "docs.pxar", &user).is_err());
+        // With this archive bound, the same source grants the archive root.
+        meta.bound_sources.insert("docs.pxar".into());
+        assert_eq!(
+            metadata_scope(&meta, "docs.pxar", &user).unwrap().prefix,
+            "/"
+        );
+    }
+
+    #[test]
     fn scope_refusals_have_stable_worker_reasons() {
         use crate::restore::ForbiddenReason::*;
         for (reason, code) in [
