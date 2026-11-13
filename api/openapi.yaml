@@ -634,6 +634,18 @@ components:
           additionalProperties:
             type: string
             enum: [key_copy_missing, password_check_due]
+    RestoredFrom:
+      type: object
+      required: [snapshot, snapshot_time, restored_at, target]
+      description: |
+        Last completed bare-metal restore. Persists across later backups.
+        The restored snapshot counts as a success at snapshot_time for its
+        source target, without claiming that a new backup or verification ran.
+      properties:
+        snapshot: { type: string, examples: ["host/desktop/2026-01-01T00:00:00Z"] }
+        snapshot_time: { type: string, format: date-time }
+        restored_at: { type: string, format: date-time }
+        target: { type: string, enum: [pbs, stick] }
     Status:
       type: object
       required: [machine, pbs, schedule, encryption, health]
@@ -642,6 +654,11 @@ components:
         The pbs object stays present (empty server/datastore in stick-only setups).
         New clients should use targets for independent target health and histories.
       properties:
+        restored_from:
+          description: Null before rescue restore; older daemons may omit this field.
+          oneOf:
+            - $ref: "#/components/schemas/RestoredFrom"
+            - type: "null"
         targets:
           type: object
           description: Only configured targets; old daemons may omit it.

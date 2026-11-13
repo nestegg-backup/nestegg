@@ -588,6 +588,11 @@ fn run_restore(
     let mut runner = Runner::new(Box::new(log));
     let client = session.client();
     let job = Job {
+        source_target: if session.stick_mount().is_some() {
+            crate::state::Target::Stick
+        } else {
+            crate::state::Target::Pbs
+        },
         plan: &plan,
         layout,
         client: &client,

@@ -94,7 +94,54 @@ paper key and certificate question: [decisions/0019](decisions/0019-rescue-paper
 
 The restored system contains a report of what was changed:
 `/var/lib/nestegg/rescue-report.txt`. The previous versions of modified
-configuration files are kept below `/var/lib/nestegg/rescue-backup/`.
+disk/boot configuration files are kept below `/var/lib/nestegg/rescue-backup/`.
+Network file backups are hidden copies next to the original, named
+`.FILE.nestegg-rescue.bak` (with a unique suffix if a copy already exists);
+their original permissions are preserved and
+network renderers do not load these copies.
+
+### Networking on replacement hardware
+
+Rescue compares MAC-pinned selectors in netplan, NetworkManager keyfiles,
+systemd `.link` files, `/etc/udev/rules.d/70-persistent-net.rules`, and
+ifupdown interfaces files with the live machine's interfaces. It automatically
+changes a pin only when there is exactly one old MAC across the discovered wired
+selectors, that MAC is absent here, other selectors are clearly Wi-Fi, and
+there is exactly one physical wired NIC. Literal block-style netplan
+`ethernets`/`match` selectors, Ethernet NetworkManager profiles and `.link`
+matches explicitly restricted to `Type=ether` are supported for repair.
+Only MAC selector bytes change: Wi-Fi passwords and other settings are preserved.
+
+Other cases are detection-only, including complex YAML, Wi-Fi, multiple
+NICs/MACs, udev rules and ifupdown `hwaddress` (which can set an address
+rather than select hardware). The final wizard/CLI summary and the report
+name the selectors found, whether they were changed, and the manual fix.
+Compare `ip -br link` after boot with the reported file; correct the MAC and
+any interface-name references (`set-name`, profile interface name, interfaces
+stanzas), then apply the configuration or reboot. Automatic MAC repair alone
+cannot prove that every name or external network dependency is correct.
+
+**Cloud-init can regenerate netplan at boot.** Rescue does not change its
+policy or datasource. Update the datasource's network configuration as well,
+or deliberately disable cloud-init network rendering with
+`network: {config: disabled}` in a cloud configuration drop-in after reviewing
+the generated network configuration. A repaired generated file alone is not
+a durable override of a datasource that still specifies the old hardware.
+
+### Status after a restore
+
+Before the first boot, rescue records the selected snapshot and its timestamp,
+clears the captured current-run record and runtime lock files, and treats that
+snapshot as the last successful backup of its source target. Health and the
+next due time use the **snapshot time**, not the restore time: restoring an
+old backup can immediately be overdue. This does not claim a new upload or
+read-back verification. Encryption-key export confirmation and unrelated
+target history remain intact.
+
+`nestegg status` shows the restore origin. JSON/API status adds nullable
+`restored_from` with `snapshot`, `snapshot_time`, `restored_at` and `target`
+(`pbs` or `stick`); it persists when later backups complete. Older state
+without this field continues to work. See decision 0030.
 
 ### The encryption key
 

@@ -131,7 +131,7 @@ impl RunLock {
             return Ok(None);
         }
         Err(LockBlocked {
-            message: blocked_message(paths),
+            message: blocked_message(paths, read_locks().as_deref()),
         }
         .into())
     }
@@ -163,13 +163,12 @@ fn run_in_progress(paths: &Paths, own_run_id: Option<&str>) -> bool {
 
 /// The message for a run lock that is blocked without a recognisable run,
 /// naming the holders `/proc/locks` lists.
-fn blocked_message(paths: &Paths) -> String {
+fn blocked_message(paths: &Paths, locks: Option<&str>) -> String {
     use std::os::unix::fs::MetadataExt;
     let path = paths.lock_file();
-    let locks = proc_locks();
     let holders = fs::metadata(&path)
         .ok()
-        .zip(locks.as_deref())
+        .zip(locks)
         .map(|(meta, locks)| proc_locks_holders(locks, meta.dev(), meta.ino()))
         .unwrap_or_default();
     let who = if locks.is_none() {
@@ -2057,7 +2056,20 @@ mod tests {
         })
         .unwrap();
         let shared = Flock::lock(file, FlockArg::LockSharedNonblock).unwrap();
-        let err = match RunLock::try_acquire(&paths) {
+        // A readable /proc/locks is not guaranteed to contain this inode
+        // (btrfs uses a different device number; concurrent enumeration is
+        // not a stable snapshot). Inject the diagnostic input, while still
+        // exercising a real shared flock and the exclusive acquisition path.
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(paths.lock_file()).unwrap();
+        let listed = format!(
+            "1: FLOCK ADVISORY READ {} {:02x}:{:02x}:{} 0 EOF\n",
+            std::process::id(),
+            nix::sys::stat::major(meta.dev()),
+            nix::sys::stat::minor(meta.dev()),
+            meta.ino()
+        );
+        let err = match RunLock::try_acquire_with(&paths, None, &|| Some(listed.clone())) {
             Err(e) => e,
             Ok(lock) => panic!("expected an error, got {}", lock.is_some()),
         };
@@ -2067,13 +2079,25 @@ mod tests {
             "{}",
             blocked.message
         );
-        if proc_locks().is_some() {
+        assert!(
+            blocked
+                .message
+                .contains(&format!("pid {}", std::process::id())),
+            "{}",
+            blocked.message
+        );
+        for locks in [Some(""), None] {
+            let err = RunLock::try_acquire_with(&paths, None, &|| locks.map(str::to_owned))
+                .err()
+                .expect("an unlisted shared holder still blocks backups");
+            let message = &err.downcast_ref::<LockBlocked>().unwrap().message;
             assert!(
-                blocked
-                    .message
-                    .contains(&format!("pid {}", std::process::id())),
-                "{}",
-                blocked.message
+                message.contains(if locks.is_none() {
+                    "cannot be read"
+                } else {
+                    "does not show who"
+                }),
+                "{message}"
             );
         }
         // A fresh record of another run: that run is starting, not an error.
