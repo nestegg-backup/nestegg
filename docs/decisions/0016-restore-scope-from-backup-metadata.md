@@ -216,6 +216,15 @@ the client's ordinary full-archive behavior. Scope refusals carry stable
 `restore_outside_home`) with the existing `forbidden` code. PBS and stick
 share these reasons; the UI does not infer them from English text.
 
+The desktop rescue acceptance fixture also configures a separate
+`docs.pxar` source at `/home/alice/Documents`, creates its `report.txt`, and
+bind-mounts the directory before the backup with `require_mount = true`.
+This keeps the source as its own archive in system mode, which normally
+folds directories on the system's file systems into `system.pxar`. The
+shared desktop API acceptance can therefore exercise the real signed,
+handle-bound below-home source in both VM fixtures; an archive absent from
+the metadata remains refused with `restore_no_home`.
+
 ## Alternatives rejected
 
 - **Keep using notes, sign them with a key on this computer:** another key
