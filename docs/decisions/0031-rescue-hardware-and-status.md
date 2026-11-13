@@ -50,3 +50,17 @@ restore origin remains distinct from the last backup. Conservative network
 repair may require manual name/datasource corrections and does not promise
 arbitrary network configuration migration. No new network access, protocol
 implementation or UI change is needed.
+
+## After review (2026-11-13)
+
+- The network check never stops a restore: it runs before the boot loader is
+  installed, so any error becomes a warning in the report and nothing is
+  changed. Symbolic links in the network configuration are not followed (their
+  targets may exist only on the running system); a link to `/dev/null` is a
+  masked file and ignored, any other link is reported and makes the fix-up
+  leave every file alone.
+- Recording the restore, removing stale lock files and writing the report are
+  warnings when they fail; the restored disk is already bootable then.
+- The restored success carries what the snapshot's signed metadata lists as
+  left out of that backup. Restoring an incomplete backup shows "incomplete",
+  not full protection; when the metadata cannot be read, that is said too.

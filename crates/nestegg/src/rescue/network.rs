@@ -249,13 +249,30 @@ pub fn fix_network(root: &Path, sys: &Path) -> Result<Vec<String>> {
     let mut configs = Vec::new();
     let mut safe = hardware_known;
     for (path, kind) in files(&root)? {
-        if !path.canonicalize()?.starts_with(&root) {
-            notes.push(format!(
-                "Network: {} points outside the restored tree; unchanged. {manual}",
-                path.strip_prefix(&root)?.display()
-            ));
-            safe = false;
-            continue;
+        // A link is never followed: its target may only exist on the running
+        // system (`/run`), or resolve differently here than after the first
+        // boot. A link to /dev/null is the usual way to mask a file.
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if fs::read_link(&path).is_ok_and(|to| to == Path::new("/dev/null")) {
+                    continue;
+                }
+                notes.push(format!(
+                    "Network: {} is a symbolic link; unchanged. {manual}",
+                    path.strip_prefix(&root)?.display()
+                ));
+                safe = false;
+                continue;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                notes.push(format!(
+                    "Network: {} could not be inspected; unchanged. {manual}",
+                    path.strip_prefix(&root)?.display()
+                ));
+                safe = false;
+                continue;
+            }
         }
         if !path.is_file() {
             continue;
@@ -412,6 +429,44 @@ mod tests {
         assert!(notes.contains("Manual fix:") && notes.contains("cloud-init may regenerate"));
         let notes = fix_network(&root, &sys).unwrap().join("\n");
         assert!(notes.contains("present on this machine"));
+    }
+    #[test]
+    fn links_are_never_followed_and_never_stop_the_restore() {
+        let (_d, root, sys) = fixture();
+        let text = netplan();
+        let p = config(&root, "etc/netplan/50-cloud-init.yaml", &text);
+        // A link into /run (not part of a backup) and one whose target only
+        // exists on the running system: both dangle in the rescue system.
+        let nm = root.join("etc/NetworkManager/system-connections");
+        fs::create_dir_all(&nm).unwrap();
+        std::os::unix::fs::symlink(
+            "/run/generated/wired.nmconnection",
+            nm.join("wired.nmconnection"),
+        )
+        .unwrap();
+        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        assert!(
+            notes.contains("wired.nmconnection is a symbolic link; unchanged"),
+            "{notes}"
+        );
+        // An unreadable part of the picture: nothing is rewritten.
+        assert_eq!(fs::read_to_string(&p).unwrap(), text);
+    }
+    #[test]
+    fn a_file_masked_with_dev_null_is_ignored() {
+        let (_d, root, sys) = fixture();
+        let text = netplan();
+        let p = config(&root, "etc/netplan/50-cloud-init.yaml", &text);
+        let links = root.join("etc/systemd/network");
+        fs::create_dir_all(&links).unwrap();
+        std::os::unix::fs::symlink("/dev/null", links.join("99-default.link")).unwrap();
+        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        assert!(!notes.contains("99-default.link"), "{notes}");
+        // The mask does not make the single wired pin ambiguous.
+        assert!(
+            fs::read_to_string(&p).unwrap().contains(&new_mac()),
+            "{notes}"
+        );
     }
     #[test]
     fn nm_and_link_selectors_share_one_mapping() {

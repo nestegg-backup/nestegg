@@ -797,7 +797,14 @@ impl Store {
     /// Called only on the offline restored tree, before its first boot.
     /// The snapshot exists and was restored, but its upload completion record
     /// could not be part of that snapshot. Do not claim read-back verification.
-    pub fn record_restore(&self, snapshot: &str, restored_at: DateTime<Utc>) -> Result<()> {
+    /// `incomplete` is what that backup left out (from its signed metadata):
+    /// a restore does not make an incomplete backup complete.
+    pub fn record_restore(
+        &self,
+        snapshot: &str,
+        restored_at: DateTime<Utc>,
+        incomplete: &[String],
+    ) -> Result<()> {
         let time = snapshot
             .rsplit('/')
             .next()
@@ -813,6 +820,8 @@ impl Store {
         );
         run.target = self.target;
         run.snapshot = Some(snapshot.to_owned());
+        run.incomplete = incomplete.to_vec();
+        run.warnings = incomplete.to_vec();
         run.finish(RunState::Succeeded, snapshot_time);
         // Rescue must not prune captured history.
         self.record_finished(&run, usize::MAX)?;
@@ -1720,6 +1729,34 @@ mod tests {
 mod rescue_tests {
     use super::*;
     #[test]
+    fn restoring_an_incomplete_backup_does_not_report_full_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: dir.path().join("config.toml"),
+            credentials_dir: dir.path().join("credentials"),
+            state_dir: dir.path().join("state"),
+            runtime_dir: dir.path().join("run"),
+            systemctl: "systemctl".into(),
+        };
+        let store = Store::for_target(&paths, Target::Pbs);
+        let time = Utc::now() - Duration::hours(2);
+        let snapshot = format!("host/desktop/{}", format_time(time));
+        let missing = vec!["source data: /srv/data was not mounted".to_string()];
+        store
+            .record_restore(&snapshot, Utc::now(), &missing)
+            .unwrap();
+        let state = store.load_state().unwrap();
+        assert_eq!(state.last_success.as_ref().unwrap().incomplete, missing);
+        assert_eq!(
+            health(true, &state, None, 36, Utc::now()),
+            Health::Incomplete
+        );
+        // A complete backup stays fine.
+        store.record_restore(&snapshot, Utc::now(), &[]).unwrap();
+        let state = store.load_state().unwrap();
+        assert_eq!(health(true, &state, None, 36, Utc::now()), Health::Ok);
+    }
+    #[test]
     fn restore_records_provenance_and_ages_from_snapshot_not_restore_time() {
         for target in [Target::Pbs, Target::Stick] {
             let dir = tempfile::tempdir().unwrap();
@@ -1746,7 +1783,7 @@ mod rescue_tests {
                 ..Default::default()
             };
             Store::new(&paths).save_state(&initial).unwrap();
-            store.record_restore(&snapshot, now).unwrap();
+            store.record_restore(&snapshot, now, &[]).unwrap();
             assert!(store.load_current().unwrap().is_none());
             let state = store.load_state().unwrap();
             let success = state.last_success.as_ref().unwrap();
@@ -1799,7 +1836,7 @@ mod rescue_tests {
         store.save_state(&state).unwrap();
         assert!(
             store
-                .record_restore("host/desktop/not-a-time", Utc::now())
+                .record_restore("host/desktop/not-a-time", Utc::now(), &[])
                 .is_err()
         );
         assert_eq!(store.load_state().unwrap(), state);

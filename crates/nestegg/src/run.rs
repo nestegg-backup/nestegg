@@ -1755,9 +1755,6 @@ fn report_context(
     }
 }
 
-/// Snapshot notes: the first line is shown as the snapshot comment in PBS;
-/// the JSON below is the status report read by the overview of all
-/// machines (`GET /api/v1/machines`). It contains no file names.
 /// What was sent for all archives together, after compression. Unknown
 /// (None) when there are no archives or one of them has no compressed amount:
 /// a partial sum would understate and still look exact.
@@ -1768,6 +1765,9 @@ fn transferred_sum(archives: &[crate::client::ArchiveStats]) -> Option<u64> {
     archives.iter().map(|s| s.transferred_bytes).sum()
 }
 
+/// Snapshot notes: the first line is shown as the snapshot comment in PBS;
+/// the JSON below is the status report read by the overview of all
+/// machines (`GET /api/v1/machines`). It contains no file names.
 pub fn snapshot_notes(run: &Run, duration_seconds: i64, ctx: &ReportContext) -> String {
     // Only archives that are part of this snapshot.
     let archive_sources: serde_json::Map<String, serde_json::Value> = ctx
