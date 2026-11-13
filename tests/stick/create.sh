@@ -10,7 +10,9 @@ bin=$(realpath "${1:?usage: create.sh BINARY ISO [LAUNCHER_TEST_BINARY]}")
 iso=$(realpath "${2:?ISO required}")
 probe=${3:-}
 if [[ -z $probe ]]; then
-    probe=$(find "$repo/target/debug/deps" -maxdepth 1 -type f -name 'stick_launcher-*' -executable | head -1)
+    # Newer cargo versions keep test binaries outside target/debug/deps; take
+    # the newest build wherever it is.
+    probe=$(find "$repo/target/debug" -type f -name 'stick_launcher-*' -executable -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
 fi
 [[ -x $probe ]] || { echo 'Build cargo test --test stick_launcher --no-run first' >&2; exit 2; }
 probe=$(realpath "$probe")
