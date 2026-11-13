@@ -8,7 +8,7 @@
 <script lang="ts">
   import Dot from "./Dot.svelte";
   import { api } from "../lib/api";
-  import { isIncomplete, otherWarnings, runTone, type RunRow } from "../lib/derive";
+  import { isIncomplete, otherWarnings, runTone, transferredBytes, type RunRow } from "../lib/derive";
   import { explainOf, runResultText } from "../lib/text";
   import { f, t } from "../lib/locale";
 
@@ -86,18 +86,20 @@
         {@const r = row.run}
         {@const open = isOpen(row, i)}
         {@const log = logs[r.id]}
+        <!-- The compressed amount actually sent; older records have none and show nothing. -->
+        {@const sent = !remote && r.state === "succeeded" ? transferredBytes(r) : null}
         <tr class="run" class:bad={r.state === "failed"}>
           <td class="m">{f.dayShort(r.started_at)}</td>
           <td class="start">{f.time(r.started_at)}</td>
           <td class="c-res"><span class="res"><Dot tone={runTone(r, damaged)} /><span class:muted={r.state === "cancelled"}>{runResultText(r, row.count, damaged, t)}</span></span></td>
           {#if !remote}<td class="m c-dur">{r.duration_seconds != null ? f.duration(r.duration_seconds) : ""}</td>{/if}
-          <td class="r c-end" class:c-empty={!row.expandable && (remote || r.uploaded_bytes == null || r.state !== "succeeded")}>
+          <td class="r c-end" class:c-empty={!row.expandable && sent == null}>
             {#if row.expandable}
               <button class="linkbtn" type="button" aria-expanded={open} aria-controls={slug(r.id)} onclick={() => toggle(row, i)}>
                 {open ? t.runs.hideLog : t.runs.showLog}
               </button>
-            {:else if !remote && r.state === "succeeded" && r.uploaded_bytes != null}
-              {f.size(r.uploaded_bytes)}
+            {:else if sent != null}
+              {f.size(sent)}
             {/if}
           </td>
         </tr>

@@ -70,7 +70,7 @@ case "$1" in
     done
     echo "[$files{\"filename\":\"index.json.blob\",\"crypt-mode\":\"none\",\"size\":1}]" > "$FAKE_STORE/files.json"
     echo "Starting backup: host/test/..."
-    echo "home.pxar: had to backup 1 MiB of 2 MiB (compressed 1 MiB) in 0.10 s"
+    echo "home.pxar: had to backup 1 MiB of 2 MiB (compressed 400 KiB) in 0.10 s"
     echo "etc.pxar: had to backup 0 B of 1 KiB (compressed 0 B) in 0.01 s"
     exit 0
     ;;
@@ -408,6 +408,8 @@ fn successful_run_records_state_and_passes_secrets_via_fds() {
     assert_eq!(state["last_success"]["state"], "succeeded");
     assert_eq!(state["last_success"]["verified"], true);
     assert_eq!(state["last_run"]["uploaded_bytes"], 1_048_576);
+    // What went over the network is the compressed amount.
+    assert_eq!(state["last_run"]["transferred_bytes"], 409_600);
     assert_eq!(state["pbs_reachable"], true);
     assert_eq!(state["last_run"]["warnings"].as_array().unwrap().len(), 1);
     // The missing optional source makes the backup incomplete.

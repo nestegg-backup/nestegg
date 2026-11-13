@@ -3,7 +3,8 @@
   import Dot from "./Dot.svelte";
   import { app } from "../lib/store.svelte";
   import { reveal } from "../lib/reveal";
-  import { STICK_INFO_COMMAND, isUuid, knownStickUuid, stickKeyCheckCommand, stickKeyCopyCommand } from "../lib/derive";
+  import { STICK_INFO_COMMAND, isUuid, knownStickUuid, registeredSticks, stickKeyCheckCommand, stickKeyCopyCommand, stickName } from "../lib/derive";
+  import { stickLabel } from "../lib/text";
   import { t } from "../lib/locale";
   import type { TargetStatus } from "../lib/types";
 
@@ -19,6 +20,12 @@
   const uuid = $derived(known ?? typed);
   const reason = $derived(stick.password_reminders?.[uuid.toLowerCase()] ?? null);
   const bad = $derived(!known && typed.trim() !== "" && !isUuid(typed));
+  // With several sticks, or a named one, say which stick the commands are for.
+  const concerns = $derived(
+    known && (registeredSticks(stick, app.config.value).length > 1 || stickName(known, stick, app.config.value))
+      ? stickLabel(known, stick, app.config.value, t)
+      : null,
+  );
 </script>
 
 <section class="pw notice-box" aria-labelledby="h-stickpw">
@@ -37,6 +44,7 @@
     </div>
     <Cmd command={STICK_INFO_COMMAND} />
   {/if}
+  {#if concerns}<p class="which">{t.stick.concerns(concerns)}</p>{/if}
   <p class="lead-in">{t.stick.passwordCmd}</p>
   {#if reason !== "key_copy_missing"}<Cmd command={stickKeyCheckCommand(uuid)} missing={t.stick.fillUuid} />{/if}
   {#if reason !== "password_check_due"}<Cmd command={stickKeyCopyCommand(uuid)} missing={t.stick.fillUuid} />{/if}
@@ -47,6 +55,7 @@
   h2 { font-size: var(--fs-m); font-weight: 600; display: flex; align-items: center; gap: 10px; }
   p { color: var(--muted); margin-top: 6px; max-width: 66ch; }
   .lead-in { color: var(--text); margin-top: 12px; }
+  .which { color: var(--text); }
   .field { margin-top: 12px; max-width: 420px; }
   .field label { display: block; font-weight: 500; font-size: 13px; margin-bottom: 4px; }
   .field .hint { margin-top: 4px; font-size: var(--fs-s); }

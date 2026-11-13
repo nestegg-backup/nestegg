@@ -607,6 +607,10 @@ const de = {
     stepCheckNow: "Das Dateisystem wird geprüft, der Backup-Dienst für den Stick startet.",
     stepUpload: "Geänderte Dateien auf den Stick schreiben",
     written: (size: string) => `${size} geschrieben`,
+    unnamed: (short: string) => `Stick ${short}`,
+    registered: "Registrierte Sticks",
+    pluggedMark: "eingesteckt",
+    concerns: (label: string) => `Betrifft: ${label}`,
     stepFinish: "Prüfen, aufräumen, aushängen",
     stepFinishSub: "Die neue Sicherung wird geprüft, alte werden nach den Regeln aufgeräumt, dann wird der Stick ausgehängt.",
     runningLead: "Sicherung auf den Stick läuft.",
@@ -842,8 +846,7 @@ const de = {
     startNeedsStick: "Steck den Backup-Stick ein, um die Dateien zurückzuholen.",
     startStick: (msg: string) => `Der Backup-Stick ließ sich nicht öffnen, es wurde nichts wiederhergestellt. Ist er eingesteckt? ${msg}`,
     runningStick: "Dateien werden vom Stick zurückgeholt.",
-    runningStickText:
-      "Lass den Stick eingesteckt, bis hier „Fertig“ steht. Wie viel schon zurückgeholt ist, meldet der Stick erst am Ende.",
+    runningStickText: "Lass den Stick eingesteckt, bis hier „Fertig“ steht.",
     failedStickGone: "Der Backup-Stick ist nicht mehr eingesteckt.",
   },
 };

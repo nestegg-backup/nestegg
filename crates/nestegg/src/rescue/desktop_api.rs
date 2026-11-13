@@ -248,7 +248,88 @@ fn validate(
     Ok(selections)
 }
 
+/// Receives the running byte count of a restore (bytes written so far and,
+/// when known, the total) from a helper thread.
+pub type Reporter = std::sync::Arc<dyn Fn(u64, Option<u64>) + Send + Sync>;
+
+/// Environment variable the daemon sets when it reads progress lines. Without
+/// it the worker writes only the final envelope, as before (decision 0029).
+pub const PROGRESS_ENV: &str = "NESTEGG_STICK_PROGRESS";
+
+/// One progress line on the worker's stdout, before the final envelope.
+pub fn progress_line(restored_bytes: u64, total_bytes: Option<u64>) -> String {
+    json!({ "progress": { "restored_bytes": restored_bytes, "total_bytes": total_bytes } })
+        .to_string()
+}
+
+/// A progress line as written by [`progress_line`]; None for anything else
+/// (such as the final envelope).
+pub fn parse_progress_line(line: &[u8]) -> Option<(u64, Option<u64>)> {
+    let value: Value = serde_json::from_slice(line).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let progress = object.get("progress")?;
+    let done = progress.get("restored_bytes")?.as_u64()?;
+    let total = progress.get("total_bytes").and_then(Value::as_u64);
+    Some((done, total))
+}
+
+/// Reports `done_before` plus the live count of the archive being restored
+/// once a second. Dropping it stops the thread and waits for it, so no line
+/// can follow the final envelope.
+struct ProgressLines {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressLines {
+    fn start(
+        report: Option<&Reporter>,
+        done_before: u64,
+        current: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        total: Option<u64>,
+    ) -> ProgressLines {
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = report.cloned().map(|report| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    report(done_before + current.load(Ordering::Relaxed), total);
+                    for _ in 0..10 {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            })
+        });
+        ProgressLines { stop, thread }
+    }
+}
+
+impl Drop for ProgressLines {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub fn execute(paths: &Paths, request: Request) -> Result<Value> {
+    execute_reporting(paths, request, None)
+}
+
+/// Like [`execute`]; a restore also reports its running byte count to `report`.
+pub fn execute_reporting(
+    paths: &Paths,
+    request: Request,
+    report: Option<&Reporter>,
+) -> Result<Value> {
     ensure!(
         nix::unistd::Uid::effective().is_root(),
         UnavailableReason::Unsupported
@@ -384,6 +465,18 @@ pub fn execute(paths: &Paths, request: Request) -> Result<Value> {
                     }
                 }
             }
+            // As for the backup server: a total only when whole archives are
+            // restored, so a percentage never rests on a guess.
+            let total = if selections.iter().all(|s| s.paths.is_empty()) {
+                let mut sum = Some(0u64);
+                for sel in &selections {
+                    let size = client.archive_size(&snapshot, &sel.archive).ok().flatten();
+                    sum = sum.zip(size).map(|(a, b)| a + b);
+                }
+                sum.filter(|&t| t > 0)
+            } else {
+                None
+            };
             let mut warnings = Vec::new();
             let mut bytes = 0;
             for sel in selections {
@@ -397,7 +490,9 @@ pub fn execute(paths: &Paths, request: Request) -> Result<Value> {
                 // Stick backups must be encrypted and signed with this key.
                 // Passing it unconditionally verifies even a forged listing.
                 let key = client.configured_key()?;
-                warnings.extend(crate::restore::execute_with_client(
+                let lines =
+                    ProgressLines::start(report, bytes, progress.restored_bytes.clone(), total);
+                let result = crate::restore::execute_with_client(
                     paths,
                     &client,
                     crate::restore::Job {
@@ -411,7 +506,9 @@ pub fn execute(paths: &Paths, request: Request) -> Result<Value> {
                     &requester,
                     &progress,
                     &mut std::io::stderr(),
-                )?);
+                );
+                drop(lines);
+                warnings.extend(result?);
                 bytes += progress
                     .restored_bytes
                     .load(std::sync::atomic::Ordering::Relaxed);
@@ -449,7 +546,17 @@ pub fn run() -> Result<u8> {
         .read_to_end(&mut input)?;
     ensure!(input.len() <= 1024 * 1024, "stick API request too large");
     let request: Request = serde_json::from_slice(&input)?;
-    let result = execute(&Paths::from_env(), request);
+    // Progress lines only for a daemon that asked for them; an older daemon
+    // expects the envelope alone on stdout.
+    let report: Option<Reporter> =
+        (std::env::var_os(PROGRESS_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))).then(|| {
+            std::sync::Arc::new(|done: u64, total: Option<u64>| {
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{}", progress_line(done, total));
+                let _ = out.flush();
+            }) as Reporter
+        });
+    let result = execute_reporting(&Paths::from_env(), request, report.as_ref());
     let envelope = match result {
         Ok(value) => json!({ "result": value }),
         Err(e) => error_envelope(&e),

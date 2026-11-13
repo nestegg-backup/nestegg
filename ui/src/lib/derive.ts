@@ -891,6 +891,41 @@ export function stickFillPercent(ts: TargetStatus): number | null {
   return Math.round(Math.max(0, Math.min(1, 1 - free / total)) * 100);
 }
 
+/**
+ * What a run actually sent (server) or wrote (stick), compressed. Null for records of older versions,
+ * which only know the new data before compression: that figure is not shown as "uploaded".
+ */
+export function transferredBytes(run: Pick<Run, "transferred_bytes">): number | null {
+  const v = run.transferred_bytes;
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+/** The configured name of a registered stick, from `/status` or `/config`; null without one or from older daemons. */
+export function stickName(uuid: string, ts?: TargetStatus | null, config?: ConfigView | null): string | null {
+  const key = uuid.trim().toLowerCase();
+  const fromStatus = Object.entries(ts?.sticks ?? {}).find(([u]) => u.toLowerCase() === key)?.[1]?.name;
+  const name = fromStatus ?? Object.entries(config?.stick_names ?? {}).find(([u]) => u.toLowerCase() === key)?.[1];
+  return typeof name === "string" && name.trim() ? name.trim() : null;
+}
+
+/**
+ * The first eight characters of a UUID for a fallback label, longer when another registered stick
+ * starts the same way: two sticks must never get the same label.
+ */
+export function shortUuid(uuid: string, others: readonly string[] = []): string {
+  const u = uuid.trim().toLowerCase();
+  const rest = others.map((o) => o.trim().toLowerCase()).filter((o) => o !== u);
+  let n = 8;
+  while (n < u.length && rest.some((o) => o.startsWith(u.slice(0, n)))) n++;
+  return u.slice(0, n);
+}
+
+/** Registered sticks in configuration order (status order for older daemons without `/config` UUIDs). */
+export function registeredSticks(ts?: TargetStatus | null, config?: ConfigView | null): string[] {
+  const all = [...(config?.stick_data_uuids ?? []), ...Object.keys(ts?.sticks ?? {})].map((u) => u.toLowerCase());
+  return [...new Set(all)].filter(isUuid);
+}
+
 export function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
 }

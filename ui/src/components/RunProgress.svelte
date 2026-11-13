@@ -1,6 +1,6 @@
 <script lang="ts">
   import { app } from "../lib/store.svelte";
-  import { runStep, runTarget, runTrigger } from "../lib/derive";
+  import { runStep, runTarget, runTrigger, transferredBytes } from "../lib/derive";
   import { f, t } from "../lib/locale";
   import type { Run } from "../lib/types";
 
@@ -14,6 +14,8 @@
     const trigger = runTrigger(run);
     return trigger === "timer" ? "timer" : trigger === "unknown" ? "unknown" : trigger === "plug" ? "plug" : "manual";
   });
+  /** Compressed amount sent so far; an older daemon reports none, then no amount is shown. */
+  const sent = $derived(transferredBytes(run));
   const elapsed = $derived(Math.max(0, (app.now.getTime() - new Date(run.started_at).getTime()) / 1000));
 
   // Archives finished so far against the size of the last backup: coarse (it moves after each archive), but honest.
@@ -28,7 +30,7 @@
     { title: t.self.stepInventory, sub: now === 1 ? t.self.stepInventorySub : "" },
     {
       title: t.stick.stepUpload,
-      sub: now >= 2 && run.uploaded_bytes ? t.stick.written(f.size(run.uploaded_bytes)) : now === 2 ? t.self.stepUploadCheck : "",
+      sub: now >= 2 && sent ? t.stick.written(f.size(sent)) : now === 2 ? t.self.stepUploadCheck : "",
     },
     { title: t.stick.stepFinish, sub: now === 3 ? t.stick.stepFinishSub : "" },
   ]);
@@ -50,11 +52,11 @@
       title: t.self.stepUpload,
       sub:
         now === 2
-          ? run.uploaded_bytes
-            ? t.self.stepUploadSub(f.size(run.uploaded_bytes))
+          ? sent
+            ? t.self.stepUploadSub(f.size(sent))
             : t.self.stepUploadCheck
-          : now > 2 && run.uploaded_bytes
-            ? t.self.stepUploadSub(f.size(run.uploaded_bytes))
+          : now > 2 && sent
+            ? t.self.stepUploadSub(f.size(sent))
             : "",
     },
     { title: t.self.stepFinish, sub: now === 3 ? t.self.stepFinishSub : "" },

@@ -36,6 +36,17 @@ lock tests cover contention with restore usage and idle state after release.
 The disposable KVM API acceptance covers scoped non-root restoration and can
 pause a catalog read to observe live usage and a competing request's busy reason.
 
-Running byte counts remain deferred. The isolated worker protocol returns one
-final envelope; streaming progress requires a separate protocol change. The UI
-continues to show elapsed time and final bytes without inventing a percentage.
+Running byte counts were first deferred, because the isolated worker returned
+one final envelope. They are now implemented (2026-11-13) as a contained
+protocol extension: the worker already counts the staging copy exactly as the
+backup-server path does (the size of the staging directory, polled while the
+client restores; the total is the archive size from the snapshot's file list,
+only when whole archives are restored). When the daemon sets
+`NESTEGG_STICK_PROGRESS=1`, the worker writes one line
+`{"progress":{"restored_bytes":N,"total_bytes":T|null}}` per second to stdout
+before the unchanged final envelope; a helper thread is joined before the
+envelope is written, so no line can follow it. The daemon splits these lines
+from the envelope and updates the job; a worker without the variable (or an
+older one) writes only the envelope, which is still accepted. The UI shows
+bytes as soon as they arrive and a bar and percentage only with a total;
+without any count (older daemon) it keeps elapsed time and final bytes.

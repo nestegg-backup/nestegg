@@ -31,14 +31,12 @@
       <h2 class="lead"><Dot tone="warn" />{t.conn.lost}</h2>
       <p class="lead-text">{t.conn.restoreUnknown}</p>
       <p class="hint">{t.restore.runningTarget} <code>{target}</code></p>
-    {:else if job?.state === "running" && fromStick}
-      <!-- The stick reports the restored size only at the end: no bar, no percentage. -->
-      <h2 class="lead"><span class="pulse" aria-hidden="true"></span>{t.restore.runningStick}</h2>
-      <p class="lead-text">{t.restore.runningTarget} <code>{target}</code>{#if job.started_at}. {t.restore.runningSince(f.duration(elapsed))}{/if}</p>
-      <p class="hint">{t.restore.runningStickText}</p>
     {:else if job?.state === "running"}
-      <h2 class="lead"><span class="pulse" aria-hidden="true"></span>{t.restore.running}</h2>
+      <h2 class="lead"><span class="pulse" aria-hidden="true"></span>{fromStick ? t.restore.runningStick : t.restore.running}</h2>
       <p class="lead-text">{t.restore.runningTarget} <code>{target}</code>{#if job.started_at}. {t.restore.runningSince(f.duration(elapsed))}{/if}</p>
+      {#if fromStick}<p class="hint">{t.restore.runningStickText}</p>{/if}
+      <!-- Same for both sources: bytes as soon as the daemon reports them, a bar only with a total.
+           An older daemon reports stick bytes only at the end: then nothing is shown here. -->
       {#if job.restored_bytes}
         <p class="hint">
           {job.total_bytes ? t.restore.progress(f.size(job.restored_bytes), f.size(job.total_bytes)) : t.restore.progressDone(f.size(job.restored_bytes))}

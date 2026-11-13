@@ -1,5 +1,5 @@
 // Restoring files from the backup stick: the request carries the source, the stick's own errors
-// are told apart from the server's, and nothing claims progress the stick does not report.
+// are told apart from the server's, and nothing claims progress the daemon does not report.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiFailure, api } from "../src/lib/api";
@@ -8,7 +8,7 @@ import { stickLine } from "../src/lib/text";
 import { createFormatter } from "../src/lib/format";
 import de from "../src/i18n/de";
 import en from "../src/i18n/en";
-import { World } from "../mock/world";
+import { SECOND_STICK_UUID, World } from "../mock/world";
 import type { Restore, Snapshot, Status, TargetStatus } from "../src/lib/types";
 
 const params = new URLSearchParams();
@@ -85,15 +85,36 @@ describe("mock: the stick as the daemon answers", () => {
     const started = w.handle("POST", "/restores", params, { target: "stick", snapshot_time: snaps[0]!.time, archive: "home.pxar", paths: ["/alice"], target_dir: "/home/alice/neu" }, t0);
     expect(started.status).toBe(202);
     const id = (started.body as Restore).id;
-    const mid = w.handle("GET", `/restores/${id}`, params, null, t0 + 3_000).body as Restore;
-    // No progress while it runs, and never a total.
+    // The mock hands out its live job object: copy it before the next request.
+    const mid = { ...(w.handle("GET", `/restores/${id}`, params, null, t0 + 3_000).body as Restore) };
+    // A running count while it runs; selected paths have no total (no percentage).
     expect(mid.state).toBe("running");
-    expect(mid.restored_bytes).toBe(0);
+    expect(mid.restored_bytes).toBeGreaterThan(0);
     expect(mid.total_bytes).toBeNull();
     const end = w.handle("GET", `/restores/${id}`, params, null, t0 + 9_000).body as Restore;
     expect(end.state).toBe("succeeded");
-    expect(end.restored_bytes).toBeGreaterThan(0);
+    expect(end.restored_bytes).toBeGreaterThan(mid.restored_bytes!);
     expect(end.total_bytes).toBeNull();
+  });
+
+  it("reports a total for whole archives, and nothing before the end like an older daemon", () => {
+    const t0 = Date.now();
+    const at = (older: boolean) => {
+      const w = new World("stick_only", "full", t0);
+      if (older) w.faults.add("stick_no_progress");
+      const time = w.stickSnapshots()[0]!.time;
+      const started = w.handle("POST", "/restores", params, { target: "stick", snapshot_time: time, archive: "home.pxar", paths: [], target_dir: "/home/alice/neu" }, t0);
+      expect(started.status).toBe(202);
+      return w.handle("GET", `/restores/${(started.body as Restore).id}`, params, null, t0 + 5_000).body as Restore;
+    };
+    const job = at(false);
+    expect(job.total_bytes).toBeGreaterThan(0);
+    expect(job.restored_bytes).toBeGreaterThan(0);
+    expect(job.restored_bytes).toBeLessThan(job.total_bytes!);
+    const before = at(true);
+    expect(before.state).toBe("running");
+    expect(before.restored_bytes).toBe(0);
+    expect(before.total_bytes).toBeNull();
   });
 
   it("an absent or pulled stick answers 503 stick_unavailable, and a running restore fails", () => {
@@ -245,7 +266,7 @@ describe("source echoes and several media", () => {
     w.faults.add("stick_multiple");
     const urls = serve(w);
     await expect(api.snapshots("stick")).rejects.toMatchObject({ reason: "ambiguous" });
-    const uuid = "01234567-89ab-cdef-0123-456789abcdee";
+    const uuid = SECOND_STICK_UUID;
     restore.setSource("stick");
     restore.setStick(uuid);
     await restore.loadStickSnapshots();

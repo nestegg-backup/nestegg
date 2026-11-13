@@ -604,6 +604,10 @@ const en = {
     stepCheckNow: "Checking the file system, starting the backup service for the stick.",
     stepUpload: "Write changed files to the stick",
     written: (size: string) => `${size} written`,
+    unnamed: (short: string) => `Stick ${short}`,
+    registered: "Registered sticks",
+    pluggedMark: "plugged in",
+    concerns: (label: string) => `For: ${label}`,
     stepFinish: "Check, clean up, unmount",
     stepFinishSub: "The new backup is checked, old ones are cleaned up by the rules, then the stick is unmounted.",
     runningLead: "Backup to the stick in progress.",
@@ -835,8 +839,7 @@ const en = {
     startNeedsStick: "Plug in the backup stick to bring the files back.",
     startStick: (msg: string) => `The backup stick could not be opened, nothing was restored. Is it plugged in? ${msg}`,
     runningStick: "Bringing the files back from the stick.",
-    runningStickText:
-      "Keep the stick plugged in until this page says “Done”. The stick only reports how much was restored at the end.",
+    runningStickText: "Keep the stick plugged in until this page says “Done”.",
     failedStickGone: "The backup stick is no longer plugged in.",
   },
 } satisfies Messages;

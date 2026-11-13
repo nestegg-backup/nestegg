@@ -5,7 +5,7 @@
   import { restore, stickNotSupported } from "../../lib/restore.svelte";
   import { href } from "../../lib/router.svelte";
   import { allDamaged, hasPbs, hasStick, isDamaged, restorableArchives, stickView } from "../../lib/derive";
-  import { stickProblemText } from "../../lib/text";
+  import { stickLabel, stickProblemText } from "../../lib/text";
   import { f, t } from "../../lib/locale";
   import type { Snapshot, Status } from "../../lib/types";
 
@@ -109,7 +109,7 @@
       {#each uuids as uuid (uuid)}
         <label class="choice where">
           <input type="radio" name="stick" value={uuid} checked={restore.stickUuid === uuid} onchange={() => restore.setStick(uuid)} />
-          <span>{uuid}</span>
+          <span>{stickLabel(uuid, stickTs, app.config.value, t)}<span class="uuid">{uuid}</span></span>
         </label>
       {/each}
     </div>
@@ -201,5 +201,6 @@
   .side { color: var(--muted); font-size: var(--fs-s); text-align: right; }
   .older { margin-top: 12px; }
   .where { overflow-wrap: anywhere; }
+  .uuid { display: block; color: var(--faint); font: var(--fs-s) / 1.4 var(--mono); }
   .dmg { color: var(--bad); font-weight: 500; margin-right: 12px; }
 </style>

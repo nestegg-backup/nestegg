@@ -1347,6 +1347,17 @@ fn pipeline(
         // Live progress for the dashboard after each finished archive.
         rep.run.processed_bytes =
             Some(rep.run.processed_bytes.unwrap_or(0) + stats.total_bytes.unwrap_or(0));
+        // The first finished archive starts both sums; an archive without a
+        // compressed amount makes the transferred sum unknown.
+        let first = rep.run.uploaded_bytes.is_none();
+        rep.run.transferred_bytes = if first {
+            stats.transferred_bytes
+        } else {
+            rep.run
+                .transferred_bytes
+                .zip(stats.transferred_bytes)
+                .map(|(a, b)| a + b)
+        };
         rep.run.uploaded_bytes =
             Some(rep.run.uploaded_bytes.unwrap_or(0) + stats.uploaded_bytes.unwrap_or(0));
         let _ = rep.store.save_current(&rep.run);
@@ -1389,6 +1400,7 @@ fn pipeline(
         .filter_map(|s| s.uploaded_bytes)
         .sum();
     rep.run.uploaded_bytes = (!outcome.archives.is_empty()).then_some(uploaded);
+    rep.run.transferred_bytes = transferred_sum(&outcome.archives);
 
     // 6. Read the snapshot back (decision 0015).
     rep.phase(
@@ -1747,6 +1759,16 @@ fn report_context(
 /// Snapshot notes: the first line is shown as the snapshot comment in PBS;
 /// the JSON below is the status report read by the overview of all
 /// machines (`GET /api/v1/machines`). It contains no file names.
+/// What was sent for all archives together, after compression. Unknown
+/// (None) when there are no archives or one of them has no compressed amount:
+/// a partial sum would understate and still look exact.
+fn transferred_sum(archives: &[crate::client::ArchiveStats]) -> Option<u64> {
+    if archives.is_empty() {
+        return None;
+    }
+    archives.iter().map(|s| s.transferred_bytes).sum()
+}
+
 pub fn snapshot_notes(run: &Run, duration_seconds: i64, ctx: &ReportContext) -> String {
     // Only archives that are part of this snapshot.
     let archive_sources: serde_json::Map<String, serde_json::Value> = ctx
@@ -1765,6 +1787,7 @@ pub fn snapshot_notes(run: &Run, duration_seconds: i64, ctx: &ReportContext) -> 
         "trigger": run.trigger,
         "duration_seconds": duration_seconds,
         "uploaded_bytes": run.uploaded_bytes,
+        "transferred_bytes": run.transferred_bytes,
         "archives": run.archives.iter().map(|a| &a.name).collect::<Vec<_>>(),
         "warnings": run.warnings.len(),
         "incomplete": run.incomplete,
@@ -1800,6 +1823,19 @@ pub fn parse_report(notes: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transferred_is_unknown_when_any_archive_lacks_it() {
+        let stats = |t: Option<u64>| crate::client::ArchiveStats {
+            name: "a.pxar".into(),
+            uploaded_bytes: Some(10),
+            transferred_bytes: t,
+            total_bytes: Some(20),
+        };
+        assert_eq!(transferred_sum(&[]), None);
+        assert_eq!(transferred_sum(&[stats(Some(3)), stats(Some(4))]), Some(7));
+        assert_eq!(transferred_sum(&[stats(Some(3)), stats(None)]), None);
+    }
 
     #[test]
     fn every_stick_step_preserves_cancellation_and_device_loss() {
