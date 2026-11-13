@@ -112,6 +112,34 @@ pub struct StickConfig {
     pub minimum_free_bytes: u64,
     #[serde(default)]
     pub retention: StickRetention,
+    /// Optional human names of registered sticks, keyed by data UUID
+    /// (`[stick.names]`). Display only: commands and the API still select a
+    /// stick by its UUID (decision 0032).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub names: std::collections::BTreeMap<String, String>,
+}
+
+/// Longest stick name, in characters.
+pub const STICK_NAME_MAX_CHARS: usize = 40;
+
+/// Check a stick name: 1 to [`STICK_NAME_MAX_CHARS`] characters, no leading or
+/// trailing white space, no control characters and no invisible formatting
+/// characters that could make one name look like another.
+pub fn validate_stick_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("a stick name must not be empty");
+    }
+    if name.trim() != name {
+        bail!("a stick name must not start or end with white space");
+    }
+    if name.chars().count() > STICK_NAME_MAX_CHARS {
+        bail!("a stick name may have at most {STICK_NAME_MAX_CHARS} characters");
+    }
+    let invisible = |c: char| matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}' | '\u{00ad}');
+    if name.chars().any(|c| c.is_control() || invisible(c)) {
+        bail!("a stick name must not contain control or invisible formatting characters");
+    }
+    Ok(())
 }
 
 fn default_stick_overdue() -> u32 {
@@ -157,7 +185,20 @@ impl StickConfig {
         if self.data_uuids.is_empty() {
             bail!("stick.data_uuids must not be empty");
         }
+        for (uuid, name) in &self.names {
+            if uuid.to_ascii_lowercase() != *uuid || !seen.contains(uuid) {
+                bail!("stick.names may only name registered data UUIDs, written in lower case");
+            }
+            validate_stick_name(name).with_context(|| format!("stick.names.{uuid}"))?;
+        }
         Ok(())
+    }
+
+    /// The configured name of a registered stick, if it has one.
+    pub fn name_of(&self, uuid: &str) -> Option<&str> {
+        self.names
+            .get(&uuid.to_ascii_lowercase())
+            .map(String::as_str)
     }
 }
 
@@ -651,6 +692,42 @@ auth_id = "backup@pbs!desktop"
         ] {
             assert!(Config::parse(&format!("{MINIMAL}\n[stick]\n{bad}\n")).is_err());
         }
+    }
+
+    #[test]
+    fn stick_names_are_optional_bound_to_registered_uuids_and_validated() {
+        let uuids = "data_uuids=['01234567-89ab-cdef-0123-456789abcdef','11111111-2222-3333-4444-555555555555']";
+        let parse = |names: &str| Config::parse(&format!("{MINIMAL}\n[stick]\n{uuids}\n{names}"));
+        // Existing configurations without names stay valid.
+        assert!(parse("").unwrap().stick.unwrap().names.is_empty());
+        let stick = parse("[stick.names]\n'01234567-89ab-cdef-0123-456789abcdef' = 'Blue stick'\n")
+            .unwrap()
+            .stick
+            .unwrap();
+        assert_eq!(
+            stick.name_of("01234567-89AB-CDEF-0123-456789ABCDEF"),
+            Some("Blue stick")
+        );
+        assert_eq!(stick.name_of("11111111-2222-3333-4444-555555555555"), None);
+        // A name survives a round trip.
+        let mut c = Config::parse(MINIMAL).unwrap();
+        c.stick = Some(stick);
+        c.backup.encryption = true;
+        assert_eq!(Config::parse(&c.to_toml().unwrap()).unwrap(), c);
+        for bad in [
+            "'99999999-2222-3333-4444-555555555555' = 'not registered'",
+            "'01234567-89AB-CDEF-0123-456789ABCDEF' = 'upper case key'",
+            "'01234567-89ab-cdef-0123-456789abcdef' = ''",
+            "'01234567-89ab-cdef-0123-456789abcdef' = ' padded'",
+            "'01234567-89ab-cdef-0123-456789abcdef' = \"bell\\u0007\"",
+            "'01234567-89ab-cdef-0123-456789abcdef' = \"line\\nbreak\"",
+            "'01234567-89ab-cdef-0123-456789abcdef' = \"right\\u202eto left\"",
+            "'01234567-89ab-cdef-0123-456789abcdef' = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+        ] {
+            assert!(parse(&format!("[stick.names]\n{bad}\n")).is_err(), "{bad}");
+        }
+        assert!(validate_stick_name(&"ä".repeat(STICK_NAME_MAX_CHARS)).is_ok());
+        assert!(validate_stick_name("Grauer Stick (Büro)").is_ok());
     }
 
     #[test]

@@ -141,21 +141,32 @@ pub fn snapshot_path(backup_id: &str, backup_time: i64) -> String {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ArchiveStats {
     pub name: String,
+    /// New data of this archive before compression ("had to backup X").
     pub uploaded_bytes: Option<u64>,
+    /// What was actually sent for that new data, after compression (and
+    /// encryption): the client's "(compressed X)". None when the client did
+    /// not print it.
+    pub transferred_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
 }
 
 /// Parse the client's per-archive summary lines, e.g.
 /// `home.pxar: had to backup 1.23 GiB of 10.5 GiB (compressed 900 MiB) in 30.12 s`.
+/// The `(compressed …)` part is optional.
 pub fn parse_archive_stats(line: &str) -> Option<ArchiveStats> {
     let (name, rest) = line.split_once(": had to backup ")?;
     let name = name.trim().rsplit(' ').next()?.to_string();
     let (uploaded, rest) = rest.split_once(" of ")?;
     let total = rest.split(" (").next().unwrap_or(rest);
     let total = total.split(" in ").next().unwrap_or(total);
+    let transferred = rest
+        .split_once("(compressed ")
+        .and_then(|(_, c)| c.split_once(')'))
+        .and_then(|(c, _)| parse_size(c));
     Some(ArchiveStats {
         name,
         uploaded_bytes: parse_size(uploaded),
+        transferred_bytes: transferred,
         total_bytes: parse_size(total),
     })
 }
@@ -1777,7 +1788,27 @@ mod tests {
         .unwrap();
         assert_eq!(s.name, "home.pxar");
         assert_eq!(s.uploaded_bytes, Some(1_610_612_736));
+        assert_eq!(s.transferred_bytes, Some(943_718_400));
         assert_eq!(s.total_bytes, Some(10_737_418_240));
+        // A real line: the compressed amount is what went over the network.
+        let s = parse_archive_stats(
+            "system.pxar: had to backup 1.925 GiB of 1.948 GiB (compressed 744.728 MiB) in 13.61 s",
+        )
+        .unwrap();
+        assert_eq!(s.name, "system.pxar");
+        assert_eq!(s.uploaded_bytes, Some(2_066_953_011));
+        assert_eq!(s.transferred_bytes, Some(780_903_907));
+        assert_eq!(s.total_bytes, Some(2_091_649_073));
+        // Without "(compressed …)" the line still parses; only that amount is unknown.
+        let s = parse_archive_stats("home.pxar: had to backup 1 MiB of 2 MiB in 0.10 s").unwrap();
+        assert_eq!(s.uploaded_bytes, Some(1_048_576));
+        assert_eq!(s.transferred_bytes, None);
+        assert_eq!(s.total_bytes, Some(2_097_152));
+        let s = parse_archive_stats("home.pxar: had to backup 1 MiB of 2 MiB").unwrap();
+        assert_eq!(
+            (s.transferred_bytes, s.total_bytes),
+            (None, Some(2_097_152))
+        );
         assert!(parse_archive_stats("Starting backup").is_none());
         assert_eq!(parse_size("0 B"), Some(0));
         assert_eq!(parse_size("2 lightyears"), None);

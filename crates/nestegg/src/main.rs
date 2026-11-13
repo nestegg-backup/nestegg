@@ -1648,6 +1648,15 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
             view.health,
             view.consecutive_failures
         );
+        for (uuid, stick) in &view.sticks {
+            let state = match (stick.in_use, stick.plugged_in) {
+                (Some(nestegg::stick::target::Usage::Backup), _) => "in use by a backup",
+                (Some(nestegg::stick::target::Usage::Restore), _) => "in use by a restore",
+                (None, true) => "plugged in",
+                (None, false) => "not plugged in",
+            };
+            println!("  {}: {state}", stick_label(uuid, stick.name.as_deref()));
+        }
     }
     if !status.pbs.server.is_empty() {
         println!(
@@ -1716,6 +1725,15 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
     Ok(0)
 }
 
+/// "Blue stick (01234567-…)" with a name, else "stick 01234567-…": the name
+/// first and the UUID as the detail, like the web UI.
+fn stick_label(uuid: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("{name} ({uuid})"),
+        None => format!("stick {uuid}"),
+    }
+}
+
 fn describe(run: Option<&Run>) -> String {
     let Some(run) = run else {
         return "never".into();
@@ -1725,10 +1743,28 @@ fn describe(run: Option<&Run>) -> String {
     if let Some(d) = run.duration_seconds {
         s.push_str(&format!(" ({d} s)"));
     }
+    if let Some(size) = transferred_text(run) {
+        s.push_str(&format!(", {size}"));
+    }
     if let Some(e) = &run.error {
         s.push_str(&format!(" - {}", e.message));
     }
     s
+}
+
+/// What a successful run sent, compressed: "uploaded 744.7 MiB" (server) or
+/// "written 744.7 MiB" (stick), the same amount the web UI shows. Records of
+/// older versions only know the new data before compression; that amount is
+/// not shown as uploaded.
+fn transferred_text(run: &Run) -> Option<String> {
+    if run.state != RunState::Succeeded {
+        return None;
+    }
+    let bytes = human_bytes(run.transferred_bytes?);
+    Some(match run.target {
+        nestegg::state::Target::Stick => format!("written {bytes}"),
+        _ => format!("uploaded {bytes}"),
+    })
 }
 
 fn history(paths: &Paths, limit: usize, json: bool) -> Result<u8> {
@@ -1913,5 +1949,27 @@ fn human_bytes(b: u64) -> String {
         format!("{b} B")
     } else {
         format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_line_shows_the_compressed_amount_as_uploaded() {
+        let mut run = Run::new(nestegg::state::Trigger::Manual, chrono::Utc::now());
+        run.state = RunState::Succeeded;
+        run.uploaded_bytes = Some(2_066_953_011);
+        // An older record knows only the new data before compression.
+        assert!(!describe(Some(&run)).contains("uploaded"));
+        run.transferred_bytes = Some(780_903_907);
+        assert!(describe(Some(&run)).ends_with(", uploaded 744.7 MiB"));
+        run.target = nestegg::state::Target::Stick;
+        assert!(describe(Some(&run)).ends_with(", written 744.7 MiB"));
+        run.state = RunState::Failed;
+        assert!(!describe(Some(&run)).contains("744.7"));
+        assert_eq!(stick_label("0123", Some("Blue")), "Blue (0123)");
+        assert_eq!(stick_label("0123", None), "stick 0123");
     }
 }

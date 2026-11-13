@@ -212,8 +212,16 @@ pub struct Run {
     pub snapshot: Option<String>,
     #[serde(default)]
     pub archives: Vec<ArchiveInfo>,
+    /// New data of this run before compression (the client's "had to backup
+    /// X"). Not the amount sent: see `transferred_bytes`.
     #[serde(default)]
     pub uploaded_bytes: Option<u64>,
+    /// What was actually sent to the server (or written to the stick) for the
+    /// new data, after compression: the sum of the client's "(compressed X)".
+    /// None in records of older versions and when the client did not report
+    /// it for every finished archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transferred_bytes: Option<u64>,
     /// Total size of the archives of the last successful run (estimate for
     /// a progress bar).
     #[serde(default)]
@@ -259,6 +267,7 @@ impl Run {
             snapshot: None,
             archives: Vec::new(),
             uploaded_bytes: None,
+            transferred_bytes: None,
             expected_bytes: None,
             processed_bytes: None,
             warnings: Vec::new(),

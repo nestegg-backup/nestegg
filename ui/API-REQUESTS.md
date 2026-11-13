@@ -3,7 +3,7 @@
 What the UI still needs from `api/openapi.yaml` and the daemon, written by the
 UI side. The core side decides and updates the contract. Every item says what
 the UI does today without it. Checked against `api/openapi.yaml` (version
-0.4.0); items that were requested earlier and are in the contract by now are
+0.6.0); items that were requested earlier and are in the contract by now are
 listed at the end.
 
 ## 1. Search inside a snapshot
@@ -149,9 +149,11 @@ listing, validation and browsing, through shutdown, flush and unmount. The UI
 requires explicit idle usage before saying safe to unplug; missing usage on an
 older daemon does not count as idle.
 
-Running byte counts for stick restores remain deferred: the isolated worker
-currently sends a single final result, so bytes arrive at completion and
-`total_bytes` remains null. Elapsed time remains visible without a percentage.
+Running byte counts for stick restores (implemented, API 0.6.0): the worker
+reports `restored_bytes` while it copies, and `total_bytes` when whole archives
+are restored, as for the backup server. The UI shows the same line and bar for
+both sources: bytes as soon as they arrive, a bar only with a total. An older
+daemon reports stick bytes only at completion; then only the elapsed time shows.
 
 ## 9. Integration notes for the core side (not API)
 
@@ -200,6 +202,18 @@ All of these are in `api/openapi.yaml` and the UI uses them:
   `/snapshots/{time}/browse` and in the body of `POST /restores`, `503
   stick_unavailable`, `TargetStatus.plugged_in` (the source choice and "not
   plugged in" in the restore flow). Details: section 8.
+
+- Uploaded amount (decision 0032): `Run.transferred_bytes`, the compressed
+  amount actually sent or written. The history column "Uploaded"/"Written"
+  and the live step text show only this field; `uploaded_bytes` (new data
+  before compression) is never labelled as uploaded. Records of older
+  versions have no `transferred_bytes` and show no amount.
+- Stick names (decision 0032): `TargetStatus.sticks[uuid].name` and
+  `ConfigView.stick_names`. The stick choice of the restore flow, the stick
+  row of "Backup destinations" (with several sticks or a name) and the key
+  reminder show the name, the UUID only as detail; without a name "Stick" and
+  the first eight UUID characters. Names are set in the terminal (`nestegg
+  stick add --name`, `nestegg stick name`); the UI does not edit them.
 
 Not used by the UI: `MachinesResponse.complete` (the list simply shows who is
 visible), `PbsInfo.overview_configured` and `SessionInfo.uid` / `root`.

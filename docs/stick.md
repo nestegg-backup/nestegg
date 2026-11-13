@@ -60,9 +60,16 @@ as a backup stick.
 ## Register and inspect
 
 ```sh
-sudo nestegg stick add /dev/sdX --image /var/cache/nestegg/releases/rescue.iso
+sudo nestegg stick add /dev/sdX --image /var/cache/nestegg/releases/rescue.iso --name "Blue stick"
 sudo nestegg stick info /dev/sdX
 ```
+
+`--name` is optional. The web UI and `nestegg status` show the name and keep
+the UUID as detail; without one they show "Stick" and the start of the UUID.
+Change or remove it later with
+`sudo nestegg stick name --uuid <UUID> "Office stick"` or `--clear`. A name
+has 1 to 40 characters and no control or invisible formatting characters
+(decision 0032).
 
 `add` records the data partition's UUID in `[stick].data_uuids` in
 `/etc/nestegg/config.toml`. It installs the desktop-trusted PBS image **from the

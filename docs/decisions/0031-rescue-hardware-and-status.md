@@ -1,4 +1,4 @@
-# 0030: Offline rescue reconciles network pins and backup state
+# 0031: Offline rescue reconciles network pins and backup state
 
 ## Context
 

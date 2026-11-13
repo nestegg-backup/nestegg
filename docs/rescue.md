@@ -141,7 +141,7 @@ target history remain intact.
 `nestegg status` shows the restore origin. JSON/API status adds nullable
 `restored_from` with `snapshot`, `snapshot_time`, `restored_at` and `target`
 (`pbs` or `stick`); it persists when later backups complete. Older state
-without this field continues to work. See decision 0030.
+without this field continues to work. See decision 0031.
 
 ### The encryption key
 

@@ -75,7 +75,13 @@ export interface Run {
   duration_seconds?: number | null;
   snapshot?: string | null;
   archives?: Archive[];
+  /** New data before compression. Not what was sent: never label it "uploaded". */
   uploaded_bytes?: number | null;
+  /**
+   * What was actually sent to the server (or written to the stick), compressed. This is the
+   * "uploaded"/"written" amount. Absent in records of older versions.
+   */
+  transferred_bytes?: number | null;
   /** Total archive size of the last successful run (progress estimate). */
   expected_bytes?: number | null;
   /** Total size of the archives finished so far in this run. */
@@ -116,7 +122,7 @@ export interface TargetStatus {
   plugged_in?: boolean | null;
   plugged_in_uuids?: string[];
   in_use?: "backup" | "restore" | null;
-  sticks?: Record<string, { plugged_in: boolean; in_use: "backup" | "restore" | null }>;
+  sticks?: Record<string, { plugged_in: boolean; in_use: "backup" | "restore" | null; /** Optional name from `[stick.names]`; absent from older daemons. */ name?: string | null }>;
   /** Last complete verification of the whole stick. */
   full_verified_at?: string | null;
   server_verify_failed?: string[];
@@ -199,9 +205,9 @@ export interface Restore {
   started_at?: string;
   finished_at?: string | null;
   error?: string | null;
-  /** Bytes restored so far (staging copy). From the stick only known at completion. */
+  /** Bytes restored so far (staging copy). From the stick: running since API 0.6.0, before only at completion. */
   restored_bytes?: number;
-  /** Expected total when whole archives are restored; always null from the stick. */
+  /** Expected total when whole archives are restored (both sources); null otherwise. */
   total_bytes?: number | null;
   warnings?: string[];
 }
@@ -217,6 +223,8 @@ export interface ConfigView {
   /** "Overdue after" of the stick target; null or absent without a stick. */
   stick_overdue_after_hours?: number | null;
   stick_data_uuids?: string[];
+  /** Lower-case UUID to the stick's optional name; unnamed sticks are absent. */
+  stick_names?: Record<string, string>;
   /** `nestegg-backup.timer` is enabled. */
   automatic_backups?: boolean;
   /** Wake-on-LAN is configured and switched on. */

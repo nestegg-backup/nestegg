@@ -573,9 +573,21 @@ fn stick_rpc(
     paths: &Paths,
     request: crate::rescue::desktop_api::Request,
 ) -> ApiResult<serde_json::Value> {
-    use std::io::Write;
+    stick_rpc_progress(paths, request, &mut |_, _| {})
+}
+
+/// Runs the isolated stick worker. A restore writes progress lines before its
+/// final envelope; each one goes to `on_progress` (bytes written so far, total
+/// if known) while the worker runs.
+fn stick_rpc_progress(
+    paths: &Paths,
+    request: crate::rescue::desktop_api::Request,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> ApiResult<serde_json::Value> {
+    use std::io::{Read, Write};
     let mut child = Command::new(std::env::current_exe().map_err(ApiError::internal)?)
         .args(["rescue", "stick-api"])
+        .env(crate::rescue::desktop_api::PROGRESS_ENV, "1")
         .env("NESTEGG_CONFIG", &paths.config_file)
         .env("NESTEGG_CREDENTIALS_DIR", &paths.credentials_dir)
         .env("NESTEGG_STATE_DIR", &paths.state_dir)
@@ -592,16 +604,55 @@ fn stick_rpc(
         .ok_or_else(|| ApiError::internal("missing worker stdin"))?
         .write_all(&bytes)
         .map_err(ApiError::internal)?;
-    let output = child.wait_with_output().map_err(ApiError::internal)?;
-    if !output.status.success() {
+    // Read stderr on its own thread so neither pipe can fill up and stall
+    // the worker while stdout is read line by line.
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ApiError::internal("missing worker stderr"))?;
+    let stderr = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = stderr.read_to_end(&mut text);
+        text
+    });
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ApiError::internal("missing worker stdout"))?;
+    let envelope = worker_envelope(stdout, on_progress).map_err(ApiError::internal)?;
+    let status = child.wait().map_err(ApiError::internal)?;
+    let stderr = stderr.join().unwrap_or_default();
+    if !status.success() {
         return Err(ApiError::internal(format!(
             "stick worker failed: {}",
-            crate::rescue::printable_block(&String::from_utf8_lossy(&output.stderr))
+            crate::rescue::printable_block(&String::from_utf8_lossy(&stderr))
         )));
     }
     let envelope: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(ApiError::internal)?;
+        serde_json::from_slice(&envelope).map_err(ApiError::internal)?;
     stick_result(envelope)
+}
+
+/// Splits the worker's stdout into progress lines (handed to `on_progress` as
+/// they arrive) and the rest, the final envelope. A worker that writes only
+/// the envelope gives the envelope unchanged.
+fn worker_envelope(
+    stdout: impl std::io::Read,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> std::io::Result<Vec<u8>> {
+    use std::io::BufRead;
+    let mut envelope = Vec::new();
+    for line in std::io::BufReader::new(stdout).split(b'\n') {
+        let line = line?;
+        match crate::rescue::desktop_api::parse_progress_line(&line) {
+            Some((done, total)) => on_progress(done, total),
+            None => {
+                envelope.extend_from_slice(&line);
+                envelope.push(b'\n');
+            }
+        }
+    }
+    Ok(envelope)
 }
 
 fn stick_result(envelope: serde_json::Value) -> ApiResult<serde_json::Value> {
@@ -1362,7 +1413,7 @@ async fn start_restore(
     let restored = job.restored.clone();
     std::thread::spawn(move || {
         let result = if stick {
-            stick_rpc(
+            stick_rpc_progress(
                 &paths,
                 crate::rescue::desktop_api::Request {
                     uuid: stick_uuid,
@@ -1372,6 +1423,19 @@ async fn start_restore(
                         selections,
                         target,
                     },
+                },
+                &mut |done, total| {
+                    restored.store(done, Ordering::Relaxed);
+                    if let Some(j) = restores
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_mut(&id)
+                    {
+                        j.restored_bytes = done;
+                        if total.is_some() {
+                            j.total_bytes = total;
+                        }
+                    }
                 },
             )
             .map(|value| {
@@ -2050,6 +2114,35 @@ mod tests {
             system_mode: false,
             incomplete: vec![],
         }
+    }
+
+    #[test]
+    fn stick_worker_progress_lines_are_split_from_the_envelope() {
+        use crate::rescue::desktop_api::progress_line;
+        let envelope = json!({ "result": { "restored_bytes": 30, "warnings": [] } }).to_string();
+        let out = format!(
+            "{}\n{}\n{envelope}",
+            progress_line(10, None),
+            progress_line(20, Some(40))
+        );
+        let mut seen = Vec::new();
+        let rest = worker_envelope(out.as_bytes(), &mut |d, t| seen.push((d, t))).unwrap();
+        assert_eq!(seen, [(10, None), (20, Some(40))]);
+        let value: serde_json::Value = serde_json::from_slice(&rest).unwrap();
+        assert_eq!(stick_result(value).ok().unwrap()["restored_bytes"], 30);
+        // An older worker writes only the envelope.
+        let mut calls = 0;
+        let rest = worker_envelope(envelope.as_bytes(), &mut |_, _| calls += 1).unwrap();
+        assert_eq!(calls, 0);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rest).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&envelope).unwrap()
+        );
+        // A result that merely contains a "progress" key is not a progress line.
+        let lookalike = json!({ "progress": { "restored_bytes": 1 }, "result": {} }).to_string();
+        let mut calls = 0;
+        worker_envelope(lookalike.as_bytes(), &mut |_, _| calls += 1).unwrap();
+        assert_eq!(calls, 0);
     }
 
     #[tokio::test]

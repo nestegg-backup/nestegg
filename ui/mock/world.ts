@@ -101,6 +101,7 @@ export type Flavor = "full" | "today";
  * - `stick_pulled`: the stick is pulled out (also at runtime: `POST /__mock/fault?stick_pulled=1|0`);
  *   stick requests answer 503 `stick_unavailable` and a running restore from it fails
  * - `stick_busy`: opening the stick fails although it is plugged in (503 `stick_unavailable`)
+ * - `stick_no_progress`: like a daemon before API 0.6.0, a stick restore reports its bytes only at the end
  */
 export const FAULTS = [
   "down",
@@ -123,6 +124,7 @@ export const FAULTS = [
   "stick_pulled",
   "stick_busy",
   "stick_multiple",
+  "stick_no_progress",
 ] as const;
 export type Fault = (typeof FAULTS)[number];
 
@@ -138,8 +140,12 @@ const DAY = 24 * HOUR;
 const GB = 1_000_000_000;
 
 /** The documentation UUID of docs/stick.md; never a real medium. */
-export const SECOND_STICK_UUID = "01234567-89ab-cdef-0123-456789abcdee";
+export const SECOND_STICK_UUID = "fedcba98-7654-3210-fedc-ba9876543210";
 export const STICK_UUID = "01234567-89ab-cdef-0123-456789abcdef";
+/** Only the first stick has a name (`[stick.names]`); the second shows the fallback. */
+export const STICK_NAMES: Record<string, string> = { [STICK_UUID]: "Blue stick" };
+/** The client's "(compressed …)" is about this share of the new data in the mock. */
+const COMPRESSED = 0.38;
 
 const iso = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
 
@@ -188,8 +194,10 @@ interface RestoreJob {
   restore: Restore;
   startedMs: number;
   totalBytes: number;
-  /** From the stick: no progress until the end, and it fails when the stick is pulled out. */
+  /** From the stick: it fails when the stick is pulled out. */
   stick?: boolean;
+  /** Whole archives are restored: the daemon knows a total. */
+  wholeArchives?: boolean;
 }
 
 const fmtClock = (ms: number) => new Date(ms).toTimeString().slice(0, 8);
@@ -292,6 +300,8 @@ function makeRun(
     verified?: boolean;
     /** Only set when given: PBS records of older versions have no target. */
     target?: Target;
+    /** A record of an older version: no `transferred_bytes`. */
+    legacy?: boolean;
   } = {},
 ): StoredRun {
   const d = new Date(startMs);
@@ -314,6 +324,7 @@ function makeRun(
         ? [...ARCHIVES.map((a) => ({ ...a, size_bytes: a.name === "home.pxar" ? 380 * GB : 0.4 * GB })), { name: "inventory.pxar", source: "/var/lib/nestegg/inventory", size_bytes: 3_000_000 }]
         : [],
     uploaded_bytes: state === "succeeded" ? (opts.uploaded ?? GB) : null,
+    ...(state === "succeeded" && !opts.legacy ? { transferred_bytes: Math.round((opts.uploaded ?? GB) * COMPRESSED) } : {}),
     // Like the daemon: every reason for "incomplete" is also a warning.
     warnings: [...(opts.warnings ?? []), ...(opts.incomplete ?? [])],
     ...(opts.incomplete?.length ? { incomplete: opts.incomplete } : {}),
@@ -436,6 +447,8 @@ export class World {
         warnings: d === 4 ? ["/home/alice/.cache/thumbnails: permission denied, skipped"] : [],
         // Backups from the last ten days were read back after the upload; older records have no such flag.
         verified: d <= 9 ? true : undefined,
+        // Records older than eleven days come from a version without the compressed amount.
+        legacy: d > 11,
       });
       this.runs.unshift(run);
     }
@@ -802,7 +815,8 @@ export class World {
       if (job.restore.state !== "running") continue;
       const el = now - job.startedMs;
       if (job.stick) {
-        // Like the stick worker: the bytes are reported once everything is copied.
+        // Like the stick worker: it opens the stick first (about 2 s), then reports the bytes
+        // copied so far once a second; an older daemon (fault `stick_no_progress`) only at the end.
         if (!this.stickIn()) {
           job.restore.state = "failed";
           job.restore.finished_at = iso(now);
@@ -811,6 +825,9 @@ export class World {
           job.restore.state = "succeeded";
           job.restore.finished_at = iso(now);
           job.restore.restored_bytes = Math.round(job.totalBytes);
+        } else if (el > 2_000 && !this.faults.has("stick_no_progress")) {
+          job.restore.restored_bytes = Math.round(Math.floor((el - 2_000) / 1_000) / 6 * job.totalBytes);
+          job.restore.total_bytes = job.wholeArchives ? Math.round(job.totalBytes) : null;
         }
         continue;
       }
@@ -853,11 +870,13 @@ export class World {
         run.state = "uploading";
         const progress = (el - 5_000) / 9_000;
         run.uploaded_bytes = Math.round(progress * total);
+        run.transferred_bytes = Math.round(progress * total * COMPRESSED);
         run.expected_bytes = 412 * GB;
         run.processed_bytes = Math.round((Math.floor(progress * 5) / 5) * 412 * GB);
       } else if (el < 19_000) {
         run.state = "finishing";
         run.uploaded_bytes = total;
+        run.transferred_bytes = Math.round(total * COMPRESSED);
       } else {
         stick.availableBytes = Math.max(0, stick.availableBytes - total);
         this.finish(now, makeRun(a.startedMs, "succeeded", { target, trigger: run.trigger, duration: Math.round(el / 1000), uploaded: total, verified: true }));
@@ -880,12 +899,14 @@ export class World {
       run.state = "uploading";
       const progress = (el - 8_000) / 10_000;
       run.uploaded_bytes = Math.round(progress * total);
+      run.transferred_bytes = Math.round(progress * total * COMPRESSED);
       // Archive sizes are only known after each archive: the estimate moves in steps.
       run.expected_bytes = 412 * GB;
       run.processed_bytes = Math.round((Math.floor(progress * 5) / 5) * 412 * GB);
     } else if (el < 20_000) {
       run.state = "finishing";
       run.uploaded_bytes = total;
+      run.transferred_bytes = Math.round(total * COMPRESSED);
     } else {
       this.reachable = true;
       this.checkedMs = a.startedMs + 5_000;
@@ -1013,6 +1034,7 @@ export class World {
           in_use: [...this.restores.values()].some((j) => j.stick && j.restore.state === "running") ? "restore" as const : running ? "backup" as const : null,
           sticks: Object.fromEntries((this.faults.has("stick_multiple") ? [STICK_UUID, SECOND_STICK_UUID] : [STICK_UUID]).map((uuid) => [uuid, {
             plugged_in: this.stickIn(),
+            name: STICK_NAMES[uuid] ?? null,
             in_use: [...this.restores.values()].some((j) => j.stick && j.restore.stick_uuid === uuid && j.restore.state === "running") ? "restore" : running ? "backup" : null,
           }])),
         } : {}),
@@ -1114,7 +1136,8 @@ export class World {
       encryption: this.encryptionOn(),
       overdue_after_hours: this.overdue(),
       stick_overdue_after_hours: this.stick ? this.stick.overdueHours : null,
-      stick_data_uuids: this.stick ? [STICK_UUID] : [],
+      stick_data_uuids: this.stick ? (this.faults.has("stick_multiple") ? [STICK_UUID, SECOND_STICK_UUID] : [STICK_UUID]) : [],
+      stick_names: this.stick ? STICK_NAMES : {},
       automatic_backups: this.timerOn(),
       wake_on_lan: this.wakeOn(),
       wake_on_lan_configured: this.wakeConfigured(),
@@ -1486,7 +1509,8 @@ export class World {
         total_bytes: null,
         warnings: [],
       };
-      this.restores.set(id, { restore, startedMs: now, totalBytes: (many ? req.archives!.length : 1) * 1.7 * GB, stick: true });
+      const whole = many ? req.archives!.every((a) => !a.paths?.length) : req.paths!.length === 0;
+      this.restores.set(id, { restore, startedMs: now, totalBytes: (many ? req.archives!.length : 1) * 1.7 * GB, stick: true, wholeArchives: whole });
       return slow({ status: 202, body: restore }, 1_500);
     }
     if (route === "GET /snapshots") {
