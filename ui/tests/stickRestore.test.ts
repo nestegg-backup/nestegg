@@ -325,7 +325,7 @@ describe("browse permission failures", () => {
     restore.setSource(source);
     restore.pick(snapshot.time);
     const reason = "this archive does not contain your home directory";
-    const refuse = () => vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ code: "forbidden", message: reason }), { status: 403 }));
+    const refuse = () => vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ code: "forbidden", reason: "restore_no_home", message: reason }), { status: 403 }));
     if (first) refuse();
     await restore.prepare(snapshot, null);
     const node = first ? restore.roots[0]! : restore.roots.find((r) => r.archive === "home.pxar")!;
@@ -352,13 +352,27 @@ describe("browse permission failures", () => {
     expect((node as TreeNode).children?.length).toBeGreaterThan(0);
   });
 
+  it.each(["pbs", "stick"] as const)("uses the machine reason from %s even when the English wording changes", async (source) => {
+    vi.stubGlobal("fetch", async () => new Response(JSON.stringify({
+      code: "forbidden", reason: "restore_outside_home", message: "new wording",
+    }), { status: 403 }));
+    let error: ApiFailure | null = null;
+    try { await api.browse("2026-11-10T18:10:00Z", "home.pxar", "/bob", source); }
+    catch (e) { error = e as ApiFailure; }
+    expect(error?.reason).toBe("restore_outside_home");
+    for (const t of [de, en]) expect(browseFailureText(error, t)).toBe(t.restore.dirOutsideHome);
+  });
+
   it("distinguishes absent source proof, out-of-home paths, other refusals and ordinary failures in both languages", () => {
     for (const t of [de, en]) {
-      const failure = (message: string, status = 403) => new ApiFailure("other", status, "forbidden", message);
+      const failure = (message: string, status = 403, reason: string | null = null) => new ApiFailure("other", status, "forbidden", message, reason);
       for (const reason of ["this snapshot has no signed source metadata", "invalid snapshot source metadata", "ask an administrator to restore it"]) {
-        expect(browseFailureText(failure(reason), t)).toBe(t.restore.dirNoMetadata);
+        expect(browseFailureText(failure(reason, 403, "restore_source_unverified"), t)).toBe(t.restore.dirNoMetadata);
       }
-      expect(browseFailureText(failure("you can only browse your home directory"), t)).toBe(t.restore.dirOutsideHome);
+      for (const message of ["you can only browse your home directory", "you can only browse your own home directory", "wording may change"]) {
+        expect(browseFailureText(failure(message, 403, "restore_outside_home"), t)).toBe(t.restore.dirOutsideHome);
+      }
+      expect(browseFailureText(failure("metadata in unrelated refusal"), t)).toContain("metadata in unrelated refusal");
       expect(browseFailureText(failure("a new refusal"), t)).toContain("a new refusal");
       expect(browseFailureText(failure("unreachable", 503), t)).toBe(t.restore.dirFailed);
       expect(browseFailureText(null, t)).toBe(t.restore.dirFailed);

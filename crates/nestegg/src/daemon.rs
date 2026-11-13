@@ -205,7 +205,7 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
-    reason: Option<crate::rescue::desktop_api::UnavailableReason>,
+    reason: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -601,6 +601,10 @@ fn stick_rpc(
     }
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).map_err(ApiError::internal)?;
+    stick_result(envelope)
+}
+
+fn stick_result(envelope: serde_json::Value) -> ApiResult<serde_json::Value> {
     if let Some(error) = envelope.get("error") {
         let (status, code) = match error["code"].as_str() {
             Some("forbidden") => (StatusCode::FORBIDDEN, "forbidden"),
@@ -616,10 +620,17 @@ fn stick_rpc(
                 .unwrap_or("stick operation failed"),
         );
         if code == "stick_unavailable" {
-            failure.reason = Some(
-                serde_json::from_value(error["reason"].clone())
-                    .unwrap_or(crate::rescue::desktop_api::UnavailableReason::Unreadable),
-            );
+            failure.reason = Some(json!(
+                serde_json::from_value::<crate::rescue::desktop_api::UnavailableReason>(
+                    error["reason"].clone()
+                )
+                .unwrap_or(crate::rescue::desktop_api::UnavailableReason::Unreadable)
+            ));
+        } else if code == "forbidden" {
+            failure.reason =
+                serde_json::from_value::<crate::restore::ForbiddenReason>(error["reason"].clone())
+                    .ok()
+                    .map(|r| json!(r));
         }
         return Err(failure);
     }
@@ -825,6 +836,12 @@ fn forbidden(msg: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::FORBIDDEN, "forbidden", msg)
 }
 
+fn scope_forbidden(reason: crate::restore::ForbiddenReason, msg: impl Into<String>) -> ApiError {
+    let mut error = forbidden(msg);
+    error.reason = Some(json!(reason));
+    error
+}
+
 /// Map typed restore errors to API errors.
 fn restore_error(e: anyhow::Error) -> ApiError {
     match e.downcast_ref::<crate::restore::RestoreError>() {
@@ -832,6 +849,9 @@ fn restore_error(e: anyhow::Error) -> ApiError {
             ApiError::new(StatusCode::CONFLICT, "target_exists", e.to_string())
         }
         Some(crate::restore::RestoreError::Forbidden(m)) => forbidden(m.clone()),
+        Some(crate::restore::RestoreError::ScopeForbidden { reason, message }) => {
+            scope_forbidden(*reason, message.clone())
+        }
         Some(crate::restore::RestoreError::BadRequest(m)) => bad_request(m.clone()),
         None => ApiError::internal(format!("{e:#}")),
     }
@@ -849,33 +869,20 @@ fn snapshot_of(config: &Config, time: &str) -> ApiResult<String> {
     ))
 }
 
-/// Metadata records canonical paths; legacy run records retain configured paths.
+/// Only handle-bound snapshot metadata grants descendant scopes.
 #[derive(Debug, PartialEq)]
 enum SnapshotSource {
-    Metadata(PathBuf),
+    Metadata(PathBuf, bool),
     LocalRecord(PathBuf),
 }
 
 impl SnapshotSource {
     fn scope(&self, user: &crate::identity::UserIdentity) -> ApiResult<crate::restore::UserScope> {
-        let no_home = || forbidden("this archive does not contain your home directory");
-        let source = match self {
-            Self::Metadata(path) => path,
-            Self::LocalRecord(path) => {
-                // A configured source below home could have been a symlink to
-                // system files. Without canonical snapshot metadata, preserve
-                // the old ancestor/home-only mapping; today's links prove nothing.
-                let home = std::fs::canonicalize(&user.home).map_err(|_| no_home())?;
-                if path != &home && path.starts_with(&home) {
-                    return Err(forbidden(
-                        "this archive needs canonical source metadata; ask an administrator \
-                         to restore it with sudo nestegg restore",
-                    ));
-                }
-                path
-            }
+        let (path, bound) = match self {
+            Self::Metadata(path, bound) => (path, *bound),
+            Self::LocalRecord(path) => (path, false),
         };
-        crate::restore::user_scope(source, &user.home, user.uid).ok_or_else(no_home)
+        crate::restore::scope_for_source(path, bound, user).map_err(restore_error)
     }
 }
 
@@ -890,7 +897,12 @@ fn snapshot_source(
     snapshot: &str,
     archive: &str,
 ) -> ApiResult<SnapshotSource> {
-    let not_in_archive = || forbidden("this archive does not contain your home directory");
+    let not_in_archive = || {
+        scope_forbidden(
+            crate::restore::ForbiddenReason::RestoreNoHome,
+            "this archive does not contain your home directory",
+        )
+    };
     let key = MetaKey::new(config, snapshot);
     let cached = app
         .metadata
@@ -914,7 +926,9 @@ fn snapshot_source(
     if let Some(meta) = meta {
         return meta
             .source_of(archive)
-            .map(|path| SnapshotSource::Metadata(PathBuf::from(path)))
+            .map(|path| {
+                SnapshotSource::Metadata(PathBuf::from(path), meta.bound_sources.contains(archive))
+            })
             .ok_or_else(not_in_archive);
     }
     let record = Store::new(&app.paths)
@@ -927,12 +941,15 @@ fn snapshot_source(
             .find(|a| a.name == archive)
             .map(|a| SnapshotSource::LocalRecord(PathBuf::from(&a.source)))
             .ok_or_else(not_in_archive),
-        None => Err(forbidden(format!(
-            "this snapshot has no backup metadata (made by an older nestegg version) and \
+        None => Err(scope_forbidden(
+            crate::restore::ForbiddenReason::RestoreSourceUnverified,
+            format!(
+                "this snapshot has no backup metadata (made by an older nestegg version) and \
              no local run record, so its contents cannot be assigned to your home \
              directory; ask an administrator to restore it with \
              `sudo nestegg restore {snapshot} {archive} <target>`"
-        ))),
+            ),
+        )),
     }
 }
 
@@ -973,10 +990,13 @@ fn interpret_metadata(
 ) -> ApiResult<Option<crate::metadata::BackupMetadata>> {
     let untrusted = |why: String| {
         eprintln!("backup metadata of {snapshot} refused: {why}");
-        forbidden(format!(
-            "the backup metadata of this snapshot cannot be used ({why}); ask an \
+        scope_forbidden(
+            crate::restore::ForbiddenReason::RestoreSourceUnverified,
+            format!(
+                "the backup metadata of this snapshot cannot be used ({why}); ask an \
              administrator to restore it with `sudo nestegg restore`"
-        ))
+            ),
+        )
     };
     match fetched {
         // No blob at all (older nestegg version): fall back to the local run
@@ -1109,7 +1129,10 @@ async fn browse(
                 crate::restore::Requester::User(user) => {
                     let scope = user_scope_for(&app, &config, &snapshot, &archive, user)?;
                     if !scope.contains(&path) && !scope.is_ancestor(&path) {
-                        return Err(forbidden("you can only browse your own home directory"));
+                        return Err(scope_forbidden(
+                            crate::restore::ForbiddenReason::RestoreOutsideHome,
+                            "you can only browse your own home directory",
+                        ));
                     }
                     Some(scope)
                 }
@@ -1275,7 +1298,10 @@ async fn start_restore(
                         normalized = vec![scope.prefix.clone()];
                     }
                     if let Some(p) = normalized.iter().find(|p| !scope.contains(p)) {
-                        return Err(forbidden(format!("{p} is outside your home directory")));
+                        return Err(scope_forbidden(
+                            crate::restore::ForbiddenReason::RestoreOutsideHome,
+                            format!("{p} is outside your home directory"),
+                        ));
                     }
                 }
                 sel.paths = normalized;
@@ -2019,9 +2045,36 @@ mod tests {
             backup_time,
             snapshot: crate::client::snapshot_path("desktop", backup_time),
             archive_sources: [("home.pxar".to_string(), "/home".to_string())].into(),
+            bound_sources: Default::default(),
             sources: vec!["/home".into()],
             system_mode: false,
             incomplete: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn pbs_and_stick_forbidden_responses_preserve_the_same_reasons() {
+        use crate::restore::{ForbiddenReason::*, RestoreError};
+        for reason in [RestoreNoHome, RestoreSourceUnverified, RestoreOutsideHome] {
+            let error = || {
+                anyhow::Error::from(RestoreError::ScopeForbidden {
+                    reason,
+                    message: "wording can change".into(),
+                })
+            };
+            let pbs = restore_error(error());
+            let stick =
+                stick_result(crate::rescue::desktop_api::error_envelope(&error())).unwrap_err();
+            for failure in [pbs, stick] {
+                assert_eq!(failure.status, StatusCode::FORBIDDEN);
+                let response = failure.into_response();
+                let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["code"], "forbidden");
+                assert_eq!(body["reason"], json!(reason));
+            }
         }
     }
 
@@ -2122,7 +2175,7 @@ mod tests {
     }
 
     #[test]
-    fn only_canonical_snapshot_metadata_grants_sources_below_home() {
+    fn only_handle_bound_snapshot_metadata_grants_sources_below_home() {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("alice");
@@ -2136,18 +2189,24 @@ mod tests {
         };
         let source = home.join("Documents");
         assert_eq!(
-            SnapshotSource::Metadata(source.clone())
+            SnapshotSource::Metadata(source.clone(), true)
                 .scope(&user)
                 .ok()
                 .expect("the source grants a scope")
                 .prefix,
             "/"
         );
-        let refusal = SnapshotSource::LocalRecord(source)
+        let refusal = SnapshotSource::LocalRecord(source.clone())
             .scope(&user)
             .unwrap_err();
         assert_eq!(refusal.status, StatusCode::FORBIDDEN);
-        assert!(refusal.message.contains("canonical source metadata"));
+        assert!(refusal.message.contains("handle-bound source metadata"));
+        assert_eq!(refusal.reason, Some(json!("restore_source_unverified")));
+        assert!(
+            SnapshotSource::Metadata(source, false)
+                .scope(&user)
+                .is_err()
+        );
         assert_eq!(
             SnapshotSource::LocalRecord(home.clone())
                 .scope(&user)
@@ -2170,7 +2229,7 @@ mod tests {
         std::os::unix::fs::symlink("/etc", &link).unwrap();
         assert!(SnapshotSource::LocalRecord(link).scope(&user).is_err());
         assert!(
-            SnapshotSource::Metadata(PathBuf::from("/etc"))
+            SnapshotSource::Metadata(PathBuf::from("/etc"), true)
                 .scope(&user)
                 .is_err()
         );
@@ -2190,6 +2249,7 @@ mod tests {
             backup_time: 1_794_000_000,
             snapshot: SNAPSHOT.into(),
             archive_sources: [("home.pxar".to_string(), "/home".to_string())].into(),
+            bound_sources: Default::default(),
             sources: vec!["/home".into()],
             system_mode: false,
             incomplete: vec![],
@@ -2212,7 +2272,7 @@ mod tests {
         store.record_run_only(&run).unwrap();
         assert_eq!(
             snapshot_source(&app, &config, SNAPSHOT, "home.pxar").ok(),
-            Some(SnapshotSource::Metadata(PathBuf::from("/home")))
+            Some(SnapshotSource::Metadata(PathBuf::from("/home"), false))
         );
         let err = snapshot_source(&app, &config, SNAPSHOT, "etc.pxar").unwrap_err();
         assert_eq!(err.status, StatusCode::FORBIDDEN);

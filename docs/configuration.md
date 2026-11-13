@@ -306,10 +306,13 @@ The daemon identifies the caller by the socket credentials:
   snapshot or, for snapshots of older versions, from the local run record;
   never from the snapshot notes, which others can change
   ([decision 0016](decisions/0016-restore-scope-from-backup-metadata.md)).
-  Sources below the home require snapshot metadata: legacy local run records
-  keep the older ancestor/home-only mapping because their paths may have
-  been symlinks at backup time. Snapshots with neither can only be restored
-  by root. With encryption off the blob is not signed; see the decision for what that means.
+  Sources below the home require handle-bound snapshot metadata (`bound_sources`):
+  the recorded path and client input must refer to the same opened directory.
+  A canonical path alone does not establish this. Older metadata and local
+  run records keep the ancestor/home-only mapping. New backups open source
+  roots without following symlink components and pass the pinned directory
+  handles to the client; configure real directory paths rather than symlinks.
+  Snapshots with neither can only be restored by root. With encryption off the blob is not signed; see the decision for what that means.
 - root (`sudo nestegg restore …`) may restore everything.
 
 The overview of all machines reads each machine's last snapshot and the

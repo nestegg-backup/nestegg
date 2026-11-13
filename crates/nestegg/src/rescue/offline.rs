@@ -402,6 +402,7 @@ fn perform(session: &Session, sources: Sources, id: &str, force_id: bool) -> Res
         backup_time: now.timestamp(),
         snapshot: snapshot.clone(),
         archive_sources: BTreeMap::from([("system.pxar".into(), "/".into())]),
+        bound_sources: Default::default(),
         sources: vec!["/".into()],
         system_mode: true,
         incomplete: Vec::new(),
@@ -450,8 +451,17 @@ fn perform(session: &Session, sources: Sources, id: &str, force_id: bool) -> Res
         rate_limit: None,
         metadata: Some(meta_path),
     };
+    let source_handles = archives
+        .iter()
+        .map(|archive| {
+            Ok((
+                archive.name.clone(),
+                crate::source::SourceDirectory::open(&archive.path)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     client
-        .backup(&spec, &mut std::io::stderr(), &mut |_| {})
+        .backup(&spec, &source_handles, &mut std::io::stderr(), &mut |_| {})
         .map_err(|e| anyhow::anyhow!("{}", e.message))?;
     sources.check_snapshots()?;
     let verify_dir = scratch.path().join("read-back");
@@ -655,6 +665,7 @@ mod tests {
             backup_time: 1,
             snapshot: snapshot_path("desktop", 1),
             archive_sources: BTreeMap::new(),
+            bound_sources: Default::default(),
             sources: vec![],
             system_mode: true,
             incomplete: vec![],

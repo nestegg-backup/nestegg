@@ -36,9 +36,9 @@ export interface Selection {
 /** Explain refusals without claiming that missing permission metadata means missing files. */
 export function browseFailureText(error: ApiFailure | null, t: Messages): string {
   if (error?.status !== 403) return t.restore.dirFailed;
-  if (error.message === "this archive does not contain your home directory") return t.restore.dirNoHome;
-  if (/metadata|ask an administrator|archive is absent/.test(error.message)) return t.restore.dirNoMetadata;
-  if (/outside your home|only browse your home/.test(error.message)) return t.restore.dirOutsideHome;
+  if (error.reason === "restore_no_home") return t.restore.dirNoHome;
+  if (error.reason === "restore_source_unverified") return t.restore.dirNoMetadata;
+  if (error.reason === "restore_outside_home") return t.restore.dirOutsideHome;
   return t.restore.dirForbidden(error.message);
 }
 

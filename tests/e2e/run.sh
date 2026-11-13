@@ -403,7 +403,7 @@ check "API restore: content matches" on_client cmp /home/alice/Documents/report.
 check "API restore: owned by the caller" no_output on_client find /home/alice/api-restore ! -user alice
 check "API restore: only the selected folder" absent_in /home/alice/api-restore/alice .bashrc
 check "API restore outside the own home is refused" \
-  responds 403 '/root is outside your home directory' alice -X POST -H 'Content-Type: application/json' \
+  responds 403 '"reason":"restore_outside_home"' alice -X POST -H 'Content-Type: application/json' \
   -d "{\"snapshot_time\":\"$ltime\",\"archive\":\"home.pxar\",\"paths\":[\"/root\"],\"target_dir\":\"/home/alice/x1\"}" \
   http://localhost/api/v1/restores
 check "API restore into an existing target is 409" \
@@ -498,7 +498,7 @@ on_client bash -c "f=\$(ls -t /var/lib/nestegg/runs/*.json | head -1) && sed -e 
 check "no metadata: the local run record is used" \
   bash -c "[[ \$($API 'http://localhost/api/v1/snapshots/$raw_time/browse?archive=home.pxar&path=/' | grep -o '\"name\":\"[^\"]*\"' | sort -u | tr -d '\n') == '\"name\":\"alice\"' ]]"
 check "legacy non-canonical source below home stays closed" \
-  responds 403 'canonical source metadata' alice "http://localhost/api/v1/snapshots/$raw_time/browse?archive=docs.pxar&path=/"
+  responds 403 'handle-bound source metadata' alice "http://localhost/api/v1/snapshots/$raw_time/browse?archive=docs.pxar&path=/"
 on_client rm -f /var/lib/nestegg/runs/20000101T000000Z-cli-0000.json
 
 check "pbs info: reachable" bash -c "$API http://localhost/api/v1/pbs | grep -q '\"reachable\":true'"

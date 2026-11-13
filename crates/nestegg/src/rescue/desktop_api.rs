@@ -92,6 +92,17 @@ fn forbidden(message: impl Into<String>) -> anyhow::Error {
     RestoreError::Forbidden(message.into()).into()
 }
 
+fn scope_forbidden(
+    reason: crate::restore::ForbiddenReason,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    RestoreError::ScopeForbidden {
+        reason,
+        message: message.into(),
+    }
+    .into()
+}
+
 fn archive_name(name: &str) -> Result<()> {
     ensure!(
         name.strip_suffix(".pxar").is_some_and(|n| !n.is_empty()
@@ -125,29 +136,44 @@ fn scope(
     let fetched = crate::metadata::fetch(client, snapshot, scratch)
         .map_err(|e| {
             if crate::client::manifest_unsigned_error(&format!("{e:#}")) {
-                forbidden("snapshot metadata is not signed with the configured key")
+                scope_forbidden(
+                    crate::restore::ForbiddenReason::RestoreSourceUnverified,
+                    "snapshot metadata is not signed with the configured key",
+                )
             } else {
                 e
             }
         })?
         .ok_or_else(|| {
-            forbidden(
+            scope_forbidden(
+                crate::restore::ForbiddenReason::RestoreSourceUnverified,
                 "this snapshot has no signed source metadata; ask an administrator to restore it",
             )
         })?;
-    let meta = crate::metadata::BackupMetadata::parse(&fetched.bytes)
-        .map_err(|_| forbidden("invalid snapshot source metadata"))?;
+    let meta = crate::metadata::BackupMetadata::parse(&fetched.bytes).map_err(|_| {
+        scope_forbidden(
+            crate::restore::ForbiddenReason::RestoreSourceUnverified,
+            "invalid snapshot source metadata",
+        )
+    })?;
     ensure!(
         meta.belongs_to(snapshot),
-        forbidden("metadata belongs to a different snapshot")
+        scope_forbidden(
+            crate::restore::ForbiddenReason::RestoreSourceUnverified,
+            "metadata belongs to a different snapshot"
+        )
     );
-    let source = meta
-        .source_of(archive)
-        .ok_or_else(|| forbidden("archive is absent from snapshot metadata"))?;
-    Ok(Some(
-        crate::restore::user_scope(Path::new(source), &user.home, user.uid)
-            .ok_or_else(|| forbidden("this archive does not contain your home directory"))?,
-    ))
+    let source = meta.source_of(archive).ok_or_else(|| {
+        scope_forbidden(
+            crate::restore::ForbiddenReason::RestoreSourceUnverified,
+            "archive is absent from snapshot metadata",
+        )
+    })?;
+    Ok(Some(crate::restore::scope_for_source(
+        Path::new(source),
+        meta.bound_sources.contains(archive),
+        user,
+    )?))
 }
 
 fn validate(
@@ -204,7 +230,10 @@ fn validate(
             }
             ensure!(
                 sel.paths.iter().all(|p| scope.contains(p)),
-                forbidden("selected path is outside your home directory")
+                scope_forbidden(
+                    crate::restore::ForbiddenReason::RestoreOutsideHome,
+                    "selected path is outside your home directory"
+                )
             );
         }
     }
@@ -298,7 +327,10 @@ pub fn execute(paths: &Paths, request: Request) -> Result<Value> {
             if let Some(scope) = &scope {
                 ensure!(
                     scope.contains(&path) || scope.is_ancestor(&path),
-                    forbidden("you can only browse your home directory")
+                    scope_forbidden(
+                        crate::restore::ForbiddenReason::RestoreOutsideHome,
+                        "you can only browse your home directory"
+                    )
                 );
             }
             let catalog = scratch.path().join("catalog");
@@ -385,6 +417,21 @@ pub fn execute(paths: &Paths, request: Request) -> Result<Value> {
     Ok(result)
 }
 
+pub(crate) fn error_envelope(e: &anyhow::Error) -> Value {
+    let code = match e.downcast_ref::<RestoreError>() {
+        Some(RestoreError::Forbidden(_) | RestoreError::ScopeForbidden { .. }) => "forbidden",
+        Some(RestoreError::BadRequest(_)) => "bad_request",
+        Some(RestoreError::TargetExists(_)) => "target_exists",
+        None => "stick_unavailable",
+    };
+    let reason = match e.downcast_ref::<RestoreError>() {
+        Some(RestoreError::ScopeForbidden { reason, .. }) => json!(reason),
+        _ if code == "stick_unavailable" => json!(unavailable_reason(e)),
+        _ => Value::Null,
+    };
+    json!({ "error": { "code": code, "reason": reason, "message": super::printable_block(&format!("{e:#}")) } })
+}
+
 /// Root-only stdin protocol for the daemon's child. Never accepts credentials
 /// or namespace/image paths, and never writes secret material to stdout.
 pub fn run() -> Result<u8> {
@@ -397,15 +444,7 @@ pub fn run() -> Result<u8> {
     let result = execute(&Paths::from_env(), request);
     let envelope = match result {
         Ok(value) => json!({ "result": value }),
-        Err(e) => {
-            let code = match e.downcast_ref::<RestoreError>() {
-                Some(RestoreError::Forbidden(_)) => "forbidden",
-                Some(RestoreError::BadRequest(_)) => "bad_request",
-                Some(RestoreError::TargetExists(_)) => "target_exists",
-                None => "stick_unavailable",
-            };
-            json!({ "error": { "code": code, "reason": (code == "stick_unavailable").then(|| unavailable_reason(&e)), "message": super::printable_block(&format!("{e:#}")) } })
-        }
+        Err(e) => error_envelope(&e),
     };
     serde_json::to_writer(std::io::stdout().lock(), &envelope)?;
     std::io::stdout().flush()?;
@@ -415,6 +454,21 @@ pub fn run() -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scope_refusals_have_stable_worker_reasons() {
+        use crate::restore::ForbiddenReason::*;
+        for (reason, code) in [
+            (RestoreNoHome, "restore_no_home"),
+            (RestoreSourceUnverified, "restore_source_unverified"),
+            (RestoreOutsideHome, "restore_outside_home"),
+        ] {
+            let error = scope_forbidden(reason, "wording can change");
+            let envelope = error_envelope(&error);
+            assert_eq!(envelope["error"]["code"], "forbidden");
+            assert_eq!(envelope["error"]["reason"], code);
+        }
+    }
+
     #[test]
     fn unavailable_reasons_are_stable_and_preserve_typed_causes() {
         for (kind, expected) in [

@@ -78,8 +78,10 @@ support are prerequisites. The desktop pipeline uses this handle for the stick t
 ## Run pipeline
 
 1. Acquire `/run/nestegg/run.lock` (no overlapping runs).
-2. Check sources exist (missing configured sources fail the run instead of
-   silently producing an incomplete backup).
+2. Open source directories component by component without following symlinks
+   and retain their handles. Missing required sources fail the run; optional
+   sources are skipped as incomplete. Derive each recorded source path from
+   its handle, not a separate path lookup (decision 0016).
 3. PBS availability: a TCP connection to the PBS port (no credentials are
    sent). If unreachable and Wake-on-LAN is configured, send the magic
    packet, repeat it with growing pauses and poll until
@@ -92,7 +94,8 @@ support are prerequisites. The desktop pipeline uses this handle for the stick t
    (package selections, manually installed packages, Flatpak/Snap lists,
    enabled units, `lsblk`/`findmnt` output, OS release).
 5. `proxmox-backup-client backup` with one archive per source
-   (`home.pxar:/home`, `etc.pxar:/etc`, …, `inventory.pxar:…`) and the
+   (`home.pxar:/proc/self/fd/N`, …, `inventory.pxar:/proc/self/fd/M`),
+   inheriting the same opened directories used for the recorded paths, and the
    metadata blob `nestegg-meta.conf` (sources, archive → source path,
    incomplete reasons; written to `/run/nestegg/tmp/`),
    `--backup-type host --backup-id <id> [--ns <ns>]`, excludes,

@@ -339,8 +339,8 @@ paths:
         The first call for a snapshot reads its catalog from the PBS (needs
         the PBS to be reachable); later calls use a local cache. Users other
         than root see only their own home directory (ancestors show only the
-        branch towards it). A canonical source inside the caller's home,
-        recorded in the snapshot metadata, grants the archive root (e.g.
+        branch towards it). A handle-bound source inside the caller's home,
+        recorded in the snapshot metadata (`bound_sources`), grants the archive root (e.g.
         /home/alice/Documents maps to / in docs.pxar). With target=stick the
         catalog is read in a private worker, not retained across media attachments. Non-root callers require
         signed snapshot metadata; all home-directory restrictions still apply.
@@ -402,7 +402,7 @@ paths:
         snapshots of older versions, in the local run record of that
         snapshot; never the snapshot notes (decision 0016). Snapshots
         with neither can only be restored by root (403 `forbidden`). Sources
-        below the home require canonical snapshot metadata; legacy local records
+        below the home require handle-bound snapshot metadata; older metadata and local records
         retain the ancestor/home-only mapping. Such descendant archives restore
         directly from their root into the target, without adding the source path.
         The client's synthetic /.pxarexclude-cli record is excluded during extraction;
@@ -559,8 +559,12 @@ components:
           enum: [run_in_progress, restore_in_progress, target_exists, cannot_cancel, already_checking, not_found, pbs_unreachable, stick_unavailable, not_implemented, bad_request, forbidden, internal]
         message: { type: string, description: Human-readable English text. }
         reason:
-          oneOf: [{ $ref: "#/components/schemas/StickUnavailableReason" }, { type: "null" }]
-          description: Always set for 503 stick_unavailable; null or absent for other errors.
+          oneOf: [{ $ref: "#/components/schemas/StickUnavailableReason" }, { $ref: "#/components/schemas/RestoreForbiddenReason" }, { type: "null" }]
+          description: Always set for 503 stick_unavailable and restore-scope 403 forbidden refusals. Null or absent for other errors and older daemons. Clients must not parse the English message.
+    RestoreForbiddenReason:
+      type: string
+      enum: [restore_no_home, restore_source_unverified, restore_outside_home]
+      description: The archive has no caller home, its source cannot be safely established, or the selected path is outside the caller home. Identical for PBS and stick.
     StickUnavailableReason:
       type: string
       enum: [not_plugged_in, ambiguous, busy, snapshot_not_on_stick, unreadable, unsupported]
