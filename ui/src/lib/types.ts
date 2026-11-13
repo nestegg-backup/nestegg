@@ -132,7 +132,17 @@ export interface TargetStatus {
   password_reminders?: Record<string, "key_copy_missing" | "password_check_due">;
 }
 
+/** The last restore of the whole computer from a backup (rescue stick). */
+export interface RestoredFrom {
+  snapshot: string;
+  snapshot_time: string;
+  restored_at: string;
+  target: Target;
+}
+
 export interface Status {
+  /** Set after the computer was put back from a backup; older daemons leave it out. */
+  restored_from?: RestoredFrom | null;
   /** Only the configured targets; older daemons leave it out (then there is only the backup server). */
   targets?: Partial<Record<Target, TargetStatus>>;
   /** Legacy fields below describe the backup server when one is configured, otherwise the stick. */

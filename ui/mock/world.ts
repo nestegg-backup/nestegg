@@ -98,6 +98,7 @@ export type Flavor = "full" | "today";
  * - `long_overdue`: an administrator set "overdue after" to 744 hours in the file: above the API's
  *   limit of 168, so the settings page can only lower it (`limits` reports 744 as the maximum)
  * - `stick_password`: the stick's key copy is due for its password re-check (`password_reminder`)
+ * - `restored`: the computer was put back from a backup three days ago (`restored_from`)
  * - `stick_pulled`: the stick is pulled out (also at runtime: `POST /__mock/fault?stick_pulled=1|0`);
  *   stick requests answer 503 `stick_unavailable` and a running restore from it fails
  * - `stick_busy`: opening the stick fails although it is plugged in (503 `stick_unavailable`)
@@ -122,6 +123,7 @@ export const FAULTS = [
   "long_overdue",
   "stick_password",
   "stick_pulled",
+  "restored",
   "stick_busy",
   "stick_multiple",
   "stick_no_progress",
@@ -1057,6 +1059,16 @@ export class World {
     const legacyDamaged = this.pbsTarget || !this.stick ? this.damagedPaths : this.stick.damagedPaths;
     return {
       ...(this.stick ? { targets } : {}),
+      ...(this.faults.has("restored")
+        ? {
+            restored_from: {
+              snapshot: "host/desktop/" + new Date(now - 4 * DAY).toISOString().slice(0, 19) + "Z",
+              snapshot_time: new Date(now - 4 * DAY).toISOString(),
+              restored_at: new Date(now - 3 * DAY).toISOString(),
+              target: this.pbsTarget ? ("pbs" as const) : ("stick" as const),
+            },
+          }
+        : {}),
       machine: { hostname: "desktop", backup_id: "desktop", os: "Linux Mint 22.2" },
       pbs: this.configured && this.pbsTarget
         ? {

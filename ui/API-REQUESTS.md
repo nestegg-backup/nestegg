@@ -217,3 +217,5 @@ All of these are in `api/openapi.yaml` and the UI uses them:
 
 Not used by the UI: `MachinesResponse.complete` (the list simply shows who is
 visible), `PbsInfo.overview_configured` and `SessionInfo.uid` / `root`.
+- Restored computer (decision 0031): `Status.restored_from` (`snapshot`, `snapshot_time`, `restored_at`,
+  `target`), shown as the fact "Restored" on the computer's page. Mock: `&fault=restored`.

@@ -229,6 +229,9 @@ const en = {
     onServer: (size: string, count: number) =>
       `${size} in the latest backup, ${count} ${plural(count, "backup", "backups")} in total`,
     onServerCount: (count: number) => `${count} ${plural(count, "backup", "backups")}`,
+    factRestored: "Restored",
+    restoredFrom: (when: Moment, backup: Moment, stick: boolean) =>
+      `${cap(at(when))}, from the backup made ${at(backup)} on the ${stick ? "backup stick" : "backup server"}`,
     factEncryption: "Encryption",
     encryptionOnKey: "On. A copy of the key is confirmed.",
     encryptionOnNoKey: "On. A copy of the key is not confirmed yet.",

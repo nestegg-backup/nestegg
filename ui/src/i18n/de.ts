@@ -228,6 +228,9 @@ const de = {
     onServer: (size: string, count: number) =>
       `${size} im letzten Stand, ${count} ${plural(count, "Stand", "Stände")} insgesamt`,
     onServerCount: (count: number) => `${count} ${plural(count, "Stand", "Stände")}`,
+    factRestored: "Wiederhergestellt",
+    restoredFrom: (when: Moment, backup: Moment, stick: boolean) =>
+      `${cap(at(when))}, aus der Sicherung von ${at(backup)} ${stick ? "vom Backup-Stick" : "vom Backup-Server"}`,
     factEncryption: "Verschlüsselung",
     encryptionOnKey: "Eingeschaltet. Eine Kopie des Schlüssels ist bestätigt.",
     encryptionOnNoKey: "Eingeschaltet. Eine Kopie des Schlüssels ist noch nicht bestätigt.",

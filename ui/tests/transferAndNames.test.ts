@@ -89,3 +89,22 @@ describe("stick names", () => {
     expect(stickLabel(SECOND_STICK_UUID, stick, config, de)).toBe(`Stick ${SECOND_STICK_UUID.slice(0, 8)}`);
   });
 });
+
+describe("a computer that was restored from a backup", () => {
+  it("the mock reports where it came from, and both languages say so", () => {
+    const w = new World("ok", "full");
+    expect((w.handle("GET", "/status", params, null).body as Status).restored_from ?? null).toBeNull();
+    w.faults.add("restored");
+    const from = (w.handle("GET", "/status", params, null).body as Status).restored_from!;
+    expect(from.target).toBe("pbs");
+    expect(new Date(from.restored_at).getTime()).toBeGreaterThan(new Date(from.snapshot_time).getTime());
+    const when = { rel: "today", time: "10:00" } as never;
+    const backup = { rel: "yesterday", time: "02:00" } as never;
+    expect(de.self.restoredFrom(when, backup, false)).toBe(
+      "Heute um 10:00, aus der Sicherung von gestern um 02:00 vom Backup-Server",
+    );
+    expect(en.self.restoredFrom(when, backup, true)).toBe(
+      "Today at 10:00, from the backup made yesterday at 02:00 on the backup stick",
+    );
+  });
+});
