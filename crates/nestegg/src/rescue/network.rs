@@ -173,14 +173,40 @@ fn ini_value<'a>(text: &'a str, wanted: &str, key: &str) -> Option<&'a str> {
     }
 }
 
-fn files(root: &Path) -> Result<Vec<(PathBuf, &'static str)>> {
+/// The first component of `rel` below `root` that is a symbolic link, if any.
+/// Such a directory would be read (and written) wherever the link points in
+/// the rescue system, not inside the restored tree.
+fn linked_component(root: &Path, rel: &str) -> Option<PathBuf> {
+    let mut path = root.to_path_buf();
+    for part in Path::new(rel).components() {
+        path.push(part);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => return Some(path),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// A configuration file and its kind ("netplan", "nm", ...).
+type ConfigFile = (PathBuf, &'static str);
+
+/// The configuration files to look at, and the places that were skipped
+/// because the way to them leads through a symbolic link.
+fn files(root: &Path) -> Result<(Vec<ConfigFile>, Vec<PathBuf>)> {
     let mut files = Vec::new();
+    let mut linked = Vec::new();
     for (dir, extension, kind) in [
         ("etc/netplan", "yaml", "netplan"),
         ("etc/NetworkManager/system-connections", "", "nm"),
         ("etc/systemd/network", "link", "link"),
         ("etc/network/interfaces.d", "", "ifupdown"),
     ] {
+        if let Some(link) = linked_component(root, dir) {
+            linked.push(link);
+            continue;
+        }
         match fs::read_dir(root.join(dir)) {
             Ok(entries) => {
                 for e in entries {
@@ -205,12 +231,21 @@ fn files(root: &Path) -> Result<Vec<(PathBuf, &'static str)>> {
         ("etc/udev/rules.d/70-persistent-net.rules", "udev"),
         ("etc/network/interfaces", "ifupdown"),
     ] {
-        if root.join(p).exists() {
+        // The parent directories; a link at the file itself is handled by
+        // the caller like any other linked file.
+        let parent = Path::new(p).parent().and_then(Path::to_str).unwrap_or("");
+        if let Some(link) = linked_component(root, parent) {
+            linked.push(link);
+            continue;
+        }
+        if fs::symlink_metadata(root.join(p)).is_ok() {
             files.push((root.join(p), kind));
         }
     }
     files.sort();
-    Ok(files)
+    linked.sort();
+    linked.dedup();
+    Ok((files, linked))
 }
 
 /// Discover physical wired NICs in the *rescue* system. Virtual interfaces
@@ -248,7 +283,15 @@ pub fn fix_network(root: &Path, sys: &Path) -> Result<Vec<String>> {
     };
     let mut configs = Vec::new();
     let mut safe = hardware_known;
-    for (path, kind) in files(&root)? {
+    let (found, linked) = files(&root)?;
+    for link in linked {
+        notes.push(format!(
+            "Network: {} is a symbolic link, so the configuration below it was not read; unchanged. {manual}",
+            link.strip_prefix(&root)?.display()
+        ));
+        safe = false;
+    }
+    for (path, kind) in found {
         // A link is never followed: its target may only exist on the running
         // system (`/run`), or resolve differently here than after the first
         // boot. A link to /dev/null is the usual way to mask a file.
@@ -451,6 +494,28 @@ mod tests {
         );
         // An unreadable part of the picture: nothing is rewritten.
         assert_eq!(fs::read_to_string(&p).unwrap(), text);
+    }
+    #[test]
+    fn a_linked_configuration_directory_is_not_read_or_written() {
+        let (d, root, sys) = fixture();
+        // Stands for a path of the rescue system the link points to.
+        let outside = d.path().join("outside-netplan");
+        let text = netplan();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("50-cloud-init.yaml"), &text).unwrap();
+        fs::create_dir_all(root.join("etc")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("etc/netplan")).unwrap();
+        let notes = fix_network(&root, &sys).unwrap().join("\n");
+        assert!(notes.contains("etc/netplan is a symbolic link"), "{notes}");
+        assert_eq!(
+            fs::read_to_string(outside.join("50-cloud-init.yaml")).unwrap(),
+            text
+        );
+        assert_eq!(
+            fs::read_dir(&outside).unwrap().count(),
+            1,
+            "no backup copy either"
+        );
     }
     #[test]
     fn a_file_masked_with_dev_null_is_ignored() {
