@@ -455,6 +455,42 @@ pub fn size_for_archive(json: &str, archive: &str) -> Option<u64> {
     (!sizes.is_empty()).then(|| sizes.iter().sum())
 }
 
+/// Keep the client's synthetic exclude record out of extracted file trees.
+/// A nonempty match list disables the client's default "include everything",
+/// so whole-archive restores need an explicit include before the exclusion.
+pub(crate) fn user_restore_patterns(
+    archive: &str,
+    target: &Path,
+    selected: &[String],
+) -> Vec<String> {
+    let mut patterns = selected.to_vec();
+    let archive = archive.strip_suffix(".didx").unwrap_or(archive);
+    if target != Path::new("-") && (archive.ends_with(".pxar") || archive.ends_with(".mpxar")) {
+        if patterns.is_empty() {
+            patterns.push("/**".into());
+        }
+        // Last match wins. Anchor at the root; nested files are user data.
+        patterns.push("!/.pxarexclude-cli".into());
+    }
+    patterns
+}
+
+/// Raw extraction keeps the caller's patterns unchanged. Rescue, inventory
+/// and read-back must retain the official client's default extraction mode.
+fn extraction_args(request: &RestoreRequest<'_>, extra: &[&str]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "restore".into(),
+        request.snapshot.into(),
+        request.archive.into(),
+        request.target.into(),
+    ];
+    for pattern in request.patterns {
+        args.extend(["--pattern".into(), pattern.into()]);
+    }
+    args.extend(extra.iter().map(OsString::from));
+    args
+}
+
 /// Crypt modes of every file that belongs to `archive` (e.g. `home.pxar`;
 /// a split archive has two: `home.mpxar` and `home.ppxar`) in the JSON of
 /// `snapshot files` or the `files` of a manifest.
@@ -855,6 +891,7 @@ impl<'a> Client<'a> {
     pub fn backup(
         &self,
         spec: &BackupSpec,
+        sources: &std::collections::BTreeMap<String, crate::source::SourceDirectory>,
         log: &mut dyn Write,
         on_archive: &mut dyn FnMut(&ArchiveStats),
     ) -> std::result::Result<BackupOutcome, RunError> {
@@ -873,7 +910,16 @@ impl<'a> Client<'a> {
                 .map_err(|e| RunError::from_error(&e, ErrorKind::Config))?;
             fds.add(&key, KEY_FD).map_err(internal)?;
         }
-        cmd.args(backup_args(spec));
+        let mut pinned_spec = spec.clone();
+        for archive in &mut pinned_spec.archives {
+            let source = sources
+                .get(&archive.name)
+                .with_context(|| format!("missing pinned source for {}", archive.name))
+                .map_err(internal)?;
+            let fd = fds.inherit_directory(&source.directory).map_err(internal)?;
+            archive.path = PathBuf::from(format!("/proc/self/fd/{fd}"));
+        }
+        cmd.args(backup_args(&pinned_spec));
         fds.apply(&mut cmd);
         let mut stats = Vec::new();
         // No time limit on the upload itself (it may legitimately take hours);
@@ -1204,12 +1250,7 @@ impl<'a> Client<'a> {
         };
         let mut fds = FdPassing::new();
         let mut cmd = self.command(&mut fds)?;
-        cmd.args(["restore", request.snapshot, request.archive])
-            .arg(request.target);
-        for p in request.patterns {
-            cmd.args(["--pattern", p]);
-        }
-        cmd.args(extra);
+        cmd.args(extraction_args(request, extra));
         if let Some(key) = &key {
             fds.add(key, KEY_FD)?;
             cmd.args(["--keyfd", &KEY_FD.to_string()]);
@@ -1545,6 +1586,81 @@ pub fn parse_time(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_rescue_inventory_and_readback_extraction_does_not_enter_pattern_mode() {
+        for (archive, extra) in [
+            ("system.pxar", vec!["--allow-existing-dirs", "true"]),
+            ("inventory.pxar", vec![]),
+            ("nestegg-meta.conf", vec![]),
+        ] {
+            let request = RestoreRequest {
+                snapshot: "host/desktop/2026-11-06T21:20:00Z",
+                archive,
+                target: Path::new("/restore"),
+                patterns: &[],
+                key: RestoreKey::Without,
+            };
+            let args = strs(&extraction_args(&request, &extra));
+            assert!(!args.iter().any(|arg| arg == "--pattern"));
+            assert_eq!(&args[4..], extra.as_slice());
+            let selected = vec!["/etc".into()];
+            let args = strs(&extraction_args(
+                &RestoreRequest {
+                    patterns: &selected,
+                    ..request
+                },
+                &[],
+            ));
+            assert_eq!(&args[4..], ["--pattern", "/etc"]);
+        }
+    }
+
+    #[test]
+    fn restore_patterns_skip_only_the_root_client_record_without_widening_selection() {
+        use pathpatterns::{MatchEntry, MatchList, MatchType, PatternFlag};
+        for selected in [vec![], vec!["/alice".into(), "/alice/**".into()]] {
+            let patterns = user_restore_patterns("home.pxar", Path::new("/restore"), &selected);
+            let entries: Vec<_> = patterns
+                .iter()
+                .map(|p| {
+                    MatchEntry::parse_pattern(p, PatternFlag::PATH_NAME, MatchType::Include)
+                        .unwrap()
+                })
+                .collect();
+            let matches = |path: &str| entries.matches(path.as_bytes(), Some(nix::libc::S_IFREG));
+            assert_eq!(matches("/.pxarexclude-cli"), Some(MatchType::Exclude));
+            assert_eq!(matches("/alice/report.txt"), Some(MatchType::Include));
+            assert_eq!(matches("/alice/.pxarexclude-cli"), Some(MatchType::Include));
+            assert_eq!(
+                matches("/bob/private.txt"),
+                if selected.is_empty() {
+                    Some(MatchType::Include)
+                } else {
+                    None
+                }
+            );
+        }
+        for archive in ["nestegg-meta.conf", "index.json", "disk.img"] {
+            assert!(user_restore_patterns(archive, Path::new("/restore"), &[]).is_empty());
+        }
+        assert!(user_restore_patterns("home.pxar", Path::new("-"), &[]).is_empty());
+        assert_eq!(
+            user_restore_patterns("home.mpxar", Path::new("/restore"), &[]),
+            ["/**", "!/.pxarexclude-cli"]
+        );
+        // Even an explicit selection of the synthetic record cannot re-include it.
+        assert_eq!(
+            user_restore_patterns(
+                "home.pxar",
+                Path::new("/restore"),
+                &["/.pxarexclude-cli".into()]
+            )
+            .last()
+            .unwrap(),
+            "!/.pxarexclude-cli"
+        );
+    }
 
     #[test]
     fn capacity_uses_backup_user_availability_and_optional_total() {

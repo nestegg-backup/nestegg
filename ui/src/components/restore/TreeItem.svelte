@@ -1,7 +1,7 @@
 <script lang="ts">
   import TreeItem from "./TreeItem.svelte";
   import { app } from "../../lib/store.svelte";
-  import { archiveSource, restore, type TreeNode } from "../../lib/restore.svelte";
+  import { archiveSource, browseFailureText, restore, type TreeNode } from "../../lib/restore.svelte";
   import { isInventoryArchive } from "../../lib/derive";
   import { f, t } from "../../lib/locale";
 
@@ -55,7 +55,7 @@
       {/if}
     {/if}
   {:else if node.failed}
-    <p class="state bad" style:--depth={depth + 1}>{t.restore.dirFailed}</p>
+    <p class="state bad" style:--depth={depth + 1}>{browseFailureText(node.error, t)}</p>
   {/if}
 </li>
 

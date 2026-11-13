@@ -107,6 +107,26 @@ def main():
         assert len(files) == 1 and files[0].read_text() == 'hello from alice\n', files
         for item in [Path(target), *Path(target).rglob('*')]:
             assert item.lstat().st_uid == os.getuid(), item
+    # The signed source is below the home: /report.txt is the archive path,
+    # and the restore target must not acquire home/alice/Documents prefixes.
+    docs = urlencode({'target': 'stick', 'stick_uuid': uuid, 'archive': 'docs.pxar', 'path': '/'})
+    status, value = request('GET', '/snapshots/' + timestamp + '/browse?' + docs)
+    assert status == 200 and any(e['name'] == 'report.txt' for e in value['entries']), (status, value)
+    traversal = urlencode({'target': 'stick', 'stick_uuid': uuid, 'archive': 'docs.pxar', 'path': '/../etc'})
+    status, value = request('GET', '/snapshots/' + timestamp + '/browse?' + traversal)
+    assert status == 400, (status, value)
+    for paths, target in [([], '/home/alice/stick-docs-full'), (['/report.txt'], '/home/alice/stick-docs-file')]:
+        status, value = request('POST', '/restores', {
+            'target': 'stick', 'stick_uuid': uuid, 'snapshot_time': timestamp,
+            'archive': 'docs.pxar', 'paths': paths, 'target_dir': target})
+        assert status == 202, (status, value)
+        value = finish(value, uuid)
+        assert value['state'] == 'succeeded', value
+        assert (Path(target) / 'report.txt').read_text() == 'document from alice\n'
+        assert not (Path(target) / '.pxarexclude-cli').exists()
+        for item in [Path(target), *Path(target).rglob('*')]:
+            assert item.lstat().st_uid == os.getuid(), item
+    print('PASS home-subdirectory stick archive: browse and whole/selected restore, root mapping, identity, no client exclude record')
     status, live = request('GET', '/status')
     assert status == 200 and live['targets']['stick']['sticks'][uuid]['in_use'] is None, live
     status, missing = request('GET', '/snapshots/2000-01-01T00:00:00Z/browse?' + query)

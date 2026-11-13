@@ -761,6 +761,10 @@ const en = {
     dirLoading: "Loading …",
     dirEmpty: "Empty folder",
     dirFailed: "This folder could not be opened.",
+    dirNoHome: "This archive contains no files from your home folder. Only an administrator can restore it with sudo nestegg restore.",
+    dirNoMetadata: "nestegg cannot safely determine which files in this backup belong to you. Ask an administrator to restore it with sudo nestegg restore.",
+    dirOutsideHome: "You can only open and restore files from your own home folder.",
+    dirForbidden: (reason: string) => `You are not allowed to open this folder. Message: ${reason}. Ask an administrator for help (sudo nestegg restore).`,
     manyAreas: (names: string) => `Each area goes into its own subfolder of the new folder (${names}).`,
     damaged: "damaged",
     damagedSnapshot:

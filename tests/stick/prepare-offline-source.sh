@@ -85,6 +85,11 @@ elif [[ $MODE == id-collision ]]; then
 fi
 case "$MODE" in
     desktop)
+        # The shared API acceptance also restores a separate below-home
+        # archive. A required bind mount keeps it separate in system mode.
+        mkdir -p "$mnt/home/alice/Documents"
+        printf 'document from alice\n' > "$mnt/home/alice/Documents/report.txt"
+        chroot "$mnt" chown -R alice:alice /home/alice/Documents
         chroot "$mnt" useradd -m -s /bin/bash bob
         printf 'second user private file\n' > "$mnt/home/bob/private.txt"
         chroot "$mnt" chown -R bob:bob /home/bob
@@ -99,8 +104,9 @@ backup_id = "e2e-src"
 data_uuids = ["$DATA_UUID"]
 [backup]
 system = true
+sources = [{archive = "docs", path = "/home/alice/Documents", require_mount = true}]
 EOF
-        sed -i 's/if nestegg backup; then/if nestegg stick key-copy --uuid '"$DATA_UUID"' --password-fd 11 11<\/root\/key-password \&\& nestegg backup --target stick; then/' "$mnt/usr/local/sbin/nestegg-e2e"
+        sed -i 's@if nestegg backup; then@if mount --bind /home/alice/Documents /home/alice/Documents \&\& nestegg stick key-copy --uuid '"$DATA_UUID"' --password-fd 11 11</root/key-password \&\& nestegg backup --target stick; then@' "$mnt/usr/local/sbin/nestegg-e2e"
         ;;
     no-nestegg)
         rm -rf "$mnt/etc/nestegg" "$mnt/var/lib/nestegg"

@@ -297,14 +297,22 @@ The daemon identifies the caller by the socket credentials:
   another server ([decision 0013](decisions/0013-editable-settings-in-the-web-ui.md)).
   Edit the file with `sudo`, then run `sudo nestegg check`.
 - Browsing and restoring is limited to the caller's own home directory
-  (other homes and archives such as `/etc` are refused). Restored files are
+  (other homes and archives such as `/etc` are refused). Sources inside the
+  home also work: an archive made from `/home/alice/Documents` opens at
+  its own root, and `/report.txt` restores directly as `report.txt` in the
+  new target. This applies to PBS and backup-stick restores. Restored files are
   written with the caller's identity into a new directory. Which part of
   an archive is the caller's home comes from the metadata blob inside the
   snapshot or, for snapshots of older versions, from the local run record;
   never from the snapshot notes, which others can change
   ([decision 0016](decisions/0016-restore-scope-from-backup-metadata.md)).
-  Snapshots with neither can only be restored by root. With encryption off
-  the blob is not signed; see the decision for what that means.
+  Sources below the home require handle-bound snapshot metadata (`bound_sources`):
+  the recorded path and client input must refer to the same opened directory.
+  A canonical path alone does not establish this. Older metadata and local
+  run records keep the ancestor/home-only mapping. New backups open source
+  roots without following symlink components and pass the pinned directory
+  handles to the client; configure real directory paths rather than symlinks.
+  Snapshots with neither can only be restored by root. With encryption off the blob is not signed; see the decision for what that means.
 - root (`sudo nestegg restore …`) may restore everything.
 
 The overview of all machines reads each machine's last snapshot and the
@@ -673,6 +681,11 @@ sudo nestegg restore host/desktop/2026-11-08T21:30:12Z home.pxar /root/restore-d
 ```
 
 Restores always go into a new directory and never overwrite files.
+
+The client's synthetic `.pxarexclude-cli` record at the archive root is
+excluded during extraction, including CLI and API restores. It describes
+backup exclude patterns, not user data. Files with that name in nested
+directories and ordinary `.pxarexclude` files are preserved.
 
 - Into a root-owned location (e.g. `/root/restore-…`): runs as root and
   restores original owners and permissions.

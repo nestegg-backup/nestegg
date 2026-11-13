@@ -55,7 +55,10 @@ local API described in [`../api/openapi.yaml`](../api/openapi.yaml).
 - **Restore:** browse a snapshot, select files/folders in one or several
   areas (several `archives` go into one subfolder each), restore into a new
   directory with progress in bytes (`/snapshots/{time}/browse`,
-  `/restores`).
+  `/restores`). Refused folders explain the 403 reason in German or English:
+  no home files, missing trustworthy source metadata, or an out-of-home path;
+  administrators can use `sudo nestegg restore`. The reason stays with each
+  folder and is cleared when retrying.
 - **Restore from the stick:** with a server and a stick the first step asks
   where the files come from ("Restore from": backup server or backup stick,
   the server is preselected); a stick-only setup goes straight to the stick.

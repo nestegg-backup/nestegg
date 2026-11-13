@@ -43,6 +43,10 @@ pub struct BackupMetadata {
     /// `home.pxar` → canonical source path, only for archives of this
     /// snapshot. Basis for the scope of unprivileged users.
     pub archive_sources: BTreeMap<String, String>,
+    /// Archives read through the same pinned directory handle as their recorded path.
+    /// Absent on older snapshots, whose canonical paths alone prove no binding.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub bound_sources: std::collections::BTreeSet<String>,
     /// Configured source paths.
     pub sources: Vec<String>,
     /// The configuration asks for a full system backup.
@@ -187,6 +191,7 @@ mod tests {
             backup_time: 1_794_000_000,
             snapshot: crate::client::snapshot_path("desktop", 1_794_000_000),
             archive_sources: [("home.pxar".to_string(), "/home".to_string())].into(),
+            bound_sources: Default::default(),
             sources: vec!["/home".into()],
             system_mode: false,
             incomplete: vec![],

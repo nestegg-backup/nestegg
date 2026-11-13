@@ -27,8 +27,43 @@ pub enum RestoreError {
     TargetExists(PathBuf),
     #[error("{0}")]
     Forbidden(String),
+    #[error("{message}")]
+    ScopeForbidden {
+        reason: ForbiddenReason,
+        message: String,
+    },
     #[error("{0}")]
     BadRequest(String),
+}
+
+/// Stable, source-independent reasons for a refused restore scope.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForbiddenReason {
+    RestoreNoHome,
+    RestoreSourceUnverified,
+    RestoreOutsideHome,
+}
+
+pub fn scope_for_source(source: &Path, bound: bool, user: &UserIdentity) -> Result<UserScope> {
+    let home = std::fs::canonicalize(&user.home).ok();
+    if !bound
+        && home
+            .as_ref()
+            .is_some_and(|home| source != home && source.starts_with(home))
+    {
+        return Err(RestoreError::ScopeForbidden {
+            reason: ForbiddenReason::RestoreSourceUnverified,
+            message: "this archive needs handle-bound source metadata; ask an administrator to restore it with sudo nestegg restore".into(),
+        }.into());
+    }
+    user_scope_with_binding(source, &user.home, user.uid, bound).ok_or_else(|| {
+        RestoreError::ScopeForbidden {
+            reason: ForbiddenReason::RestoreNoHome,
+            message: "this archive does not contain your home directory".into(),
+        }
+        .into()
+    })
 }
 
 /// Who asked for the restore.
@@ -263,6 +298,7 @@ pub fn execute_with_client(
     if exists {
         return Err(RestoreError::TargetExists(target.to_path_buf()).into());
     }
+    let patterns = crate::client::user_restore_patterns(job.archive, target, job.patterns);
     let direct = matches!(requester, Requester::Root { .. }) && root_controlled_parent(target)?;
     if direct {
         client.restore(
@@ -270,7 +306,7 @@ pub fn execute_with_client(
                 snapshot: job.snapshot,
                 archive: job.archive,
                 target,
-                patterns: job.patterns,
+                patterns: &patterns,
                 key: job.key,
             },
             log,
@@ -339,7 +375,7 @@ pub fn execute_with_client(
                 snapshot: job.snapshot,
                 archive: job.archive,
                 target: &data,
-                patterns: job.patterns,
+                patterns: &patterns,
                 key: job.key,
             },
             log,
@@ -362,17 +398,29 @@ pub fn execute_with_client(
 /// that corresponds to their home directory.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserScope {
-    /// Archive-internal path of the home directory, e.g. `/alice`.
+    /// Archive-internal path of the allowed subtree, e.g. `/alice`.
+    /// `/` also covers an archive sourced from a directory below the home.
     pub prefix: String,
 }
 
 /// Map a user's home directory onto an archive: `home = /home/alice` and
-/// the archive's source path `/home` give `/alice`. `source_path` must
+/// the archive's source path `/home` give `/alice`. A source inside the
+/// home (e.g. `/home/alice/Documents`) grants the archive root `/`.
+/// `source_path` must
 /// describe the snapshot itself, not the current configuration (which may
 /// have changed since), and must come from a source the user cannot
 /// change: the snapshot's metadata blob or the local run record, never the
 /// snapshot notes (decision 0016).
 pub fn user_scope(source_path: &Path, home: &Path, uid: u32) -> Option<UserScope> {
+    user_scope_with_binding(source_path, home, uid, true)
+}
+
+fn user_scope_with_binding(
+    source_path: &Path,
+    home: &Path,
+    uid: u32,
+    bound: bool,
+) -> Option<UserScope> {
     use std::os::unix::fs::MetadataExt;
     // The home directory must be a real directory owned by the caller and
     // not the root directory (system accounts).
@@ -412,12 +460,25 @@ pub fn user_scope(source_path: &Path, home: &Path, uid: u32) -> Option<UserScope
             return None;
         }
     }
-    let source_path = source_path.to_path_buf();
-    let rel = home.strip_prefix(&source_path).ok()?;
-    if rel.as_os_str().is_empty() {
-        // The archive is the home directory itself (e.g. source `/home/alice`).
+    // Compare the recorded path lexically: the source may no longer exist.
+    // Never resolve it against today's file system or accept traversal.
+    if !source_path.is_absolute()
+        || source_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    if source_path.starts_with(&home) {
+        // Enforce binding against this final home resolution too. A changed
+        // home symlink between the explanatory check and here cannot grant
+        // an unbound descendant archive.
+        if !bound && source_path != home {
+            return None;
+        }
         return Some(UserScope { prefix: "/".into() });
     }
+    let rel = home.strip_prefix(source_path).ok()?;
     Some(UserScope {
         prefix: format!("/{}", rel.to_str()?),
     })
@@ -536,6 +597,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn changed_home_link_cannot_turn_an_unbound_source_into_a_descendant_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("alice");
+        let source = home.join("Documents");
+        std::fs::create_dir_all(&source).unwrap();
+        let link = dir.path().join("home-link");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        assert!(user_scope_with_binding(&source, &link, uid, false).is_some());
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(user_scope_with_binding(&source, &link, uid, false).is_none());
+        assert_eq!(
+            user_scope_with_binding(&source, &link, uid, true)
+                .unwrap()
+                .prefix,
+            "/"
+        );
+    }
+
+    #[test]
     fn key_files_must_be_small_regular_files() {
         let dir = tempfile::tempdir().unwrap();
         let ok = dir.path().join("key.json");
@@ -625,6 +707,38 @@ mod tests {
                 user_scope(Path::new("/"), Path::new(home), 0).is_none(),
                 "{home}"
             );
+        }
+    }
+
+    #[test]
+    fn archives_sourced_inside_home_start_at_the_archive_root() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("alice");
+        std::fs::create_dir(&home).unwrap();
+        let uid = std::fs::metadata(&home).unwrap().uid();
+        // No current source directory is needed: metadata describes the past.
+        for source in [
+            home.clone(),
+            home.join("Documents"),
+            home.join("Documents/work"),
+        ] {
+            let scope = user_scope(&source, &home, uid).unwrap();
+            assert_eq!(scope.prefix, "/");
+            assert!(scope.contains("/"));
+            assert!(scope.contains("/report.txt"));
+            assert!(!scope.is_ancestor("/"));
+            assert!(patterns_for(&[scope.prefix]).is_empty());
+            assert!(user_scope(&source, &home, uid + 1).is_none());
+        }
+        for source in [
+            root.path().join("alicex/Documents"),
+            root.path().join("bob/Documents"),
+            home.join("../bob"),
+            home.join("Documents/../../bob"),
+            PathBuf::from("relative"),
+        ] {
+            assert!(user_scope(&source, &home, uid).is_none(), "{source:?}");
         }
     }
 

@@ -35,6 +35,18 @@ case "$1" in
       echo "Error: authentication failed - invalid credentials" >&2
       exit 255
     fi
+    # Swap after metadata was recorded, before the client opens the source.
+    if [ -n "$FAKE_SWAP_SOURCE" ]; then
+      mv "$FAKE_SWAP_SOURCE" "$FAKE_SWAP_SOURCE.moved"
+      ln -s "$FAKE_SWAP_OUTSIDE" "$FAKE_SWAP_SOURCE"
+      for a in "$@"; do
+        case "$a" in home.pxar:*)
+          path="${a#home.pxar:}"
+          test -f "$path/alice/notes.txt" && ! test -e "$path/secret" || exit 98
+          echo PINNED-SOURCE-OK >> "$FAKE_LOG"
+        esac
+      done
+    fi
     # Keep what a server would store: the file list and the metadata blob.
     mode=encrypt
     case " $* " in *" --crypt-mode none "*) mode=none ;; esac
@@ -848,7 +860,14 @@ fn missing_required_source_fails() {
     fs::remove_dir_all(env.root().join("src/etc")).unwrap();
     let out = env.run(&["run"]);
     assert_eq!(code(&out), 1);
-    assert_eq!(env.state()["last_run"]["error"]["kind"], "source_missing");
+    let state = env.state();
+    assert_eq!(state["last_run"]["error"]["kind"], "source_missing");
+    assert!(
+        state["last_run"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not exist")
+    );
 }
 
 #[test]
@@ -2947,4 +2966,89 @@ fn stick_api_never_falls_back_to_pbs_and_explains_absence() {
     assert_eq!(code, 200, "{snapshots}");
     assert_eq!(snapshots["target"], "pbs");
     assert!(snapshots["stick_uuid"].is_null());
+}
+
+#[test]
+fn source_swap_after_metadata_cannot_upload_another_directory() {
+    let env = Env::new();
+    let source = env.root().join("src/home");
+    let outside = env.root().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret"), "must not be uploaded").unwrap();
+    let out = env
+        .command(&["run", "--trigger", "cli"])
+        .env("FAKE_SWAP_SOURCE", &source)
+        .env("FAKE_SWAP_OUTSIDE", &outside)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(env.fake_log().contains("PINNED-SOURCE-OK"));
+    let meta = nestegg::metadata::BackupMetadata::parse(
+        &fs::read(env.root().join("fake-store/meta")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta.source_of("home.pxar"), source.to_str());
+    assert!(meta.bound_sources.contains("home.pxar"));
+    // The next run accepts the configured symlink and records its new target.
+    let out = env.run(&["run", "--trigger", "cli"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = nestegg::metadata::BackupMetadata::parse(
+        &fs::read(env.root().join("fake-store/meta")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta.source_of("home.pxar"), outside.to_str());
+}
+
+#[test]
+fn inventory_that_cannot_be_pinned_is_skipped_as_incomplete() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+    let env = Env::new();
+    let state = env.root().join("state");
+    let actual = env.root().join(std::ffi::OsStr::from_bytes(b"state-\xff"));
+    fs::rename(&state, &actual).unwrap();
+    symlink(&actual, &state).unwrap();
+    let config = env.root().join("etc/config.toml");
+    fs::write(
+        &config,
+        fs::read_to_string(&config)
+            .unwrap()
+            .replace("inventory = false", "inventory = true"),
+    )
+    .unwrap();
+    let out = env.run(&["run", "--trigger", "cli"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        state.join("inventory/README.txt").is_file(),
+        "generation succeeded"
+    );
+    let state = env.state();
+    let run = &state["last_success"];
+    assert_eq!(run["verified"], true);
+    assert!(
+        run["incomplete"].as_array().unwrap().iter().any(|reason| {
+            let reason = reason.as_str().unwrap();
+            reason.contains("inventory failed") && reason.contains("not valid UTF-8")
+        }),
+        "{run}"
+    );
+    let log = env.fake_log();
+    let backup = log
+        .lines()
+        .find(|line| line.starts_with("ARGS backup "))
+        .unwrap();
+    assert!(backup.contains("home.pxar:"));
+    assert!(!backup.contains("inventory.pxar:"));
 }

@@ -64,9 +64,9 @@ affected.
 - A blob encrypted with an earlier key generation cannot be read with the
   current key; users then get an error for that snapshot (as before: its
   catalog needs the key too). root restores it with `--keyfile`.
-- The run record holds the configured source path (not canonicalised). If a
-  source was configured through a symlink, the mapping fails closed
-  (refused), it does not widen.
+- Legacy run records hold the configured source path (not canonicalised).
+  New records hold the pinned source's resolved path, but do not carry the
+  signed handle binding. Neither kind grants the new below-home scope.
 - **Residual risk, unencrypted backups:** without encryption the manifest is
   not signed and the blob is not encrypted. Finished snapshots cannot be
   changed through the PBS API, but whoever can create snapshots in this
@@ -154,6 +154,82 @@ was switched on), so they are not refused outright, but the restore now says so:
   "not protected": the CLI says that the archive is not in the snapshot, and
   the daemon's restore job fails with that message. An archive that is listed
   without a crypt mode (an older server) gets its own message in the CLI too.
+
+## Update 2026-11-13: archives sourced below a user's home
+
+A recorded source may also be the home itself or any directory below it.
+For example, source `/home/alice/Documents` grants alice the entire
+`docs.pxar` archive: `/report.txt` in the archive means
+`/home/alice/Documents/report.txt` at backup time. Browsing starts at `/`,
+and a whole-archive restore copies its contents directly into the new
+target, without adding a `home/alice/Documents` prefix.
+
+This mapping is shared by PBS and desktop stick browsing/restoring. The
+source still comes only from trusted snapshot metadata, never the request,
+current configuration or mutable notes. The PBS legacy run-record fallback
+keeps its previous ancestor/home-only mapping: configured paths below the
+home could have been symlinks to system files at backup time. Only snapshot
+metadata whose `bound_sources` includes the archive can grant this new
+descendant scope; a canonical path alone is not evidence that the
+client read that directory.
+Comparisons use path components, require an absolute source and refuse `..`; `/home/alicex` and other users' homes do not qualify.
+The source need not exist today. Home ownership checks, normalized archive
+paths, signature verification and copying as the caller remain in force.
+Archives sourced above the home still expose only the branch towards the
+home, and archives outside it remain refused.
+
+The UI keeps the refusal for each folder. It distinguishes archives without
+home files from snapshots whose source cannot be established safely and
+explains the administrator's `sudo nestegg restore` route in German and
+English. A missing source proof is not described as missing user files.
+
+## Update 2026-11-13: bind recorded sources to directory handles
+
+Before metadata is written, every configured source is canonicalized, accepting
+symlinks in the configuration as before, then opened component by component
+from `/` with `O_NOFOLLOW | O_DIRECTORY`. Missing sources and symlinks introduced
+after canonicalization fail closed (optional sources are skipped as incomplete).
+There is no raw-path fallback. The recorded path comes from the opened
+handle's `/proc/self/fd` link. Before recording it, the path is re-opened
+without symlinks and its device and inode must match the original handle.
+This rejects misleading paths from detached mounts (for example after a
+lazy unmount); any failure skips an optional source as incomplete or fails a
+required source. The client inherits a duplicate of the original
+handle and reads `/proc/self/fd/N`, including for `system.pxar` (`/`). It
+never receives the configured path for a second lookup. Renaming a source
+and replacing it with a symlink after recording therefore cannot change
+which root directory is uploaded. Descendant symlinks remain ordinary pxar
+symlink entries; this pins archive roots, not a frozen filesystem snapshot.
+
+`bound_sources` is an optional set of archive names in the signed metadata.
+Only handle-bound sources grant the new below-home permission, for both PBS
+and desktop stick requests. Older metadata without this field and legacy
+local records retain the ancestor/home-only mapping. Existing snapshots
+without the binding require root to restore a below-home source. Signing a
+canonical path authenticates the recorded claim; it does not establish the
+identity of the uploaded directory.
+
+User file restores exclude the client's synthetic `/.pxarexclude-cli` at
+the user-restore boundary. Rescue, inventory and read-back extraction keep
+the client's ordinary full-archive behavior. Scope refusals carry stable
+`reason` values (`restore_no_home`, `restore_source_unverified`,
+`restore_outside_home`) with the existing `forbidden` code. PBS and stick
+share these reasons; the UI does not infer them from English text.
+
+The desktop rescue acceptance fixture also configures a separate
+`docs.pxar` source at `/home/alice/Documents`, creates its `report.txt`, and
+bind-mounts the directory before the backup with `require_mount = true`.
+This keeps the source as its own archive in system mode, which normally
+folds directories on the system's file systems into `system.pxar`. The
+shared desktop API acceptance can therefore exercise the real signed,
+handle-bound below-home source in both VM fixtures; an archive absent from
+the metadata remains refused with `restore_no_home`.
+
+Offline backup releases its pinned source handles after the client has
+finished uploading. Keeping them until function exit would make the
+explicit source unmount fail with `target is busy`, even after successful
+read-back verification. The handles remain pinned throughout the upload;
+read-back and maintenance no longer need the source descriptors.
 
 ## Alternatives rejected
 

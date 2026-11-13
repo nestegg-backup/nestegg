@@ -1023,13 +1023,13 @@ fn pipeline(
         }
     }
 
-    // 2. Sources. Resolve the paths first: touching a path may trigger an
+    // 2. Sources. Pin the directories first: touching a path may trigger an
     // automount, and the mount table must be read afterwards.
-    let resolved: Vec<Option<PathBuf>> = config
+    let resolved: Vec<Result<crate::source::SourceDirectory>> = config
         .backup
         .sources
         .iter()
-        .map(|s| fs::canonicalize(&s.path).ok())
+        .map(|s| crate::source::SourceDirectory::open(&s.path))
         .collect();
     let mut covered: Vec<PathBuf> = config
         .backup
@@ -1059,8 +1059,25 @@ fn pipeline(
         }
     };
     let mut archives = Vec::new();
+    let mut source_handles = std::collections::BTreeMap::new();
     for (source, canonical) in config.backup.sources.iter().zip(resolved) {
-        if let Some(canonical) = canonical {
+        let open_error = canonical
+            .as_ref()
+            .err()
+            .map(|error| {
+                if error.downcast_ref::<nix::errno::Errno>() == Some(&nix::errno::Errno::ENOENT)
+                    || error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    "does not exist".to_string()
+                } else {
+                    format!("cannot be opened without symlinks ({error:#})")
+                }
+            })
+            .unwrap_or_default();
+        if let Ok(opened) = canonical {
+            let canonical = &opened.path;
             // system.pxar only needs the system's own file systems; a missing
             // USB or network disk listed in fstab is not part of it.
             let system_fstab: Vec<crate::mounts::FstabEntry>;
@@ -1076,7 +1093,7 @@ fn pipeline(
                 _ => &fstab,
             };
             let check = crate::mounts::check_source(
-                &canonical,
+                canonical,
                 source.require_mount,
                 &covered,
                 &mounts,
@@ -1105,11 +1122,12 @@ fn pipeline(
             }
             archives.push(ArchiveSpec {
                 name: source.archive.clone(),
-                path: source.path.clone(),
+                path: opened.path.clone(),
             });
+            source_handles.insert(source.archive.clone(), opened);
         } else if source.optional {
             rep.incomplete(format!(
-                "optional source {} does not exist, skipped",
+                "optional source {} {open_error}, skipped",
                 source.path.display()
             ));
         } else {
@@ -1117,7 +1135,7 @@ fn pipeline(
                 RunState::Failed,
                 RunError {
                     kind: ErrorKind::SourceMissing,
-                    message: format!("source {} does not exist", source.path.display()),
+                    message: format!("source {} {open_error}", source.path.display()),
                 },
             );
             return Ok(());
@@ -1192,8 +1210,11 @@ fn pipeline(
     if config.backup.inventory {
         rep.phase(RunState::Inventory, "writing system inventory");
         let dir: PathBuf = paths.inventory_dir();
-        match crate::inventory::generate(&dir) {
-            Ok(report) => {
+        match crate::inventory::generate(&dir).and_then(|report| {
+            let opened = crate::source::SourceDirectory::open(&dir)?;
+            Ok((report, opened))
+        }) {
+            Ok((report, opened)) => {
                 rep.line(&format!(
                     "inventory: {} files written, {} skipped",
                     report.written.len(),
@@ -1211,6 +1232,7 @@ fn pipeline(
                         crate::layout::LAYOUT_FILE
                     ));
                 }
+                source_handles.insert("inventory".into(), opened);
                 archives.push(ArchiveSpec {
                     name: "inventory".into(),
                     path: dir.clone(),
@@ -1243,7 +1265,7 @@ fn pipeline(
         }
     }
     // Metadata blob, part of every snapshot (decisions 0015 and 0016).
-    let ctx = report_context(config, &state);
+    let ctx = report_context(config, &state, &source_handles);
     let meta = backup_metadata(config, &ctx, &backup_id, backup_time, &archives, &rep.run);
     let meta_bytes = meta.to_bytes();
     let meta_file = match write_metadata_file(paths, &rep.run.id, &meta_bytes) {
@@ -1321,7 +1343,7 @@ fn pipeline(
     }
     let mut log = rep.log.try_clone().context("cannot duplicate log handle")?;
     rep.reclaim_after_failure = local.is_some();
-    let outcome = client.backup(&spec, &mut log, &mut |stats| {
+    let outcome = client.backup(&spec, &source_handles, &mut log, &mut |stats| {
         // Live progress for the dashboard after each finished archive.
         rep.run.processed_bytes =
             Some(rep.run.processed_bytes.unwrap_or(0) + stats.total_bytes.unwrap_or(0));
@@ -1611,6 +1633,12 @@ fn backup_metadata(
             .filter(|(name, _)| archives.iter().any(|a| &a.file_name() == *name))
             .filter_map(|(name, path)| Some((name.clone(), path.as_str()?.to_string())))
             .collect(),
+        bound_sources: ctx
+            .archive_sources
+            .keys()
+            .filter(|name| archives.iter().any(|a| a.file_name() == **name))
+            .cloned()
+            .collect(),
         sources: ctx.sources.clone(),
         system_mode: config.backup.system,
         incomplete: run.incomplete.clone(),
@@ -1692,7 +1720,11 @@ pub struct ReportContext {
     pub overdue_after_hours: u32,
 }
 
-fn report_context(config: &Config, state: &crate::state::State) -> ReportContext {
+fn report_context(
+    config: &Config,
+    state: &crate::state::State,
+    sources: &std::collections::BTreeMap<String, crate::source::SourceDirectory>,
+) -> ReportContext {
     ReportContext {
         hostname: crate::config::hostname(),
         os: crate::status::os_name(),
@@ -1703,17 +1735,10 @@ fn report_context(config: &Config, state: &crate::state::State) -> ReportContext
             .iter()
             .map(|s| s.path.display().to_string())
             .collect(),
-        archive_sources: config
-            .backup
-            .sources
+        archive_sources: sources
             .iter()
-            .map(|s| {
-                let path = fs::canonicalize(&s.path).unwrap_or_else(|_| s.path.clone());
-                (
-                    format!("{}.pxar", s.archive),
-                    serde_json::json!(path.display().to_string()),
-                )
-            })
+            .filter(|(name, _)| config.backup.sources.iter().any(|s| &s.archive == *name))
+            .map(|(name, source)| (format!("{name}.pxar"), serde_json::json!(source.path)))
             .collect(),
         overdue_after_hours: config.overdue_after_hours,
     }

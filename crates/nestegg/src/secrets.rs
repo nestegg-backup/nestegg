@@ -414,6 +414,18 @@ impl FdPassing {
         Ok(target_fd)
     }
 
+    /// Inherit a pinned backup root above all fixed secret descriptor targets.
+    pub fn inherit_directory(&mut self, directory: &fs::File) -> Result<i32> {
+        let high = nix::fcntl::fcntl(
+            directory,
+            nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(FIRST_SOURCE_FD),
+        )?;
+        // SAFETY: fcntl returned a new descriptor owned by this value.
+        let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(high) };
+        self.entries.push((fd, high));
+        Ok(high)
+    }
+
     /// Install the descriptors in the child via `pre_exec`.
     pub fn apply(&self, cmd: &mut Command) {
         use std::os::unix::process::CommandExt;
