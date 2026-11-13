@@ -245,6 +245,53 @@ partition_hashes b > "$work/retry-before"
 partition_hashes b > "$work/retry-after"
 cmp "$work/retry-before" "$work/retry-after"
 both retried a
+# A broken inactive filesystem/marker must be repairable without recreation.
+# Alternate directions so neither slot is accidentally treated as special.
+active=a
+for damage in filesystem marker; do
+    inactive=b; part=4
+    if [[ $active == b ]]; then inactive=a; part=3; fi
+    partition_hashes "$active" > "$work/repair-$damage-before"
+    attach
+    if [[ $damage == filesystem ]]; then
+        # Destroy FAT metadata, including the volume identity, on this owned
+        # image partition only. ESP records the serial needed for rebuilding.
+        dd if=/dev/zero of="${loop}p$part" bs=1M count=16 conv=fsync status=none
+    else
+        mount -o nodev,nosuid,noexec "${loop}p$part" "$work/esp"
+        printf 'nestegg-slot-v2\nslot_uuid=torn\n' > "$work/esp/nestegg-stick"
+        sync "$work/esp/nestegg-stick" "$work/esp"
+        umount "$work/esp"
+    fi
+    detach
+    "$bin" stick info "$stick" --test-image > "$work/damaged-$damage.json" 2> "$work/damaged-$damage.log"
+    grep -q "\"active_slot\": \"$active\"" "$work/damaged-$damage.json"
+    grep -q '"inactive_slot_damaged": true' "$work/damaged-$damage.json"
+    grep -q 'Repair it with nestegg stick update' "$work/damaged-$damage.log"
+    "$bin" stick add "$stick" --test-image --image "$iso" > "$work/add-$damage.json" 2> "$work/add-$damage.log"
+    grep -q '"inactive_slot_damaged": true' "$work/add-$damage.json"
+    grep -q 'Repair it with nestegg stick update' "$work/add-$damage.log"
+    both "damaged-$damage" "$active"
+    "$bin" stick update "$stick" --test-image --image "$iso" > "$work/repair-$damage.log" 2>&1
+    "$bin" stick info "$stick" --test-image > "$work/repaired-$damage.json"
+    grep -q "\"active_slot\": \"$inactive\"" "$work/repaired-$damage.json"
+    grep -q '"inactive_slot_damaged": false' "$work/repaired-$damage.json"
+    partition_hashes "$active" > "$work/repair-$damage-after"
+    cmp "$work/repair-$damage-before" "$work/repair-$damage-after"
+    both "repaired-$damage" "$inactive"
+    active=$inactive
+    echo "PASS $damage repair: previous active partition and ESP unchanged"
+done
+# Re-check data, snapshots and partition table after both formatting repairs.
+attach
+sfdisk --dump "$loop" | sed "s#$loop#DISK#g" > "$work/layout-repaired"
+cmp "$work/layout-before" "$work/layout-repaired"
+mount -o nodev,nosuid,noexec "${loop}p5" "$work/data"
+grep -qx 'data survives both updates' "$work/data/retained.txt"
+find "$work/data/nestegg" -type f -print0 | sort -z | xargs -0 sha256sum | sed "s#$work/data/##g" > "$work/snapshots-repaired"
+cmp "$work/snapshots-before" "$work/snapshots-repaired"
+umount "$work/data"
+detach
 # Only after all preservation checks: deliberately recreate the owned image.
 # This exercises the second ERASE confirmation and replacing an existing ext4.
 python3 "$here/confirm.py" "$bin" stick create "$stick" --test-image --image "$iso" >"$work/recreate.log" 2>&1

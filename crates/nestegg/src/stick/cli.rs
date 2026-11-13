@@ -217,6 +217,11 @@ pub fn run(command: StickCmd, paths: &Paths) -> Result<u8> {
             set_name(&paths.config_file, &info.data_uuid, Some(name))?;
         }
     }
+    if info.inactive_slot_damaged {
+        eprintln!(
+            "The active live slot is valid; the inactive slot filesystem or marker is damaged. Repair it with nestegg stick update DISK --image RELEASE.iso; backups are preserved. Do not recreate the stick."
+        );
+    }
     println!("{}", serde_json::to_string_pretty(&info)?);
     Ok(0)
 }

@@ -4,6 +4,12 @@ set -euo pipefail
 umask 022
 action=$1; disk=$2; image=$3; cache=$4; work=$5; slot_mib=$6
 cache_tmp=
+# Indirectly read through ok_name below.
+# shellcheck disable=SC2034
+slot_a_ok=1
+# shellcheck disable=SC2034
+slot_b_ok=1
+inactive_slot_damaged=false
 mount --make-rprivate /
 exec 3>&1
 exec 1>&2
@@ -141,25 +147,40 @@ else
         fail 'old single-FAT stick layout: create the stick again; this erases all backups on it (save them elsewhere first)'
     fi
     [[ $(head -n1 "$work/esp/nestegg-stick") == nestegg-stick-v2 ]] || fail 'unknown stick format'
-    for name in boot slot_a slot_b data; do
-        device=${!name}
-        uuid=$(blkid -p -s UUID -o value "$device")
-        [[ $uuid =~ ^[0-9A-Fa-f-]+$ ]] || fail 'invalid partition UUID'
-        printf -v "${name}_uuid" '%s' "$uuid"
+    # Read exactly five data lines, never device paths or shell code. Slot
+    # identities come from the immutable ESP even if a slot lost its filesystem.
+    mapfile -t marker < "$work/esp/nestegg-stick"
+    ((${#marker[@]} == 5)) || fail 'invalid stick marker'
+    boot_uuid=${marker[1]#boot_uuid=}
+    slot_a_uuid=${marker[2]#slot_a_uuid=}
+    slot_b_uuid=${marker[3]#slot_b_uuid=}
+    data_uuid=${marker[4]#data_uuid=}
+    for uuid in "$boot_uuid" "$slot_a_uuid" "$slot_b_uuid"; do
+        [[ $uuid =~ ^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$ ]] || fail 'invalid stick marker UUID'
     done
+    [[ $data_uuid =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || fail 'invalid data UUID'
+    cmp -s "$work/esp/nestegg-stick" <(stick_marker) || fail 'invalid stick marker'
+    [[ $(blkid -p -s UUID -o value "$boot") == "$boot_uuid" && $(blkid -p -s UUID -o value "$data") == "$data_uuid" ]] || fail 'invalid stick marker or partition UUIDs'
     [[ $boot_uuid != "$slot_a_uuid" && $boot_uuid != "$slot_b_uuid" && $slot_a_uuid != "$slot_b_uuid" ]] || fail 'duplicate live/boot UUIDs'
     [[ $(blkid -p -s TYPE -o value "$data") == ext4 && $(blkid -p -s LABEL -o value "$data") == NESTEGG_DATA ]] || fail 'not a nestegg data partition'
-    cmp -s "$work/esp/nestegg-stick" <(stick_marker) || fail 'invalid stick marker or partition UUIDs'
     for candidate in a b; do
+        # Paths are fixed partition numbers on the confirmed disk. No marker
+        # can redirect a later format or write to another device.
         device=$(slot_device "$candidate")
-        [[ $(blkid -p -s TYPE -o value "$device") == vfat ]] || fail 'not a nestegg live partition'
-        mount -o ro,nodev,nosuid,noexec "$device" "$work/slot_$candidate"
-        uuid=$(blkid -p -s UUID -o value "$device")
-        cmp -s "$work/slot_$candidate/nestegg-stick" <(slot_marker "$uuid") || fail 'invalid slot marker'
+        uuid_name=slot_${candidate}_uuid
+        if [[ $(blkid -p -s TYPE -o value "$device" || true) == vfat && $(blkid -p -s UUID -o value "$device" || true) == "${!uuid_name}" ]] \
+            && mount -o ro,nodev,nosuid,noexec "$device" "$work/slot_$candidate" \
+            && cmp -s "$work/slot_$candidate/nestegg-stick" <(slot_marker "${!uuid_name}"); then
+            continue
+        fi
+        printf -v "slot_${candidate}_ok" '%s' 0
+        if mountpoint -q "$work/slot_$candidate"; then umount "$work/slot_$candidate"; fi
     done
     # Inspect committed descriptors as data, never source medium code as root.
     slot=; generation=0
     for candidate in a b; do
+        ok_name=slot_${candidate}_ok
+        [[ ${!ok_name} == 1 ]] || continue
         cfg=$work/slot_$candidate/live/$candidate/boot.cfg
         commit=$work/slot_$candidate/live/$candidate/commit.sha256
         [[ -f $cfg && -f $commit ]] || continue
@@ -181,6 +202,9 @@ else
         if ((candidate_generation > generation)); then slot=$candidate; generation=$candidate_generation; fi
     done
     [[ $slot == a || $slot == b ]] || fail 'no committed bootable live slot'
+    if [[ $slot == a ]]; then inactive=b; else inactive=a; fi
+    ok_name=slot_${inactive}_ok
+    [[ ${!ok_name} == 1 ]] || inactive_slot_damaged=true
     if [[ $action == update ]]; then
         ((generation < 999999999)) || fail 'slot generation exhausted'
         generation=$((generation + 1))
@@ -188,17 +212,38 @@ else
         target=$work/slot_$slot
         # Count available bytes plus the replaceable inactive directory. Include
         # allocation rounding for every file and metadata/GRUB overhead.
-        cluster=$(stat -f -c %S "$target")
+        if [[ $inactive_slot_damaged == true ]]; then
+            cluster=32768
+        else
+            cluster=$(stat -f -c %S "$target")
+        fi
         needed=16777216
         while IFS= read -r -d '' file; do
             size=$(stat -c %s "$file")
             needed=$((needed + (size / cluster + 1) * cluster))
         done < <(find -L "$live" -type f -print0)
-        available=$(( $(stat -f -c %a "$target") * cluster ))
+        if [[ $inactive_slot_damaged == true ]]; then
+            # Bound the new payload before any write, allowing FAT overhead.
+            available=$(( $(blockdev --getsize64 "$(slot_device "$slot")") - 16777216 ))
+        else
+            available=$(( $(stat -f -c %a "$target") * cluster ))
+        fi
         reclaim=0
         if [[ -d $target/live/$slot ]]; then reclaim=$(du -s -B1 "$target/live/$slot" | cut -f1); fi
         ((needed <= available + reclaim)) || fail 'not enough free space for replacement live slot'
-        mount -o remount,rw,nodev,nosuid,noexec "$target"
+        if [[ $inactive_slot_damaged == true ]]; then
+            uuid_name=slot_${slot}_uuid
+            uuid=${!uuid_name}
+            echo "Rebuilding damaged inactive live slot $slot; active slot and backups are preserved" >&2
+            mkfs.vfat -F32 -i "${uuid//-/}" -n "NESTEGG_${slot^^}" "$(slot_device "$slot")" >/dev/null
+            sync "$(slot_device "$slot")"
+            mount -o nodev,nosuid,noexec "$(slot_device "$slot")" "$target"
+            slot_marker "$uuid" > "$target/nestegg-stick"
+            sync "$target/nestegg-stick" "$target"
+            inactive_slot_damaged=false
+        else
+            mount -o remount,rw,nodev,nosuid,noexec "$target"
+        fi
     elif [[ $action != info && $action != add ]]; then fail 'unknown operation'; fi
 fi
 [[ $boot_uuid =~ ^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$ && $data_uuid =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || fail 'invalid UUID'
@@ -281,4 +326,4 @@ else
     image_hash=$(sha256sum "$work/slot_$slot/live/$slot/filesystem.squashfs" | cut -d' ' -f1)
 fi
 [[ $image_hash =~ ^[0-9a-f]{64}$ ]] || fail 'invalid image hash'
-printf '{"data_uuid":"%s","boot_uuid":"%s","active_slot":"%s","image_sha256":"%s"}\n' "$data_uuid" "$boot_uuid" "$slot" "$image_hash" >&3
+printf '{"data_uuid":"%s","boot_uuid":"%s","active_slot":"%s","image_sha256":"%s","inactive_slot_damaged":%s}\n' "$data_uuid" "$boot_uuid" "$slot" "$image_hash" "$inactive_slot_damaged" >&3

@@ -82,7 +82,8 @@ has 1 to 40 characters and no control or invisible formatting characters
 `/etc/nestegg/config.toml`. It installs the desktop-trusted PBS image **from the
 verified ISO**, never from the stick, and preserves existing settings and
 comments. Repeating registration does not duplicate the UUID. `info` reports the
-ESP/data UUIDs, active slot and live filesystem hash, without modifying the stick.
+ESP/data UUIDs, active slot, live filesystem hash and `inactive_slot_damaged`,
+without modifying the stick.
 The stick's identifying files are parsed as data, never executed as root.
 
 Cloned data UUIDs on multiple devices are refused rather than resolved through
@@ -106,13 +107,24 @@ slot, compares the copied squashfs/kernel/initrd, and flushes the payload. It fs
 publishes that slot's GRUB configuration checksum **last**. A fixed GRUB
 dispatcher checks the two configurations and chooses the highest committed
 generation, with a second menu entry for the other committed slot; the previous active slot and configuration remain available while
-the replacement is being written. No partitioning, formatting, datastore mount
-or backup deletion occurs during update. The ESP and both slot partitions are initially mounted read-only. Only the
-inactive slot is remounted read-write after format, descriptor, payload and
+the replacement is being written. No partitioning, datastore mount
+or backup deletion occurs during update. Formatting is confined to a damaged
+inactive slot, as described below. The ESP is initially mounted read-only and both slot mounts are attempted
+read-only. Only the inactive slot is opened for writing after identity, descriptor, payload and
 free-space checks pass. The active slot and ESP receive no writes, including
 their FAT/FSInfo metadata; a torn inactive FAT cannot damage their filesystems.
 The old inactive commit is removed and fsynced before replacing its payload.
 Insufficient space leaves both slots untouched.
+
+If the inactive filesystem or its root marker is damaged, `info` and `add`
+still work when the ESP marker and active slot validate. They report
+`inactive_slot_damaged: true` and explain the repair command. Run the same
+`stick update` command above: it reformats only the inactive partition with
+its recorded volume serial, restores its marker, then writes and commits the
+new system normally. The active slot and ESP stay byte-identical; the GPT,
+data partition and backups are preserved. Do **not** use `stick create` for
+this repair, since recreation erases backups. If neither slot is valid or
+the ESP/data identity is invalid, operations still refuse.
 
 If an update is interrupted, reconnect the disk and rerun the command. An
 incomplete inactive slot is replaced. Do not unplug while a command is still

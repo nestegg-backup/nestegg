@@ -34,9 +34,10 @@ Checksums protect completeness, not authenticity of a hostile boot medium.
 GRUB itself is installed only at creation; a future bootloader or partition-
 format change requires explicit recreation, not an ordinary live update.
 
-Update initially mounts the ESP and both slots read-only, parses descriptors
-as data and checks the inactive partition's available/reclaimable space. It
-remounts **only the inactive partition** read-write. It removes and fsyncs any
+Update initially mounts the ESP read-only and attempts both slots read-only,
+parses descriptors as data and checks the inactive partition's
+available/reclaimable space. It remounts **only the inactive partition**
+read-write. It removes and fsyncs any
 old inactive commit before replacing payload bytes, verifies copied files,
 fsyncs every payload file and directory, writes and fsyncs the generated boot
 descriptor, and publishes/fsyncs its checksum commit and parents last. Neither
@@ -51,8 +52,10 @@ GRUB passes the selected slot UUID as `live-media`, keeping the matching
 squashfs loop backing file, and checks the data partition is the unique ext4
 sibling on that same disk. An attached rescue ISO cannot supply its image or
 data. Desktop PBS remains the independently verified fixed local cache;
-`stick add` still installs it only from the trusted release ISO. The JSON CLI
-fields are unchanged; `boot_uuid` continues to identify the ESP.
+`stick add` still installs it only from the trusted release ISO. Existing JSON CLI
+fields retain their meaning; `boot_uuid` continues to identify the ESP.
+`inactive_slot_damaged` additionally reports a damaged sibling filesystem
+or marker.
 
 ## Verification
 
@@ -98,3 +101,43 @@ Verified on 2026-11-13 using disposable image files only:
 Physical flash endurance and controllers that corrupt sectors outside the
 written partition or lose acknowledged writes remain hardware acceptance
 concerns; partition isolation cannot repair such firmware failures.
+
+## After review: damaged inactive slots
+
+The exact ESP marker is the source of the recorded FAT volume identities,
+including when the inactive filesystem no longer probes or mounts. The ESP
+and data identities must still match the fixed sibling partitions on the
+confirmed disk, and a slot is eligible as active only when its filesystem
+identity, slot marker, descriptor, commit and payload validate. With one
+valid active slot, `info` and `add` succeed and expose
+`inactive_slot_damaged: true` for a damaged sibling filesystem or marker,
+with a repair instruction. If no slot validates, operations still refuse.
+
+`update` bounds the replacement payload against the inactive partition size
+before writing, then rebuilds that partition with `mkfs.vfat -i` using its
+recorded serial and restores its exact marker. Partition paths are always
+fixed numbers on the confirmed disk, never values supplied by a marker.
+The normal verified copy and real file/directory fsync barriers still publish
+the commit last. The ESP, active partition, GPT and NESTEGG_DATA receive no
+writes. No recreation, backup loss or disk-guard exception is required.
+
+Acceptance adds destroyed inactive FAT metadata and a torn slot marker in
+opposite update directions. Both `info` and `add` must report degradation;
+BIOS/UEFI must boot the intact slot before repair and the new slot afterward.
+Whole-partition active/ESP hashes, the GPT and encrypted snapshot hashes are
+compared across both repairs.
+
+Post-review verification on disposable images (2026-11-13):
+
+- `tests/stick/create.sh` passed all 28 SeaBIOS/OVMF boots, both repair
+  directions, truthful degraded `info`/`add`, whole active/ESP checksums,
+  unchanged GPT and encrypted snapshots, and the crafted-marker update
+  refusal with the entire disk image unchanged.
+- `tests/stick/durability.sh` passed 50 replay cuts, six with a complete new
+  commit; whole active/ESP checksums and their read-only mappings passed.
+- `cargo test`, all-target Clippy with warnings denied, rustfmt, ShellCheck
+  on changed scripts and the privacy tree check passed. The three privileged
+  launcher tests also passed inside the media acceptance fixture.
+- The first concurrent media run exceeded the existing 60-second half-copy
+  probe wait under heavy I/O. The unchanged complete acceptance passed when
+  rerun alone; no test deadline or assertion was weakened.

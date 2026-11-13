@@ -325,6 +325,7 @@ pub(super) struct Info {
     pub boot_uuid: String,
     pub active_slot: String,
     pub image_sha256: String,
+    pub inactive_slot_damaged: bool,
 }
 impl Info {
     pub fn validate(&self) -> Result<()> {

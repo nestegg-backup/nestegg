@@ -54,6 +54,17 @@ if "$bin" stick info "$stick" --test-image > "$work/crafted-marker.log" 2>&1; th
 grep -q 'invalid stick marker' "$work/crafted-marker.log"
 attach; mount -o nodev,nosuid,noexec "${loop}p2" "$work/esp"
 cp "$work/saved.esp-marker" "$work/esp/nestegg-stick"
+# A marker must never supply a format/write destination. Reject a path in
+# place of a recorded serial before any medium write, even during update.
+sed 's#^slot_a_uuid=.*#slot_a_uuid=/dev/not-a-slot#' "$work/saved.esp-marker" > "$work/esp/nestegg-stick"
+sync "$work/esp/nestegg-stick"; umount "$work/esp"; detach
+sha256sum "$stick" > "$work/crafted-update-before"
+if "$bin" stick update "$stick" --test-image --image "$iso" > "$work/crafted-update.log" 2>&1; then exit 1; fi
+grep -q 'invalid stick marker UUID' "$work/crafted-update.log"
+sha256sum "$stick" > "$work/crafted-update-after"
+cmp "$work/crafted-update-before" "$work/crafted-update-after"
+attach; mount -o nodev,nosuid,noexec "${loop}p2" "$work/esp"
+cp "$work/saved.esp-marker" "$work/esp/nestegg-stick"
 # The root-mounted FAT file has root uid/mode, but is still untrusted code.
 printf 'untrusted ISO\n' > "$work/esp/untrusted.iso"
 truncate -s 8G "$work/untrusted-target.img"
