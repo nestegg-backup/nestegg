@@ -163,17 +163,25 @@ fn scope(
             "metadata belongs to a different snapshot"
         )
     );
+    Ok(Some(metadata_scope(&meta, archive, user)?))
+}
+
+fn metadata_scope(
+    meta: &crate::metadata::BackupMetadata,
+    archive: &str,
+    user: &crate::identity::UserIdentity,
+) -> Result<crate::restore::UserScope> {
     let source = meta.source_of(archive).ok_or_else(|| {
         scope_forbidden(
-            crate::restore::ForbiddenReason::RestoreSourceUnverified,
-            "archive is absent from snapshot metadata",
+            crate::restore::ForbiddenReason::RestoreNoHome,
+            "this archive does not contain your home directory",
         )
     })?;
-    Ok(Some(crate::restore::scope_for_source(
+    crate::restore::scope_for_source(
         Path::new(source),
         meta.bound_sources.contains(archive),
         user,
-    )?))
+    )
 }
 
 fn validate(
@@ -454,6 +462,42 @@ pub fn run() -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn metadata() -> crate::metadata::BackupMetadata {
+        crate::metadata::BackupMetadata::parse(
+            &serde_json::to_vec(&json!({
+                "format": 1,
+                "nestegg_version": "test",
+                "backup_id": "desktop",
+                "hostname": "desktop.example.com",
+                "backup_time": 0,
+                "snapshot": "host/desktop/1970-01-01T00:00:00Z",
+                "archive_sources": {},
+                "sources": [],
+                "system_mode": false
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn user(home: &Path) -> crate::identity::UserIdentity {
+        crate::identity::UserIdentity {
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            groups: vec![],
+            home: home.into(),
+        }
+    }
+
+    #[test]
+    fn archive_absent_from_stick_metadata_has_the_same_reason_as_pbs() {
+        let error =
+            metadata_scope(&metadata(), "docs.pxar", &user(Path::new("/home/alice"))).unwrap_err();
+        let envelope = error_envelope(&error);
+        assert_eq!(envelope["error"]["code"], "forbidden");
+        assert_eq!(envelope["error"]["reason"], "restore_no_home");
+    }
+
     #[test]
     fn scope_refusals_have_stable_worker_reasons() {
         use crate::restore::ForbiddenReason::*;
