@@ -678,3 +678,49 @@ async fn upstream_failure_keeps_the_bound_attempt_for_a_later_retry() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].2["attempt"], requests[1].2["attempt"]);
 }
+
+#[tokio::test]
+async fn pre_activation_retry_preserves_a_used_key_and_reads_the_current_primary_copy() {
+    let hub = Hub::start().await;
+    let computer = Computer::new();
+    hub.reply(200, hub.success());
+    assert!(
+        !computer
+            .join(&hub, &[], "interrupt-enable")
+            .await
+            .status
+            .success()
+    );
+    let journal = computer
+        .paths
+        .state_dir
+        .join("join-transaction/journal.json");
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    value["activated"] = json!(false); // crash immediately before saving activation
+    std::fs::write(journal, serde_json::to_vec(&value).unwrap()).unwrap();
+    let mut run = nestegg::state::Run::new(nestegg::state::Trigger::Manual, chrono::Utc::now());
+    run.finish(nestegg::state::RunState::Succeeded, chrono::Utc::now());
+    Store::new(&computer.paths)
+        .record_finished(&run, 10)
+        .unwrap();
+    let key = nestegg::secrets::Secret::new(b"current-key-after-interruption".to_vec());
+    nestegg::secrets::write_private_file(
+        &computer.paths.credentials_dir.join("encryption-key"),
+        key.as_bytes(),
+    )
+    .unwrap();
+    hub.reply(200, hub.success());
+    success(&computer.join(&hub, &[], "").await);
+    assert_eq!(
+        std::fs::read(computer.paths.credentials_dir.join("encryption-key")).unwrap(),
+        key.as_bytes()
+    );
+    assert_eq!(
+        Store::new(&computer.paths)
+            .load_state()
+            .unwrap()
+            .key_digest
+            .as_deref(),
+        Some(nestegg::secrets::digest(&key).as_str())
+    );
+}

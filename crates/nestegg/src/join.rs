@@ -696,10 +696,8 @@ async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activatio
         needs_key = !key_exists && response.existing_snapshots > 0;
         if !needs_key {
             let key_path = tx.dir.join("key.json");
-            if !key_path.exists() {
-                if let Some(key) = existing.as_ref() { secrets::create_new_private_file(&key_path, key.as_bytes())?; }
-                else { crate::client::local::create_key(&key_path)?; }
-            }
+            if let Some(key) = existing.as_ref() { secrets::write_private_file(&key_path, key.as_bytes())?; }
+            else if !key_path.exists() { crate::client::local::create_key(&key_path)?; }
             let info = crate::client::local::key_info(&key_path)?;
             info.require_unprotected()?;
             let key = Secret::new(fs::read(&key_path)?);
@@ -717,6 +715,9 @@ async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activatio
             let file_name = entry.file_name();
             let name = file_name.to_str().context("invalid staged credential name")?;
             let plain = name.strip_suffix(".cred").unwrap_or(name);
+            // A resumed journal can contain an earlier staged key. Never
+            // publish it over a primary key, or while recovery is required.
+            if plain == secrets::ENCRYPTION_KEY && (key_exists || needs_key) { continue; }
             let alternate = if name.ends_with(".cred") { paths.credentials_dir.join(plain) } else { paths.credentials_dir.join(format!("{name}.cred")) };
             secrets::write_private_file(&paths.credentials_dir.join(name), &fs::read(entry.path())?)?;
             match fs::remove_file(alternate) { Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()), _ => {} }
