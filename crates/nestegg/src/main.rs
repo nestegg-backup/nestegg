@@ -26,6 +26,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Manage the optional household hub.
+    Hub(nestegg::hub::cli::Args),
     /// Create the configuration and directories (root).
     Init(InitArgs),
     /// Join a hub and start the first backup (root).
@@ -328,6 +330,7 @@ fn main() -> ExitCode {
 
 fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
     match cmd {
+        Cmd::Hub(args) => nestegg::hub::cli::run(args),
         Cmd::Init(args) => init(paths, args),
         Cmd::Join(args) => {
             require_root("nestegg join")?;

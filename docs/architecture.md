@@ -39,11 +39,12 @@ transfer and restore stay in the official client.
 | `nestegg notify` (`nestegg-notify.service`, `.timer`) | root | Hourly health check, also started after every backup run: tells logged-in users (`notify-send`, run as the user) and an optional hook command when backups fail, are overdue, incomplete or damaged, and when they work again. Remembers what it reported in `notify.json` ([decision 0017](decisions/0017-notifications.md)). |
 | `nestegg daemon` (`nestegg.service`) | root | Local JSON API over a Unix socket. Reads state/history, lists snapshots, starts runs (`systemctl start nestegg-backup.service`) and restores, and changes the few settings group members may change (rhythm, overdue threshold, excludes, Wake-on-LAN on/off, timer on/off; [decision 0013](decisions/0013-editable-settings-in-the-web-ui.md)). |
 | `nestegg <command>` | user in group `nestegg`, or root | CLI. Read commands go through the socket; `init`, `credentials` and `key` need root. |
+| `nestegg hub serve` (`nestegg-hub.service`) | dedicated `nestegg-hub` user | Optional household HTTPS API, provisioning, installer/package delivery and PBS overview; no backup data or desktop restores. See [hub setup](hub.md). |
 | `nestegg ui` | user in group `nestegg` | Starts a local HTTP server on `127.0.0.1:<random>` with a one-time token in the URL, opens the browser, serves the embedded web UI from `ui/dist`, and forwards `/api/v1/*` to the socket. |
 
 Authorization is done by Unix permissions on the socket (group `nestegg`).
 The browser side is protected by the random port, loopback binding and a
-per-session token. Nothing listens on a network interface.
+per-session token. The optional household hub is separate: it listens on HTTPS, authenticates administrators with sessions and computers with hashed credentials, and provisions PBS tokens (decision 0034). The local daemon and local UI retain their loopback/socket model.
 
 The backup and daemon units are hardened only with options that restrict
 privileges (`NoNewPrivileges`, no module loading, read-only `/proc/sys` and
@@ -127,6 +128,8 @@ support are prerequisites. The desktop pipeline uses this handle for the stick t
 
 | Path | Content |
 |---|---|
+| `/etc/nestegg-hub/hub.toml`, `credentials/`, `tls.key` | Optional hub configuration, separate PBS credential and root-only TLS key. |
+| `/var/lib/nestegg-hub/` | Locked atomic hub state, public master key/proof, package store and PBS overview cache. |
 | `/etc/nestegg/config.toml` | Configuration (no secrets). Written by `nestegg init` and, for the settings of decision 0013, by the daemon (only the touched keys, atomically). |
 | `/etc/nestegg/master-public.pem` | Household RSA master public key; every encrypted target receives `--master-pubkey-file`. Only its matching, proven hub key covers the key-copy gate. |
 | `/var/lib/nestegg/join-transaction/` | Private, durable undo journal for interrupted join; removed after successful setup or rollback. |
@@ -140,6 +143,7 @@ support are prerequisites. The desktop pipeline uses this handle for the stick t
 
 ## Interfaces
 
+- Hub API contract: [`api/hub-openapi.yaml`](../api/hub-openapi.yaml); implementation in `crates/nestegg/src/hub/`, embedded `ui/dist/hub.html` at `/`, installer at `/join.sh` and package/checksum at `/pkg/*`.
 - API contract between daemon and UI: [`api/openapi.yaml`](../api/openapi.yaml).
   It is the single source of truth; the UI never talks to the PBS directly.
 - Configuration reference and setup guide: [`docs/configuration.md`](configuration.md);

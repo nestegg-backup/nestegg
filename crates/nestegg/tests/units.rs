@@ -367,3 +367,39 @@ fn manual_run_unit_properties_hide_nothing() {
         );
     }
 }
+
+/// The hub neither archives nor restores local paths, so unlike the desktop
+/// services it can and must use a separate identity and a filesystem sandbox.
+#[test]
+fn hub_is_unprivileged_and_receives_only_its_own_credentials() {
+    let text = unit_text("nestegg-hub.service");
+    for (key, value) in [
+        ("User", "nestegg-hub"),
+        ("Group", "nestegg-hub"),
+        ("ExecStart", "/usr/bin/nestegg hub serve"),
+        ("NoNewPrivileges", "yes"),
+        ("ProtectSystem", "strict"),
+        ("ProtectHome", "yes"),
+        ("PrivateTmp", "yes"),
+        ("PrivateDevices", "yes"),
+        ("ProtectKernelModules", "yes"),
+        ("RestrictSUIDSGID", "yes"),
+        ("CapabilityBoundingSet", ""),
+        ("UMask", "0077"),
+        ("StateDirectoryMode", "0700"),
+        ("ReadWritePaths", "/var/lib/nestegg-hub"),
+        (
+            "LoadCredentialEncrypted",
+            "password:/etc/nestegg-hub/credentials/password.cred",
+        ),
+        ("LoadCredential", "hub-tls-key:/etc/nestegg-hub/tls.key"),
+    ] {
+        assert_eq!(setting(&text, "Service", key), [value], "{key}");
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest = std::fs::read_to_string(root.join("crates/nestegg/Cargo.toml")).unwrap();
+    assert!(manifest.contains("packaging/systemd/nestegg-hub.service"));
+    assert!(manifest.contains("packaging/hub/nestegg-hub.sysusers"));
+    // Desktop tests above retain the whole-filesystem requirements of 0007.
+    assert!(!violations(&text).is_empty());
+}
