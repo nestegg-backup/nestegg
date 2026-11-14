@@ -28,7 +28,7 @@
     stickOnly,
     stickView,
   } from "../lib/derive";
-  import { selfSummary } from "../lib/text";
+  import { encryptionFact, selfSummary } from "../lib/text";
   import { f, t } from "../lib/locale";
   import type { Status, Target } from "../lib/types";
 
@@ -81,6 +81,7 @@
   const next = $derived(status.schedule.next_run ?? null);
   // No backup can run: the facts must not promise a time.
   const blocked = $derived(backupBlocked(status));
+  const encryption = $derived(encryptionFact(status, t));
 
   // The run ends and the cancel block disappears. If the focus is in it, it would fall to <body>:
   // the new status sentence takes it. (Before the DOM changes, so the block is still there to ask.)
@@ -284,14 +285,18 @@
         {/if}
         <dt>{t.self.factEncryption}</dt>
         <dd>
-          {#if !status.encryption.enabled}
-            {t.self.encryptionOff}
-          {:else if status.encryption.key_exported}
-            {t.self.encryptionOnKey}
+          {#if encryption.warn}
+            <span class="warn-text">{encryption.text}</span>
           {:else}
-            <span class="warn-text">{t.self.encryptionOnNoKey}</span>
+            {encryption.text}
           {/if}
+          {#if encryption.extra}<span class="extra">{encryption.extra}</span>{/if}
         </dd>
+        {#if status.hub}
+          <!-- Decision 0034: a quiet line, the hub changes nothing on this page. -->
+          <dt>{t.self.factHub}</dt>
+          <dd>{t.self.hubName(status.hub.name)} <span class="extra">{status.hub.url}</span></dd>
+        {/if}
       </dl>
     </aside>
   </div>
@@ -299,6 +304,7 @@
 
 <style>
   .warn-text { color: var(--warn); }
+  .extra { display: block; color: var(--muted); font-size: var(--fs-s); }
   .pick { display: flex; gap: 6px; margin-bottom: 14px; }
   .pick .btn[aria-pressed="true"] { background: var(--sel); border-color: var(--field-border); }
   .reasons, .damaged { margin-top: 22px; max-width: 720px; padding: 14px 16px 16px; }

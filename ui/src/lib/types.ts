@@ -170,7 +170,15 @@ export interface Status {
     key_exported?: boolean;
     /** An encryption key is stored on this computer (it may still be unconfirmed). null or absent: unknown. */
     key_present?: boolean | null;
+    /**
+     * This computer joined a hub and backs up with the household master key (decision 0034): a copy
+     * of its key, encrypted to the master key, is in every snapshot, and the master key copy is proven.
+     * That stands in for a confirmed copy of this computer's own key. null or absent: no master key.
+     */
+    master_key?: { fingerprint: string; proven_at: string } | null;
   };
+  /** The hub this computer joined (decision 0034); null or absent: not managed by a hub. */
+  hub?: { name: string; url: string } | null;
   /** Snapshots of this machine (`host/desktop/2026-11-08T21:30:12Z`) that the server's own check marked as failed. */
   server_verify_failed?: string[];
 }

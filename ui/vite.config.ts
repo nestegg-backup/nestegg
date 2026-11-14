@@ -50,6 +50,14 @@ export default defineConfig(({ command }) => ({
     target: "es2022",
     assetsInlineLimit: 0,
     modulePreload: { polyfill: false },
+    // Two pages of one build: the local interface (`nestegg ui`) and the hub's interface
+    // (`nestegg hub serve` serves hub.html at `/`). Both use the same relative assets.
+    rollupOptions: {
+      input: {
+        index: fileURLToPath(new URL("./index.html", import.meta.url)),
+        hub: fileURLToPath(new URL("./hub.html", import.meta.url)),
+      },
+    },
     reportCompressedSize: true,
   },
   test: {

@@ -103,6 +103,8 @@ export type Flavor = "full" | "today";
  *   stick requests answer 503 `stick_unavailable` and a running restore from it fails
  * - `stick_busy`: opening the stick fails although it is plugged in (503 `stick_unavailable`)
  * - `stick_no_progress`: like a daemon before API 0.6.0, a stick restore reports its bytes only at the end
+ * - `hub`: the computer joined a hub (decision 0034): `/status` has `hub` and `encryption.master_key`,
+ *   and no own key copy is confirmed (`key_exported: false`), which the master key stands in for
  */
 export const FAULTS = [
   "down",
@@ -127,6 +129,7 @@ export const FAULTS = [
   "stick_busy",
   "stick_multiple",
   "stick_no_progress",
+  "hub",
 ] as const;
 export type Fault = (typeof FAULTS)[number];
 
@@ -775,7 +778,7 @@ export class World {
     const wantPbs = target !== "stick" && this.pbsTarget;
     if ((target === "stick" && !this.stick) || (target === "pbs" && !this.pbsTarget) || (!wantStick && !wantPbs))
       return err(400, "invalid_target", "requested target is not configured");
-    const needKey = this.encryptionOn() && !this.keyExported;
+    const needKey = this.encryptionOn() && !this.keyExported && !this.faults.has("hub");
     const first: Target = wantStick ? "stick" : "pbs";
     const blocked = !this.configured || (this.pbsTarget && !this.credentialsStored) || needKey;
     if (blocked) {
@@ -1104,9 +1107,13 @@ export class World {
       encryption: {
         enabled: this.encryptionOn(),
         key_fingerprint: this.encryptionOn() && this.configured && this.keyCreated ? "<FINGERPRINT>" : null, // placeholder, see AGENTS.md
-        key_exported: this.encryptionOn() && this.keyExported,
+        key_exported: this.encryptionOn() && this.keyExported && !this.faults.has("hub"),
         key_present: this.faults.has("unknown_stored") ? null : this.configured && this.keyCreated,
+        ...(this.faults.has("hub") && this.encryptionOn()
+          ? { master_key: { fingerprint: "<FINGERPRINT>", proven_at: new Date(this.createdMs - 20 * DAY).toISOString() } }
+          : {}),
       },
+      ...(this.faults.has("hub") ? { hub: { name: "Home", url: "https://hub.example.com:8443" } } : {}),
       ...(legacyDamaged.length ? { server_verify_failed: [...legacyDamaged] } : {}),
     };
   }

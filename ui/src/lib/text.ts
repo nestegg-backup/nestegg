@@ -2,10 +2,25 @@
 // can be tested with both languages.
 
 import type { Messages } from "../i18n";
-import { ageOf, errorKind, registeredSticks, shortUuid, stickName, hasPbs, isUnknownRun, knownErrorKind, machineKind, otherWarnings, runEnd, runState, runTarget, runTrigger, selfKind, setupGuide, stickOnly, stickTone, stickView, succeededKind, type MachineKind, type SelfKind, type ServerBackups, type StickKind, type StickView } from "./derive";
+import { ageOf, errorKind, registeredSticks, shortUuid, stickName, hasPbs, isUnknownRun, knownErrorKind, machineKind, masterKeyProtected, otherWarnings, runEnd, runState, runTarget, runTrigger, selfKind, setupGuide, stickOnly, stickTone, stickView, succeededKind, type MachineKind, type SelfKind, type ServerBackups, type StickKind, type StickView } from "./derive";
 import type { Reach } from "./check";
 import type { Formatter } from "./format";
 import type { ConfigView, Machine, Run, Status, TargetStatus } from "./types";
+
+/**
+ * The encryption line of "About this PC" and of the settings. With the household master key of a
+ * hub (decision 0034) the key is protected even without a confirmed own copy; that copy is then an
+ * optional extra (`extra`), never a warning.
+ */
+export function encryptionFact(s: Status, t: Messages): { text: string; warn: boolean; extra: string | null } {
+  if (!s.encryption.enabled) return { text: t.self.encryptionOff, warn: false, extra: null };
+  if (masterKeyProtected(s)) {
+    return { text: t.self.encryptionMaster, warn: false, extra: s.encryption.key_exported ? null : t.self.encryptionMasterOwn };
+  }
+  return s.encryption.key_exported
+    ? { text: t.self.encryptionOnKey, warn: false, extra: null }
+    : { text: t.self.encryptionOnNoKey, warn: true, extra: null };
+}
 
 /** The newest run was cancelled and no success came after it. */
 function cancelledAfter(last: Run | null, success: Run | null): Run | null {
