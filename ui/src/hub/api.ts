@@ -33,6 +33,10 @@ export function asHubFailure(e: unknown): HubFailure {
   return e instanceof HubFailure ? e : new HubFailure(0, null, e instanceof Error ? e.message : String(e));
 }
 
+export function hubFailureText(failure: HubFailure, messages: { hub: { internal: string } }): string {
+  return failure.code === "hub_error" ? messages.hub.internal : failure.message;
+}
+
 type Fetch = typeof fetch;
 
 /** Called on every 401 except for the login itself: the session has ended. */

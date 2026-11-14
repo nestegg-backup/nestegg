@@ -2,7 +2,7 @@
   import { tick } from "svelte";
   import Cmd from "../components/Cmd.svelte";
   import Dot from "../components/Dot.svelte";
-  import { asHubFailure } from "./api";
+  import { asHubFailure, hubFailureText } from "./api";
   import { hubName, MASTER_KEY_CONFIRM_COMMAND, minutesLeft, newMachines, packageCommand, validityText } from "./derive";
   import { hub } from "./store.svelte";
   import { statusBar } from "../lib/statusbar.svelte";
@@ -110,7 +110,7 @@
         void hub.loadHub();
       } else {
         view = { kind: "form" };
-        problem = fail.status === 0 ? d.offline : d.failed(fail.message);
+        problem = fail.status === 0 ? d.offline : d.failed(hubFailureText(fail, t));
       }
     }
   }
@@ -134,7 +134,7 @@
       await focusFirst("p.text");
     } catch (err) {
       const fail = asHubFailure(err);
-      if (!fail.unauthorized) problem = t.hub.codes.revokeFailed(fail.message);
+      if (!fail.unauthorized) problem = t.hub.codes.revokeFailed(hubFailureText(fail, t));
     } finally {
       revoking = false;
     }

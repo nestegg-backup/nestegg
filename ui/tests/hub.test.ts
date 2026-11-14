@@ -5,7 +5,7 @@ import de from "../src/i18n/de";
 import en from "../src/i18n/en";
 import { createFormatter } from "../src/lib/format";
 import { machineSummary } from "../src/lib/text";
-import { HUB_HEADER, HubFailure, hubRequest, setUnauthorizedHandler } from "../src/hub/api";
+import { HUB_HEADER, HubFailure, hubFailureText, hubRequest, setUnauthorizedHandler } from "../src/hub/api";
 import {
   asMachine,
   hubKind,
@@ -240,4 +240,11 @@ describe("hub mock", () => {
     expect(text).toContain("hub.example.com");
     expect(text).toContain("pbs.example.com");
   });
+});
+
+it("explains internal hub failures in both languages without blaming PBS", () => {
+  const failure = new HubFailure(500, "hub_error", "server details");
+  expect(hubFailureText(failure, de)).toBe(de.hub.internal);
+  expect(hubFailureText(failure, en)).toBe(en.hub.internal);
+  expect(hubFailureText(new HubFailure(503, "pbs_refused", "refused"), en)).toBe("refused");
 });

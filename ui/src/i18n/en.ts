@@ -852,6 +852,7 @@ const en = {
     failedStickGone: "The backup stick is no longer plugged in.",
   },
   hub: {
+    internal: "Internal hub error. Check the service and its logs on the hub.",
     name: "Hub",
     pageTitle: (household: string) => `${household} – nestegg hub`,
     loading: "Loading …",
@@ -865,7 +866,7 @@ const en = {
       empty: "Please enter the password.",
       wrong: "The password is not right. Try again.",
       rateLimited:
-        "Too many wrong attempts in a row. The hub now waits a while before it accepts a password again. Try again in a few minutes.",
+        "Too many login attempts. Wait a few seconds and try again.",
       offline: "The hub does not answer. Is it still running? Try again in a moment.",
       failed: (msg: string) => `Logging in did not work. Message: ${msg}`,
       ended: "You are logged out, for example because the session expired. Please log in again.",

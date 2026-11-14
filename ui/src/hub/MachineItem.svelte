@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import Dot from "../components/Dot.svelte";
-  import { asHubFailure } from "./api";
+  import { asHubFailure, hubFailureText } from "./api";
   import { hubName, hubSummary, incompleteReasons } from "./derive";
   import { hub } from "./store.svelte";
   import { statusBar } from "../lib/statusbar.svelte";
@@ -55,8 +55,8 @@
         fail.status === 503 || fail.code === "pbs_unreachable"
           ? t.hub.remove.pbs
           : fail.code === "pbs_refused"
-            ? t.hub.remove.refused(fail.message)
-            : t.hub.remove.failed(fail.message);
+            ? t.hub.remove.refused(hubFailureText(fail, t))
+            : t.hub.remove.failed(hubFailureText(fail, t));
       asking = false;
       await tick();
       problemEl?.focus();

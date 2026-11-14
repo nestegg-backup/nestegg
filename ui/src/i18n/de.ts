@@ -859,6 +859,7 @@ const de = {
     failedStickGone: "Der Backup-Stick ist nicht mehr eingesteckt.",
   },
   hub: {
+    internal: "Interner Fehler im Hub. Prüfe den Dienst und seine Protokolle auf dem Hub.",
     name: "Hub",
     pageTitle: (household: string) => `${household} – nestegg-Hub`,
     loading: "Wird geladen …",
@@ -871,8 +872,7 @@ const de = {
       working: "Wird geprüft …",
       empty: "Bitte das Passwort eingeben.",
       wrong: "Das Passwort stimmt nicht. Versuch es noch einmal.",
-      rateLimited:
-        "Zu viele falsche Versuche hintereinander. Der Hub wartet jetzt eine Weile, bevor er wieder ein Passwort annimmt. Versuch es in ein paar Minuten noch einmal.",
+      rateLimited: "Zu viele Anmeldeversuche. Warte ein paar Sekunden und versuche es erneut.",
       offline: "Der Hub antwortet nicht. Läuft er noch? Versuch es gleich noch einmal.",
       failed: (msg: string) => `Die Anmeldung hat nicht geklappt. Meldung: ${msg}`,
       ended: "Du bist abgemeldet, zum Beispiel weil die Sitzung abgelaufen ist. Melde dich neu an.",

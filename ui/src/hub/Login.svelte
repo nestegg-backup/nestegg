@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { asHubFailure } from "./api";
+  import { asHubFailure, hubFailureText } from "./api";
   import { hub } from "./store.svelte";
   import { t } from "../lib/locale";
 
@@ -33,7 +33,7 @@
             ? l.wrong
             : f.status === 0
               ? l.offline
-              : l.failed(f.message);
+              : l.failed(hubFailureText(f, t));
       if (f.status === 401) password = "";
       await tick();
       input?.focus();
