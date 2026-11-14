@@ -1662,6 +1662,7 @@ mod tests {
     #[test]
     fn names_from_the_server_with_control_characters_are_not_offered() {
         let snap = |name: &str| SnapshotInfo {
+            key_fingerprint: None,
             time: String::new(),
             snapshot: name.into(),
             size_bytes: None,
@@ -1804,6 +1805,7 @@ mod tests {
     #[test]
     fn backup_list_says_whether_a_backup_is_encrypted() {
         let snap = |modes: &[(&str, &str)]| SnapshotInfo {
+            key_fingerprint: None,
             time: String::new(),
             snapshot: String::new(),
             size_bytes: None,

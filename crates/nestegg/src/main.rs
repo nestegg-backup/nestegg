@@ -261,8 +261,11 @@ enum KeyCmd {
     Recover {
         #[arg(long)]
         master_key: PathBuf,
+        #[arg(long, required_unless_present = "install", conflicts_with = "install")]
+        output: Option<PathBuf>,
+        /// Install as this computer's key and start its first backup.
         #[arg(long)]
-        output: PathBuf,
+        install: bool,
         /// Snapshot time (RFC 3339), default: newest finished snapshot.
         #[arg(long)]
         snapshot: Option<String>,
@@ -1036,8 +1039,15 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
             master_key,
             output,
             snapshot,
+            install,
         } => {
-            nestegg::masterkey::recover(paths, &master_key, &output, snapshot.as_deref())?;
+            nestegg::masterkey::recover(
+                paths,
+                &master_key,
+                output.as_deref(),
+                snapshot.as_deref(),
+                install,
+            )?;
         }
         KeyCmd::Show => {
             let state = store.load_state()?;

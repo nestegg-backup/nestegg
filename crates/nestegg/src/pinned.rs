@@ -12,6 +12,12 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 use x509_cert::der::{Decode, Encode};
 
+#[derive(Debug, thiserror::Error)]
+#[error("hub request was not sent")]
+pub struct NotSent;
+
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
+
 pub fn pin_der(spki: &[u8]) -> String {
     format!("sha256//{}", STANDARD.encode(Sha256::digest(spki)))
 }
@@ -149,12 +155,21 @@ impl Endpoint {
         body: Vec<u8>,
     ) -> Result<(u16, Vec<u8>)> {
         validate_pin(pin)?;
-        tokio::time::timeout(
-            Duration::from_secs(240),
-            self.post_inner(pin, route, credential, body),
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let result = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.post_inner(pin, route, credential, body, &sent),
         )
         .await
-        .context("the hub took too long to answer; check that it is running and try again")?
+        .context("the hub took too long to answer; check that it is running and try again")
+        .and_then(|r| r);
+        result.map_err(|e| {
+            if sent.load(std::sync::atomic::Ordering::Relaxed) {
+                e
+            } else {
+                e.context(NotSent)
+            }
+        })
     }
     async fn post_inner(
         &self,
@@ -162,6 +177,7 @@ impl Endpoint {
         route: &str,
         credential: Option<&[u8]>,
         body: Vec<u8>,
+        sent: &std::sync::atomic::AtomicBool,
     ) -> Result<(u16, Vec<u8>)> {
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -200,6 +216,7 @@ impl Endpoint {
             header.set_sensitive(true);
             request = request.header("authorization", header);
         }
+        sent.store(true, std::sync::atomic::Ordering::Relaxed);
         let response = sender
             .send_request(request.body(Full::new(Bytes::from(body)))?)
             .await

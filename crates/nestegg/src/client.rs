@@ -321,6 +321,9 @@ pub fn manifest_unsigned_error(message: &str) -> bool {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SnapshotInfo {
+    /// Display-only manifest identity supplied by the official snapshot list.
+    #[serde(skip)]
+    pub key_fingerprint: Option<String>,
     pub time: String,
     pub snapshot: String,
     pub size_bytes: Option<u64>,
@@ -400,6 +403,7 @@ pub fn parse_snapshot_list(json: &str) -> Result<Vec<SnapshotInfo>> {
             Some(crypt_modes.iter().any(|(_, m)| m == "encrypt"))
         };
         out.push(SnapshotInfo {
+            key_fingerprint: item["fingerprint"].as_str().map(str::to_string),
             snapshot: format!("{backup_type}/{backup_id}/{time_str}"),
             time: time_str,
             size_bytes: item["size"].as_u64(),
@@ -725,7 +729,7 @@ impl<'a> Client<'a> {
         }
         fds.apply(&mut cmd);
         let output = run_capturing(&mut cmd, Some(std::time::Duration::from_secs(12 * 3600)))?;
-        if output.stopped != Stopped::No {
+        if !matches!(output.stopped, Stopped::No) {
             bail!("client query cancelled or timed out");
         }
         if !output.status.success() {

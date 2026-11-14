@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, Config, HubConfig, Paths};
@@ -29,7 +30,7 @@ pub struct JoinArgs {
     /// Take over this computer's existing backup group. Never use for another computer.
     #[arg(long)]
     pub adopt: bool,
-    /// Replace the configuration and token, keeping the existing encryption key.
+    /// Replace hub settings and token, keeping other settings and the encryption key.
     #[arg(long)]
     pub replace_config: bool,
 }
@@ -37,6 +38,7 @@ pub struct JoinArgs {
 #[derive(Serialize)]
 struct JoinRequest<'a> {
     code: &'a str,
+    attempt: &'a str,
     hostname: String,
     backup_id: &'a str,
     adopt: bool,
@@ -48,6 +50,7 @@ struct JoinRequest<'a> {
 // Deliberately no Debug: these types contain secrets returned only once.
 #[derive(Deserialize)]
 struct JoinResponse {
+    existing_snapshots: u64,
     machine_id: String,
     backup_id: String,
     machine_credential: String,
@@ -99,7 +102,10 @@ fn error_message(code: &str) -> &'static str {
             "another computer already uses this backup name. Choose a different name with --name <name>"
         }
         "name_exists_on_pbs" => {
-            "backups with this name already exist on the backup server. Use --adopt only if they belong to THIS SAME computer, keeping its original encryption key; otherwise choose --name <another-name>"
+            "backups with this name already exist on the backup server. Use --adopt only if they belong to THIS SAME computer or its replacement; recover its original key after joining if needed; otherwise choose --name <another-name>"
+        }
+        "hub_error" => {
+            "the hub has an internal error. Ask its administrator to check the hub service and its logs, then repeat this command"
         }
         "pbs_unreachable" => {
             "the hub cannot reach the backup server. Check that the backup server is switched on and connected, then try again"
@@ -173,17 +179,28 @@ fn make_config(
             "the hub's master key proof is dated in the future; check the clocks of this computer and the hub"
         );
     }
-    let mut cfg = config::example(
+    let mut cfg = if paths.config_file.exists() {
+        Config::load(&paths.config_file)?
+    } else {
+        let mut cfg = config::example(
+            &response.pbs.server,
+            &response.pbs.datastore,
+            &response.pbs.auth_id,
+        );
+        cfg.backup.system = true;
+        cfg
+    };
+    cfg.pbs = config::example(
         &response.pbs.server,
         &response.pbs.datastore,
         &response.pbs.auth_id,
-    );
+    )
+    .pbs;
     let pbs = cfg.pbs.as_mut().expect("example has PBS");
     pbs.port = response.pbs.port;
     pbs.namespace = response.pbs.namespace.clone();
     pbs.fingerprint = response.pbs.fingerprint.clone();
     cfg.backup_id = Some(response.backup_id.clone());
-    cfg.backup.system = true;
     cfg.backup.master_public_key = Some(paths.master_public_key());
     cfg.hub = Some(HubConfig {
         name: response.hub.name.clone(),
@@ -220,7 +237,6 @@ trait Activation {
     fn user_to_add(&self) -> Result<Option<String>>;
     fn add_user(&mut self) -> Result<()>;
     fn start_backup(&mut self) -> Result<()>;
-    fn rollback(&mut self, before: &[UnitState], user: Option<&str>) -> Result<()>;
 }
 struct SystemActivation<'a> {
     paths: &'a Paths,
@@ -323,43 +339,11 @@ impl Activation for SystemActivation<'_> {
     fn start_backup(&mut self) -> Result<()> {
         self.command(&["start", "--no-block", "nestegg-backup.service"])
     }
-    fn rollback(&mut self, before: &[UnitState], user: Option<&str>) -> Result<()> {
-        let mut errors = Vec::new();
-        for unit in before.iter().rev() {
-            if !unit.active
-                && let Err(e) = self.command(&["stop", &unit.name])
-            {
-                errors.push(e.to_string());
-            }
-            if !unit.enabled
-                && unit.name != "nestegg-backup.service"
-                && let Err(e) = self.command(&["disable", &unit.name])
-            {
-                errors.push(e.to_string());
-            }
-        }
-        if let Some(user) = user {
-            let success = Command::new("gpasswd")
-                .args(["-d", user, crate::daemon::GROUP])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            // gpasswd also returns nonzero when add_user had not happened yet.
-            if success.is_err() {
-                errors.push("could not restore the calling user's group membership".into());
-            }
-        }
-        if !errors.is_empty() {
-            bail!("{}", errors.join("; "));
-        }
-        Ok(())
-    }
 }
 
-// A durable undo journal. Config is published last, after both credentials,
-// the master public key and key state. Interrupted invocations are rolled
-// back before any subsequent join. Only files written by join are tracked.
+// A durable join journal. Config is published last, after credentials and key
+// state. Before activation files can be restored; after activation retries
+// complete the setup. Only files written by join are tracked.
 #[derive(Serialize, Deserialize)]
 struct Original {
     path: PathBuf,
@@ -375,6 +359,17 @@ struct Journal {
     remote: Option<(String, String)>,
     activated: bool,
     user_to_add: Option<String>,
+    #[serde(default)]
+    enrollment: Option<Enrollment>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Enrollment {
+    url: String,
+    pin: String,
+    code_digest: String,
+    name: String,
+    attempt: String,
 }
 struct Transaction {
     dir: PathBuf,
@@ -400,6 +395,7 @@ impl Transaction {
                 remote: None,
                 activated: false,
                 user_to_add,
+                enrollment: None,
             },
         };
         let mut files = vec![
@@ -446,6 +442,24 @@ impl Transaction {
         tx.save()?;
         Ok(tx)
     }
+    fn commit(&self, paths: &Paths) -> Result<()> {
+        let completed = paths
+            .state_dir
+            .join(format!(".join-completed-{:016x}", rand::random::<u64>()));
+        fs::rename(&self.dir, &completed)?;
+        if let Err(e) = fs::File::open(&paths.state_dir).and_then(|dir| dir.sync_all()) {
+            eprintln!(
+                "warning: joined setup is committed, but its commit marker could not be synced: {e}"
+            );
+        }
+        if let Err(e) = fs::remove_dir_all(&completed) {
+            eprintln!(
+                "warning: joined setup is committed, but its private undo files at {} could not be removed: {e}",
+                completed.display()
+            );
+        }
+        Ok(())
+    }
     fn save(&self) -> Result<()> {
         secrets::write_private_file(
             &self.dir.join("journal.json"),
@@ -468,8 +482,23 @@ impl Transaction {
         }
         Ok(Some(Self { journal: serde_json::from_slice(&fs::read(journal)?).context("the join undo journal is damaged; ask an administrator to recover it before joining")?, dir }))
     }
-    fn rollback_files(&self) -> Result<()> {
+    fn rollback_files(&self, paths: &Paths) -> Result<()> {
+        let state = Store::new(paths).load_state()?;
+        let used = state.last_run.is_some()
+            || paths.current_run_file().exists()
+            || state.last_success.is_some()
+            || paths
+                .runs_dir()
+                .read_dir()
+                .is_ok_and(|mut entries| entries.next().is_some());
         for original in &self.journal.files {
+            let key = original
+                .path
+                .file_name()
+                .is_some_and(|n| n == "encryption-key" || n == "encryption-key.cred");
+            if key && (used || original.backup.is_some()) {
+                continue;
+            }
             match &original.backup {
                 Some(backup) => {
                     secrets::write_private_file(&original.path, &fs::read(self.dir.join(backup))?)?;
@@ -490,11 +519,11 @@ impl Transaction {
         }
         Ok(())
     }
-    async fn rollback(&self, activation: &mut dyn Activation) -> Result<()> {
+    async fn rollback(&self, paths: &Paths, _activation: &mut dyn Activation) -> Result<()> {
         if self.journal.activated {
-            activation.rollback(&self.journal.units, self.journal.user_to_add.as_deref())?;
+            bail!("activated setup must be completed; run the same join command again");
         }
-        self.rollback_files()?;
+        self.rollback_files(paths)?;
         if let Some((url, pin)) = &self.journal.remote {
             let credential = fs::read(self.dir.join("remote-credential"))?;
             let (status, body) = Endpoint::parse(url)?.post(pin, "/machines/self/leave", Some(&credential), b"{}".to_vec()).await
@@ -535,12 +564,25 @@ pub async fn join(paths: &Paths, args: JoinArgs) -> Result<()> {
 async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activation) -> Result<()> {
     let endpoint = Endpoint::parse(&args.hub_url)?;
     crate::pinned::validate_pin(&args.pin)?;
-    let _lock = crate::run::RunLock::try_acquire(paths)?
+    let lock = crate::run::RunLock::try_acquire(paths)?
         .context("a backup is running; wait for it to finish before joining")?;
-    if let Some(tx) = Transaction::load(paths)? {
-        tx.rollback(activation).await?;
+    let previous = Transaction::load(paths)?;
+    if let Some(tx) = &previous
+        && tx.journal.activated
+    {
+        activation.enable()?;
+        activation.add_user()?;
+        tx.commit(paths)?;
+        drop(lock);
+        if SecretStore::new(&paths.credentials_dir).exists(secrets::ENCRYPTION_KEY) {
+            activation.start_backup()?;
+        }
+        println!("Interrupted join completed; the existing encryption key was kept.");
+        return Ok(());
     }
-    configured(paths, args.replace_config)?;
+    if previous.is_none() {
+        configured(paths, args.replace_config)?;
+    }
     let name = args.name.clone().unwrap_or_else(config::hostname);
     if name.is_empty()
         || name.len() > 64
@@ -566,6 +608,46 @@ async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activatio
             .context("configuration has no directory")?,
     )?;
     fs::create_dir_all(&paths.state_dir)?;
+    let mut tx = if let Some(tx) = previous {
+        if let Some(e) = &tx.journal.enrollment {
+            if e.url != endpoint.origin
+                || e.pin != args.pin
+                || e.code_digest != secrets::digest(&Secret::new(args.code.as_bytes().to_vec()))
+                || e.name != name
+            {
+                bail!(
+                    "an interrupted join is pending; repeat the same command with the original code and name"
+                );
+            }
+            tx.rollback_files(paths)?;
+            tx
+        } else {
+            tx.rollback(paths, activation).await?;
+            Transaction::begin(
+                paths,
+                units,
+                SecretStore::new(&paths.credentials_dir).exists(secrets::ENCRYPTION_KEY),
+                activation.user_to_add()?,
+            )?
+        }
+    } else {
+        Transaction::begin(
+            paths,
+            units,
+            SecretStore::new(&paths.credentials_dir).exists(secrets::ENCRYPTION_KEY),
+            activation.user_to_add()?,
+        )?
+    };
+    if tx.journal.enrollment.is_none() {
+        tx.journal.enrollment = Some(Enrollment {
+            url: endpoint.origin.clone(),
+            pin: args.pin.clone(),
+            name: name.clone(),
+            code_digest: secrets::digest(&Secret::new(args.code.as_bytes().to_vec())),
+            attempt: URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()),
+        });
+        tx.save()?;
+    }
     let secret_store = SecretStore::new(&paths.credentials_dir);
     let key_exists = secret_store.exists(secrets::ENCRYPTION_KEY);
     // Reading an existing key is required; a broken sealed key must be imported,
@@ -575,25 +657,35 @@ async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activatio
     } else {
         None
     };
-    let mut tx = Transaction::begin(paths, units, key_exists, activation.user_to_add()?)?;
+    let mut uncertain = false;
+    let mut needs_key = false;
     let result = async {
         let staged = SecretStore::new(&tx.dir.join("credentials"));
-        let key_path = tx.dir.join("key.json");
-        if let Some(key) = existing.as_ref() { secrets::create_new_private_file(&key_path, key.as_bytes())?; }
-        else { crate::client::local::create_key(&key_path)?; }
-        let info = crate::client::local::key_info(&key_path)?;
-        info.require_unprotected()?;
-        let key = Secret::new(fs::read(&key_path)?);
-        if !key_exists { staged.store(secrets::ENCRYPTION_KEY, &key, true)?; }
-        let request = JoinRequest { code: &args.code, hostname: config::hostname(), backup_id: &name, adopt: args.adopt, os: crate::status::os_name(), nestegg_version: env!("CARGO_PKG_VERSION") };
-        let (status, body) = endpoint.post(&args.pin, "/join", None, serde_json::to_vec(&request)?).await?;
+        let request = JoinRequest { code: &args.code, attempt: &tx.journal.enrollment.as_ref().expect("enrollment").attempt, hostname: config::hostname(), backup_id: &name, adopt: args.adopt, os: crate::status::os_name(), nestegg_version: env!("CARGO_PKG_VERSION") };
+        let bytes = serde_json::to_vec(&request)?;
+        let mut response = None;
+        let mut last_error = None;
+        // Same durable attempt for all retries, including after process death.
+        for _ in 0..3 {
+            match endpoint.post(&args.pin, "/join", None, bytes.clone()).await {
+                Ok(answer) => { response = Some(answer); break; }
+                Err(error) => {
+                    let not_sent = error.is::<crate::pinned::NotSent>();
+                    uncertain |= !not_sent;
+                    last_error = Some(error);
+                    if not_sent && !uncertain { break; }
+                },
+            }
+        }
+        let (status, body) = response.ok_or_else(|| last_error.unwrap_or_else(|| anyhow::anyhow!("no hub response"))).context("connection to the hub broke or timed out; repeat the SAME join command to repair enrollment")?;
+        uncertain = status >= 500;
         response_ok(status, &body, 200)?;
         let response: serde_json::Value = serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("the hub returned unreadable setup details; ask its administrator to check whether this computer joined before trying again"))?;
         // Keep a usable cleanup credential even if another response field is
         // malformed. Neither response data nor serde errors are printed.
         let credential = response.get("machine_credential").and_then(serde_json::Value::as_str)
             .filter(|c| !c.is_empty()).context("the hub returned no cleanup credential; ask its administrator to remove any new registration before joining again")?;
-        secrets::create_new_private_file(&tx.dir.join("remote-credential"), credential.as_bytes())?;
+        secrets::write_private_file(&tx.dir.join("remote-credential"), credential.as_bytes())?;
         tx.journal.remote = Some((endpoint.origin.clone(), args.pin.clone()));
         tx.save()?;
         let response: JoinResponse = serde_json::from_value(response).map_err(|_| anyhow::anyhow!("the hub returned incomplete setup details; ask its administrator to check it"))?;
@@ -601,10 +693,22 @@ async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activatio
         staged.store(secrets::PASSWORD, &Secret::new(response.pbs.secret.into_bytes()), true)?;
         staged.store(secrets::MACHINE_CREDENTIAL, &Secret::new(response.machine_credential.into_bytes()), true)?;
         let mut state = Store::new(paths).load_state()?;
-        state.key_fingerprint = Some(info.fingerprint);
-        state.key_digest = Some(secrets::digest(&key));
+        needs_key = !key_exists && response.existing_snapshots > 0;
+        if !needs_key {
+            let key_path = tx.dir.join("key.json");
+            if !key_path.exists() {
+                if let Some(key) = existing.as_ref() { secrets::create_new_private_file(&key_path, key.as_bytes())?; }
+                else { crate::client::local::create_key(&key_path)?; }
+            }
+            let info = crate::client::local::key_info(&key_path)?;
+            info.require_unprotected()?;
+            let key = Secret::new(fs::read(&key_path)?);
+            if !key_exists { staged.store(secrets::ENCRYPTION_KEY, &key, true)?; }
+            state.key_fingerprint = Some(info.fingerprint);
+            state.key_digest = Some(secrets::digest(&key));
+        }
         state.master_key = Some(Proof { fingerprint: response.master_key.fingerprint, proven_at: response.master_key.proven_at });
-        state.join_backup_pending = true;
+        state.join_backup_pending = !needs_key;
         state.consecutive_failures = 0;
         state.failed_config = None;
         secrets::create_private_dir(&paths.credentials_dir)?;
@@ -622,7 +726,12 @@ async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activatio
         // calculate status. It is never writable by the group.
         crate::settings::write_file_atomic(&paths.master_public_key(), &response.master_key.public_key_pem, 0o644)?;
         Store::new(paths).save_state(&state)?;
-        crate::settings::write_file_atomic(&paths.config_file, &cfg.to_toml()?, 0o640)?;
+        let text = merged_config(paths, &cfg)?;
+        if paths.config_file.exists() {
+            let backup = paths.config_file.with_file_name(format!("config.toml.before-join-{:016x}", rand::random::<u64>()));
+            secrets::create_new_private_file(&backup, &fs::read(&paths.config_file)?)?;
+        }
+        crate::settings::write_file_atomic(&paths.config_file, &text, 0o640)?;
         let group = nix::unistd::Group::from_name(crate::daemon::GROUP).ok().flatten();
         if let Some(group) = group {
             for path in [paths.config_file.clone(), paths.state_dir.clone()] { nix::unistd::chown(&path, None, Some(group.gid))?; }
@@ -632,21 +741,15 @@ async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activatio
         tx.save()?;
         activation.enable()?;
         activation.add_user()?;
-        activation.start_backup()?;
-        // Atomic commit marker: an interrupted cleanup must never undo a
-        // successful join on the next invocation.
-        let completed = paths.state_dir.join(format!(".join-completed-{:016x}", rand::random::<u64>()));
-        fs::rename(&tx.dir, &completed)?;
-        if let Err(e) = fs::File::open(&paths.state_dir).and_then(|dir| dir.sync_all()) {
-            eprintln!("warning: setup succeeded, but its commit marker could not be synced: {e}");
-        }
-        if let Err(e) = fs::remove_dir_all(&completed) {
-            eprintln!("warning: setup succeeded, but its private undo files at {} could not be removed: {e}", completed.display());
-        }
+        tx.commit(paths)?;
         Ok::<_, anyhow::Error>(cfg)
     }.await;
     match result {
         Ok(cfg) => {
+            drop(lock);
+            if !needs_key {
+                activation.start_backup()?;
+            }
             println!(
                 "Joined {} as {}. Backup configuration, credentials and master-key protection are ready.",
                 cfg.hub.as_ref().expect("joined").name,
@@ -655,14 +758,30 @@ async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activatio
             if key_exists {
                 println!("Your existing encryption key was kept unchanged.");
             }
-            println!(
-                "The first backup is starting in the background. Open the interface with: nestegg ui"
-            );
+            if needs_key {
+                println!(
+                    "Existing backups found. No encryption key was created and no backup was started."
+                );
+                println!(
+                    "Continue with the old key: sudo nestegg key recover --master-key <file> --install (one key reads old and new backups)."
+                );
+                println!(
+                    "Or start with a new key: sudo nestegg key create (old backups then require the master key)."
+                );
+            } else {
+                println!(
+                    "The first backup is starting in the background. Open the interface with: nestegg ui"
+                );
+            }
             println!("Log out and back in so membership in group nestegg takes effect.");
             Ok(())
         }
         Err(error) => {
-            if let Err(rollback) = tx.rollback(activation).await {
+            if tx.journal.activated || uncertain {
+                return Err(error
+                    .context("join is unfinished; repeat the same command to complete it safely"));
+            }
+            if let Err(rollback) = tx.rollback(paths, activation).await {
                 bail!(
                     "{error:#}. Cleanup is unfinished: {rollback:#}. Run the same join command again to recover"
                 );
@@ -725,4 +844,28 @@ pub async fn leave(paths: &Paths, force: bool) -> Result<()> {
         "This computer no longer backs up to the hub's PBS target until it joins again or receives its own token with nestegg init. Its encryption key and existing backups were kept."
     );
     Ok(())
+}
+
+/// Retain comments and all settings outside the hub's authority.
+fn merged_config(paths: &Paths, cfg: &Config) -> Result<String> {
+    if !paths.config_file.exists() {
+        return cfg.to_toml();
+    }
+    let mut old: toml_edit::DocumentMut = fs::read_to_string(&paths.config_file)?.parse()?;
+    let new: toml_edit::DocumentMut = cfg.to_toml()?.parse()?;
+    for name in ["pbs", "wake", "hub", "backup_id"] {
+        old.remove(name);
+        if let Some(value) = new.get(name) {
+            old[name] = value.clone();
+        }
+    }
+    old["backup"]["master_public_key"] = new["backup"]["master_public_key"].clone();
+    let text = old.to_string();
+    Config::parse(&text)?;
+    Ok(text)
+}
+
+/// Called after committing key recovery, with no run lock held.
+pub fn start_first_backup(paths: &Paths) -> Result<()> {
+    SystemActivation { paths }.start_backup()
 }

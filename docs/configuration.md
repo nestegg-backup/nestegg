@@ -23,10 +23,12 @@ Never accept a replacement pin just because a connection failed.
 
 Join writes the PBS settings and Wake-on-LAN defaults, stores the PBS token and
 machine credential, and creates an encryption key only if none is already
-stored. It enables the local interface daemon and the backup and notification
+stored and the backup group has no existing snapshots. With old snapshots and
+no key, it finishes setup but creates no key and starts no backup; see below. It enables the local interface daemon and the backup and notification
 timers, adds the user who called sudo to group `nestegg`, and starts the first
-backup in the background. Full system backup is on, with the same sources,
-excludes and daily rhythm as `nestegg init`. Open the interface with `nestegg ui`
+backup in the background when a key is ready. For a fresh configuration, full
+system backup is on, with the same sources, excludes and daily rhythm as
+`nestegg init`. Existing local settings are preserved with `--replace-config`. Open the interface with `nestegg ui`
 after logging out and back in so the new group membership applies. The first
 backup can take hours; follow it with `nestegg status`.
 
@@ -42,25 +44,30 @@ The hub never receives either the computer's key or the private master key.
 
 Use `--name <backup-id>` to choose a name instead of the short host name (1–64
 letters, digits, `-`, `_`, `.`). If the PBS already has that backup group, use
-`--adopt` only for **the same computer**, keeping or importing its original
-encryption key first. Adopting another computer's backups does not make them
-yours or recover its encryption key.
+`--adopt` only for **the same computer or its replacement**. A replacement
+without a key must recover it after joining; adoption itself does not recover
+the key.
 
 An existing configuration is refused. Normally leave its old hub first. With
 `--replace-config` you explicitly replace the configuration and PBS token while
-keeping the existing encryption key byte for byte; join never replaces or
+preserving sources, excludes, schedule, notifications and registered sticks.
+Only the hub-controlled target, identity, wake settings and master public key
+are replaced; the old file stays beside it as `config.toml.before-join-<random>`.
+It keeps the existing encryption key byte for byte; join never replaces or
 deletes an existing key, even if it cannot be decrypted. A configuration from a
 previous hub may still have a registration there: remove it in that hub if you
 replace the configuration instead of leaving first.
 
-Setup stages credentials and keeps a private undo journal at
-`/var/lib/nestegg/join-transaction/`. A failure restores the previous local files
-and service states and asks the hub to remove the new registration. After a
-crash, rerun join to finish this cleanup before starting another enrollment.
-If cleanup cannot reach the hub, the journal retains the credential needed to
-retry. If a connection is lost before the join response arrives, only the hub
-can tell whether the one-time code was consumed: check its computer list and
-remove a newly registered entry before trying again with a new code.
+Setup stages credentials and keeps a private journal at
+`/var/lib/nestegg/join-transaction/`, including a random enrollment attempt.
+A connection failure causes up to three requests using that same attempt.
+After interruption, rerun the exact command with the same code and name:
+the hub can replace the enrollment secrets for this attempt until code expiry.
+Other reuse of a used code is refused. An already activated setup completes
+instead of undoing itself; its encryption key is kept. The first backup starts
+after commit and release of the run lock. Other failures before activation
+restore previous local files and remove the new registration where possible.
+Do not delete the journal while a join is unfinished.
 
 ```sh
 sudo nestegg leave          # revoke the PBS token and detach this computer
@@ -76,29 +83,53 @@ backup group each require explicit consent.
 `--force` may leave the registration and PBS token on the hub; ask its
 administrator to remove them. Backup sticks and their data are retained.
 
-### Recovering a computer key with the master key
+### Replacing a lost computer
 
-With the computer's PBS login configured and the administrator's private master
-key available on a separate medium:
+Remove the dead computer in the hub, then create a new code. Run the printed
+bootstrap command on the replacement with `--name <old-name> --adopt`. If it
+already has a configuration, add `--replace-config`. Join restores PBS access
+under the same token identity with a fresh secret; **the token secret on the
+dead computer is gone**. The master key alone cannot log in to PBS.
+
+With old snapshots and no key, join creates no key and starts no backup.
+Status and check explain the missing key. Continue with the original key:
+
+```sh
+sudo nestegg key recover --master-key /media/usb/master-private.pem --install
+# If several keys are listed, choose the intended old snapshot explicitly:
+# add --snapshot 2026-11-14T12:00:00Z
+```
+
+The official client owns the passphrase prompt. Recovery reports the snapshot
+time and fingerprint, verifies the recovered key against the signed manifest,
+and installs it without overwriting a different existing key. It records the
+household master-key coverage and starts the first backup. Old and new backups
+stay readable with this one key. Restore a file from an old snapshot to check.
+
+Alternatively, `sudo nestegg key create` deliberately starts a new key. Old
+snapshots then remain readable only by recovering their key with the master
+key. The default recovery examines manifest fingerprints across finished
+snapshots, lists distinct fingerprints with time ranges, and requires
+`--snapshot` if there is more than one. The newest finished snapshot is used
+only when there is one key identity. Manifests shown before recovery are
+server metadata; the official client verifies the chosen snapshot's signature
+with the recovered key before it can be installed.
+
+To recover to a separate private file instead of installing:
 
 ```sh
 sudo nestegg key recover --master-key /media/usb/master-private.pem --output recovered.json
-# An older snapshot: add --snapshot 2026-11-14T12:00:00Z
-sudo nestegg key import recovered.json
 ```
 
-The newest finished snapshot is used by default. The master key's password
-prompt belongs directly to the official client; nestegg does not read or store
-the password. The recovered key is checked against the signed snapshot manifest,
-written as a private file without a password, and accepted by `nestegg key
-import`. An existing output file is never overwritten. Keep this recovered file
-safe, and prove an independent copy if you use the computer without its hub.
-A PBS login is still needed: the master key decrypts backups but does not log in
-to the server.
+An existing output file is never overwritten. Keep the recovered file safe;
+prove an independent copy if using this computer without the hub.
 
 Backups remain restorable without nestegg. On a Linux computer with only the
-official client, enter the PBS token secret when prompted (or use its supported
-password file/descriptor), then run:
+official client, first regain access to the old group: join under the old name
+as above and use the newly issued token secret, or have a PBS administrator
+issue a new secret for the same token identity. Use the client's supported
+password prompt or password file/descriptor; the lost token secret cannot be
+recovered. With that login configured, run:
 
 ```sh
 export PBS_REPOSITORY='backup@pbs!desktop@pbs.example.com:8007:backups'

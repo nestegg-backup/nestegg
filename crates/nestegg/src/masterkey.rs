@@ -77,8 +77,9 @@ pub fn check_file(path: &Path, expected: &str) -> Result<()> {
 pub fn recover(
     paths: &crate::config::Paths,
     master: &Path,
-    output: &Path,
+    output: Option<&Path>,
     snapshot: Option<&str>,
+    install: bool,
 ) -> Result<()> {
     use crate::client::{self, Client};
     use crate::secrets::{self, Secret, SecretStore};
@@ -91,12 +92,26 @@ pub fn recover(
             let parsed = DateTime::parse_from_rfc3339(time).context("--snapshot must be a snapshot time in RFC 3339 format, for example 2026-11-14T12:00:00Z")?;
             client::snapshot_path(&id, parsed.timestamp())
         }
-        None => client::last_finished_snapshot(
-            &client.list_snapshots_bounded(&id, client::readback_list_timeout())?,
-        )
-        .context("this computer has no finished snapshot on the backup server")?
-        .snapshot
-        .clone(),
+        None => {
+            let snapshots = client.list_snapshots_bounded(&id, client::readback_list_timeout())?;
+            let finished: Vec<_> = snapshots
+                .iter()
+                .filter(|s| s.archives.iter().any(|a| a == "index.json.blob"))
+                .collect();
+            let mut identities = Vec::new();
+            for s in &finished {
+                let fingerprint = s
+                    .key_fingerprint
+                    .clone()
+                    .unwrap_or_else(|| "unknown / unsigned".into());
+                identities.push((s.time.clone(), fingerprint));
+            }
+            require_single_key(&identities)?;
+            client::last_finished_snapshot(&snapshots)
+                .context("this computer has no finished snapshot on the backup server")?
+                .snapshot
+                .clone()
+        }
     };
     let absolute = |path: &Path| -> Result<std::path::PathBuf> {
         Ok(if path.is_absolute() {
@@ -105,19 +120,21 @@ pub fn recover(
             std::env::current_dir()?.join(path)
         })
     };
-    let output = absolute(output)?;
+    let output = output.map(absolute).transpose()?;
     let master = absolute(master)?;
     let user = crate::identity::UserIdentity::from_sudo()?;
-    if user
-        .as_ref()
-        .map(|u| crate::identity::exists_as(u, &output))
-        .transpose()?
-        .unwrap_or_else(|| output.symlink_metadata().is_ok())
-    {
-        bail!(
-            "{} already exists; choose a new --output file (nothing was overwritten)",
-            output.display()
-        );
+    if let Some(output) = &output {
+        if user
+            .as_ref()
+            .map(|u| crate::identity::exists_as(u, output))
+            .transpose()?
+            .unwrap_or_else(|| output.symlink_metadata().is_ok())
+        {
+            bail!(
+                "{} already exists; choose a new --output file (nothing was overwritten)",
+                output.display()
+            );
+        }
     }
     // Read the master key with the caller's rights. The client opens a
     // private copy, so it cannot follow an arbitrary user-controlled path
@@ -159,14 +176,74 @@ pub fn recover(
     if !client.open_snapshot_with_key(&snapshot, &key)? {
         bail!("the snapshot is not signed; the recovered key could not be verified");
     }
-    match &user {
-        Some(user) => crate::identity::write_new_file_as(user, &output, key.as_bytes())?,
-        None => secrets::create_new_private_file(&output, key.as_bytes())?,
-    }
     println!(
-        "Recovered key from {snapshot} (fingerprint {}). Written to {}. Import it with: sudo nestegg key import <recovered-file>",
-        info.fingerprint,
-        output.display()
+        "Recovered key from {snapshot} (fingerprint {}).",
+        info.fingerprint
+    );
+    if install {
+        let lock = crate::run::RunLock::try_acquire(paths)?
+            .context("a backup is running; try again when it has finished")?;
+        let secrets = SecretStore::new(&paths.credentials_dir);
+        let mut state = crate::state::Store::new(paths).load_state()?;
+        if secrets.exists(secrets::ENCRYPTION_KEY) {
+            let current = secrets.load(secrets::ENCRYPTION_KEY)?;
+            let current_path = work.path().join("current.json");
+            secrets::create_new_private_file(&current_path, current.as_bytes())?;
+            let fingerprint = client::local::key_info(&current_path)?.fingerprint;
+            ensure_same_key(&fingerprint, &info.fingerprint)?;
+        }
+        // A joined computer retains its authenticated household proof. Check
+        // that the configured public key still matches before enabling backups.
+        state.master_key = covered(&config, &state)?;
+        secrets.store(secrets::ENCRYPTION_KEY, &key, true)?;
+        state.key_fingerprint = Some(info.fingerprint);
+        state.key_digest = Some(secrets::digest(&key));
+        state.join_backup_pending = true;
+        state.consecutive_failures = 0;
+        state.failed_config = None;
+        crate::state::Store::new(paths).save_state(&state)?;
+        drop(lock);
+        crate::join::start_first_backup(paths)?;
+        println!(
+            "Recovered key installed; the first backup is starting. This key reads old and new backups."
+        );
+    } else if let Some(output) = output {
+        match &user {
+            Some(user) => crate::identity::write_new_file_as(user, &output, key.as_bytes())?,
+            None => secrets::create_new_private_file(&output, key.as_bytes())?,
+        }
+        println!(
+            "Written to {}. Import it with: sudo nestegg key import <recovered-file>",
+            output.display()
+        );
+    } else {
+        bail!("choose --output <file> or --install");
+    }
+
+    Ok(())
+}
+
+fn ensure_same_key(current: &str, recovered: &str) -> Result<()> {
+    anyhow::ensure!(
+        current == recovered,
+        "a different encryption key already exists ({current}); --install never overwrites a different key"
+    );
+    Ok(())
+}
+
+fn require_single_key(identities: &[(String, String)]) -> Result<()> {
+    let mut ranges = std::collections::BTreeMap::<&str, (&str, &str)>::new();
+    for (time, fingerprint) in identities {
+        let range = ranges.entry(fingerprint).or_insert((time, time));
+        range.0 = range.0.min(time);
+        range.1 = range.1.max(time);
+    }
+    for (fingerprint, (first, last)) in &ranges {
+        println!("Snapshot key {fingerprint}: {first} to {last}");
+    }
+    anyhow::ensure!(
+        ranges.len() <= 1,
+        "this backup group contains more than one key; choose the intended snapshot with --snapshot <RFC3339-time>"
     );
     Ok(())
 }
@@ -227,5 +304,21 @@ mod tests {
         assert!(require_coverage(&cfg, &state, "current-key", false).is_err());
         assert!(require_coverage(&cfg, &state, "current-key", true).is_ok());
         assert!(fingerprint(b"not a PEM key").is_err());
+    }
+    #[test]
+    fn recovery_never_silently_selects_between_distinct_keys_or_overwrites_another_key() {
+        let snapshots = vec![
+            ("2026-01-01T00:00:00Z".into(), "first".into()),
+            ("2026-01-02T00:00:00Z".into(), "second".into()),
+        ];
+        assert!(
+            require_single_key(&snapshots)
+                .unwrap_err()
+                .to_string()
+                .contains("--snapshot")
+        );
+        assert!(require_single_key(&snapshots[..1]).is_ok());
+        assert!(ensure_same_key("first", "second").is_err());
+        assert!(ensure_same_key("first", "first").is_ok());
     }
 }
