@@ -7,6 +7,7 @@ pub mod check;
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod hub;
 pub mod identity;
 pub mod inventory;
 pub mod keyproof;

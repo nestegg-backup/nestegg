@@ -26,6 +26,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Manage the optional household hub.
+    Hub(nestegg::hub::cli::Args),
     /// Create the configuration and directories (root).
     Init(InitArgs),
     /// Manage the PBS password / API token secret (root).
@@ -310,6 +312,7 @@ fn main() -> ExitCode {
 
 fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
     match cmd {
+        Cmd::Hub(args) => nestegg::hub::cli::run(args),
         Cmd::Init(args) => init(paths, args),
         Cmd::Credentials(CredCmd::SetPassword {
             allow_plain,

@@ -1,0 +1,38 @@
+[Unit]
+Description=nestegg household backup hub
+Documentation=file:/usr/share/doc/nestegg/hub.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/nestegg-hub/hub.toml
+
+[Service]
+Type=simple
+User=nestegg-hub
+Group=nestegg-hub
+ExecStart=/usr/bin/nestegg hub serve
+Restart=on-failure
+RestartSec=5s
+StateDirectory=nestegg-hub
+StateDirectoryMode=0700
+UMask=0077
+# PID 1 decrypts the root-owned password, then exposes only these two
+# credentials to the unprivileged service. init must use systemd-creds.
+LoadCredentialEncrypted=password:/etc/nestegg-hub/credentials/password.cred
+LoadCredential=hub-tls-key:/etc/nestegg-hub/tls.key
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+SystemCallFilter=~@module @reboot @swap @obsolete @cpu-emulation @debug @raw-io @clock
+ReadWritePaths=/var/lib/nestegg-hub
+
+[Install]
+WantedBy=multi-user.target

@@ -2,6 +2,7 @@
 set -e
 if [ "$1" = "configure" ]; then
     systemd-sysusers nestegg.conf >/dev/null 2>&1 || groupadd --system nestegg 2>/dev/null || true
+    systemd-sysusers nestegg-hub.conf >/dev/null 2>&1 || true
     systemd-tmpfiles --create nestegg.conf >/dev/null 2>&1 || true
     mkdir -p /etc/nestegg /var/lib/nestegg
     chmod 0755 /etc/nestegg
@@ -46,6 +47,9 @@ if [ "$1" = "configure" ]; then
     if [ -d /run/systemd/system ]; then
         running=yes
         systemctl daemon-reload >/dev/null 2>&1 || true
+        if systemctl is-active --quiet nestegg-hub.service; then
+            systemctl restart nestegg-hub.service || true
+        fi
         if systemctl is-active --quiet nestegg.service; then
             systemctl restart nestegg.service || true
         fi
@@ -77,6 +81,8 @@ if [ "$1" = "configure" ]; then
                 # remove and reinstall before `nestegg init` would leave it
                 # off for good (the one-time marker below is already set).
                 nestegg-notify.timer) ;;
+                nestegg-hub.service)
+                    [ -e /etc/nestegg-hub/hub.toml ] || continue ;;
                 nestegg.service|nestegg-backup.timer)
                     [ "$configured" = yes ] || continue ;;
                 *) continue ;;
