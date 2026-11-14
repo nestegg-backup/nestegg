@@ -11,6 +11,7 @@
   import { hasPbs, hasStick, scheduleHours } from "../lib/derive";
   import { DEFAULT_LIMITS, settingsProblem } from "../lib/settings";
   import { intervalOptions, overdueFor, parseHours, problemText, saveFailure, serialListEdits } from "../lib/settingsForm";
+  import { encryptionFact } from "../lib/text";
   import { f, t } from "../lib/locale";
   import type { SettingKey, SettingsChange, Status, Target } from "../lib/types";
 
@@ -555,13 +556,14 @@
         <div class="pref ro-row">
           <dt class="l">{s.encryption}</dt>
           <dd class="c">
-            {!status.encryption.enabled
-              ? t.self.encryptionOff
-              : status.encryption.key_exported
-                ? t.self.encryptionOnKey
-                : t.self.encryptionOnNoKey}
+            {encryptionFact(status, t).text}
           </dd>
         </div>
+        {#if status.hub}
+          <div class="pref ro-row">
+            <dt class="l">{t.self.factHub}</dt><dd class="c">{t.self.hubName(status.hub.name)}, {status.hub.url}</dd>
+          </div>
+        {/if}
         {#if status.encryption.key_fingerprint}
           <div class="pref ro-row">
             <dt class="l">{s.fingerprint}</dt><dd class="c"><code>{status.encryption.key_fingerprint}</code></dd>

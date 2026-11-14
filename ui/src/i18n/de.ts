@@ -235,6 +235,10 @@ const de = {
     encryptionOnKey: "Eingeschaltet. Eine Kopie des Schlüssels ist bestätigt.",
     encryptionOnNoKey: "Eingeschaltet. Eine Kopie des Schlüssels ist noch nicht bestätigt.",
     encryptionOff: "Ausgeschaltet. Die Sicherungen liegen unverschlüsselt auf dem Server.",
+    encryptionMaster: "Eingeschaltet. Geschützt durch den Haushaltsschlüssel des Hubs.",
+    encryptionMasterOwn: "Eine eigene Kopie des Schlüssels ist zusätzlich möglich, aber nicht nötig.",
+    factHub: "Verwaltet von",
+    hubName: (name: string) => `Hub „${name}“`,
     incompleteLead: (m: Moment) => `${cap(at(m))} gesichert, aber nicht vollständig.`,
     incompleteLeadUndated: "Gesichert, aber nicht vollständig.",
     incompleteText: "Die Sicherung hat funktioniert, enthält aber nicht alles, was eingestellt ist. Was fehlt, steht unten.",
@@ -323,6 +327,8 @@ const de = {
       "Die Sicherungen werden auf diesem PC verschlüsselt, bevor sie zum Server gehen. Den Schlüssel dafür legst du jetzt an.",
     keyCreateImport:
       "Hast du schon einen Schlüssel von früher, zum Beispiel nach einer Neuinstallation, legst du keinen neuen an, sondern holst den alten zurück: sudo nestegg key import <Schlüsseldatei>. Sonst lassen sich die älteren Sicherungen nicht öffnen.",
+    keyStoreMaster:
+      "Erledigt: Der Haushaltsschlüssel des Hubs schützt die Sicherungen dieses PCs. Eine eigene Kopie ist möglich, aber nicht nötig.",
     keyStoreWhy:
       "Ohne diesen Schlüssel kann niemand die Sicherungen öffnen, auch du nicht, wenn der PC kaputtgeht. Darum muss eine Kopie außerhalb dieses PCs liegen. Eine Kopie, die nur auf diesem PC liegt, zählt nicht, und eine in einem gesicherten Ordner auch nicht, selbst auf einer externen Platte. Es gibt mehrere Wege, einer genügt. Gesichert wird erst, wenn du die Kopie bestätigt hast.",
     usbTitle: "Auf einen USB-Stick",

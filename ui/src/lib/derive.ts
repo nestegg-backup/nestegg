@@ -67,7 +67,7 @@ export type SelfKind = "unconfigured" | "running" | "key_missing" | "failing" | 
 export function selfKind(s: Status): SelfKind {
   if (s.health === "unconfigured") return "unconfigured";
   if (s.health === "running" || isActive(s.current_run)) return "running";
-  if (s.encryption.enabled && s.encryption.key_exported === false) return "key_missing";
+  if (keyCopyMissing(s)) return "key_missing";
   // The daemon reports `failing` when the last run's state is unknown. An older daemon says `ok`
   // then: the page does not repeat "Everything is fine" above an entry it cannot read.
   if (isUnknownRun(s.last_run) && (s.health === "ok" || s.health === "incomplete" || s.health === "overdue")) return "failing";
@@ -556,6 +556,23 @@ export function keyMissing(s: Status): boolean {
 }
 
 /**
+ * The household master key of a hub protects this computer's backups (decision 0034): every
+ * snapshot carries a copy of this computer's key, encrypted to the proven master key. Absent
+ * (older daemon) or null: no.
+ */
+export function masterKeyProtected(s: Status): boolean {
+  return !!s.encryption.master_key;
+}
+
+/**
+ * Encryption is on and no copy of the key outside this PC is confirmed, and no master key
+ * stands in for it. Unknown (`key_exported` absent) never counts as missing.
+ */
+export function keyCopyMissing(s: Status): boolean {
+  return s.encryption.enabled && s.encryption.key_exported === false && !masterKeyProtected(s);
+}
+
+/**
  * Why no backup can run at the moment (so "next backup: 02:00" would be untrue), or null.
  * Same order as the setup guide: the token secret, then the key, then the key copy. Unknown
  * values (null or absent) never count as missing.
@@ -571,7 +588,7 @@ export function backupBlocked(s: Status): Blocked | null {
   if (s.last_run?.state === "failed" && s.last_run.error?.kind === "credentials_unreadable" && !isActive(s.current_run))
     return "credentials_unreadable";
   if (s.encryption.enabled && keyMissing(s)) return "key_create";
-  if (s.encryption.enabled && s.encryption.key_exported === false) return "key_confirm";
+  if (keyCopyMissing(s)) return "key_confirm";
   return null;
 }
 
@@ -604,7 +621,7 @@ export function setupGuide(s: Status): Guide | null {
     connect: unconfigured,
     credentials: !unconfigured && hasPbs(s) && s.pbs.credentials_stored === false,
     key_create: !unconfigured && noKey,
-    key_store: !unconfigured && encrypted && !noKey && s.encryption.key_exported === false,
+    key_store: !unconfigured && encrypted && !noKey && s.encryption.key_exported === false && !masterKeyProtected(s),
     first_backup: s.health === "never",
   };
   const anyOther = Object.values(open).some(Boolean);

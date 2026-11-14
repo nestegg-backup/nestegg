@@ -212,6 +212,7 @@ Add faults to any scenario with `&fault=a,b`:
 | `stick_busy` | the stick is plugged in but cannot be opened (`503 stick_unavailable`) |
 | `stick_multiple` | two registered sticks are plugged in: the first is named "Blue stick", the second has no name |
 | `stick_no_progress` | like a daemon before API 0.6.0: a stick restore reports `restored_bytes` only when it is done |
+| `hub` | the computer joined a hub (decision 0034): `/status` has `hub` and `encryption.master_key`, no own key copy is confirmed; the master key stands in for it (no key warning, the guide's key step is done) |
 
 `down` can also be switched while the page is open:
 `curl -X POST 'http://127.0.0.1:5173/__mock/fault?down=1'` (and `down=0`); it

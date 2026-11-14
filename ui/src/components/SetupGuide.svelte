@@ -17,6 +17,7 @@
     STICK_INFO_COMMAND,
     isUuid,
     knownStickUuid,
+    masterKeyProtected,
     stickFile,
     stickKeyCopyCommand,
     stickOnly,
@@ -55,6 +56,9 @@
     first_backup: g.firstBackup,
   };
   const at = $derived(guide.steps.indexOf(guide.current));
+  // A hub's household master key stands in for the copy of this PC's own key (decision 0034).
+  const master = $derived(masterKeyProtected(status));
+  const isDone = (step: GuideStep, i: number) => i < at || (i !== at && step === "key_store" && master);
 
   // Not secret, but real names of the user's server: kept in memory only.
   let server = $state("");
@@ -100,13 +104,16 @@
   <h2 class="sec-title" id="h-guide" tabindex="-1" bind:this={heading}>{g.title}</h2>
   <ol class="steps" aria-label={g.stepsLabel}>
     {#each guide.steps as step, i (step)}
-      <li class="step" class:done={i < at} class:now={i === at} aria-current={i === at ? "step" : undefined}>
+      <li class="step" class:done={isDone(step, i)} class:now={i === at} aria-current={i === at ? "step" : undefined}>
         <span class="n" aria-hidden="true">{i + 1}</span>
         <div class="body">
           <p class="title">
             {titles[step]}
-            <span class="sr">, {i < at ? g.done : i === at ? g.now : g.later}</span>
+            <span class="sr">, {isDone(step, i) ? g.done : i === at ? g.now : g.later}</span>
           </p>
+          {#if step === "key_store" && master && i !== at}
+            <p class="hint master">{g.keyStoreMaster}</p>
+          {/if}
           {#if i === at}
             {#if step === "connect"}
               <p class="text">{g.setupIntro}</p>
@@ -265,6 +272,7 @@
   .lead-in { margin-top: 18px; color: var(--text); }
   .hint { max-width: 66ch; }
   .foot { margin-top: 16px; }
+  .master { margin-top: 2px; }
   .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; margin-top: 16px; max-width: 640px; }
   .field label { display: block; font-weight: 500; font-size: 13px; margin-bottom: 4px; }
   .field .hint { margin-top: 4px; font-size: var(--fs-s); }

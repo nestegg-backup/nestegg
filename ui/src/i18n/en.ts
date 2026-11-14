@@ -236,6 +236,10 @@ const en = {
     encryptionOnKey: "On. A copy of the key is confirmed.",
     encryptionOnNoKey: "On. A copy of the key is not confirmed yet.",
     encryptionOff: "Off. The backups are stored unencrypted on the server.",
+    encryptionMaster: "On. Protected by the household master key of the hub.",
+    encryptionMasterOwn: "An own copy of the key is possible as an extra, but not needed.",
+    factHub: "Managed by",
+    hubName: (name: string) => `Hub “${name}”`,
     incompleteLead: (m: Moment) => `Backed up ${at(m)}, but not completely.`,
     incompleteLeadUndated: "Backed up, but not completely.",
     incompleteText: "The backup worked, but it does not contain everything that is set up. What is missing is listed below.",
@@ -324,6 +328,8 @@ const en = {
       "The backups are encrypted on this computer before they go to the server. You create the key for that now.",
     keyCreateImport:
       "If you already have a key from before, for example after a reinstall, do not create a new one but bring the old one back: sudo nestegg key import <key file>. Otherwise the older backups cannot be opened.",
+    keyStoreMaster:
+      "Done: the household master key of the hub protects the backups of this PC. An own copy is possible, but not needed.",
     keyStoreWhy:
       "Without this key nobody can open the backups, not even you if the computer breaks. That is why a copy must be kept outside this computer. A copy that only lies on this computer does not count, nor does one inside a folder that is backed up, even on an external disk. There are several ways; one is enough. Backups only start once you have confirmed the copy.",
     usbTitle: "On a USB stick",
