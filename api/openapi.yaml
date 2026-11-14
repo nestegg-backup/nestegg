@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: nestegg local API
-  version: 0.6.0
+  version: 0.7.0
   summary: Local control API of the nestegg daemon.
   description: |
     Served by `nestegg daemon` on the Unix socket `/run/nestegg/api.sock`
@@ -578,7 +578,7 @@ components:
       required: [version, api_version]
       properties:
         version: { type: string, examples: ["0.1.0"] }
-        api_version: { type: string, examples: ["2"], description: Version 2 adds source echoes and live per-stick usage; old clients remain supported. }
+        api_version: { type: string, examples: ["3"], description: Version 3 adds hub membership and proven master-key coverage; old clients remain supported. }
     TargetStatus:
       type: object
       required: [health, state, consecutive_failures, overdue_after_hours, password_reminder]
@@ -657,6 +657,13 @@ components:
         The pbs object stays present (empty server/datastore in stick-only setups).
         New clients should use targets for independent target health and histories.
       properties:
+        hub:
+          type: [object, "null"]
+          description: Hub membership, or null for a standalone computer.
+          required: [name, url]
+          properties:
+            name: { type: string }
+            url: { type: string, format: uri }
         restored_from:
           description: Null before rescue restore; older daemons may omit this field.
           oneOf:
@@ -731,6 +738,13 @@ components:
             enabled: { type: boolean }
             key_fingerprint: { type: [string, "null"], description: Fingerprint of the encryption key (not secret). }
             key_exported: { type: boolean, description: The user proved with a copy of the key or the check code of the paper key that a copy exists outside this computer. }
+            master_key:
+              type: [object, "null"]
+              description: Non-null only while joined to a hub whose master key copy is proven and the configured public key file still matches its recorded fingerprint. Does not change key_exported.
+              required: [fingerprint, proven_at]
+              properties:
+                fingerprint: { type: string }
+                proven_at: { type: string, format: date-time }
             key_present: { type: [boolean, "null"], description: "An encryption key is stored on this computer (`nestegg key create` or `key import`); it may still be unconfirmed. Null or absent: unknown." }
         server_verify_failed:
           type: array

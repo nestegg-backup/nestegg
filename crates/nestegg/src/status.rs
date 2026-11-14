@@ -19,6 +19,7 @@ pub struct Status {
     pub restored_from: Option<crate::state::RestoredFrom>,
     pub targets: std::collections::BTreeMap<crate::state::Target, TargetStatus>,
     pub machine: Machine,
+    pub hub: Option<HubStatus>,
     pub pbs: PbsStatus,
     pub schedule: Schedule,
     pub current_run: Option<Run>,
@@ -100,6 +101,12 @@ fn password_reminders(
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct HubStatus {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Machine {
     pub hostname: String,
     pub backup_id: String,
@@ -134,6 +141,7 @@ pub struct Encryption {
     pub enabled: bool,
     pub key_fingerprint: Option<String>,
     pub key_exported: bool,
+    pub master_key: Option<crate::masterkey::Proof>,
     /// An encryption key is stored (it may still be unconfirmed). `None`:
     /// this process may not look into the credentials directory (not root).
     pub key_present: Option<bool>,
@@ -329,6 +337,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
             );
         }
     }
+    let master_key = config.and_then(|c| crate::masterkey::covered(c, &state).ok().flatten());
     // Legacy fields continue to describe PBS when configured; stick-only
     // installations project their sole target into those fields.
     let state = if config.is_some_and(|c| c.pbs.is_none()) {
@@ -339,6 +348,10 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
     Ok(Status {
         restored_from: state.restored_from.clone(),
         targets,
+        hub: config.and_then(|c| c.hub.as_ref()).map(|h| HubStatus {
+            name: h.name.clone(),
+            url: h.url.clone(),
+        }),
         machine: Machine {
             hostname: crate::config::hostname(),
             backup_id: config
@@ -389,6 +402,7 @@ pub fn build(paths: &Paths, config: Option<&Config>, timer: bool) -> Result<Stat
         last_success: state.last_success.clone(),
         overdue_after_hours,
         encryption: Encryption {
+            master_key,
             enabled: config.is_none_or(|c| c.backup.encryption),
             key_fingerprint: state.key_fingerprint.clone(),
             key_exported: state.key_exported()

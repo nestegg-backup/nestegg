@@ -81,6 +81,11 @@ pub struct BackupSpec {
 
 /// Arguments after `proxmox-backup-client` for a backup (no secrets).
 pub fn backup_args(spec: &BackupSpec) -> Vec<OsString> {
+    backup_args_with_master(spec, None)
+}
+
+/// Shared by the remote PBS and isolated stick PBS clients.
+pub fn backup_args_with_master(spec: &BackupSpec, master: Option<&Path>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["backup".into()];
     for archive in &spec.archives {
         let mut a = OsString::from(format!("{}:", archive.file_name()));
@@ -101,6 +106,10 @@ pub fn backup_args(spec: &BackupSpec) -> Vec<OsString> {
     if spec.encrypt {
         args.extend(["--keyfd".into(), KEY_FD.to_string().into()]);
         args.extend(["--crypt-mode".into(), "encrypt".into()]);
+        if let Some(master) = master {
+            args.push("--master-pubkey-file".into());
+            args.push(master.as_os_str().to_owned());
+        }
     } else {
         args.extend(["--crypt-mode".into(), "none".into()]);
     }
@@ -898,6 +907,34 @@ impl<'a> Client<'a> {
         Ok(())
     }
 
+    /// The configured master public key applies to both PBS targets.
+    pub fn master_public_key(&self) -> Option<&Path> {
+        self.config
+            .backup
+            .encryption
+            .then_some(self.config.backup.master_public_key.as_deref())
+            .flatten()
+    }
+
+    /// Fetch the RSA-wrapped key without needing the lost encryption key.
+    /// The blob is encrypted to the master key by the official client.
+    pub fn fetch_master_key_blob(&self, snapshot: &str, output: &Path) -> Result<()> {
+        let mut fds = FdPassing::new();
+        let mut cmd = self.command(&mut fds)?;
+        cmd.args(["restore", snapshot, "rsa-encrypted.key"])
+            .arg(output);
+        self.add_namespace(&mut cmd);
+        fds.apply(&mut cmd);
+        let captured = cmd.output().context("cannot run proxmox-backup-client")?;
+        if !captured.status.success() {
+            bail!(
+                "could not fetch the master-key recovery blob; check the PBS login and that this snapshot was made with a master public key: {}",
+                String::from_utf8_lossy(&captured.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     /// Run a backup, streaming all client output into `log`.
     pub fn backup(
         &self,
@@ -930,7 +967,10 @@ impl<'a> Client<'a> {
             let fd = fds.inherit_directory(&source.directory).map_err(internal)?;
             archive.path = PathBuf::from(format!("/proc/self/fd/{fd}"));
         }
-        cmd.args(backup_args(&pinned_spec));
+        cmd.args(backup_args_with_master(
+            &pinned_spec,
+            self.master_public_key(),
+        ));
         fds.apply(&mut cmd);
         let mut stats = Vec::new();
         // No time limit on the upload itself (it may legitimately take hours);
@@ -1750,6 +1790,29 @@ mod tests {
         assert!(joined.contains("--include-dev /boot/efi"));
         assert!(joined.contains("--change-detection-mode metadata"));
         assert!(joined.contains("--rate 10MiB"));
+    }
+
+    #[test]
+    fn master_public_key_is_passed_to_both_target_argument_sets_only_with_encryption() {
+        for namespace in [Some("desktops".to_string()), None] {
+            let mut spec = spec();
+            spec.namespace = namespace;
+            let master = Path::new("/etc/nestegg/master-public.pem");
+            let args = strs(&backup_args_with_master(&spec, Some(master)));
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--master-pubkey-file", "/etc/nestegg/master-public.pem"])
+            );
+            assert!(
+                !strs(&backup_args_with_master(&spec, None))
+                    .contains(&"--master-pubkey-file".to_string())
+            );
+            spec.encrypt = false;
+            assert!(
+                !strs(&backup_args_with_master(&spec, Some(master)))
+                    .contains(&"--master-pubkey-file".to_string())
+            );
+        }
     }
 
     #[test]

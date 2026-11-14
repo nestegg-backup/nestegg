@@ -2353,7 +2353,7 @@ fn daemon_serves_status_runs_and_snapshots() {
 
     let (code, health) = request(&socket, "GET", "/api/v1/health");
     assert_eq!(code, 200);
-    assert_eq!(health["api_version"], "2");
+    assert_eq!(health["api_version"], "3");
 
     let (code, status) = request(&socket, "GET", "/api/v1/status");
     assert_eq!(code, 200);

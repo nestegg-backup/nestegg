@@ -37,6 +37,13 @@ impl Paths {
         }
     }
 
+    pub fn master_public_key(&self) -> PathBuf {
+        self.config_file
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("master-public.pem")
+    }
+
     pub fn socket(&self) -> PathBuf {
         self.runtime_dir.join("api.sock")
     }
@@ -85,6 +92,9 @@ pub struct Config {
     /// Registered removable datastores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stick: Option<StickConfig>,
+    /// Hub membership. Contains no credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub: Option<HubConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<WakeConfig>,
     #[serde(default)]
@@ -100,6 +110,15 @@ pub struct Config {
     /// cannot change it, because `command` runs as root.
     #[serde(default, skip_serializing_if = "NotifyConfig::is_default")]
     pub notify: NotifyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HubConfig {
+    pub name: String,
+    pub url: String,
+    pub pin: String,
+    pub machine_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -321,6 +340,9 @@ pub struct BackupConfig {
     pub include_dev: Vec<PathBuf>,
     #[serde(default = "default_true")]
     pub encryption: bool,
+    /// RSA master public key passed to the official client for every target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_public_key: Option<PathBuf>,
     /// Add the generated system inventory as `inventory.pxar`.
     #[serde(default = "default_true")]
     pub inventory: bool,
@@ -346,6 +368,7 @@ impl Default for BackupConfig {
             excludes: default_excludes(),
             include_dev: Vec::new(),
             encryption: true,
+            master_public_key: None,
             inventory: true,
             system: false,
             change_detection_mode: None,
@@ -456,6 +479,21 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(hub) = &self.hub {
+            crate::pinned::Endpoint::parse(&hub.url)?;
+            crate::pinned::validate_pin(&hub.pin)?;
+            if hub.machine_id.is_empty() || hub.name.chars().any(char::is_control) {
+                bail!("invalid hub membership");
+            }
+        }
+        if self
+            .backup
+            .master_public_key
+            .as_ref()
+            .is_some_and(|p| !p.is_absolute())
+        {
+            bail!("backup.master_public_key must be an absolute path");
+        }
         if let Some(stick) = &self.stick {
             stick.validate()?;
         }
@@ -624,6 +662,7 @@ pub fn example(server: &str, datastore: &str, auth_id: &str) -> Config {
             fingerprint: None,
         }),
         stick: None,
+        hub: None,
         wake: None,
         backup: BackupConfig::default(),
         schedule: ScheduleConfig::default(),

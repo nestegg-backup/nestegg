@@ -1008,16 +1008,10 @@ fn pipeline(
                 .as_ref()
                 .and_then(|uuid| state.stick_media.get(uuid))
                 .is_some_and(|proof| proof.key_digest.as_deref() == Some(&key_digest));
-        if state.key_exported_digest.as_deref() != Some(key_digest.as_str()) && !stick_proof {
-            rep.fail(
-                RunState::Failed,
-                config_error(
-                    "the encryption key has not been exported yet; run `nestegg key export <file>` \
-                     (and move it to a USB stick) or `nestegg key paperkey --format html --output \
-                     key.html` (print it, then delete the file), then prove it with `nestegg key \
-                     confirm-exported --file <copy>` or `--paper-code <code> --printed`",
-                ),
-            );
+        if let Err(error) =
+            crate::masterkey::require_coverage(config, &state, &key_digest, stick_proof)
+        {
+            rep.fail(RunState::Failed, config_error(&format!("{error:#}")));
             return Ok(());
         }
     }

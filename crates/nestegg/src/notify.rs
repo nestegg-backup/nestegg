@@ -4266,6 +4266,7 @@ mod tests {
         damaged: &[&str],
     ) -> Status {
         Status {
+            hub: None,
             restored_from: None,
             targets: Default::default(),
             machine: status::Machine {
@@ -4294,6 +4295,7 @@ mod tests {
             health,
             overdue_after_hours: 36,
             encryption: status::Encryption {
+                master_key: None,
                 enabled: true,
                 key_fingerprint: None,
                 key_exported: true,

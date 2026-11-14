@@ -185,7 +185,16 @@ fn read_back_steps(
         client.snapshot_files_bounded(expected.snapshot, crate::client::readback_list_timeout())?;
     let mut archives = expected.archives.clone();
     archives.push(crate::metadata::ARCHIVE.to_string());
-    let problems = listing_problems(&files, &archives, expected.encrypted);
+    let mut problems = listing_problems(&files, &archives, expected.encrypted);
+    if client.master_public_key().is_some() {
+        // The RSA envelope is already encrypted to the household master key,
+        // so its crypt-mode need not be the archives' crypt-mode.
+        problems.extend(listing_problems(
+            &files,
+            &["rsa-encrypted.key".into()],
+            false,
+        ));
+    }
     if !problems.is_empty() {
         return Ok(mismatch(problems.join("; ")));
     }

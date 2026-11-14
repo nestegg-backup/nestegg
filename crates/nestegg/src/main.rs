@@ -28,6 +28,14 @@ struct Cli {
 enum Cmd {
     /// Create the configuration and directories (root).
     Init(InitArgs),
+    /// Join a hub and start the first backup (root).
+    Join(nestegg::join::JoinArgs),
+    /// Leave the hub, keeping the encryption key and existing backups (root).
+    Leave {
+        /// Detach locally even when the hub cannot confirm removal.
+        #[arg(long)]
+        force: bool,
+    },
     /// Manage the PBS password / API token secret (root).
     #[command(subcommand)]
     Credentials(CredCmd),
@@ -247,6 +255,16 @@ enum KeyCmd {
         /// A key file or a saved paper key (text or HTML).
         file: PathBuf,
     },
+    /// Recover this computer's encryption key from a backup with the household master key.
+    Recover {
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        /// Snapshot time (RFC 3339), default: newest finished snapshot.
+        #[arg(long)]
+        snapshot: Option<String>,
+    },
     /// Show key fingerprint and export status.
     Show,
 }
@@ -311,6 +329,16 @@ fn main() -> ExitCode {
 fn dispatch(cmd: Cmd, paths: &Paths) -> Result<u8> {
     match cmd {
         Cmd::Init(args) => init(paths, args),
+        Cmd::Join(args) => {
+            require_root("nestegg join")?;
+            tokio::runtime::Runtime::new()?.block_on(nestegg::join::join(paths, args))?;
+            Ok(0)
+        }
+        Cmd::Leave { force } => {
+            require_root("nestegg leave")?;
+            tokio::runtime::Runtime::new()?.block_on(nestegg::join::leave(paths, force))?;
+            Ok(0)
+        }
         Cmd::Credentials(CredCmd::SetPassword {
             allow_plain,
             overview,
@@ -1001,6 +1029,13 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
         }
         KeyCmd::ConfirmExported(args) => confirm_exported(paths, &store, &secrets_store, args)?,
         KeyCmd::Verify { file } => return key_verify(paths, &secrets_store, &file),
+        KeyCmd::Recover {
+            master_key,
+            output,
+            snapshot,
+        } => {
+            nestegg::masterkey::recover(paths, &master_key, &output, snapshot.as_deref())?;
+        }
         KeyCmd::Show => {
             let state = store.load_state()?;
             println!(
@@ -1019,6 +1054,19 @@ fn key(paths: &Paths, cmd: KeyCmd) -> Result<u8> {
                 "exported:     {}",
                 if state.key_exported() { "yes" } else { "NO" }
             );
+            if let Ok(cfg) = Config::load(&paths.config_file) {
+                match nestegg::masterkey::covered(&cfg, &state) {
+                    Ok(Some(proof)) => println!(
+                        "protection:   proven household master key ({})",
+                        proof.fingerprint
+                    ),
+                    Err(e) => println!("master key:   NOT COVERED: {e:#}"),
+                    Ok(None) if state.key_exported() => {
+                        println!("protection:   own key copy proven")
+                    }
+                    Ok(None) => println!("protection:   no proven key copy"),
+                }
+            }
         }
     }
     Ok(0)
@@ -1658,6 +1706,9 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
             println!("  {}: {state}", stick_label(uuid, stick.name.as_deref()));
         }
     }
+    if let Some(hub) = &status.hub {
+        println!("Hub:          {} ({})", hub.name, hub.url);
+    }
     if !status.pbs.server.is_empty() {
         println!(
             "PBS:          {} / {}{}",
@@ -1706,14 +1757,22 @@ fn status(paths: &Paths, json: bool) -> Result<u8> {
     if status.encryption.enabled {
         println!(
             "Encryption:   on{}",
-            if status.encryption.key_exported {
-                ""
+            if status.encryption.master_key.is_some() {
+                " - protected by the proven household master key"
+            } else if status.encryption.key_exported {
+                " - own key copy proven"
             } else {
                 " - KEY NOT EXPORTED YET"
             }
         );
     } else {
         println!("Encryption:   off");
+    }
+    if status.encryption.master_key.is_none()
+        && let Some(cfg) = &cfg
+        && let Err(cause) = nestegg::masterkey::covered(cfg, &Store::new(paths).load_state()?)
+    {
+        println!("Master key:   NOT COVERED: {cause:#}");
     }
     if !status.server_verify_failed.is_empty() {
         println!(

@@ -26,6 +26,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use nix::fcntl::OFlag;
 
+pub const MACHINE_CREDENTIAL: &str = "machine-credential";
 pub const PASSWORD: &str = "password";
 pub const ENCRYPTION_KEY: &str = "encryption-key";
 /// Secret of the read-only overview token (optional).
@@ -95,6 +96,9 @@ impl std::error::Error for Unreadable {}
 /// The command that stores the secret `name` again.
 pub fn restore_command(name: &str) -> &'static str {
     match name {
+        MACHINE_CREDENTIAL => {
+            "sudo nestegg leave --force, then sudo nestegg join <hub-url> --pin <pin> --code <code> --replace-config"
+        }
         ENCRYPTION_KEY => "sudo nestegg key import <exported key file>",
         OVERVIEW_PASSWORD => "sudo nestegg credentials set-password --overview",
         _ => "sudo nestegg credentials set-password",

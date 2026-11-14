@@ -24,7 +24,7 @@ use crate::secrets::SecretStore;
 use crate::state::{Run, Store, Trigger, is_valid_run_id};
 
 pub const GROUP: &str = "nestegg";
-pub const API_VERSION: &str = "2";
+pub const API_VERSION: &str = "3";
 
 #[derive(Clone)]
 struct App {

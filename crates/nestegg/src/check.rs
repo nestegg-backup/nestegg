@@ -194,6 +194,20 @@ fn run_items(paths: &Paths, options: &CheckOptions, tracker: &mut WakeTracker) -
                 String::new(),
             );
         }
+        let state = Store::new(paths).load_state().ok();
+        let master = state
+            .as_ref()
+            .map(|s| crate::masterkey::covered(&cfg, s))
+            .transpose();
+        let master_covered = matches!(&master, Ok(Some(Some(_))));
+        let master_detail = match &master {
+            Ok(Some(Some(proof))) => format!(
+                "protected by the proven household master key ({})",
+                proof.fingerprint
+            ),
+            Err(e) => format!("{e:#}. "),
+            _ => String::new(),
+        };
         let exported = Store::new(paths)
             .load_state()
             .map(|s| {
@@ -208,14 +222,14 @@ fn run_items(paths: &Paths, options: &CheckOptions, tracker: &mut WakeTracker) -
             })
             .unwrap_or(false);
         r.report(
-            exported,
+            exported || master_covered,
             "encryption key exported",
-            if exported {
-                String::new()
+            if master_covered {
+                master_detail
+            } else if exported {
+                format!("own key copy proven. {master_detail}")
             } else {
-                "export the key, then run `nestegg key confirm-exported --file <copy>` \
-                 (or, for a printed paper key, `--paper-code <code> --printed`)"
-                    .into()
+                format!("{master_detail}export the key, then run `nestegg key confirm-exported --file <copy>` (or, for a printed paper key, `--paper-code <code> --printed`)")
             },
         );
     }

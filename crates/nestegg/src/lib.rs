@@ -27,3 +27,7 @@ pub mod stick;
 pub mod ui;
 pub mod verify;
 pub mod wake;
+
+pub mod join;
+pub mod masterkey;
+pub mod pinned;

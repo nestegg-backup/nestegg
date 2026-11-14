@@ -350,6 +350,9 @@ pub struct State {
     /// Fingerprint reported by `proxmox-backup-client key show`.
     #[serde(default)]
     pub key_fingerprint: Option<String>,
+    /// Proven household master key (decision 0034); own proof stays independent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_key: Option<crate::masterkey::Proof>,
     /// SHA-256 of the current key file (not secret; set by `key create`).
     #[serde(default)]
     pub key_digest: Option<String>,
