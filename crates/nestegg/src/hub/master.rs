@@ -248,7 +248,8 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
     } else {
         (args.file, args.paper_code)
     };
-    if let Some(file) = file {
+    let mut local_copies = Vec::new();
+    let encrypted = if let Some(file) = file {
         let real = std::fs::canonicalize(&file)?;
         ensure!(
             !real.starts_with(std::fs::canonicalize(&config.state_dir)?)
@@ -263,6 +264,9 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
             ),
             "copy does not contain this household's master key"
         );
+        if crate::keyproof::locate(&real).needs_statement() {
+            local_copies.push(real.clone());
+        }
         if crate::keyproof::locate(&real).needs_statement() && !args.accept_local_copy {
             ensure!(
                 prompt(
@@ -271,6 +275,7 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
                 "copy outside the hub was not confirmed"
             );
         }
+        bytes
     } else if let Some(code) = code {
         let code = crate::keyproof::normalize_check_code(&code).context("not a check code")?;
         ensure!(
@@ -280,18 +285,6 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
             ),
             "check code does not belong to this master key"
         );
-        if let Some(file) = &t.state.master.paper_file {
-            match std::fs::metadata(file) {
-                Ok(_) => ensure!(
-                    !crate::keyproof::locate(file).needs_statement(),
-                    "paper key file still exists on this disk; print and delete it or move it to removable media; alternatively prove the file with --file and --accept-local-copy"
-                ),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                Err(e) => {
-                    return Err(e).context("cannot verify that the paper key file was removed");
-                }
-            }
-        }
         if !args.printed {
             ensure!(
                 prompt(
@@ -300,15 +293,35 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
                 "printed copy not confirmed"
             );
         }
+        crate::restore::read_small_regular_file(
+            &config.state_dir.join("master/master-private.pem"),
+            1024 * 1024,
+        )?
     } else {
         anyhow::bail!("proof required");
+    };
+    // Decrypt before removing any copy or changing the proof. Only OpenSSL
+    // reads the freshly entered passphrase, directly from the terminal.
+    decrypt_proof(&encrypted)?;
+    if let Some(file) = &t.state.master.paper_file
+        && crate::keyproof::locate(file).needs_statement()
+    {
+        local_copies.push(file.clone());
+    }
+    // Include matching copies in the managed master directory, even if an
+    // administrator renamed the pending PEM there while resuming setup.
+    for entry in std::fs::read_dir(config.state_dir.join("master"))? {
+        let path = entry?.path();
+        if path != config.state_dir.join("master/master-private.pem") && path.is_file() && let Ok(bytes) = crate::restore::read_small_regular_file(&path, 4 * 1024 * 1024)
+            && let Ok(data) = pem_data(&bytes)
+            && crypto::matches(&data, t.state.master.private_digest.as_deref().unwrap_or(""))
+        { local_copies.push(path); }
+    }
+    for file in local_copies {
+        remove_copy(&file)?;
     }
     let private = config.state_dir.join("master/master-private.pem");
-    match std::fs::remove_file(&private) {
-        Ok(()) => std::fs::File::open(private.parent().context("master directory")?)?.sync_all()?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-        Err(e) => return Err(e).context("remove hub's private master key"),
-    }
+    remove_copy(&private)?;
     t.state.master.proven_at = Some(state::now());
     t.state.master.private_digest = None;
     t.state.master.paper_code_digest = None;
@@ -316,6 +329,39 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
     println!(
         "Master key copy proven; the private part was removed from the hub. Unplug removable media and keep it away from this machine."
     );
+    Ok(())
+}
+
+fn decrypt_proof(encrypted: &[u8]) -> Result<()> {
+    let (begin, end) = pem_boundaries();
+    let pem = format!("{begin}\n{}\n{end}\n", pem_data(encrypted)?);
+    let mut copy = tempfile::NamedTempFile::new()?;
+    copy.write_all(pem.as_bytes())?;
+    copy.flush()?;
+    let status = Command::new("openssl")
+        .args(["pkey", "-noout", "-in"])
+        .arg(copy.path())
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("run openssl to verify the master-key passphrase")?;
+    ensure!(
+        status.success(),
+        "master-key decryption failed: wrong passphrase or damaged copy; no proof was recorded and no copy was removed"
+    );
+    Ok(())
+}
+
+fn remove_copy(file: &Path) -> Result<()> {
+    match std::fs::remove_file(file) {
+        Ok(()) => std::fs::File::open(file.parent().context("key directory")?)?.sync_all()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => anyhow::bail!(
+            "private master-key copy still exists at {}; move it away or delete it, then repeat the proof; no proof was recorded",
+            file.display()
+        ),
+    }
     Ok(())
 }
 
@@ -335,4 +381,178 @@ mod tests {
         );
         assert!(pem_data(b"not a key").is_err());
     }
+    // Run only as the PTY child below. The test harness never reads the
+    // password; OpenSSL owns the terminal throughout its prompt.
+    #[test]
+    fn proof_child() {
+        let Ok(path) = std::env::var("NESTEGG_PROOF_CONFIG") else {
+            return;
+        };
+        let config: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let paper = std::env::var("NESTEGG_PROOF_PAPER").ok();
+        let args = Confirm {
+            file: paper
+                .is_none()
+                .then(|| config.state_dir.join("../copy.html")),
+            paper_code: paper,
+            printed: true,
+            accept_local_copy: true,
+        };
+        let result = confirm(&config, args);
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+    }
+
+    fn terminal_proof(config: &Path, answer: &str, code: Option<&str>) -> bool {
+        let script = r#"
+import os,pty,select,signal,sys,time
+pid,fd=pty.fork()
+if pid==0:
+ os.execv(sys.argv[1],[sys.argv[1],'--exact','hub::master::tests::proof_child','--nocapture'])
+pending=b''
+deadline=time.monotonic()+30
+try:
+ while time.monotonic()<deadline:
+  if select.select([fd],[],[],.1)[0]:
+   try: part=os.read(fd,65536)
+   except OSError: break
+   if not part: break
+   pending=(pending+part)[-65536:]
+   if pending.rstrip().endswith(b':') and b'pass phrase' in pending.lower():
+    os.write(fd,sys.argv[2].encode()+b'\n'); pending=b''
+  done,status=os.waitpid(pid,os.WNOHANG)
+  if done:
+   pid=None; sys.exit(0 if os.waitstatus_to_exitcode(status)==0 else 1)
+ if pid:
+  _,status=os.waitpid(pid,0); pid=None
+  sys.exit(0 if os.waitstatus_to_exitcode(status)==0 else 1)
+finally:
+ os.close(fd)
+ if pid:
+  os.kill(pid,signal.SIGKILL); os.waitpid(pid,0)
+"#;
+        let mut command = Command::new("python3");
+        command
+            .args(["-c", script])
+            .arg(std::env::current_exe().unwrap())
+            .arg(answer)
+            .env("NESTEGG_PROOF_CONFIG", config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(code) = code {
+            command.env("NESTEGG_PROOF_PAPER", code);
+        }
+        command.status().unwrap().success()
+    }
+
+    #[test]
+    fn real_encrypted_key_requires_fresh_correct_passphrase_and_removes_local_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let master = root.join("state/master");
+        std::fs::create_dir_all(&master).unwrap();
+        let private = master.join("master-private.pem");
+        let mut generate = Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+                "-aes-256-cbc",
+                "-pass",
+                "stdin",
+                "-out",
+            ])
+            .arg(&private)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        generate
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"disposable-proof-passphrase\n")
+            .unwrap();
+        assert!(generate.wait().unwrap().success());
+        let bytes = std::fs::read(&private).unwrap();
+        let data = pem_data(&bytes).unwrap();
+        let config = Config {
+            name: "Home".into(),
+            url: "https://hub.example.com:8443".into(),
+            listen: "127.0.0.1:8443".into(),
+            state_dir: root.join("state"),
+            credentials_dir: root.join("credentials"),
+            certificate: root.join("tls.crt"),
+            private_key: root.join("tls.key"),
+            pbs: super::super::config::Pbs {
+                server: "pbs.example.com".into(),
+                port: 8007,
+                datastore: "backups".into(),
+                namespace: None,
+                user: "backup@pbs".into(),
+                fingerprint: None,
+            },
+            wake: None,
+        };
+        std::fs::create_dir(&config.credentials_dir).unwrap();
+        let config_path = root.join("hub.toml");
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let paper = root.join("paper.html");
+        let copy = root.join("copy.html");
+        let code = crate::keyproof::check_code(&data);
+        for by_code in [false, true] {
+            std::fs::write(&private, &bytes).unwrap();
+            std::fs::write(master.join("renamed-copy.pem"), &bytes).unwrap();
+            std::fs::write(&paper, &bytes).unwrap();
+            std::fs::write(&copy, &bytes).unwrap();
+            let mut t = Transaction::open(&config.state_dir).unwrap();
+            t.state.master.public_key_pem = Some("public fixture".into());
+            t.state.master.paper_written = true;
+            t.state.master.private_digest = Some(crypto::hash(&data));
+            t.state.master.paper_code_digest = Some(crypto::hash(&code));
+            t.state.master.paper_file = Some(paper.clone());
+            t.state.master.proven_at = None;
+            t.save().unwrap();
+            drop(t);
+            let before = std::fs::read(config.state_dir.join("state.json")).unwrap();
+            let proof_code = by_code.then_some(code.as_str());
+            assert!(!terminal_proof(
+                &config_path,
+                "wrong-disposable-passphrase",
+                proof_code
+            ));
+            assert_eq!(
+                before,
+                std::fs::read(config.state_dir.join("state.json")).unwrap()
+            );
+            assert!(private.exists() && paper.exists() && copy.exists());
+            assert!(terminal_proof(
+                &config_path,
+                "disposable-proof-passphrase",
+                proof_code
+            ));
+            assert!(!private.exists() && !paper.exists() && !master.join("renamed-copy.pem").exists());
+            assert!(by_code || !copy.exists());
+            assert!(
+                Transaction::open(&config.state_dir)
+                    .unwrap()
+                    .state
+                    .master
+                    .proven_at
+                    .is_some()
+            );
+        }
+    }
+    #[test]
+    fn an_unremovable_copy_names_the_path_and_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("paper.html");
+        std::fs::create_dir(&blocked).unwrap();
+        let message = remove_copy(&blocked).unwrap_err().to_string();
+        assert!(message.contains(blocked.to_str().unwrap()));
+        assert!(message.contains("no proof was recorded"));
+    }
+
 }
