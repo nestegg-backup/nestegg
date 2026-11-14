@@ -23,7 +23,7 @@ pub struct State {
     pub admin_hash: String,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Master {
     pub public_key_pem: Option<String>,
@@ -51,6 +51,15 @@ pub struct Code {
     pub note: Option<String>,
     pub created_at: String,
     pub expires_at: String,
+    #[serde(default)]
+    pub enrollment: Option<Enrollment>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Enrollment {
+    pub attempt_digest: String,
+    pub backup_id: String,
+    pub machine_id: String,
 }
 impl Code {
     pub fn valid(&self, now: &str) -> bool {
@@ -83,6 +92,12 @@ pub struct Transaction {
 }
 impl Transaction {
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_inner(dir, false)
+    }
+    pub fn open_bounded(dir: &Path) -> Result<Self> {
+        Self::open_inner(dir, true)
+    }
+    fn open_inner(dir: &Path, bounded: bool) -> Result<Self> {
         crate::secrets::create_private_dir(dir)?;
         let f = OpenOptions::new()
             .read(true)
@@ -92,7 +107,22 @@ impl Transaction {
             .mode(0o600)
             .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
             .open(dir.join(".hub.lock"))?;
-        let lock = Flock::lock(f, FlockArg::LockExclusive).map_err(|(_, e)| e)?;
+        let started = std::time::Instant::now();
+        let mut file = f;
+        let lock = loop {
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => break lock,
+                Err((returned, nix::errno::Errno::EWOULDBLOCK))
+                    if !bounded || started.elapsed() < std::time::Duration::from_secs(5) =>
+                {
+                    file = returned;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err((_, e)) => {
+                    return Err(e).context("hub state lock unavailable after bounded wait");
+                }
+            }
+        };
         let state = match std::fs::read(dir.join("state.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes).context("read hub state")?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),

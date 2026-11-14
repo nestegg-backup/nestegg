@@ -420,10 +420,12 @@ impl FdPassing {
 
     /// Inherit a pinned backup root above all fixed secret descriptor targets.
     pub fn inherit_directory(&mut self, directory: &fs::File) -> Result<i32> {
-        let high = nix::fcntl::fcntl(
-            directory,
-            nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(FIRST_SOURCE_FD),
-        )?;
+        self.inherit_file(directory)
+    }
+
+    /// Inherit an already-open file without giving the child a replaceable path.
+    pub fn inherit_file(&mut self, file: &fs::File) -> Result<i32> {
+        let high = nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(FIRST_SOURCE_FD))?;
         // SAFETY: fcntl returned a new descriptor owned by this value.
         let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(high) };
         self.entries.push((fd, high));

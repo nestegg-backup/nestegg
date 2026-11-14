@@ -98,9 +98,16 @@ impl Client {
             .context("PBS TLS handshake failed")?;
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             let _ = connection.await;
         });
+        struct Driver(tokio::task::JoinHandle<()>);
+        impl Drop for Driver {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _driver = Driver(driver);
         let query = form(fields);
         let uri = if method == Method::GET && !query.is_empty() {
             format!("/api2/json{path}?{query}")
@@ -396,6 +403,7 @@ pub(crate) mod tests {
     pub struct Fake {
         pub config: Pbs,
         pub calls: Arc<Mutex<Vec<(Method, String, String)>>>,
+        pub gate: Arc<tokio::sync::Semaphore>,
         pub refuse_acl: Arc<AtomicBool>,
         pub token: Arc<AtomicBool>,
         pub with_snapshot: Arc<AtomicBool>,
@@ -428,11 +436,14 @@ pub(crate) mod tests {
             let with_snapshot = Arc::new(AtomicBool::new(false));
             let show_snapshot = with_snapshot.clone();
             let (record, refuse, has_token) = (calls.clone(), refuse_acl.clone(), token.clone());
+            let gate = Arc::new(tokio::sync::Semaphore::new(1));
+            let request_gate = gate.clone();
             let task = tokio::spawn(async move {
                 let acceptor = tokio_rustls::TlsAcceptor::from(tls);
                 loop {
                     let (stream, _) = listener.accept().await.unwrap();
                     let acceptor = acceptor.clone();
+                    let request_gate = request_gate.clone();
                     let show_snapshot = show_snapshot.clone();
                     let (record, refuse, has_token) =
                         (record.clone(), refuse.clone(), has_token.clone());
@@ -443,6 +454,7 @@ pub(crate) mod tests {
                         let svc = hyper::service::service_fn(
                             move |req: Request<hyper::body::Incoming>| {
                                 let show_snapshot = show_snapshot.clone();
+                                let request_gate = request_gate.clone();
                                 let (record, refuse, has_token) =
                                     (record.clone(), refuse.clone(), has_token.clone());
                                 async move {
@@ -467,6 +479,7 @@ pub(crate) mod tests {
                                         path.clone(),
                                         String::from_utf8(body.to_vec()).unwrap(),
                                     ));
+                                    let _permit = request_gate.acquire().await.unwrap();
                                     let mut status = hyper::StatusCode::OK;
                                     let data = if path.ends_with("/access/ticket") {
                                         json!({"ticket":"test-ticket","CSRFPreventionToken":"test-csrf"})
@@ -529,6 +542,7 @@ pub(crate) mod tests {
                     fingerprint: Some(super::super::tls::hex_fingerprint(der.as_ref())),
                 },
                 calls,
+                gate,
                 refuse_acl,
                 token,
                 with_snapshot,

@@ -33,6 +33,10 @@ struct Hub {
     config: Arc<Config>,
     pin: String,
     auth: Arc<Mutex<Auth>>,
+    logins: Arc<tokio::sync::Mutex<()>>,
+    login_slots: Arc<tokio::sync::Semaphore>,
+    provisioning: Arc<tokio::sync::Mutex<()>>,
+    downloads: Arc<tokio::sync::Semaphore>,
 }
 #[derive(Default)]
 struct Auth {
@@ -44,7 +48,9 @@ struct Session {
     generation: String,
 }
 const IDLE: Duration = Duration::from_secs(30 * 60);
-const DELAY: Duration = Duration::from_millis(750);
+const DELAY: Duration = Duration::from_secs(1);
+const JOIN_TIMEOUT: Duration = Duration::from_secs(180);
+const DOWNLOADS: usize = 4;
 
 impl Auth {
     fn session(&mut self, token: &str, generation: &str) -> bool {
@@ -61,7 +67,14 @@ impl Auth {
         self.attempts
             .retain(|_, (at, _)| at.elapsed() < Duration::from_secs(60));
         if self.attempts.len() >= 16384 && !self.attempts.contains_key(&ip) {
-            return true;
+            if let Some(oldest) = self
+                .attempts
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(ip, _)| *ip)
+            {
+                self.attempts.remove(&oldest);
+            }
         }
         let n = self.attempts.entry(ip).or_insert((Instant::now(), 0));
         n.1 += 1;
@@ -97,8 +110,8 @@ fn bad() -> Error {
 }
 fn internal(_: anyhow::Error) -> Error {
     error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "pbs_unreachable",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "hub_error",
         "Hub storage or TLS configuration unavailable; inspect the hub locally",
     )
 }
@@ -148,6 +161,10 @@ pub async fn serve(config: Config) -> Result<()> {
         pin: super::tls::pin(&config.certificate)?,
         config: Arc::new(config),
         auth: Arc::default(),
+        logins: Arc::default(),
+        login_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+        provisioning: Arc::default(),
+        downloads: Arc::new(tokio::sync::Semaphore::new(DOWNLOADS)),
     };
     let app = Router::new().fallback(handle).with_state(hub);
     loop {
@@ -176,7 +193,11 @@ async fn handle(State(hub): State<Hub>, req: Request) -> Response {
     let head = req.method() == Method::HEAD;
     let mut response = match dispatch(hub, req).await {
         Ok(r) => r,
-        Err(e) => e.into_response(),
+        Err(e) => {
+            // Never log request bodies, URLs, identifiers, or upstream messages.
+            eprintln!("hub request failed: status={} code={}", e.0.as_u16(), e.1);
+            e.into_response()
+        }
     };
     let h = response.headers_mut();
     h.insert(header::CONTENT_SECURITY_POLICY,header::HeaderValue::from_static("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
@@ -272,7 +293,7 @@ async fn api(
     address: std::net::IpAddr,
     body: Value,
 ) -> std::result::Result<Response, Error> {
-    let mut t = Transaction::open(&hub.config.state_dir).map_err(internal)?;
+    let mut t = Transaction::open_bounded(&hub.config.state_dir).map_err(internal)?;
     let logged_in = hub
         .auth
         .lock()
@@ -292,23 +313,44 @@ async fn api(
                     .unwrap()
                     .sessions
                     .remove(&crypto::hash(&session));
+                eprintln!("hub session ended");
                 return Ok((StatusCode::NO_CONTENT,[(header::SET_COOKIE,"nestegg_hub_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0")]).into_response());
             }
             Method::POST => {
-                let limited = hub.auth.lock().unwrap().limited(address);
-                if limited {
-                    drop(t);
-                    tokio::time::sleep(DELAY).await;
-                    return Err(error(
+                let password = body["password"].as_str().ok_or_else(bad)?;
+                let hash = t.state.admin_hash.clone();
+                let generation = t.state.password_generation.clone();
+                drop(t);
+                if logged_in {
+                    return Ok(StatusCode::NO_CONTENT.into_response());
+                }
+                // Bound both verification rate and queue length. At most three
+                // accepted logins can be ahead of this one; no address-based
+                // lockout can reject a correct password after it is checked.
+                let _slot = hub.login_slots.clone().try_acquire_owned().map_err(|_| {
+                    error(
                         StatusCode::TOO_MANY_REQUESTS,
                         "rate_limited",
-                        "Try again later",
-                    ));
-                }
-                let password = body["password"].as_str().ok_or_else(bad)?;
-                if !crypto::password_matches(password.as_bytes(), &t.state.admin_hash) {
-                    drop(t);
+                        "Login queue busy; retry shortly",
+                    )
+                })?;
+                let _lane = hub.logins.lock().await;
+                if !crypto::password_matches(password.as_bytes(), &hash) {
+                    let limited = hub.auth.lock().unwrap().limited(address);
                     tokio::time::sleep(DELAY).await;
+                    eprintln!("hub login failed");
+                    return Err(if limited {
+                        error(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "rate_limited",
+                            "Try again later",
+                        )
+                    } else {
+                        unauthorized()
+                    });
+                }
+                let current = Transaction::open_bounded(&hub.config.state_dir).map_err(internal)?;
+                if current.state.password_generation != generation {
                     return Err(unauthorized());
                 }
                 let token = crypto::random_secret();
@@ -320,10 +362,11 @@ async fn api(
                     crypto::hash(&token),
                     Session {
                         last: Instant::now(),
-                        generation: t.state.password_generation.clone(),
+                        generation,
                     },
                 );
                 auth.attempts.remove(&address);
+                eprintln!("hub session created");
                 return Ok((
                     StatusCode::NO_CONTENT,
                     [(
@@ -339,7 +382,10 @@ async fn api(
         }
     }
     if path == "/join" && method == Method::POST {
-        return join(&hub, t, body).await;
+        drop(t);
+        return tokio::time::timeout(JOIN_TIMEOUT, join(&hub, body))
+            .await
+            .map_err(|_| upstream(anyhow::anyhow!("join timed out")))?;
     }
     if path == "/machines/self/leave" && method == Method::POST {
         let id = t
@@ -356,19 +402,21 @@ async fn api(
     }
     match (method,path) {
         (Method::GET|Method::HEAD,"/hub") => Ok(Json(hub_info(&hub,&t.state)).into_response()),
-        (Method::GET|Method::HEAD,"/join-codes") => Ok(Json(json!({"codes": t.state.codes.iter().filter(|c| c.valid(&state::now())).map(|c| c.info()).collect::<Vec<_>>()})).into_response()),
+        (Method::GET|Method::HEAD,"/join-codes") => Ok(Json(json!({"codes": t.state.codes.iter().filter(|c| c.valid(&state::now()) && c.enrollment.is_none()).map(|c| c.info()).collect::<Vec<_>>()})).into_response()),
         (Method::POST,"/join-codes") => {
             let note = body.get("note").map(|n| n.as_str().ok_or_else(bad)).transpose()?;
             let result = create_code(&hub.config,&hub.pin,&mut t,note)?;
             Ok((StatusCode::CREATED,Json(result)).into_response())
         }
         (Method::GET|Method::HEAD,"/machines") => {
-            let reachable = match login(&hub.config).await {
-                Ok(client) => match client.overview().await {
-                    Ok(groups) => { t.state.pbs_groups = groups; t.state.pbs_read_at = Some(state::now()); t.save().map_err(internal)?; true }
-                    Err(_) => false,
-                }, Err(_) => false,
+            drop(t);
+            let groups = match login(&hub.config).await {
+                Ok(client) => client.overview().await.ok(),
+                Err(_) => None,
             };
+            let reachable = groups.is_some();
+            let mut t = Transaction::open_bounded(&hub.config.state_dir).map_err(internal)?;
+            if let Some(groups) = groups { t.state.pbs_groups = groups; t.state.pbs_read_at = Some(state::now()); t.save().map_err(internal)?; eprintln!("hub PBS overview refreshed"); }
             Ok(Json(machines(&t.state,reachable)).into_response())
         }
         (Method::DELETE,p) if p.starts_with("/machines/") => remove(&hub,t,p.trim_start_matches("/machines/")).await,
@@ -378,6 +426,7 @@ async fn api(
             t.state.codes.retain(|c| c.code_id != id);
             if n == t.state.codes.len() { return Err(error(StatusCode::NOT_FOUND,"not_found","Code not found")); }
             t.save().map_err(internal)?;
+            eprintln!("hub join code revoked");
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         _ => Err(error(StatusCode::NOT_FOUND,"not_found","Unknown endpoint")),
@@ -413,6 +462,7 @@ pub(super) fn create_code(
         digest: crypto::hash(&code),
         note: note.map(str::to_string),
         created_at: state::now(),
+        enrollment: None,
         expires_at: (chrono::Utc::now() + chrono::Duration::minutes(30))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     };
@@ -422,28 +472,20 @@ pub(super) fn create_code(
     t.state.codes.retain(|c| c.valid(&state::now()));
     t.state.codes.push(info);
     t.save().map_err(internal)?;
+    eprintln!("hub join code created");
     Ok(result)
 }
 
-async fn login(config: &Config) -> Result<pbs::Client> {
-    let password = config.password()?;
-    let mut client = pbs::Client::new(&config.pbs)?;
-    client.login(password.as_bytes()).await?;
+async fn login(config: &Config) -> std::result::Result<pbs::Client, Error> {
+    let password = config.password().map_err(internal)?;
+    let mut client = pbs::Client::new(&config.pbs).map_err(internal)?;
+    client.login(password.as_bytes()).await.map_err(upstream)?;
     Ok(client)
-}
-async fn awake(config: &Config) -> Result<()> {
-    let mut c = crate::config::example(&config.pbs.server, &config.pbs.datastore, &config.pbs.user);
-    c.pbs.as_mut().context("PBS configuration")?.port = config.pbs.port;
-    c.wake = config.wake.clone();
-    ensure!(
-        crate::wake::ensure_available(&c, |_| {})? != crate::wake::Availability::Unreachable,
-        "PBS unavailable"
-    );
-    Ok(())
 }
 #[derive(Deserialize)]
 struct Join {
     code: String,
+    attempt: String,
     hostname: String,
     backup_id: Option<String>,
     #[serde(default)]
@@ -451,16 +493,30 @@ struct Join {
     os: Option<String>,
     nestegg_version: Option<String>,
 }
-async fn join(hub: &Hub, mut t: Transaction, body: Value) -> std::result::Result<Response, Error> {
+async fn join(hub: &Hub, body: Value) -> std::result::Result<Response, Error> {
     let req: Join = serde_json::from_value(body).map_err(|_| bad())?;
-    let now = state::now();
-    // Scan every code and compare fixed-length hashes in constant time.
-    let mut found = None;
-    for (i, c) in t.state.codes.iter().enumerate() {
-        if crypto::matches(&req.code, &c.digest) && c.valid(&now) {
-            found = Some(i);
-        }
+    if req.attempt.len() < 43
+        || req.attempt.len() > 256
+        || !req
+            .attempt
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return Err(bad());
     }
+    // Provisioning operations serialize independently of the short state lock.
+    // This lane is inside the total join deadline, including its queue wait.
+    let _provisioning = hub.provisioning.lock().await;
+    let mut t = Transaction::open_bounded(&hub.config.state_dir).map_err(internal)?;
+    let now = state::now();
+    let name = req.backup_id.as_deref().unwrap_or(&req.hostname);
+    let found = t.state.codes.iter().position(|c| {
+        crypto::matches(&req.code, &c.digest)
+            && c.valid(&now)
+            && c.enrollment.as_ref().is_none_or(|e| {
+                e.backup_id == name && crypto::matches(&req.attempt, &e.attempt_digest)
+            })
+    });
     let Some(index) = found else {
         drop(t);
         tokio::time::sleep(DELAY).await;
@@ -477,7 +533,6 @@ async fn join(hub: &Hub, mut t: Transaction, body: Value) -> std::result::Result
             "Prove master key first",
         ));
     }
-    let name = req.backup_id.as_deref().unwrap_or(&req.hostname);
     if !super::config::valid_name(name)
         || req.hostname.is_empty()
         || req.hostname.len() > 255
@@ -486,22 +541,56 @@ async fn join(hub: &Hub, mut t: Transaction, body: Value) -> std::result::Result
     {
         return Err(bad());
     }
-    if t.state.machines.iter().any(|m| m.backup_id == name) {
+    let enrollment = t.state.codes[index]
+        .enrollment
+        .clone()
+        .unwrap_or_else(|| state::Enrollment {
+            attempt_digest: crypto::hash(&req.attempt),
+            backup_id: name.into(),
+            machine_id: crypto::random_secret(),
+        });
+    if t.state
+        .machines
+        .iter()
+        .any(|m| m.backup_id == name && m.machine_id != enrollment.machine_id)
+    {
         return Err(error(
             StatusCode::CONFLICT,
             "name_taken",
             "Computer name is already joined",
         ));
     }
-    awake(&hub.config).await.map_err(upstream)?;
-    let client = login(&hub.config).await.map_err(upstream)?;
+    let code_id = t.state.codes[index].code_id.clone();
+    let retry = t.state.codes[index].enrollment.is_some();
+    let pending = t.state.pending_joins.iter().any(|n| n == name);
+    drop(t);
+    let config = hub.config.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut c =
+            crate::config::example(&config.pbs.server, &config.pbs.datastore, &config.pbs.user);
+        c.pbs.as_mut().context("PBS configuration")?.port = config.pbs.port;
+        c.wake = config.wake.clone().map(|mut w| {
+            w.timeout_seconds = w.timeout_seconds.min(60);
+            w
+        });
+        ensure!(
+            crate::wake::ensure_available(&c, |_| {})? != crate::wake::Availability::Unreachable,
+            "PBS unavailable"
+        );
+        anyhow::Ok(())
+    })
+    .await
+    .map_err(|_| internal(anyhow::anyhow!("wake task failed")))?
+    .map_err(upstream)?;
+    let client = login(&hub.config).await?;
     let groups = client.groups().await.map_err(upstream)?;
     let auth_id = format!("{}!{name}", hub.config.pbs.user);
-    if let Some(group) = groups
+    let group = groups
         .iter()
-        .find(|g| g["backup-type"] == "host" && g["backup-id"] == name)
-    {
-        if !req.adopt {
+        .find(|g| g["backup-type"] == "host" && g["backup-id"] == name);
+    let existing_snapshots = group.and_then(|g| g["backup-count"].as_u64()).unwrap_or(0);
+    if let Some(group) = group {
+        if !req.adopt && !retry {
             return Err(error(
                 StatusCode::CONFLICT,
                 "name_exists_on_pbs",
@@ -516,29 +605,54 @@ async fn join(hub: &Hub, mut t: Transaction, body: Value) -> std::result::Result
             ));
         }
     }
-    // A durable intent permits safe compensation after a process crash or a
-    // lost token response. Never delete an unrelated, pre-existing token.
-    if t.state.pending_joins.iter().any(|n| n == name) {
-        client.delete_token(name).await.map_err(upstream)?;
-        t.state.pending_joins.retain(|n| n != name);
-        t.save().map_err(internal)?;
-    }
-    if client.token_exists(name).await.map_err(upstream)? {
+    if !retry && !pending && client.token_exists(name).await.map_err(upstream)? {
         return Err(error(
             StatusCode::CONFLICT,
             "name_taken",
             "A PBS token already uses this name",
         ));
     }
-    t.state.pending_joins.push(name.into());
+    // Persist the binding before any mutation on PBS. A lost token response or
+    // process crash is repaired only by this same attempt and backup identity.
+    t = Transaction::open_bounded(&hub.config.state_dir).map_err(internal)?;
+    let code = t
+        .state
+        .codes
+        .iter_mut()
+        .find(|c| c.code_id == code_id)
+        .ok_or_else(|| error(StatusCode::FORBIDDEN, "invalid_code", "Code revoked"))?;
+    code.enrollment = Some(enrollment.clone());
+    if !t.state.pending_joins.iter().any(|n| n == name) {
+        t.state.pending_joins.push(name.into());
+    }
     t.save().map_err(internal)?;
+    drop(t);
+    if retry || pending {
+        client.delete_token(name).await.map_err(upstream)?;
+    }
     let (auth_id, secret) = client.create_token(name).await.map_err(upstream)?;
     if let Err(e) = client.acl(&auth_id).await {
         let _ = client.delete_token(name).await;
         return Err(upstream(e));
     }
-    let machine_id = crypto::random_secret();
+    let machine_id = enrollment.machine_id;
     let credential = crypto::random_secret();
+    t = Transaction::open_bounded(&hub.config.state_dir).map_err(internal)?;
+    if !t
+        .state
+        .codes
+        .iter()
+        .any(|c| c.code_id == code_id && c.valid(&state::now()))
+    {
+        drop(t);
+        let _ = client.delete_token(name).await;
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "invalid_code",
+            "Code expired or revoked",
+        ));
+    }
+    t.state.machines.retain(|m| m.machine_id != machine_id);
     t.state.machines.push(state::Machine {
         machine_id: machine_id.clone(),
         backup_id: name.into(),
@@ -548,34 +662,40 @@ async fn join(hub: &Hub, mut t: Transaction, body: Value) -> std::result::Result
         joined_at: now,
         credential_digest: crypto::hash(&credential),
     });
-    t.state.codes.remove(index);
     t.state.pending_joins.retain(|n| n != name);
-    if let Err(e) = t.save() {
-        let _ = client.delete_token(name).await;
-        return Err(internal(e));
-    }
+    t.save().map_err(internal)?;
+    eprintln!("hub computer joined");
     let c = &hub.config;
-    Ok(Json(json!({"machine_id":machine_id,"backup_id":name,"machine_credential":credential,
+    Ok(Json(json!({"machine_id":machine_id,"backup_id":name,"existing_snapshots":existing_snapshots,"machine_credential":credential,
         "pbs":{"server":c.pbs.server,"port":c.pbs.port,"datastore":c.pbs.datastore,"namespace":c.pbs.namespace,"fingerprint":c.pbs.fingerprint,"auth_id":auth_id,"secret":secret},
         "wake":c.wake.as_ref().map(|w|json!({"mac":w.mac,"broadcast":w.broadcast.to_string(),"timeout_seconds":w.timeout_seconds})),
         "master_key":{"public_key_pem":t.state.master.public_key_pem,"fingerprint":t.state.master.fingerprint,"proven_at":t.state.master.proven_at},
         "hub":{"name":c.name,"url":c.url,"pin":hub.pin}
     })).into_response())
 }
+
 async fn remove(hub: &Hub, mut t: Transaction, id: &str) -> std::result::Result<Response, Error> {
-    let machine = t
+    drop(t);
+    let _provisioning = hub.provisioning.lock().await;
+    t = Transaction::open_bounded(&hub.config.state_dir).map_err(internal)?;
+    let name = t
         .state
         .machines
         .iter()
         .find(|m| m.machine_id == id)
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "not_found", "Computer not found"))?;
-    let client = login(&hub.config).await.map_err(upstream)?;
-    client
-        .delete_token(&machine.backup_id)
-        .await
-        .map_err(upstream)?;
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "not_found", "Computer not found"))?
+        .backup_id
+        .clone();
+    drop(t);
+    let client = login(&hub.config).await?;
+    client.delete_token(&name).await.map_err(upstream)?;
+    t = Transaction::open_bounded(&hub.config.state_dir).map_err(internal)?;
     t.state.machines.retain(|m| m.machine_id != id);
+    t.state
+        .codes
+        .retain(|c| c.enrollment.as_ref().is_none_or(|e| e.machine_id != id));
     t.save().map_err(internal)?;
+    eprintln!("hub computer removed");
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -618,7 +738,7 @@ fn static_file(hub: &Hub, path: &str) -> std::result::Result<Response, Error> {
             .into_response());
     }
     if path == "/pkg/nestegg.deb" || path == "/pkg/SHA256SUMS" {
-        let t = Transaction::open(&hub.config.state_dir).map_err(internal)?;
+        let t = Transaction::open_bounded(&hub.config.state_dir).map_err(internal)?;
         let pkg = t
             .state
             .package
@@ -635,7 +755,32 @@ fn static_file(hub: &Hub, path: &str) -> std::result::Result<Response, Error> {
                 header::CONTENT_TYPE,
                 "application/vnd.debian.binary-package",
             )],
-            std::fs::read(pkg.file).map_err(|e| internal(e.into()))?,
+            {
+                let permit = hub.downloads.clone().try_acquire_owned().map_err(|_| {
+                    error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limited",
+                        "Too many package downloads",
+                    )
+                })?;
+                let file = std::fs::File::open(pkg.file).map_err(|e| internal(e.into()))?;
+                let stream = futures_util::stream::try_unfold(
+                    (tokio::fs::File::from_std(file), permit),
+                    |(mut file, permit)| async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut bytes = vec![0u8; 64 * 1024];
+                        let n = file.read(&mut bytes).await.inspect_err(|_| {
+                            eprintln!("hub package stream failed: code=hub_error");
+                        })?;
+                        if n == 0 {
+                            return Ok::<_, std::io::Error>(None);
+                        }
+                        bytes.truncate(n);
+                        Ok(Some((bytes, (file, permit))))
+                    },
+                );
+                Body::from_stream(stream)
+            },
         )
             .into_response());
     }
@@ -665,6 +810,10 @@ fn static_file(hub: &Hub, path: &str) -> std::result::Result<Response, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn join_budget_leaves_response_delivery_time() {
+        assert!(JOIN_TIMEOUT + Duration::from_secs(30) < crate::pinned::REQUEST_TIMEOUT);
+    }
     #[test]
     fn sessions_expire_and_password_change_revokes_them() {
         let mut a = Auth::default();
@@ -699,6 +848,32 @@ mod tests {
         a.attempts.get_mut(&ip).unwrap().0 -= Duration::from_secs(61);
         assert!(!a.limited(ip));
     }
+    #[test]
+    fn address_table_evicts_oldest_instead_of_locking_out_new_addresses() {
+        let mut auth = Auth::default();
+        let oldest = "192.0.2.1".parse().unwrap();
+        auth.attempts
+            .insert(oldest, (Instant::now() - Duration::from_secs(10), 7));
+        for n in 1..16384u32 {
+            auth.attempts.insert(
+                std::net::Ipv6Addr::from(
+                    u128::from("2001:db8::".parse::<std::net::Ipv6Addr>().unwrap()) + u128::from(n),
+                )
+                .into(),
+                (Instant::now(), 1),
+            );
+        }
+        assert!(!auth.limited("203.0.113.1".parse().unwrap()));
+        assert_eq!(auth.attempts.len(), 16384);
+        assert!(!auth.attempts.contains_key(&oldest));
+    }
+    #[test]
+    fn internal_errors_are_500_and_do_not_echo_sensitive_context() {
+        let e = internal(anyhow::anyhow!("private diagnostic"));
+        assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.1, "hub_error");
+        assert!(!e.2.contains("private diagnostic"));
+    }
 }
 
 #[cfg(test)]
@@ -725,7 +900,7 @@ mod api_tests {
             b"test-only-password",
         )
         .unwrap();
-        let mut t = Transaction::open(&config.state_dir).unwrap();
+        let mut t = Transaction::open_bounded(&config.state_dir).unwrap();
         t.state.admin_hash = crypto::password_hash(b"test-only-admin").unwrap();
         t.state.password_generation = "generation".into();
         t.state.master.public_key_pem = Some("test public key".into());
@@ -744,6 +919,10 @@ mod api_tests {
                 config: Arc::new(config),
                 pin: "sha256//test".into(),
                 auth: Arc::default(),
+                logins: Arc::default(),
+                login_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+                provisioning: Arc::default(),
+                downloads: Arc::new(tokio::sync::Semaphore::new(DOWNLOADS)),
             },
         )
     }
@@ -755,6 +934,10 @@ mod api_tests {
         cookie: Option<&str>,
         custom: bool,
     ) -> Response {
+        let mut body = body;
+        if path == "/api/hub/v1/join" && body.get("attempt").is_none() {
+            body["attempt"] = json!("A".repeat(43));
+        }
         let mut req = Request::builder().method(method).uri(path);
         if custom {
             req = req.header("X-Nestegg-Hub", "1");
@@ -771,7 +954,7 @@ mod api_tests {
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap()
     }
     fn code(hub: &Hub) -> Value {
-        let mut t = Transaction::open(&hub.config.state_dir).unwrap();
+        let mut t = Transaction::open_bounded(&hub.config.state_dir).unwrap();
         create_code(&hub.config, &hub.pin, &mut t, None).unwrap()
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -791,7 +974,7 @@ mod api_tests {
         )
         .await;
         assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let t = Transaction::open(&hub.config.state_dir).unwrap();
+        let t = Transaction::open_bounded(&hub.config.state_dir).unwrap();
         assert_eq!(t.state.codes.len(), 1);
         assert!(t.state.machines.is_empty());
         assert_eq!(t.state.pending_joins, vec!["desktop"]);
@@ -811,8 +994,8 @@ mod api_tests {
         .await;
         assert_eq!(joined.status(), StatusCode::OK);
         let joined = body(joined).await;
-        let t = Transaction::open(&hub.config.state_dir).unwrap();
-        assert!(t.state.codes.is_empty());
+        let t = Transaction::open_bounded(&hub.config.state_dir).unwrap();
+        assert!(t.state.codes[0].enrollment.is_some());
         assert!(t.state.pending_joins.is_empty());
         assert_eq!(t.state.machines.len(), 1);
         assert!(crypto::matches(
@@ -824,7 +1007,22 @@ mod api_tests {
         assert!(!disk.contains(joined["machine_credential"].as_str().unwrap()));
         assert!(!disk.contains("test-only-token-value"));
         drop(t);
-        let denied = request(&hub, Method::POST, "/api/hub/v1/join", req, None, false).await;
+        let again = request(
+            &hub,
+            Method::POST,
+            "/api/hub/v1/join",
+            req.clone(),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::OK);
+        let again = body(again).await;
+        assert_eq!(again["machine_id"], joined["machine_id"]);
+        assert_ne!(again["machine_credential"], joined["machine_credential"]);
+        let mut other = req;
+        other["attempt"] = json!("B".repeat(43));
+        let denied = request(&hub, Method::POST, "/api/hub/v1/join", other, None, false).await;
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
         assert_eq!(body(denied).await["code"], "invalid_code");
     }
@@ -900,7 +1098,7 @@ mod api_tests {
             StatusCode::CREATED
         );
         // Password command's generation change invalidates every old session.
-        let mut t = Transaction::open(&hub.config.state_dir).unwrap();
+        let mut t = Transaction::open_bounded(&hub.config.state_dir).unwrap();
         t.state.password_generation = "changed".into();
         t.save().unwrap();
         drop(t);
@@ -922,7 +1120,7 @@ mod api_tests {
     async fn code_gates_expiry_revocation_and_security_headers() {
         let fake = pbs::tests::Fake::start().await;
         let (_dir, hub) = fixture(&fake);
-        let mut t = Transaction::open(&hub.config.state_dir).unwrap();
+        let mut t = Transaction::open_bounded(&hub.config.state_dir).unwrap();
         t.state.master.proven_at = None;
         assert_eq!(
             create_code(&hub.config, &hub.pin, &mut t, None)
@@ -940,7 +1138,7 @@ mod api_tests {
         );
         drop(t);
         let expired = code(&hub);
-        let mut t = Transaction::open(&hub.config.state_dir).unwrap();
+        let mut t = Transaction::open_bounded(&hub.config.state_dir).unwrap();
         t.state.codes[0].expires_at = "2000-01-01T00:00:00Z".into();
         t.save().unwrap();
         drop(t);
@@ -971,5 +1169,145 @@ mod api_tests {
             fake.calls.lock().unwrap().is_empty(),
             "invalid codes never contact PBS"
         );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_logins_share_one_verification_lane_without_address_lockout() {
+        let fake = pbs::tests::Fake::start().await;
+        let (_dir, hub) = fixture(&fake);
+        let start = Instant::now();
+        let mut failures = Vec::new();
+        for n in 1..=3 {
+            let hub = hub.clone();
+            failures.push(tokio::spawn(async move {
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/hub/v1/session")
+                    .header("X-Nestegg-Hub", "1")
+                    .extension(SocketAddr::new(
+                        std::net::Ipv4Addr::new(192, 0, 2, n).into(),
+                        1234,
+                    ))
+                    .body(Body::from(r#"{"password":"wrong"}"#))
+                    .unwrap();
+                handle(State(hub), req).await
+            }));
+        }
+        tokio::task::yield_now().await;
+        let correct = tokio::time::timeout(
+            Duration::from_secs(10),
+            request(
+                &hub,
+                Method::POST,
+                "/api/hub/v1/session",
+                json!({"password":"test-only-admin"}),
+                None,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(correct.status(), StatusCode::NO_CONTENT);
+        for failure in failures {
+            assert_eq!(failure.await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(start.elapsed() >= 3 * DELAY);
+        // A full login queue never delays an established browser session.
+        let cookie = correct.headers()[header::SET_COOKIE].to_str().unwrap();
+        let slots = hub.login_slots.acquire_many(4).await.unwrap();
+        assert_eq!(
+            request(
+                &hub,
+                Method::POST,
+                "/api/hub/v1/session",
+                json!({"password":"unused"}),
+                Some(cookie),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        drop(slots);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waiting_join_does_not_hold_state_lock_and_downloads_are_streamed_and_bounded() {
+        let fake = pbs::tests::Fake::start().await;
+        let (_dir, hub) = fixture(&fake);
+        let code = code(&hub);
+        let lane = hub.provisioning.lock().await;
+        let waiting = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                request(
+                    &hub,
+                    Method::POST,
+                    "/api/hub/v1/join",
+                    json!({"code":code["code"],"hostname":"desktop"}),
+                    None,
+                    false,
+                )
+                .await
+            })
+        };
+        let session = tokio::time::timeout(
+            Duration::from_secs(1),
+            request(
+                &hub,
+                Method::GET,
+                "/api/hub/v1/session",
+                json!({}),
+                None,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+        let network = fake.gate.acquire().await.unwrap();
+        drop(lane);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fake.calls.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let session = tokio::time::timeout(
+            Duration::from_secs(2),
+            request(
+                &hub,
+                Method::GET,
+                "/api/hub/v1/session",
+                json!({}),
+                None,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+        drop(network);
+        assert_eq!(waiting.await.unwrap().status(), StatusCode::OK);
+        let t = Transaction::open_bounded(&hub.config.state_dir).unwrap();
+        let file = t.state.package.as_ref().unwrap().file.clone();
+        std::fs::write(&file, vec![7u8; 1024 * 1024]).unwrap();
+        t.save().unwrap();
+        drop(t);
+        let mut responses = Vec::new();
+        for _ in 0..DOWNLOADS {
+            responses.push(static_file(&hub, "/pkg/nestegg.deb").unwrap());
+        }
+        assert_eq!(
+            static_file(&hub, "/pkg/nestegg.deb").unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Replacing disk content after opening proves bodies were not eagerly read.
+        std::fs::write(&file, b"streamed").unwrap();
+        let bytes = to_bytes(responses.pop().unwrap().into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"streamed");
+        assert!(static_file(&hub, "/pkg/nestegg.deb").is_ok());
     }
 }

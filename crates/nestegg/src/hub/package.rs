@@ -51,5 +51,7 @@ pub fn add(state_dir: &Path, path: &Path) -> Result<()> {
         sha256: digest,
         file,
     });
-    t.save().context("publish package metadata")
+    t.save().context("publish package metadata")?;
+    eprintln!("hub package published");
+    Ok(())
 }

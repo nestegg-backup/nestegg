@@ -226,7 +226,7 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
             create(config, &paper)?;
         }
     }
-    let mut t = Transaction::open(&config.state_dir)?;
+    let t = Transaction::open(&config.state_dir)?;
     ensure!(
         t.state.master.public_key_pem.is_some(),
         "no master key exists; complete hub init first"
@@ -235,6 +235,8 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
         println!("Master key copy is already proven.");
         return Ok(());
     }
+    let master = t.state.master.clone();
+    drop(t);
     let (file, code) = if args.file.is_none() && args.paper_code.is_none() {
         let choice = prompt("Proof: type file or paper")?;
         if choice == "file" {
@@ -260,7 +262,7 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
         ensure!(
             crypto::matches(
                 &pem_data(&bytes)?,
-                t.state.master.private_digest.as_deref().unwrap_or("")
+                master.private_digest.as_deref().unwrap_or("")
             ),
             "copy does not contain this household's master key"
         );
@@ -279,10 +281,7 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
     } else if let Some(code) = code {
         let code = crate::keyproof::normalize_check_code(&code).context("not a check code")?;
         ensure!(
-            crypto::matches(
-                &code,
-                t.state.master.paper_code_digest.as_deref().unwrap_or("")
-            ),
+            crypto::matches(&code, master.paper_code_digest.as_deref().unwrap_or("")),
             "check code does not belong to this master key"
         );
         if !args.printed {
@@ -303,19 +302,31 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
     // Decrypt before removing any copy or changing the proof. Only OpenSSL
     // reads the freshly entered passphrase, directly from the terminal.
     decrypt_proof(&encrypted)?;
-    if let Some(file) = &t.state.master.paper_file
+    if let Some(file) = &master.paper_file
         && crate::keyproof::locate(file).needs_statement()
     {
         local_copies.push(file.clone());
     }
+    // Terminal prompts and decryption never hold the hub state lock.
+    let mut t = Transaction::open(&config.state_dir)?;
+    ensure!(
+        t.state.master.private_digest == master.private_digest
+            && t.state.master.proven_at.is_none(),
+        "master-key setup changed during proof; repeat the confirmation"
+    );
     // Include matching copies in the managed master directory, even if an
     // administrator renamed the pending PEM there while resuming setup.
     for entry in std::fs::read_dir(config.state_dir.join("master"))? {
         let path = entry?.path();
-        if path != config.state_dir.join("master/master-private.pem") && path.is_file() && let Ok(bytes) = crate::restore::read_small_regular_file(&path, 4 * 1024 * 1024)
-            && let Ok(data) = pem_data(&bytes)
-            && crypto::matches(&data, t.state.master.private_digest.as_deref().unwrap_or(""))
-        { local_copies.push(path); }
+        if path == config.state_dir.join("master/master-private.pem") {
+            continue;
+        }
+        let bytes = crate::restore::read_small_regular_file(&path, 4 * 1024 * 1024).with_context(|| format!("cannot check managed master-key file {}; move it away or delete it before proving the copy; no proof was recorded", path.display()))?;
+        if let Ok(data) = pem_data(&bytes)
+            && crypto::matches(&data, master.private_digest.as_deref().unwrap_or(""))
+        {
+            local_copies.push(path);
+        }
     }
     for file in local_copies {
         remove_copy(&file)?;
@@ -335,15 +346,23 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
 fn decrypt_proof(encrypted: &[u8]) -> Result<()> {
     let (begin, end) = pem_boundaries();
     let pem = format!("{begin}\n{}\n{end}\n", pem_data(encrypted)?);
-    let mut copy = tempfile::NamedTempFile::new()?;
+    // An anonymous file leaves no private PEM behind after SIGKILL either.
+    // Only its descriptor is inherited; stdin remains the administrator's TTY.
+    use std::io::Seek;
+    let mut copy = tempfile::tempfile()?;
     copy.write_all(pem.as_bytes())?;
-    copy.flush()?;
-    let status = Command::new("openssl")
+    copy.rewind()?;
+    let mut fds = crate::secrets::FdPassing::new();
+    let fd = fds.inherit_file(&copy)?;
+    let mut command = Command::new("openssl");
+    command
         .args(["pkey", "-noout", "-in"])
-        .arg(copy.path())
+        .arg(format!("/proc/self/fd/{fd}"))
         .stdin(Stdio::inherit())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    fds.apply(&mut command);
+    let status = command
         .status()
         .context("run openssl to verify the master-key passphrase")?;
     ensure!(
@@ -476,6 +495,24 @@ finally:
             .write_all(b"disposable-proof-passphrase\n")
             .unwrap();
         assert!(generate.wait().unwrap().success());
+        let mut public = Command::new("openssl")
+            .args(["pkey", "-in"])
+            .arg(&private)
+            .args(["-passin", "stdin", "-pubout", "-out"])
+            .arg(master.join("master-public.pem"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        public
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"disposable-proof-passphrase\n")
+            .unwrap();
+        assert!(public.wait().unwrap().success());
+        let public_pem = std::fs::read_to_string(master.join("master-public.pem")).unwrap();
         let bytes = std::fs::read(&private).unwrap();
         let data = pem_data(&bytes).unwrap();
         let config = Config {
@@ -508,7 +545,9 @@ finally:
             std::fs::write(&paper, &bytes).unwrap();
             std::fs::write(&copy, &bytes).unwrap();
             let mut t = Transaction::open(&config.state_dir).unwrap();
-            t.state.master.public_key_pem = Some("public fixture".into());
+            t.state.master.public_key_pem = Some(public_pem.clone());
+            t.state.master.fingerprint =
+                Some(crate::masterkey::fingerprint(public_pem.as_bytes()).unwrap());
             t.state.master.paper_written = true;
             t.state.master.private_digest = Some(crypto::hash(&data));
             t.state.master.paper_code_digest = Some(crypto::hash(&code));
@@ -528,12 +567,30 @@ finally:
                 std::fs::read(config.state_dir.join("state.json")).unwrap()
             );
             assert!(private.exists() && paper.exists() && copy.exists());
+            // An unremovable recorded path must never publish proof either.
+            std::fs::remove_file(&paper).unwrap();
+            std::fs::create_dir(&paper).unwrap();
+            assert!(!terminal_proof(
+                &config_path,
+                "disposable-proof-passphrase",
+                proof_code
+            ));
+            assert_eq!(
+                before,
+                std::fs::read(config.state_dir.join("state.json")).unwrap()
+            );
+            assert!(private.exists());
+            std::fs::remove_dir(&paper).unwrap();
+            std::fs::write(&paper, &bytes).unwrap();
+            std::fs::write(&copy, &bytes).unwrap();
             assert!(terminal_proof(
                 &config_path,
                 "disposable-proof-passphrase",
                 proof_code
             ));
-            assert!(!private.exists() && !paper.exists() && !master.join("renamed-copy.pem").exists());
+            assert!(
+                !private.exists() && !paper.exists() && !master.join("renamed-copy.pem").exists()
+            );
             assert!(by_code || !copy.exists());
             assert!(
                 Transaction::open(&config.state_dir)
@@ -554,5 +611,4 @@ finally:
         assert!(message.contains(blocked.to_str().unwrap()));
         assert!(message.contains("no proof was recorded"));
     }
-
 }
