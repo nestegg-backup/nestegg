@@ -89,6 +89,54 @@ local API described in [`../api/openapi.yaml`](../api/openapi.yaml).
   reports both). Missing API pieces: `API-REQUESTS.md`, section 7.
 - **Overview of several machines:** same UI, a list fed by a read-only PBS
   connection (`/machines`).
+- **Joined to a hub (decision 0034):** `/status` may carry
+  `encryption.master_key` (`{fingerprint, proven_at}`) and `hub`
+  (`{name, url}`). With a master key the key copy counts as done: no key
+  warning, nothing blocked, the guide's step "keep the key safe" is shown as
+  done with one line, and an own copy is an optional extra. "Managed by"
+  names the hub in "About this computer" and the settings. Absent or null
+  (older daemon): nothing changes.
+
+## The hub's interface (`hub.html`, decision 0034 stage 1)
+
+A second page of the same build, served by the hub (not by `nestegg ui`). It
+talks only to the hub API ([`../api/hub-openapi.yaml`](../api/hub-openapi.yaml),
+relative URLs `api/hub/v1/*`), so the hub serves `dist/hub.html` at `/` and
+every other file of `dist/` (`assets/*`, `theme.js`, `licenses/*`) from the
+same directory at the same relative path. `dist/index.html` is the local
+interface and is not needed by the hub (and `hub.html` is useless under
+`nestegg ui`, which has no hub API).
+
+- **Login:** one password field; 401 says the password is wrong, 429
+  `rate_limited` says to wait. The session is the hub's `HttpOnly` cookie; the
+  page stores nothing. Every request that is not GET carries
+  `X-Nestegg-Hub: 1`. A 401 on any later request drops the data and shows the
+  login again ("you are logged out"). This page is the one exception to "the
+  page never asks for a password" below: it asks for the hub's
+  administrator password, by design of decision 0034.
+- **Computers:** `GET /machines`, problems first. Each computer's state is the
+  local interpretation of another computer's report (`machineKind`,
+  `machineSummary`, same wording), plus what only the hub knows: damaged
+  (`last_snapshot_verified: false`), incomplete (`report.incomplete`), joined
+  without a snapshot yet, and "unknown" while the hub has never read the PBS.
+  An own key copy (`report.key_exported`) is not asked of a hub computer: the
+  proven master key is a precondition of joining. While the PBS does not
+  answer the page says so with `pbs_read_at`, and "overdue" is judged at that
+  time, not against data that cannot change. Groups without a computer
+  (`unmanaged`) are listed separately with one sentence.
+- **Add computer:** a dialog; optional note, `POST /join-codes`, the command
+  line with a copy button (the code is never broken across lines), three
+  short steps, the remaining validity. While it is open the list is asked
+  every 5 s (otherwise 60 s); a new `machine_id` ends the dialog with "X has
+  joined". `master_key_unproven` and `no_package` (also known beforehand from
+  `GET /hub`) are states with the command for the hub's terminal and "check
+  again". Open codes are listed below the computers and can be revoked.
+- **Remove computer:** an inline confirmation that says what happens (access
+  deleted, backups stay, the computer stops backing up until it joins again);
+  503 says that nothing was changed.
+- **About this hub:** household, server and namespace, PBS user, Wake-on-LAN,
+  master key (confirmed or not, fingerprint), package on offer, address,
+  version; log out.
 
 Read [`../docs/architecture.md`](../docs/architecture.md) and decision
 records `docs/decisions/0003-*.md` first. The look and layout follow
@@ -100,7 +148,7 @@ status bar, settings in the pane), which replaces most of 0005.
 1. **No network requests except to the same origin.** No CDNs, web fonts,
    analytics or external images – the UI must work fully offline and never
    leak that a machine is running nestegg.
-2. **Build output in `ui/dist/`** (static files: `index.html` + assets). The
+2. **Build output in `ui/dist/`** (static files: `index.html`, `hub.html` + shared assets). The
    Rust binary embeds this directory at compile time; there is no Node.js at
    runtime. Keep the bundle small.
 3. **Auth:** `nestegg ui` opens `/#token=<token>`. On load, read the token
@@ -274,6 +322,34 @@ u32`; `invalid value: integer `-1`, expected u32`); `problemText` turns the
   too long in bytes, control and invisible characters, spaces at the ends, a
   leading `-`, a pattern that matches everything, duplicates).
 
+### Mock of the hub
+
+The dev server also answers `/api/hub/v1/*` from `mock/hub.ts`, with a
+session cookie like the hub (password `hub`, or `NESTEGG_MOCK_HUB_PASSWORD`)
+and the `X-Nestegg-Hub` rule. Open
+`http://127.0.0.1:5173/hub.html?scenario=<name>`; loading the page with
+`?scenario=` resets the hub mock and logs in, except for `logged_out` and
+`rate_limited`. It does not touch the scenario of the local mock.
+
+| `?scenario=` | What it shows |
+|---|---|
+| `ok` (default) | six computers: fine, overdue, failed, incomplete, damaged, joined without a backup; one group without a computer; one open code |
+| `logged_out` | the login (password `hub`; three wrong ones in a row lock it for a minute: 429) |
+| `empty` | logged in, no computer yet |
+| `pbs_asleep` | the PBS does not answer, the list is from 9 hours ago |
+| `pbs_never` | the hub has never read the PBS: no snapshots known |
+| `master_key_unproven` | "Add computer" is refused with `master_key_unproven` |
+| `no_package` | refused with `no_package` |
+| `code_created` | a created code is used after about 8 s (otherwise about 20 s); the computer gets its first backup 40 s later |
+| `rate_limited` | logged out, every login answers 429 |
+| `errors` | removing answers 503 `pbs_unreachable`, creating a code 500 |
+
+Faults with `&fault=a,b`, or at runtime with
+`curl -X POST 'http://127.0.0.1:5173/__mock/hub?down=1'` (and `=0`): `down`
+(connection closed, as with a stopped hub), `machines` (500), `create` (500),
+`remove` (503 `pbs_unreachable`), `refused` (503 `pbs_refused`), `no_join` (a
+code is never used), `short_codes` (codes valid for 70 s, to see one expire).
+
 To use another port, set `NESTEGG_UI_PORT` (not `--port`), so the HMR
 websocket uses the same port.
 
@@ -314,8 +390,9 @@ The page comes from the dev server, API calls go to the daemon socket with
 | `src/lib/format.ts` | Date, size and duration formatting |
 | `src/i18n/` | German and English strings |
 | `src/styles/tokens.css` | Colour tokens, dark and light (by system preference or by choice) |
-| `mock/` | Dev-server mock of the API |
-| `tests/` | Vitest: derivation, the new states and the guide, formatting, i18n key parity, contrast (WCAG AA, both themes), theme, settings, restore, mock |
+| `hub.html`, `src/hub/` | The hub's interface: `Hub.svelte` (login or list), `Computers`, `MachineItem` (state and removal), `AddComputer` (dialog), `OpenCodes`, `HubFacts`; `api.ts` (cookie session, `X-Nestegg-Hub`), `store.svelte.ts` (polling), `derive.ts` (state of a computer on top of `machineKind`/`machineSummary`) |
+| `mock/` | Dev-server mock of the API (`world.ts`) and of the hub API (`hub.ts`) |
+| `tests/` | Vitest: derivation, the new states and the guide, formatting, i18n key parity, contrast (WCAG AA, both themes), theme, settings, restore, mock, hub page and its mock (`hub.test.ts`), master key (`masterKey.test.ts`) |
 
 ## Working agreement between agents
 

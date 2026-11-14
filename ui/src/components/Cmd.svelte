@@ -6,8 +6,15 @@
    * A terminal command with a copy button. `label` puts a short lead-in in front ("Ändern im Terminal:").
    * A command that still contains a placeholder (`<NAME>`) cannot be copied: the button stays in the
    * tab order but does nothing (`aria-disabled`), and `missing` (or a general sentence) says why.
+   * `keep`: a part of the command that must not be broken across lines (a one-time code with
+   * hyphens); the text and what is copied stay exactly `command`.
    */
-  let { command, label, missing }: { command: string; label?: string; missing?: string } = $props();
+  let { command, label, missing, keep }: { command: string; label?: string; missing?: string; keep?: string } = $props();
+
+  const kept = $derived.by(() => {
+    const i = keep ? command.lastIndexOf(keep) : -1;
+    return i < 0 || !keep ? null : { before: command.slice(0, i), keep, after: command.slice(i + keep.length) };
+  });
 
   const incomplete = $derived(hasPlaceholder(command));
   // What the button copies, for its accessible name: the command on one line, not too long.
@@ -37,7 +44,11 @@
 
 <div class="cmd" class:labelled={!!label}>
   {#if label}<span class="label">{label}</span>{/if}
-  <code>{command}</code>
+  {#if kept}
+    <code>{kept.before}<span class="keep">{kept.keep}</span>{kept.after}</code>
+  {:else}
+    <code>{command}</code>
+  {/if}
   <button
     class="btn small"
     type="button"
@@ -58,6 +69,7 @@
   }
   code { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); }
   .btn { flex: none; }
+  .keep { white-space: nowrap; }
   .why { flex: none; color: var(--muted); font-size: var(--fs-s); max-width: 16em; }
   .labelled { background: none; border: 0; padding: 0; max-width: none; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
   .labelled code {
