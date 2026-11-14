@@ -350,6 +350,9 @@ pub struct State {
     /// Fingerprint reported by `proxmox-backup-client key show`.
     #[serde(default)]
     pub key_fingerprint: Option<String>,
+    /// Join requested an immediate PBS backup, even when the old one is recent.
+    #[serde(default)]
+    pub join_backup_pending: bool,
     /// Proven household master key (decision 0034); own proof stays independent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_key: Option<crate::masterkey::Proof>,
@@ -472,6 +475,8 @@ impl TargetState {
         }
     }
     fn apply(&self, s: &mut State) {
+        // A household join requests a PBS backup, never a stick run.
+        s.join_backup_pending = false;
         s.last_run = self.last_run.clone();
         s.last_success = self.last_success.clone();
         s.consecutive_failures = self.consecutive_failures;
@@ -966,6 +971,7 @@ impl Store {
         write_json_atomic(&dir.join(format!("{}.json", run.id)), run)?;
         let mut state = self.load_state()?;
         state.last_run = Some(run.clone());
+        state.join_backup_pending = false;
         match run.state {
             RunState::Succeeded => {
                 state.last_success = Some(run.clone());

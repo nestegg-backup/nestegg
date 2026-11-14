@@ -400,8 +400,16 @@ async fn already_configured_refused_before_contact_and_replace_keeps_key() {
     let key = computer.paths.credentials_dir.join("encryption-key");
     nestegg::secrets::write_private_file(&key, b"existing-key-must-not-change").unwrap();
     hub.reply(200, hub.success());
+    let mut previous = nestegg::state::Run::new(nestegg::state::Trigger::Timer, chrono::Utc::now());
+    previous.finish(nestegg::state::RunState::Succeeded, chrono::Utc::now());
+    Store::new(&computer.paths)
+        .record_finished(&previous, 10)
+        .unwrap();
     let out = computer.join(&hub, &["--replace-config"], "").await;
     success(&out);
+    let state = Store::new(&computer.paths).load_state().unwrap();
+    assert!(state.join_backup_pending);
+    assert_eq!(state.last_success.unwrap().id, previous.id);
     assert!(text(&out).contains("kept unchanged"));
     assert_eq!(
         std::fs::read(&key).unwrap(),

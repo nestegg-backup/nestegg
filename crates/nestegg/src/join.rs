@@ -604,6 +604,7 @@ async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activatio
         state.key_fingerprint = Some(info.fingerprint);
         state.key_digest = Some(secrets::digest(&key));
         state.master_key = Some(Proof { fingerprint: response.master_key.fingerprint, proven_at: response.master_key.proven_at });
+        state.join_backup_pending = true;
         state.consecutive_failures = 0;
         state.failed_config = None;
         secrets::create_private_dir(&paths.credentials_dir)?;

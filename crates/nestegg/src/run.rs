@@ -740,6 +740,9 @@ fn timer_skip(
         return None;
     };
     let now = Utc::now();
+    if state.join_backup_pending {
+        return None;
+    }
     if !is_due(state, cfg.schedule.interval_hours, now) {
         return Some(format!(
             "not due yet (last success within {} h)",
@@ -1931,6 +1934,55 @@ mod tests {
                 .unwrap()
                 .contains("not due yet")
         );
+    }
+
+    #[test]
+    fn join_requests_one_pbs_attempt_without_erasing_a_recent_success() {
+        let cfg = Ok(crate::config::example(
+            "pbs.example.com",
+            "store",
+            "backup@pbs!desktop",
+        ));
+        let mut success = Run::new(Trigger::Timer, Utc::now());
+        success.finish(RunState::Succeeded, Utc::now());
+        let mut state = crate::state::State {
+            last_success: Some(success.clone()),
+            join_backup_pending: true,
+            ..Default::default()
+        };
+        let options = RunOptions {
+            target: TargetSelection::Pbs,
+            stick_uuid: None,
+            trigger: Trigger::Timer,
+            run_id: None,
+            force: false,
+        };
+        assert!(timer_skip(&cfg, &state, None, &options).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            state_dir: dir.path().into(),
+            config_file: dir.path().join("config.toml"),
+            credentials_dir: dir.path().join("credentials"),
+            runtime_dir: dir.path().join("runtime"),
+            systemctl: dir.path().join("no-systemctl"),
+        };
+        let store = Store::new(&paths);
+        store.save_state(&state).unwrap();
+        let stick = Store::for_target(&paths, Target::Stick);
+        assert!(!stick.load_state().unwrap().join_backup_pending);
+        let mut attempt = Run::new(Trigger::Timer, Utc::now());
+        attempt.target = Target::Stick;
+        attempt.finish(RunState::Failed, Utc::now());
+        stick.record_finished(&attempt, 10).unwrap();
+        assert!(store.load_state().unwrap().join_backup_pending);
+        attempt.target = Target::Pbs;
+        store.record_finished(&attempt, 10).unwrap();
+        state = store.load_state().unwrap();
+        assert!(!state.join_backup_pending);
+        assert_eq!(state.last_success.unwrap().id, success.id);
+        // Consuming the request restores the normal daily rhythm.
+        let state = store.load_state().unwrap();
+        assert!(timer_skip(&cfg, &state, None, &options).is_some());
     }
 
     #[test]
