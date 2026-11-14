@@ -7,6 +7,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 deb="${1:-$(find "$repo/target/debian" -maxdepth 1 -name 'nestegg_*_amd64.deb' 2>/dev/null | sort | tail -1)}"
 [[ -f "$deb" ]] || { echo 'Build UI, then cargo build --release && cargo deb -p nestegg --no-build.'; exit 2; }
+echo "== package sha256 $(sha256sum "$deb" | cut -d ' ' -f1)"
 prefix="nestegg-hub-join-$$-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 cleanup() {
   for suffix in desktop portable hub pbs; do docker rm -f "$prefix-$suffix" >/dev/null 2>&1 || true; done

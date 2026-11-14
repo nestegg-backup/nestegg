@@ -36,11 +36,13 @@ Add `--prepare-pbs` for automatic PBS preparation, `--wake-mac
 00:00:5e:00:53:01` for a sleeping PBS. Missing required values are requested at
 the terminal. Use `--root-namespace` to explicitly select the datastore root.
 Passwords are entered without echo; the administrator password
-is entered twice. Private `--pbs-password-file`,
+is entered twice and must contain at least 12 characters. Private
+`--pbs-password-file`,
 `--pbs-admin-password-file` and `--admin-password-file` inputs support
 unattended setup; their contents are never command arguments. The master-key
 passphrase always goes directly from the controlling terminal to the official
-client, including when the other inputs come from files.
+client at creation and to OpenSSL at proof, including when other inputs come
+from files.
 
 Unless `--fingerprint` is supplied, initialization fetches and displays the
 PBS certificate fingerprint and requires explicit confirmation. Compare it
@@ -64,15 +66,21 @@ sudo nestegg hub master-key confirm --file /media/usb/household-master.html
 sudo nestegg hub master-key confirm --paper-code <CODE-ON-THE-SHEET>
 ```
 
-A copy on removable media is compared with the encrypted private key. A local
-or unclassifiable location additionally needs the statement that another copy
-exists off the hub (`--accept-local-copy` without a terminal). A paper check
-code needs the statement that the sheet is printed and stored elsewhere
-(`--printed` without a terminal); a remembered paper file still on the hub
-blocks that path. Unplug the removable medium after proof. The hub deletes
-its private master key before recording the proof. Until that proof succeeds,
-it refuses to create join codes. `init` refuses to overwrite an existing
-configuration; `master-key confirm` resumes pending proof after interruption.
+A file proof compares the encrypted PEM and then decrypts that copy once with
+OpenSSL. A paper-code proof decrypts the hub's pending private PEM. Enter the
+passphrase freshly at that program's terminal prompt; nestegg never reads it.
+A wrong passphrase records nothing and removes nothing. A local or
+unclassifiable file additionally needs the statement that another copy exists off the hub
+(`--accept-local-copy` without a terminal). A paper code needs the statement
+that the sheet is printed and stored elsewhere (`--printed` without a terminal).
+After successful decryption, nestegg removes private copies in `master/`, the
+recorded paper file if local, and the supplied proof file if local, before
+recording proof. If a copy cannot be removed, the message names the file to
+move away or delete and proof remains pending. Keep the independent copy safe;
+`--accept-local-copy` does not permit keeping a private copy on the hub.
+Unplug removable media after proof. Until proof succeeds, join codes are refused.
+`init` refuses to overwrite an existing configuration; `master-key confirm`
+resumes pending proof after interruption.
 
 Start the service after proof:
 
@@ -131,8 +139,24 @@ nestegg join "$hub" --pin "$pin" --code "$code" "$@"
 
 Additional script arguments support `--name <backup-id>` and `--adopt`.
 Already installed computers can run `sudo nestegg join <url> --pin <pin>
---code <code>` directly. Codes expire after 30 minutes, are used only once,
-and stay usable when PBS provisioning fails. The code and returned secrets
+--code <code>` directly. Codes expire after 30 minutes and enroll one computer.
+The computer keeps a
+random enrollment attempt in its private join journal. Until expiry, the same
+attempt and backup name can redeem the code again, rotating the token secret
+and machine credential. Other reuse is refused. Only the attempt hash is kept
+on the hub. Connection failures after sending cause up to three automatic
+requests with the same attempt. PBS and internal errors retain the attempt for a later retry;
+a failure before sending, such as a wrong pin, leaves no enrollment journal.
+If interrupted, run the same command again; keep the journal.
+An activated setup completes on retry and keeps its encryption key.
+
+The hub bounds total join work, including waiting for another provisioning
+operation, to **180 seconds**. The computer's request timeout is **240 seconds**,
+leaving 60 seconds for response delivery. Wake-on-LAN waits at most 60 seconds
+within that budget; individual PBS requests have a 15-second timeout. State
+locks cover disk transactions only, never PBS calls, wake waits or login delays.
+Other requests remain responsive while provisioning waits. The code and
+returned secrets
 are disclosed only at creation. The PBS is woken for joining when configured;
 listings never wake it and show the last cached PBS data when it is asleep.
 
@@ -140,6 +164,42 @@ A joined name is unavailable. A name with an existing backup group requires
 explicit adoption; it can be adopted only when its owner is exactly the new
 token ID, such as `backup@pbs!desktop` after an earlier hub removal. Groups
 owned by another identity cannot be taken over with the hub's restricted role.
+
+## Replacing a lost computer
+
+1. Remove the dead computer in the hub; its snapshots stay on PBS.
+2. Create a new join code. On the replacement, run its bootstrap command with
+   `--name <old-name> --adopt` (or use the installed `nestegg join` command).
+   If replacing an existing configuration, also pass `--replace-config`.
+3. With existing snapshots and no local key, join installs configuration and
+   credentials but creates no key and starts no backup. Status/check report the
+   missing key. Install the old key with:
+
+   ```sh
+   sudo nestegg key recover --master-key /media/usb/master-private.pem --install
+   ```
+
+   Enter the master passphrase at the official client's prompt. The command
+   reports snapshot time and fingerprint, verifies the recovered key against
+   the signed manifest, installs it, and starts the first backup. One key reads
+   both old and new snapshots. It never replaces a different existing key.
+   If several key fingerprints occur in the group, it lists their time ranges
+   and requires `--snapshot <RFC3339-time>`. Without `--install`, use
+   `--output <new-file>` to export the recovered key instead.
+4. Restore a file from an old snapshot and check it. New backups use the same
+   group and recovered key. Alternatively, `sudo nestegg key create` starts a
+   new key generation; old backups then require recovery with the master key.
+
+The dead computer's token secret is gone. Access to its old group comes from
+joining again under the same name, which creates a new secret for the same
+PBS token identity. The master key alone does not grant PBS login access.
+For the plain-client recovery and restore commands, see
+[configuration](configuration.md#replacing-a-lost-computer).
+
+`--replace-config` preserves sources, excludes, schedule, registered sticks,
+notifications and other local settings. It changes only the hub's PBS target,
+backup identity, wake settings, hub association and master public key. The old
+configuration is kept beside it as `config.toml.before-join-<random>`.
 
 ## Stored data and permissions
 
@@ -161,8 +221,19 @@ State transactions use a separate lock inode, atomic replacement and directory
 fsync. Joins record a non-secret pending intent before creating a PBS token;
 a retry compensates an interrupted attempt before creating a fresh token.
 Server-side sessions expire after 30 minutes idle and disappear on restart.
-Login failures are delayed and limited by the actual peer address, not a
-forwarded header. Session cookies are `HttpOnly; Secure; SameSite=Strict`.
+Password checks use one global lane with a one-second delay per failure,
+regardless of source address. At most four login requests are admitted at
+once; excess requests receive `429` without checking a password. An admitted
+correct login can wait behind at most three failed checks (about three
+seconds), and is never refused by the per-address failure counter. Valid
+sessions bypass login throttling. Per-address failures are tracked using the
+actual peer;
+the bounded table evicts its oldest entry instead of refusing new addresses.
+Internal hub failures return `500 hub_error`; PBS failures remain
+`503 pbs_unreachable` or `pbs_refused`. Failed requests and state changes emit
+short service stderr records without request data or secrets. Packages stream
+from disk in 64 KiB chunks, with at most four concurrent downloads. Session
+cookies are `HttpOnly; Secure; SameSite=Strict`.
 Browser mutations require `X-Nestegg-Hub: 1`; the code-authorized join and
 Bearer-authorized leave endpoints need no browser session/header.
 
@@ -175,7 +246,12 @@ after changing the host/TPM, just like desktop systemd credentials.
 ## Threat model and removal
 
 A compromised hub can create tokens, read encrypted backups and add snapshots.
-Its namespace role cannot delete backups or decrypt their contents. It serves
+Its namespace role cannot delete backups or decrypt their contents. Anyone
+with the hub administrator password or the PBS household user's password can
+delete every computer's PBS token. This stops all household backups until the
+computers join again; the existing backups remain. The PBS user, as owner of
+its tokens' backup groups, may also add snapshots to any computer's group,
+including misleading snapshots. It serves
 a script and package run as root on new computers, so it can take over computers
 that join after compromise. Protect it like the PBS. Stage 1 trusts the hub's
 package checksum; checking a public release checksum is future work. Possession

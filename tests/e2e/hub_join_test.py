@@ -56,7 +56,7 @@ def ok(label, condition=True):
     print('  ok  ' + label, flush=True)
 
 
-def terminal(container, args, answers):
+def terminal(container, args, answers, succeeds=True):
     """Give the official client's password prompts their own controlling TTY."""
     pid, fd = pty.fork()
     if pid == 0:
@@ -73,7 +73,7 @@ def terminal(container, args, answers):
                 if not part:
                     break
                 pending = (pending + part)[-65536:]
-                if pending.lower().rstrip().endswith(b':') and b'password' in pending.lower():
+                if pending.lower().rstrip().endswith(b':') and (b'password' in pending.lower() or b'pass phrase' in pending.lower()):
                     if prompts >= len(answers):
                         raise RuntimeError('unexpected password prompt')
                     os.write(fd, answers[prompts].encode() + b'\n')
@@ -82,7 +82,7 @@ def terminal(container, args, answers):
             done, status = os.waitpid(pid, os.WNOHANG)
             if done:
                 pid = None
-                if os.waitstatus_to_exitcode(status):
+                if (os.waitstatus_to_exitcode(status) == 0) != succeeds:
                     raise RuntimeError('terminal operation failed; output withheld')
                 if prompts != len(answers):
                     raise RuntimeError('expected password prompts were not seen')
@@ -91,7 +91,7 @@ def terminal(container, args, answers):
             done, status = os.waitpid(pid, os.WNOHANG)
             if done:
                 pid = None
-                if os.waitstatus_to_exitcode(status) == 0 and prompts == len(answers):
+                if (os.waitstatus_to_exitcode(status) == 0) == succeeds and prompts == len(answers):
                     return
         raise RuntimeError('terminal operation failed or timed out; output withheld')
     finally:
@@ -235,6 +235,15 @@ def check_join(container, name, previous_count=0, previous_run=None):
     return machine, snapshot
 
 
+def start_desktop(container, hostname):
+    run(['docker', 'run', '-d', '-t', '--name', container, '--hostname', hostname,
+         '--network', NET, '--cgroupns=host', '--cap-add', 'SYS_ADMIN',
+         '--security-opt', 'seccomp=unconfined', '--security-opt', 'apparmor=unconfined',
+         '-v', '/sys/fs/cgroup:/sys/fs/cgroup:rw', '--tmpfs', '/run', '--tmpfs', '/run/lock', PREFIX + '-client'])
+    wait_for('systemd boot', lambda: dx(container, 'systemctl', 'is-system-running', check=False).stdout.strip()
+             in (b'running', b'degraded'))
+
+
 class References(html.parser.HTMLParser):
     def __init__(self):
         super().__init__()
@@ -278,7 +287,13 @@ try:
     # Administrator's saved PEM, before proof deletes the private hub copy.
     master_copy = dx(HUB, 'cat', '/var/lib/nestegg-hub/master/master-private.pem').stdout
     dx(HUB, 'cp', '/run/master.html', '/run/master-copy.html')
-    dx(HUB, 'nestegg', 'hub', 'master-key', 'confirm', '--file', '/run/master-copy.html', '--accept-local-copy')
+    proof_command = ['nestegg', 'hub', 'master-key', 'confirm', '--file', '/run/master-copy.html', '--accept-local-copy']
+    proof_before = dx(HUB, 'cat', '/var/lib/nestegg-hub/state.json').stdout
+    terminal(HUB, proof_command, ['wrong-disposable-passphrase'], succeeds=False)
+    ok('wrong passphrase leaves proof state and private copies unchanged', proof_before == dx(HUB, 'cat', '/var/lib/nestegg-hub/state.json').stdout and dx(HUB, 'test', '-f', '/run/master-copy.html').returncode == 0)
+    ok('wrong passphrase cannot unlock join codes', dx(HUB, 'nestegg', 'hub', 'join-code', check=False).returncode != 0)
+    terminal(HUB, proof_command, [MASTER_PASSWORD])
+    ok('recorded and supplied local master copies removed', dx(HUB, 'sh', '-c', 'test ! -e /run/master.html && test ! -e /run/master-copy.html').returncode == 0)
     ok('hub initialized with PBS preparation, package and master proof')
     ok('private master removed after proof', dx(HUB, 'test', '!', '-e',
        '/var/lib/nestegg-hub/master/master-private.pem').returncode == 0)
@@ -321,12 +336,7 @@ try:
         ok('CSP permits same-origin ' + directive,
            "'self'" in policy.get(directive, policy.get('default-src', [])))
     for container, hostname in ((FIRST, 'desktop'), (SECOND, 'portable')):
-        run(['docker', 'run', '-d', '-t', '--name', container, '--hostname', hostname,
-             '--network', NET, '--cgroupns=host', '--cap-add', 'SYS_ADMIN',
-             '--security-opt', 'seccomp=unconfined', '--security-opt', 'apparmor=unconfined',
-             '-v', '/sys/fs/cgroup:/sys/fs/cgroup:rw', '--tmpfs', '/run', '--tmpfs', '/run/lock', PREFIX + '-client'])
-        wait_for('systemd boot', lambda: dx(container, 'systemctl', 'is-system-running', check=False).stdout.strip()
-                 in (b'running', b'degraded'))
+        start_desktop(container, hostname)
         ok(hostname + ': starts with neither nestegg nor backup client', dx(container, 'sh', '-c',
            '! command -v nestegg && ! command -v proxmox-backup-client && test ! -e /etc/nestegg/config.toml').returncode == 0)
     code1 = request('/api/hub/v1/join-codes', 'POST', {}, wanted=201)
@@ -335,6 +345,7 @@ try:
     ok('one-command bootstrap completes', joined.returncode == 0)
     ok('bootstrap package downloads stay sandboxed by apt', b'unsandboxed' not in joined.stdout + joined.stderr)
     first_machine, snapshot = check_join(FIRST, 'desktop')
+    old_contents = dx(FIRST, 'cat', '/home/alice/notes.txt').stdout
     code2 = request('/api/hub/v1/join-codes', 'POST', {}, wanted=201)
     wrong_pin = 'sha256//' + 'A' * 43 + '='
     # A fresh second computer: a pin mismatch cannot install even one package.
@@ -386,11 +397,96 @@ try:
     # repeat enrollment needs replacement and same-computer adoption consent.
     reject(SECOND, 'sudo nestegg join ' + URL + ' --pin ' + PIN + ' --code ' + code3['code'] + ' --name laptop',
            'this computer is already configured')
-    rejoined = as_user(SECOND, code3['command'] + ' --name laptop --adopt --replace-config')
-    ok('second join under old name completes with explicit adoption/replacement', rejoined.returncode == 0)
+    # Kill after the activation record, before enable can start any unit.
+    write(SECOND, '/usr/local/bin/nestegg-interrupt-activation', '#!/bin/sh\nif [ "$1" = enable ]; then kill -KILL "$PPID"; exit 1; fi\nexec /usr/bin/systemctl "$@"\n')
+    dx(SECOND, 'chmod', '700', '/usr/local/bin/nestegg-interrupt-activation')
+    rejoin_command = 'sudo nestegg join ' + URL + ' --pin ' + PIN + ' --code ' + code3['code'] + ' --name laptop --adopt --replace-config'
+    interrupted = as_user(SECOND, rejoin_command.replace('sudo nestegg', 'sudo env NESTEGG_SYSTEMCTL=/usr/local/bin/nestegg-interrupt-activation nestegg'))
+    journal = dx(SECOND, 'cat', '/var/lib/nestegg/join-transaction/journal.json', check=False)
+    if journal.returncode:
+        for line in (interrupted.stdout + interrupted.stderr).splitlines():
+            if line.startswith(b'error:'): print(line.decode(errors='replace'), flush=True)
+    ok('join interrupted after durable activation', interrupted.returncode != 0 and journal.returncode == 0 and json.loads(journal.stdout)['activated'])
+    ok('interruption keeps the already-used key', key_before == dx(SECOND, 'sha256sum', '/etc/nestegg/credentials/encryption-key.cred').stdout)
+    rejoined = as_user(SECOND, rejoin_command)
+    ok('same command rolls activated setup forward', rejoined.returncode == 0)
     check_join(SECOND, 'laptop', second_machine['snapshot_count'], second_machine['report']['run'])
     ok('rejoin keeps the original sealed computer key', key_before ==
        dx(SECOND, 'sha256sum', '/etc/nestegg/credentials/encryption-key.cred').stdout)
+
+    print('== replace a lost computer on a genuinely fresh client', flush=True)
+    run(['docker', 'rm', '-f', FIRST])
+    start_desktop(FIRST, 'replacement')
+    replacement_code = request('/api/hub/v1/join-codes', 'POST', {}, wanted=201)
+    replacement = as_user(FIRST, replacement_code['command'] + ' --name desktop --adopt')
+    ok('replacement join completes and explains both key choices', replacement.returncode == 0 and b'--install' in replacement.stdout and b'key create' in replacement.stdout)
+    ok('replacement join creates no encryption key', dx(FIRST, 'sh', '-c', 'test ! -e /etc/nestegg/credentials/encryption-key && test ! -e /etc/nestegg/credentials/encryption-key.cred').returncode == 0)
+    pending_state = json.loads(dx(FIRST, 'cat', '/var/lib/nestegg/state.json').stdout)
+    ok('replacement join starts no backup', not pending_state.get('last_run') and not pending_state.get('join_backup_pending') and dx(FIRST, 'systemctl', 'is-active', '--quiet', 'nestegg-backup.service', check=False).returncode != 0)
+    ok('status reports missing encryption key', json.loads(dx(FIRST, 'nestegg', 'status', '--json').stdout)['encryption']['key_present'] is False)
+    missing_check = dx(FIRST, 'nestegg', 'check', check=False)
+    ok('check refuses missing encryption key with a reason', missing_check.returncode != 0 and b'key' in missing_check.stdout.lower())
+    write(FIRST, '/root/master-private.pem', master_copy)
+    terminal(FIRST, ['nestegg', 'key', 'recover', '--master-key', '/root/master-private.pem', '--install'], [MASTER_PASSWORD])
+    wait_for('replacement first backup after recovery', lambda: backup_finished(FIRST), 180)
+    ok('recovery installs the original key fingerprint', json.loads(dx(FIRST, 'cat', '/var/lib/nestegg/state.json').stdout)['key_fingerprint'] == original)
+    dx(FIRST, 'nestegg', 'restore', snapshot, 'home.pxar', '/root/restored-old')
+    ok('installed key restores a file from the OLD snapshot', dx(FIRST, 'cat', '/root/restored-old/alice/notes.txt').stdout == old_contents)
+    new_snapshots = json.loads(dx(FIRST, 'nestegg', 'snapshots', '--json').stdout)
+    newest = new_snapshots[0]['snapshot']
+    ok('new backup lands in the same group', len(new_snapshots) >= 2 and newest.startswith('host/desktop/') and newest != snapshot)
+    dx(FIRST, 'nestegg', 'restore', newest, 'home.pxar', '/root/restored-new')
+    ok('one installed key reads both old and new snapshots', dx(FIRST, 'cmp', '/home/alice/notes.txt', '/root/restored-new/alice/notes.txt').returncode == 0)
+
+    print('== deterministic lost enrollment response and same-command repair', flush=True)
+    # TLS passes through unchanged; the relay drops server bytes once the hub
+    # has durably enrolled the requested computer. It never reads credentials.
+    dx(HUB, 'pkill', '-u', 'nestegg-hub', '-x', 'nestegg')
+    dx(HUB, 'sed', '-i', 's/listen = "0.0.0.0:8443"/listen = "0.0.0.0:8444"/', '/etc/nestegg-hub/hub.toml')
+    write(HUB, '/run/drop_proxy.py', r'''import json,pathlib,socket,threading
+marker=pathlib.Path('/run/drop-enrollment-response')
+def connection(client):
+ upstream=socket.create_connection(('127.0.0.1',8444))
+ def pipe(source,target,reply=False):
+  try:
+   while True:
+    data=source.recv(65536)
+    if not data: break
+    if reply and marker.exists():
+     state=json.loads(pathlib.Path('/var/lib/nestegg-hub/state.json').read_text())
+     if any(m['backup_id']==marker.read_text().strip() for m in state['machines']): break
+    target.sendall(data)
+  except OSError: pass
+  finally:
+   for s in (source,target):
+    try: s.shutdown(socket.SHUT_RDWR)
+    except OSError: pass
+    s.close()
+ threading.Thread(target=pipe,args=(client,upstream),daemon=True).start()
+ threading.Thread(target=pipe,args=(upstream,client,True),daemon=True).start()
+listener=socket.socket();listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);listener.bind(('0.0.0.0',8443));listener.listen()
+while True:
+ client,_=listener.accept();threading.Thread(target=connection,args=(client,),daemon=True).start()
+''')
+    run(['docker', 'exec', '-d', '-u', 'nestegg-hub', '-e', 'CREDENTIALS_DIRECTORY=/run/hub-credentials', HUB, 'nestegg', 'hub', 'serve'])
+    run(['docker', 'exec', '-d', HUB, 'python3', '/run/drop_proxy.py'])
+    wait_for('relayed hub', lambda: dx(HUB, 'curl', '-skf', '--pinnedpubkey', PIN, URL + '/', check=False).returncode == 0)
+    # Sessions are intentionally in memory and vanish on a hub restart.
+    request('/api/hub/v1/session', 'POST', {'password': hub_password}, wanted=204)
+    lost_code = request('/api/hub/v1/join-codes', 'POST', {}, wanted=201)
+    write(HUB, '/run/drop-enrollment-response', 'response-lost')
+    repair_command = 'sudo nestegg join ' + URL + ' --pin ' + PIN + ' --code ' + lost_code['code'] + ' --name response-lost --replace-config'
+    lost = as_user(FIRST, repair_command)
+    ok('lost response leaves a repairable client journal', lost.returncode != 0 and dx(FIRST, 'test', '-f', '/var/lib/nestegg/join-transaction/journal.json').returncode == 0)
+    enrolled = next(m for m in json.loads(dx(HUB, 'cat', '/var/lib/nestegg-hub/state.json').stdout)['machines'] if m['backup_id'] == 'response-lost')
+    dx(HUB, 'rm', '/run/drop-enrollment-response')
+    previous_run = json.loads(dx(FIRST, 'cat', '/var/lib/nestegg/state.json').stdout).get('last_run', {}).get('id')
+    repair = as_user(FIRST, repair_command)
+    ok('running the SAME command repairs a lost response', repair.returncode == 0)
+    repaired = [m for m in machines()['machines'] if m['backup_id'] == 'response-lost']
+    ok('repair retains one enrollment and its machine identity', len(repaired) == 1 and repaired[0]['machine_id'] == enrolled['machine_id'])
+    wait_for('repaired enrollment backup', lambda: backup_finished(FIRST, previous_run), 180)
+    ok('repaired enrollment completes a backup')
     print(f'== result: {passed} passed, 0 failed; {time.monotonic() - started:.1f} seconds', flush=True)
 finally:
     for container in (FIRST, SECOND, HUB, PBS):

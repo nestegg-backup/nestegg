@@ -5,13 +5,16 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 bin="$(realpath "${1:-$repo/target/debug/nestegg}")"
-net="nestegg-master-e2e-$$"
-pbs="nestegg-master-e2e-pbs-$$"
-client="nestegg-master-e2e-client-$$"
-client_image="nestegg-e2e-client:ubuntu-24.04"
+e2e_id="$$-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+net="nestegg-master-e2e-$e2e_id"
+pbs="nestegg-master-e2e-pbs-$e2e_id"
+client="nestegg-master-e2e-client-$e2e_id"
+client_image="$net-client-image"
+export NESTEGG_E2E_PBS_IMAGE="$net-pbs-image"
 cleanup() {
   docker rm -f "$client" "$pbs" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
+  docker image rm "$client_image" "$NESTEGG_E2E_PBS_IMAGE" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 source "$here/lib.sh"
@@ -70,8 +73,12 @@ original_fingerprint="$(on_client proxmox-backup-client key show /root/original.
 on_client rm -f /etc/nestegg/credentials/encryption-key /etc/nestegg/credentials/encryption-key.cred
 recover() {
   local output="$1"; shift
-  printf '%s\n' "$master_password" | docker exec -i "$client" timeout 60 script -qec \
-    "nestegg key recover --master-key /root/master/master-private.pem --output '$output' $*" /dev/null >/dev/null
+  local destination="--output '$output'"
+  [[ "$output" != --install ]] || destination=--install
+  local diagnostic status=0
+  diagnostic="$(printf '%s\n' "$master_password" | docker exec -i "$client" timeout 60 script -qec \
+    "nestegg key recover --master-key /root/master/master-private.pem $destination $*" /dev/null)" || status=$?
+  if [[ $status -ne 0 ]]; then printf '%s\n' "$diagnostic" | sed -n '/^error:/p'; return "$status"; fi
 }
 check 'recover newest snapshot with terminal password prompt' recover /root/recovered.json
 check 'recover explicit snapshot time' recover /root/recovered-explicit.json --snapshot "${snapshot##*/}"
@@ -99,4 +106,21 @@ on_client mv /etc/nestegg/master-public.pem /etc/nestegg/master-public.saved
 check 'missing master public key blocks backups' fails_with 1 'master public key file.*missing' on_client nestegg run --trigger manual
 check 'missing master key is null in the API status' on_client bash -c 'nestegg status --json | grep -q '"'"'"master_key": null'"'"''
 on_client mv /etc/nestegg/master-public.saved /etc/nestegg/master-public.pem
+# A deliberately new key generation in the same disposable group must not
+# silently hide the old key behind the newest snapshot.
+on_client nestegg key create --force --allow-plain >/dev/null
+check 'a new key generation can back up with master coverage' on_client nestegg run --trigger manual
+check 'mixed key generations require an explicit snapshot' fails_with 1 'more than one key.*--snapshot' \
+  on_client nestegg key recover --master-key /root/master/master-private.pem --output /root/ambiguous.json
+check 'mixed-key refusal writes no recovered key' on_client test ! -e /root/ambiguous.json
+
+installed_before="$(on_client sha256sum /etc/nestegg/credentials/encryption-key)"
+check 'install refuses a different existing encryption key' fails_with 1 'different encryption key already exists' \
+  recover --install --snapshot "${snapshot##*/}"
+check 'refused install leaves the existing key unchanged' test "$installed_before" = "$(on_client sha256sum /etc/nestegg/credentials/encryption-key)"
+
+check 'an explicit old snapshot still recovers its original key' recover /root/old-again.json --snapshot "${snapshot##*/}"
+old_again_fingerprint="$(on_client proxmox-backup-client key show /root/old-again.json --output-format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["fingerprint"])')"
+check 'explicit recovery names the original fingerprint' test "$old_again_fingerprint" = "$original_fingerprint"
+
 result

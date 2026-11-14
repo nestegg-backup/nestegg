@@ -45,7 +45,7 @@ def ok(label, condition=True):
     print('  ok  ' + label, flush=True)
 
 
-def init_with_terminal(args):
+def init_with_terminal(args, expected_prompts=2):
     pid, terminal = pty.fork()
     if pid == 0:
         os.execvp('docker', ['docker', 'exec', '-it', hub, *args])
@@ -62,9 +62,9 @@ def init_with_terminal(args):
                 if not part:
                     break
                 pending = (pending + part)[-32768:]
-                if pending.lower().rstrip().endswith(b':') and b'password' in pending.lower():
+                if pending.lower().rstrip().endswith(b':') and (b'password' in pending.lower() or b'pass phrase' in pending.lower()):
                     prompts += 1
-                    if prompts > 2:
+                    if prompts > expected_prompts:
                         raise RuntimeError('unexpected master-key prompt')
                     os.write(terminal, b'e2e-disposable-master-passphrase\n')
                     pending = b''
@@ -83,7 +83,7 @@ def init_with_terminal(args):
                 if line.startswith('error:'):
                     print(line, file=sys.stderr)
             raise RuntimeError('hub init failed')
-        ok('master password passed directly through terminal', prompts == 2)
+        ok('master password passed directly through terminal', prompts == expected_prompts)
     finally:
         os.close(terminal)
 
@@ -92,6 +92,8 @@ pin = None
 
 
 def request(path, method='GET', body=None, session=True, header=True, bearer_file=None, wanted=200):
+    if path == '/api/hub/v1/join' and body is not None:
+        body.setdefault('attempt', secrets.token_urlsafe(32))
     args = ['curl', '-fsS' if wanted < 400 else '-sS', '-k', '--pinnedpubkey', pin,
             '-w', '\n%{http_code}', '-X', method]
     if session:
@@ -115,19 +117,19 @@ def request(path, method='GET', body=None, session=True, header=True, bearer_fil
 
 try:
     print('== disposable PBS and hub', flush=True)
-    for image in ['nestegg-e2e-pbs', 'nestegg-e2e-client:debian-trixie']:
+    for image in [prefix + '-pbs-image', prefix + '-client-image']:
         if run(['docker', 'image', 'inspect', image], check=False).returncode:
-            dockerfile = 'pbs.Dockerfile' if image == 'nestegg-e2e-pbs' else 'client.Dockerfile'
+            dockerfile = 'pbs.Dockerfile' if image == prefix + '-pbs-image' else 'client.Dockerfile'
             args = ['docker', 'build', '-q', '-t', image, '-f', str(here / dockerfile)]
             if dockerfile == 'client.Dockerfile':
                 args += ['--build-arg', 'BASE=debian:trixie']
             run(args + [str(here)])
     run(['docker', 'network', 'create', '--internal', net])
     run(['docker', 'run', '-d', '--name', pbs, '--hostname', 'pbs', '--network', net,
-         '--network-alias', 'pbs.example.com', '--tmpfs', '/run', 'nestegg-e2e-pbs'])
+         '--network-alias', 'pbs.example.com', '--tmpfs', '/run', prefix + '-pbs-image'])
     run(['docker', 'run', '-d', '--name', hub, '--network', net, '--network-alias', 'hub.example.com',
          '--tmpfs', '/run', '-v', binary + ':/usr/local/bin/nestegg:ro',
-         'nestegg-e2e-client:debian-trixie', 'sleep', 'infinity'])
+         prefix + '-client-image', 'sleep', 'infinity'])
     for _ in range(120):
         if dx(pbs, 'curl', '-skf', 'https://127.0.0.1:8007/api2/json/ping', check=False).returncode == 0:
             break
@@ -165,7 +167,7 @@ try:
     pending_master['master']['paper_written'] = False
     write(hub, '/var/lib/nestegg-hub/state.json', json.dumps(pending_master))
     dx(hub, 'cp', '/run/master.html', '/run/master-copy.html')
-    dx(hub, 'nestegg', 'hub', 'master-key', 'confirm', '--file', '/run/master-copy.html', '--accept-local-copy')
+    init_with_terminal(['nestegg', 'hub', 'master-key', 'confirm', '--file', '/run/master-copy.html', '--accept-local-copy'], 1)
     ok('interrupted master output resumes before proof', json.loads(dx(hub, 'cat', '/var/lib/nestegg-hub/state.json').stdout)['master']['paper_written'])
     ok('proof removes private master key', dx(hub, 'test', '!', '-e', '/var/lib/nestegg-hub/master/master-private.pem').returncode == 0)
     # Simulate PID 1's LoadCredential* delivery, then actually run as the
@@ -193,9 +195,8 @@ try:
     paper = dx(hub, 'cat', '/run/master-repeat.html').stdout.decode()
     paper_code = re.search(r'Check code:</td><td><b[^>]*>([0-9A-F-]+)', paper).group(1)
     repeat = ['nestegg', 'hub', '--config', '/etc/nestegg-hub-repeat/hub.toml', 'master-key', 'confirm']
-    ok('paper code needs removal of remembered local file', dx(hub, *repeat, '--paper-code', paper_code, '--printed', check=False).returncode != 0)
-    dx(hub, 'rm', '/run/master-repeat.html')
-    dx(hub, *repeat, '--paper-code', paper_code, '--printed')
+    init_with_terminal([*repeat, '--paper-code', paper_code, '--printed'], 1)
+    ok('recorded local paper file removed', dx(hub, 'test', '!', '-e', '/run/master-repeat.html').returncode == 0)
     ok('printed paper code proves master key after file removal')
     serve = subprocess.Popen(['docker', 'exec', '-u', 'nestegg-hub', '-e', 'CREDENTIALS_DIRECTORY=/run/hub-credentials', hub,
                               'nestegg', 'hub', 'serve'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -208,6 +209,7 @@ try:
     ok('HTTPS service runs as dedicated unprivileged account')
     ok('no session is unauthorized', request('/api/hub/v1/hub', session=False, wanted=401)['code'] == 'unauthorized')
     ok('login requires custom header', request('/api/hub/v1/session', 'POST', {'password': hub_password}, session=False, header=False, wanted=401)['code'] == 'unauthorized')
+    request('/api/hub/v1/session', 'POST', {'password': 'wrong-disposable-password'}, wanted=401)
     request('/api/hub/v1/session', 'POST', {'password': hub_password}, wanted=204)
     cookie = dx(hub, 'cat', '/run/hub-cookie').stdout.decode()
     ok('session cookie flags', '#HttpOnly_' in cookie and '\tTRUE\t' in cookie)
@@ -221,7 +223,12 @@ try:
     ok('codes stored/listed only as hashes', code['code'] not in json.dumps(listing))
     state = dx(hub, 'cat', '/var/lib/nestegg-hub/state.json').stdout
     ok('raw code absent from disk state', code['code'].encode() not in state)
-    joined = request('/api/hub/v1/join', 'POST', {'code': code['code'], 'hostname': 'desktop'}, session=False, header=False)
+    enrollment = {'code': code['code'], 'hostname': 'desktop'}
+    joined = request('/api/hub/v1/join', 'POST', enrollment, session=False, header=False)
+    again = request('/api/hub/v1/join', 'POST', enrollment, session=False, header=False)
+    ok('same attempt repairs a lost response and rotates credential', joined['machine_id'] == again['machine_id'] and joined['machine_credential'] != again['machine_credential'])
+    joined = again
+    ok('new group has zero existing snapshots', joined['existing_snapshots'] == 0)
     ok('join returns correct PBS token identity', joined['pbs']['auth_id'] == 'backup@pbs!desktop')
     ok('machine credential has 256 bits', len(joined['machine_credential']) == 64)
     request('/api/hub/v1/join', 'POST', {'code': code['code'], 'hostname': 'second'}, session=False, wanted=403)
@@ -283,6 +290,7 @@ try:
     ok('removal revokes machine credential')
     ok('existing backup requires adoption', request('/api/hub/v1/join', 'POST', {'code': code2['code'], 'hostname': 'desktop'}, wanted=409)['code'] == 'name_exists_on_pbs')
     rejoined = request('/api/hub/v1/join', 'POST', {'code': code2['code'], 'hostname': 'desktop', 'adopt': True})
+    ok('adoption reports existing snapshot count', rejoined['existing_snapshots'] == 1)
     ok('same token identity adopts its former backup group', rejoined['pbs']['auth_id'] == joined['pbs']['auth_id'])
     write(hub, '/run/machine-auth', 'Authorization: Bearer ' + rejoined['machine_credential'] + '\n')
     request('/api/hub/v1/machines/self/leave', 'POST', session=False, header=False, bearer_file='/run/machine-auth', wanted=204)
@@ -292,7 +300,7 @@ try:
     request('/api/hub/v1/session', 'POST', {'password': hub_password}, wanted=204)
     dx(hub, 'nestegg', 'hub', 'password', '--password-file', '/run/hub-admin-password')
     ok('CLI password change revokes live sessions', not request('/api/hub/v1/session')['logged_in'])
-    print(f'== result: {passed} passed, 0 failed', flush=True)
+    sensitive_values = [hub_password, admin_pw, joined['pbs']['secret'], joined['machine_credential'], code['code'], enrollment['attempt']]
 finally:
     if serve is not None:
         serve.terminate()
@@ -301,3 +309,12 @@ finally:
     run(['docker', 'network', 'rm', net], check=False)
     if serve is not None:
         serve.wait(timeout=15)
+        service_log = serve.stderr.read()
+        if 'sensitive_values' in globals():
+            ok('service log excludes passwords, codes, attempts and credentials', all(v.encode() not in service_log for v in sensitive_values))
+            ok('service logs failed requests and state changes', all(event in service_log for event in [b'hub request failed', b'hub login failed', b'hub computer joined', b'hub computer removed', b'hub join code created', b'hub join code revoked']))
+
+    for image in (prefix + '-pbs-image', prefix + '-client-image'):
+        run(['docker', 'image', 'rm', image], check=False)
+
+print(f'== result: {passed} passed, 0 failed', flush=True)

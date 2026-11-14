@@ -9,16 +9,19 @@ here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 bin="${1:-$repo/target/debug/nestegg}"
 base="${2:-ubuntu:24.04}"
-net="nestegg-e2e-$$"
-pbs="nestegg-e2e-pbs-$$"
-client="nestegg-e2e-client-$$"
-wol="nestegg-e2e-wol-$$"
-client_image="nestegg-e2e-client:$(echo "$base" | tr ':/' '--')"
+e2e_id="$$-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+net="nestegg-e2e-$e2e_id"
+pbs="nestegg-e2e-pbs-$e2e_id"
+client="nestegg-e2e-client-$e2e_id"
+wol="nestegg-e2e-wol-$e2e_id"
+client_image="$net-client-image"
 
+export NESTEGG_E2E_PBS_IMAGE="$net-pbs-image"
 cleanup() {
   [[ -n "${KEEP:-}" ]] && { echo "(KEEP set: containers $pbs $client left running)"; return; }
   docker rm -f "$pbs" "$client" "$wol" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
+  docker image rm "$client_image" "$NESTEGG_E2E_PBS_IMAGE" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 [[ -x "$bin" ]] || { echo "nestegg binary not found: $bin (run cargo build first)"; exit 2; }
