@@ -103,6 +103,15 @@ Windows and macOS are not planned: nestegg is a Linux system service
 built on Linux mechanisms, and it must not reimplement the PBS protocol;
 whether an official client exists for those systems has not been checked.
 
+## v0.5 – Hub (decided, not implemented)
+
+- One instance in the home network that manages the backups of all
+  computers; adding a computer is one command. The hub is never in the data
+  path, creates the PBS token of each computer itself and replaces the key
+  copy per computer by one household master key.
+- Decision and stages: `docs/decisions/0034-hub.md`. Publication waits for
+  stages 1 and 2.
+
 ## Not planned
 
 - An allowed time window for backups and the desktop keyring as a credential
