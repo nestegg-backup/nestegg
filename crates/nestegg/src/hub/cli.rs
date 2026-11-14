@@ -143,6 +143,7 @@ pub fn run(args: Args) -> Result<u8> {
                     t.state.admin_hash = crypto::password_hash(password.as_bytes())?;
                     t.state.password_generation = crypto::random_secret();
                     t.save()?;
+                    eprintln!("hub administrator password changed");
                     println!("Administrator password changed; existing sessions are revoked.");
                 }
                 Command::Package {
@@ -250,6 +251,9 @@ fn password(file: Option<&Path>, label: &str, twice: bool) -> Result<Secret> {
         bytes.pop();
     }
     ensure!(!bytes.is_empty(), "password must not be empty");
+    if twice {
+        validate_admin_password(&bytes)?;
+    }
     Ok(Secret::new(bytes))
 }
 
@@ -297,6 +301,12 @@ fn init_hub(runtime: &tokio::runtime::Runtime, path: &Path, args: Init) -> Resul
         }),
     };
     config.validate()?;
+    let admin_password = password(
+        args.admin_password_file.as_deref(),
+        "Hub administrator password",
+        true,
+    )?;
+
     if config.pbs.fingerprint.is_none() && !args.system_roots {
         let fp = super::tls::discover(&config.pbs.server, config.pbs.port)?;
         println!("PBS certificate SHA-256: {fp}");
@@ -343,11 +353,6 @@ fn init_hub(runtime: &tokio::runtime::Runtime, path: &Path, args: Init) -> Resul
             false,
         )?
     };
-    let admin_password = password(
-        args.admin_password_file.as_deref(),
-        "Hub administrator password",
-        true,
-    )?;
     let mut client = super::pbs::Client::new(&config.pbs)?;
     runtime
         .block_on(async {
@@ -433,4 +438,22 @@ fn assign_state_owner(config: &Config) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn validate_admin_password(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        std::str::from_utf8(bytes)?.chars().count() >= 12,
+        "administrator password must contain at least 12 characters"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn administrator_password_requires_twelve_characters() {
+        assert!(super::validate_admin_password(b"short").is_err());
+        assert!(super::validate_admin_password(b"twelve-chars").is_ok());
+        assert!(super::validate_admin_password("1234567890é".as_bytes()).is_err());
+    }
 }
