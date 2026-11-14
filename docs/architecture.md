@@ -111,7 +111,8 @@ support are prerequisites. The desktop pipeline uses this handle for the stick t
    `--change-detection-mode`, rate limit. The encryption key (`--keyfd`) and the
    token secret (`PBS_PASSWORD_FD`) are handed over on file descriptors; no
    secret is ever a command-line argument or written to a log.
-6. Read the snapshot back: all archives listed, metadata blob and
+6. Read the snapshot back: all archives listed (also `rsa-encrypted.key.blob`
+   when a master public key is configured), metadata blob and
    inventory restored and identical; otherwise `verification_failed`. Then
    record the snapshots the server's own verification marked as failed
    ([decision 0015](decisions/0015-complete-and-verified-backups.md)).
@@ -127,6 +128,8 @@ support are prerequisites. The desktop pipeline uses this handle for the stick t
 | Path | Content |
 |---|---|
 | `/etc/nestegg/config.toml` | Configuration (no secrets). Written by `nestegg init` and, for the settings of decision 0013, by the daemon (only the touched keys, atomically). |
+| `/etc/nestegg/master-public.pem` | Household RSA master public key; every encrypted target receives `--master-pubkey-file`. Only its matching, proven hub key covers the key-copy gate. |
+| `/var/lib/nestegg/join-transaction/` | Private, durable undo journal for interrupted join; removed after successful setup or rollback. |
 | `/etc/nestegg/credentials/` | Encrypted credentials (`*.cred`, `systemd-creds`) or root-only plain files. |
 | `/var/lib/nestegg/stick/pbs.squashfs` | Desktop-trusted PBS root copied only from a verified release ISO by stick create/update/add. |
 | `/var/lib/nestegg/state.json` | Last run, last success, next run. |
@@ -146,6 +149,9 @@ support are prerequisites. The desktop pipeline uses this handle for the stick t
 
 | Path | Owner | Content |
 |---|---|---|
+| `crates/nestegg/src/join.rs` | computer | Transactional computer enrollment, service activation, leave and local forced detach. |
+| `crates/nestegg/src/pinned.rs` | computer | Bounded hyper/tokio-rustls HTTPS client; ring verifies signatures, SPKI pin alone authenticates the hub. |
+| `crates/nestegg/src/masterkey.rs` | computer | Master public-key fingerprint/proof gate and recovery through the official client. |
 | `crates/nestegg/` | core | Rust binary: CLI, run pipeline, daemon, UI server. |
 | `api/openapi.yaml` | core (changes reviewed by UI) | HTTP API contract. |
 | `ui/` | UI | Web UI source; build output `ui/dist/` is embedded into the binary. |
@@ -176,3 +182,27 @@ history pointers, retry time, free space and password reminders.
 `POST /targets/stick/runs` starts a manual stick backup. Existing top-level status
 fields remain available. See [0026](decisions/0026-desktop-stick-target.md) and the
 single API authority, `api/openapi.yaml`.
+
+## Computer enrollment (decision 0034, stage 1)
+
+The computer contacts only `POST /join` and `POST /machines/self/leave` of
+`api/hub-openapi.yaml`; the hub is never contacted by the backup pipeline.
+`join.rs` stages both credentials through the existing secret store and keeps
+existing encryption keys untouched. It publishes config only after credentials,
+master public key and key proof are installed. A durable undo journal restores
+prior files and service states after failures; a rerun recovers interrupted
+setup before contacting the hub for a new join. A successful join commits by
+renaming that journal before removing its private backup files. Remote joins
+whose response never arrives cannot be rolled back without a credential; the
+command and configuration guide explain checking the hub in that case.
+
+`State.master_key` is independent of `key_exported_digest`. `masterkey::covered`
+requires hub membership, the recorded proof and a public file whose DER SPKI
+fingerprint matches; the pipeline checks the exact loaded key's own proof or
+this master-key proof (or the existing stick-only proof). Both remote and stick
+clients add `--master-pubkey-file`; read-back requires the RSA recovery blob.
+The additive local API exposes `Status.hub` and `Status.encryption.master_key`
+without redefining `key_exported`. Leaving revokes the hub token and removes
+its local secret, so network backups require joining again or standalone setup;
+this follows the explicit stage-1 leave contract rather than decision 0034's
+earlier statement that leaving continues backups with that token.

@@ -1,6 +1,120 @@
 # Configuration and setup
 
-## Quick start
+## Joining a hub
+
+If your household has a nestegg hub, install the nestegg package and the official
+backup client, then copy the command from **Add computer** in the hub:
+
+```sh
+sudo nestegg join https://hub.example.com:8443 --pin 'sha256//<PIN>' --code '<CODE>'
+```
+
+The one-time code lasts 30 minutes. The pin is the SHA-256 of the certificate's
+DER SubjectPublicKeyInfo, encoded as `sha256//` plus base64, exactly like
+`curl --pinnedpubkey`. The pin alone authenticates the connection, including a
+self-signed certificate; certificate-authority trust is not used. If the pin
+differs, stop and check both the address and pin with the hub administrator.
+Never accept a replacement pin just because a connection failed.
+
+Join writes the PBS settings and Wake-on-LAN defaults, stores the PBS token and
+machine credential, and creates an encryption key only if none is already
+stored. It enables the local interface daemon and the backup and notification
+timers, adds the user who called sudo to group `nestegg`, and starts the first
+backup in the background. Full system backup is on, with the same sources,
+excludes and daily rhythm as `nestegg init`. Open the interface with `nestegg ui`
+after logging out and back in so the new group membership applies. The first
+backup can take hours; follow it with `nestegg status`.
+
+The computer is protected by the household's proven master key copy. The public
+part is stored at `/etc/nestegg/master-public.pem`, and every snapshot includes
+an RSA-encrypted copy of this computer's encryption key. nestegg checks that
+this public key still matches the fingerprint recorded at join; a missing or
+changed file stops master-key coverage and is explained by `nestegg check`,
+`nestegg key show` and `nestegg status`. Your own key export and paper key remain
+available as independent protection. `encryption.key_exported` still means your
+own key copy is proven, even when `encryption.master_key` supplies coverage.
+The hub never receives either the computer's key or the private master key.
+
+Use `--name <backup-id>` to choose a name instead of the short host name (1–64
+letters, digits, `-`, `_`, `.`). If the PBS already has that backup group, use
+`--adopt` only for **the same computer**, keeping or importing its original
+encryption key first. Adopting another computer's backups does not make them
+yours or recover its encryption key.
+
+An existing configuration is refused. Normally leave its old hub first. With
+`--replace-config` you explicitly replace the configuration and PBS token while
+keeping the existing encryption key byte for byte; join never replaces or
+deletes an existing key, even if it cannot be decrypted. A configuration from a
+previous hub may still have a registration there: remove it in that hub if you
+replace the configuration instead of leaving first.
+
+Setup stages credentials and keeps a private undo journal at
+`/var/lib/nestegg/join-transaction/`. A failure restores the previous local files
+and service states and asks the hub to remove the new registration. After a
+crash, rerun join to finish this cleanup before starting another enrollment.
+If cleanup cannot reach the hub, the journal retains the credential needed to
+retry. If a connection is lost before the join response arrives, only the hub
+can tell whether the one-time code was consumed: check its computer list and
+remove a newly registered entry before trying again with a new code.
+
+```sh
+sudo nestegg leave          # revoke the PBS token and detach this computer
+sudo nestegg leave --force  # detach locally if the hub cannot confirm removal
+```
+
+Existing backups and the encryption key stay. The local PBS token secret is
+removed too, so this computer no longer backs up to that PBS target until it
+joins again or receives its own token through the standalone setup below.
+`--force` may leave the registration and PBS token on the hub; ask its
+administrator to remove them. Backup sticks and their data are retained.
+
+### Recovering a computer key with the master key
+
+With the computer's PBS login configured and the administrator's private master
+key available on a separate medium:
+
+```sh
+sudo nestegg key recover --master-key /media/usb/master-private.pem --output recovered.json
+# An older snapshot: add --snapshot 2026-11-14T12:00:00Z
+sudo nestegg key import recovered.json
+```
+
+The newest finished snapshot is used by default. The master key's password
+prompt belongs directly to the official client; nestegg does not read or store
+the password. The recovered key is checked against the signed snapshot manifest,
+written as a private file without a password, and accepted by `nestegg key
+import`. An existing output file is never overwritten. Keep this recovered file
+safe, and prove an independent copy if you use the computer without its hub.
+A PBS login is still needed: the master key decrypts backups but does not log in
+to the server.
+
+Backups remain restorable without nestegg. On a Linux computer with only the
+official client, enter the PBS token secret when prompted (or use its supported
+password file/descriptor), then run:
+
+```sh
+export PBS_REPOSITORY='backup@pbs!desktop@pbs.example.com:8007:backups'
+export PBS_FINGERPRINT='<FINGERPRINT>'  # omit for a CA-trusted PBS certificate
+proxmox-backup-client snapshot list host/desktop --ns desktops
+# Choose a snapshot time from that list:
+snapshot='host/desktop/2026-11-14T12:00:00Z'
+umask 077
+proxmox-backup-client restore "$snapshot" rsa-encrypted.key ./rsa-encrypted.key --ns desktops
+proxmox-backup-client key import-with-master-key ./recovered.json \
+  --master-keyfile /media/usb/master-private.pem \
+  --encrypted-keyfile ./rsa-encrypted.key --kdf none
+proxmox-backup-client restore "$snapshot" system.pxar ./restored \
+  --keyfile ./recovered.json --ns desktops
+```
+
+Omit `--ns desktops` when no namespace is configured; choose the actual data
+archive (`system.pxar`, `home.pxar`, ...) for the final command. The server lists
+the recovery blob as `rsa-encrypted.key.blob`; the restore command uses
+`rsa-encrypted.key`. Only the private master key can decrypt that envelope.
+Anyone holding it and PBS read access can recover every household computer's
+key, so keep it away from the hub and the computers it protects.
+
+## Quick start (standalone)
 
 On the PBS (once per machine, in the PBS web UI or shell):
 
@@ -471,6 +585,15 @@ Stored in `/etc/nestegg/credentials/` (mode 0700):
 | `password.cred` / `password` | Password or API token secret |
 | `overview-password.cred` / `overview-password` | Secret of the optional read-only overview token |
 | `encryption-key.cred` / `encryption-key` | Encryption key (`proxmox-backup-client` key file without password) |
+| `machine-credential.cred` / `machine-credential` | Computer's Bearer credential for its hub; written by join and removed by leave |
+
+The hub's public key is not a secret: `/etc/nestegg/master-public.pem` is
+readable but only root may change it. `[backup] master_public_key` selects that
+file for **both** PBS and stick backups. `[hub]` records `name`, `url`, `pin` and
+`machine_id`, never the credential. The key state in
+`/var/lib/nestegg/state.json` records `master_key.fingerprint` and
+`master_key.proven_at`; only a joined computer whose public file still matches
+that proof gets master-key coverage.
 
 `*.cred` files are encrypted with `systemd-creds` (systemd 250 or newer). They
 are sealed to this computer's TPM when it has one, plus systemd's host key
@@ -479,7 +602,8 @@ changes and firmware updates do not make them unreadable
 ([decision 0008](decisions/0008-credentials-without-pcr-binding.md)). If the
 TPM is present but not usable, the host key alone is used. Without
 `systemd-creds` (e.g. Ubuntu 22.04 / Linux Mint 21 with systemd 249), pass
-`--allow-plain` to store a root-only file instead. Secrets reach
+`--allow-plain` to store a root-only file instead. Join automatically uses this
+root-only fallback when systemd-creds is unavailable. Secrets reach
 `proxmox-backup-client` through inherited file descriptors, never via command
 line arguments, environment values or logs.
 
@@ -494,7 +618,8 @@ sudo nestegg key import /media/usb/nestegg-key.json
 **The encryption key is the only way to read encrypted backups.** If it only
 exists on this computer and the disk fails, the backups are lost. That is why
 backups refuse to run until `nestegg key confirm-exported` was executed with
-proof that a copy exists (below). The reasoning is in
+proof that a copy exists (below), or a joined hub supplies a proven master-key
+copy and its configured public key still matches the recorded fingerprint. The reasoning is in
 [decisions/0018](decisions/0018-key-export-must-be-proven.md).
 
 ### Exporting and proving the key
