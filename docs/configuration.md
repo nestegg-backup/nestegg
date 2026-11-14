@@ -2,12 +2,17 @@
 
 ## Joining a hub
 
-If your household has a nestegg hub, install the nestegg package and the official
-backup client, then copy the command from **Add computer** in the hub:
+If your household has a nestegg hub, copy the command from **Add computer**
+in the hub. It installs nestegg and the official backup client, then joins:
 
 ```sh
-sudo nestegg join https://hub.example.com:8443 --pin 'sha256//<PIN>' --code '<CODE>'
+curl -fsSk --pinnedpubkey 'sha256//<PIN>' https://hub.example.com:8443/join.sh \
+  | sudo sh -s -- '<CODE>'
 ```
+
+The bootstrap needs `curl` and `sudo` already installed. If nestegg and the
+backup client are already installed, `sudo nestegg join <url> --pin <pin>
+--code <code>` joins directly.
 
 The one-time code lasts 30 minutes. The pin is the SHA-256 of the certificate's
 DER SubjectPublicKeyInfo, encoded as `sha256//` plus base64, exactly like
@@ -65,6 +70,9 @@ sudo nestegg leave --force  # detach locally if the hub cannot confirm removal
 Existing backups and the encryption key stay. The local PBS token secret is
 removed too, so this computer no longer backs up to that PBS target until it
 joins again or receives its own token through the standalone setup below.
+Rejoining this same computer under its old name needs a fresh code and
+`--name <old-name> --adopt --replace-config`: the retained configuration and
+backup group each require explicit consent.
 `--force` may leave the registration and PBS token on the hub; ask its
 administrator to remove them. Backup sticks and their data are retained.
 

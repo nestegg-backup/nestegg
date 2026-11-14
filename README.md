@@ -49,12 +49,13 @@ cargo test                                   # unit and integration tests
 cargo clippy --all-targets -- -D warnings
 cargo build && tests/e2e/run.sh              # real PBS + client in containers
 cargo deb -p nestegg && tests/e2e/systemd.sh # package + systemd services
+tests/e2e/hub-join.sh target/debian/nestegg_<version>_amd64.deb # real one-command hub onboarding
 tests/e2e/upgrade.sh old.deb new.deb         # package upgrade, remove, purge
 ```
 
 The end-to-end scripts start a disposable Proxmox Backup Server from the
 official packages in Docker; nothing outside the containers is touched.
-`systemd.sh` and `upgrade.sh` need the host cgroup namespace and run their
+`systemd.sh`, `hub-join.sh` and `upgrade.sh` need the host cgroup namespace and run their
 systemd container with `CAP_SYS_ADMIN` and without seccomp/AppArmor
 confinement (so the units' sandboxing really applies); only run them on a
 disposable machine or CI runner. `upgrade.sh` installs the old package, backs

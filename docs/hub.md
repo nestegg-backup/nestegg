@@ -105,7 +105,7 @@ isolated instances; adjust the unit's state path and credential sources too.
 
 Open the hub URL in a browser and log in with the administrator password.
 Browser trust of a self-signed certificate must be established separately;
-CLI clients pin its public key. The UI lane supplies `hub.html`; a build
+CLI clients pin its public key. The UI build supplies `hub.html`; a build
 without it displays a small placeholder while the API remains available.
 The hub embeds `ui/dist/hub.html` and its assets from the same build directory
 as the local interface. A normal multi-page Vite build must retain
@@ -189,12 +189,44 @@ requires the PBS to answer; a failure leaves the computer recorded for retry.
 An administrator removal does not contact the computer. Its next backup fails
 until it rejoins with a fresh code. Stage 1's machine-authenticated leave has the
 same token-revoking behavior as administrator removal, as specified by the API.
+Leaving also removes the local token secret, so backups stop until the computer
+joins again or receives its own token with `nestegg init`. The encryption key
+and configuration are kept. To rejoin the same computer under its old name,
+append `--name <old-name> --adopt --replace-config` to a fresh bootstrap
+command; the existing encryption key is kept.
 
-Two requirements need reconciliation at integration. The authoritative bootstrap
+One requirement needs reconciliation. The authoritative bootstrap
 command and `nestegg join --code` interface carry the one-time code in process
 arguments; this conflicts with a blanket ban on codes in arguments. The hub
 follows that required interface, while passwords, token secrets and machine
 credentials never enter process arguments. Removing code arguments requires a
-coordinated bootstrap/computer CLI contract change. Also, decision 0034 says a
-leaving computer keeps backing up, but the API explicitly revokes its PBS token;
-stage 1 implements the API's revocation semantics.
+coordinated bootstrap/computer CLI contract change.
+
+## End-to-end onboarding check
+
+Build the UI and package as described in
+[configuration](configuration.md), then run:
+
+```sh
+tests/e2e/hub-join.sh target/debian/nestegg_<version>_amd64.deb
+```
+
+The test creates its own uniquely named images, network, PBS, unprivileged hub
+and two fresh systemd desktops, and removes them on exit, including failures.
+It needs Docker and the same disposable-machine privileges as `systemd.sh`.
+Only the desktops' bootstrap installs the backup client and nestegg. The test
+uses the exact returned command in an ordinary user's new login session,
+checks master-key recovery, cookie sessions and built assets, revokes tokens,
+and rejoins the same computer with its original key and backup group. Joining
+records one pending PBS backup, so even a recent earlier success cannot make
+the first run after rejoining skip the backup; previous success evidence stays.
+
+Docker's overlay root cannot supply a bare-metal system image. The test keeps
+system mode enabled and checks that this limitation is disclosed as incomplete;
+the home backup, verification and file restore must still succeed. This is not
+a bare-metal restore test. The printed command also needs `curl` and `sudo`
+before it can fetch the installer. In a shell without `pipefail`, a failed
+`curl` can be hidden by the empty `sudo sh` succeeding; the test uses Bash with
+`pipefail` and verifies that a wrong pin installs and writes nothing. Changing
+that portable bootstrap command's exit behavior needs a separate contract
+decision.
