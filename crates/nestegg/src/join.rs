@@ -576,8 +576,18 @@ async fn join_with(paths: &Paths, args: JoinArgs, activation: &mut dyn Activatio
         drop(lock);
         if SecretStore::new(&paths.credentials_dir).exists(secrets::ENCRYPTION_KEY) {
             activation.start_backup()?;
+            println!("Interrupted join completed; the existing encryption key was kept.");
+        } else {
+            println!(
+                "Interrupted join completed. This computer has no encryption key yet, so no backup was started."
+            );
+            println!(
+                "Continue with the old key: sudo nestegg key recover --master-key <file> --install (one key reads old and new backups)."
+            );
+            println!(
+                "Or start with a new key: sudo nestegg key create (old backups then require the master key)."
+            );
         }
-        println!("Interrupted join completed; the existing encryption key was kept.");
         return Ok(());
     }
     if previous.is_none() {
@@ -861,6 +871,10 @@ fn merged_config(paths: &Paths, cfg: &Config) -> Result<String> {
         }
     }
     old["backup"]["master_public_key"] = new["backup"]["master_public_key"].clone();
+    // The household master key protects nothing in an unencrypted backup: a
+    // computer that had encryption switched off must not keep that and be
+    // shown as protected.
+    old["backup"]["encryption"] = toml_edit::value(true);
     let text = old.to_string();
     Config::parse(&text)?;
     Ok(text)

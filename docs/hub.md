@@ -73,9 +73,13 @@ A wrong passphrase records nothing and removes nothing. A local or
 unclassifiable file additionally needs the statement that another copy exists off the hub
 (`--accept-local-copy` without a terminal). A paper code needs the statement
 that the sheet is printed and stored elsewhere (`--printed` without a terminal).
-After successful decryption, nestegg removes private copies in `master/`, the
-recorded paper file if local, and the supplied proof file if local, before
-recording proof. If a copy cannot be removed, the message names the file to
+After successful decryption, nestegg removes private copies in `master/`
+before recording proof. The recorded paper file and the supplied proof file
+are removed only when they certainly lie on the hub itself (a disk of the
+hub, its memory or its container layer). Where nestegg cannot tell (a network
+share, or any path inside a container that hides its devices), it deletes
+nothing, because that file may be your only copy; it names the file and you
+decide. If a copy cannot be removed, the message names the file to
 move away or delete and proof remains pending. Keep the independent copy safe;
 `--accept-local-copy` does not permit keeping a private copy on the hub.
 Unplug removable media after proof. Until proof succeeds, join codes are refused.
@@ -172,8 +176,8 @@ owned by another identity cannot be taken over with the hub's restricted role.
    `--name <old-name> --adopt` (or use the installed `nestegg join` command).
    If replacing an existing configuration, also pass `--replace-config`.
 3. With existing snapshots and no local key, join installs configuration and
-   credentials but creates no key and starts no backup. Status/check report the
-   missing key. Install the old key with:
+   credentials but creates no key and starts no backup. `nestegg check` and the
+   failed scheduled run name the missing key and the two commands. Install the old key with:
 
    ```sh
    sudo nestegg key recover --master-key /media/usb/master-private.pem --install

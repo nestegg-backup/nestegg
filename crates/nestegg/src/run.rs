@@ -989,7 +989,13 @@ fn pipeline(
         if !secrets.exists(secrets::ENCRYPTION_KEY) {
             rep.fail(
                 RunState::Failed,
-                config_error("encryption is enabled but no key exists; run `nestegg key create`"),
+                config_error(if config.hub.is_some() {
+                    // A computer that joined under a name with earlier
+                    // backups gets no key from `join` on purpose.
+                    "this computer has no encryption key yet. If it replaces a computer that already had backups, continue with the old key: `sudo nestegg key recover --master-key <file> --install`. To start with a new key instead: `sudo nestegg key create` (the old backups then need the master key)"
+                } else {
+                    "encryption is enabled but no key exists; run `nestegg key create`"
+                }),
             );
             return Ok(());
         }

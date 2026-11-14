@@ -251,6 +251,7 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
         (args.file, args.paper_code)
     };
     let mut local_copies = Vec::new();
+    let mut kept_copies: Vec<PathBuf> = Vec::new();
     let encrypted = if let Some(file) = file {
         let real = std::fs::canonicalize(&file)?;
         ensure!(
@@ -266,16 +267,39 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
             ),
             "copy does not contain this household's master key"
         );
-        if crate::keyproof::locate(&real).needs_statement() {
-            local_copies.push(real.clone());
-        }
-        if crate::keyproof::locate(&real).needs_statement() && !args.accept_local_copy {
-            ensure!(
-                prompt(
-                    "Type yes to state that another copy exists outside the hub's disk (or use --accept-local-copy)"
-                )? == "yes",
-                "copy outside the hub was not confirmed"
-            );
+        let location = crate::keyproof::locate(&real);
+        match hub_copy(&real, &location) {
+            // On a disk of the hub itself: it has to go, and only after the
+            // statement that this is not the only copy.
+            HubCopy::OnHub => {
+                if !args.accept_local_copy {
+                    ensure!(
+                        prompt(&format!(
+                            "{} {} and will be deleted after the proof. Type yes to state that another copy exists outside the hub's disk (or use --accept-local-copy)",
+                            real.display(),
+                            location.describe()
+                        ))? == "yes",
+                        "copy outside the hub was not confirmed"
+                    );
+                }
+                local_copies.push(real.clone());
+            }
+            // A network share, an overlay, a container without device
+            // information: this may be the only copy. Never delete it.
+            HubCopy::Undecidable => {
+                if !args.accept_local_copy {
+                    ensure!(
+                        prompt(&format!(
+                            "{} {}. Type yes to state that this copy, or another one, is stored outside the hub's disk (or use --accept-local-copy)",
+                            real.display(),
+                            location.describe()
+                        ))? == "yes",
+                        "copy outside the hub was not confirmed"
+                    );
+                }
+                kept_copies.push(real.clone());
+            }
+            HubCopy::Elsewhere => {}
         }
         bytes
     } else if let Some(code) = code {
@@ -292,10 +316,20 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
                 "printed copy not confirmed"
             );
         }
-        crate::restore::read_small_regular_file(
+        let pending = crate::restore::read_small_regular_file(
             &config.state_dir.join("master/master-private.pem"),
             1024 * 1024,
-        )?
+        )?;
+        // The key that is decrypted below must be the one whose public half
+        // the computers receive, not whatever lies in that file now.
+        ensure!(
+            crypto::matches(
+                &pem_data(&pending)?,
+                master.private_digest.as_deref().unwrap_or("")
+            ),
+            "the pending private key on the hub is not this household's master key; prove with --file and a copy of the sheet"
+        );
+        pending
     } else {
         anyhow::bail!("proof required");
     };
@@ -303,9 +337,13 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
     // reads the freshly entered passphrase, directly from the terminal.
     decrypt_proof(&encrypted)?;
     if let Some(file) = &master.paper_file
-        && crate::keyproof::locate(file).needs_statement()
+        && file.exists()
     {
-        local_copies.push(file.clone());
+        match hub_copy(file, &crate::keyproof::locate(file)) {
+            HubCopy::OnHub => local_copies.push(file.clone()),
+            HubCopy::Undecidable => kept_copies.push(file.clone()),
+            HubCopy::Elsewhere => {}
+        }
     }
     // Terminal prompts and decryption never hold the hub state lock.
     let mut t = Transaction::open(&config.state_dir)?;
@@ -340,7 +378,60 @@ pub fn confirm(config: &Config, args: Confirm) -> Result<()> {
     println!(
         "Master key copy proven; the private part was removed from the hub. Unplug removable media and keep it away from this machine."
     );
+    kept_copies.sort();
+    kept_copies.dedup();
+    for file in kept_copies {
+        println!(
+            "Not deleted: {} (nestegg cannot tell whether it lies on the hub's own disk). If it does, move it away or delete it yourself; if it is your copy on a network share, keep it.",
+            file.display()
+        );
+    }
     Ok(())
+}
+
+/// What the proof does with a file that holds the private master key.
+#[derive(Debug, PartialEq, Eq)]
+enum HubCopy {
+    /// Certainly on a disk of the hub: must not stay (decision 0034).
+    OnHub,
+    /// Not decidable (network share, overlay, container without device
+    /// information). It may be the administrator's only copy, so it is
+    /// never deleted; the administrator is told.
+    Undecidable,
+    /// Removable medium.
+    Elsewhere,
+}
+
+fn hub_copy(path: &Path, location: &crate::keyproof::Location) -> HubCopy {
+    use crate::keyproof::Location;
+    match location {
+        Location::Internal | Location::InBackup(_) => HubCopy::OnHub,
+        Location::Unknown(_) => hub_copy_by_fs(file_system_type(path).as_deref()),
+        Location::Removable => HubCopy::Elsewhere,
+    }
+}
+
+/// A location without device information is still certainly on this machine
+/// when the file system lives in its memory or is its container layer.
+/// Everything else (network shares, and disk file systems whose device is
+/// hidden, as in a container) stays undecidable.
+fn hub_copy_by_fs(fs_type: Option<&str>) -> HubCopy {
+    match fs_type {
+        Some("tmpfs" | "ramfs" | "devtmpfs" | "overlay") => HubCopy::OnHub,
+        _ => HubCopy::Undecidable,
+    }
+}
+
+fn file_system_type(path: &Path) -> Option<String> {
+    let out = Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", "-T"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !text.is_empty()).then_some(text)
 }
 
 fn decrypt_proof(encrypted: &[u8]) -> Result<()> {
@@ -601,6 +692,28 @@ finally:
                     .is_some()
             );
         }
+    }
+    #[test]
+    fn only_copies_certainly_on_the_hub_are_deleted() {
+        use crate::keyproof::Location;
+        let anywhere = Path::new("/nonexistent/master.html");
+        assert_eq!(hub_copy(anywhere, &Location::Internal), HubCopy::OnHub);
+        assert_eq!(
+            hub_copy(anywhere, &Location::InBackup("inside /home".into())),
+            HubCopy::OnHub
+        );
+        assert_eq!(hub_copy(anywhere, &Location::Removable), HubCopy::Elsewhere);
+        // Memory and container layers are this machine.
+        for fs in ["tmpfs", "ramfs", "overlay"] {
+            assert_eq!(hub_copy_by_fs(Some(fs)), HubCopy::OnHub);
+        }
+        // A network share may hold the administrator's only copy; a disk
+        // file system with a hidden device (container) cannot be told from
+        // a mounted stick. Neither is ever deleted.
+        for fs in ["nfs4", "cifs", "fuse.sshfs", "9p", "ext4", "zfs"] {
+            assert_eq!(hub_copy_by_fs(Some(fs)), HubCopy::Undecidable);
+        }
+        assert_eq!(hub_copy_by_fs(None), HubCopy::Undecidable);
     }
     #[test]
     fn an_unremovable_copy_names_the_path_and_fails() {

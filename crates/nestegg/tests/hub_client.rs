@@ -642,6 +642,23 @@ async fn replace_config_preserves_household_settings_and_keeps_backup_copy() {
 }
 
 #[tokio::test]
+async fn replace_config_switches_encryption_on_again() {
+    // The master key protects nothing in an unencrypted backup: a computer
+    // that had encryption off must not keep that and be shown as protected.
+    let hub = Hub::start().await;
+    let computer = Computer::new();
+    let mut cfg = nestegg::config::example("old.example.com", "old-backups", "backup@pbs!old");
+    cfg.backup.encryption = false;
+    cfg.backup.excludes.push("keep-my-exclude".into());
+    std::fs::write(&computer.paths.config_file, cfg.to_toml().unwrap()).unwrap();
+    hub.reply(200, hub.success());
+    success(&computer.join(&hub, &["--replace-config"], "").await);
+    let actual = Config::load(&computer.paths.config_file).unwrap();
+    assert!(actual.backup.encryption);
+    assert_eq!(actual.backup.excludes, cfg.backup.excludes);
+}
+
+#[tokio::test]
 async fn dropped_response_retries_with_same_durable_attempt_after_restart() {
     let hub = Hub::start().await;
     let computer = Computer::new();

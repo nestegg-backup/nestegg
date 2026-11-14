@@ -92,7 +92,9 @@ under the same token identity with a fresh secret; **the token secret on the
 dead computer is gone**. The master key alone cannot log in to PBS.
 
 With old snapshots and no key, join creates no key and starts no backup.
-Status and check explain the missing key. Continue with the original key:
+`nestegg check` and the failed scheduled run (shown by `nestegg status` and in
+the interface) say that the key is missing and name the two commands. Continue
+with the original key:
 
 ```sh
 sudo nestegg key recover --master-key /media/usb/master-private.pem --install

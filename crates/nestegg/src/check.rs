@@ -180,7 +180,13 @@ fn run_items(paths: &Paths, options: &CheckOptions, tracker: &mut WakeTracker) -
         );
     }
     if cfg.backup.encryption {
-        if options.login {
+        // A computer that joined a hub under a name with earlier backups
+        // has no key on purpose; say what to do instead of only "missing".
+        let no_key_yet = cfg.hub.is_some() && !store.exists(secrets::ENCRYPTION_KEY);
+        let recover_hint = "none yet. Replacing a computer that had backups: sudo nestegg key recover --master-key <file> --install; or start with a new key: sudo nestegg key create";
+        if no_key_yet {
+            r.report(false, "encryption key", recover_hint.to_string());
+        } else if options.login {
             let key = store.load(secrets::ENCRYPTION_KEY);
             r.report(
                 key.is_ok(),

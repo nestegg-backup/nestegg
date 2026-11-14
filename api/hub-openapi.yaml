@@ -360,6 +360,7 @@ components:
         attempt:
           type: string
           minLength: 43
+          maxLength: 256
           pattern: '^[A-Za-z0-9_-]+$'
           description: |
             Random base64url enrollment identity, kept in the computer's journal.
