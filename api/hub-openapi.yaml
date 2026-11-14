@@ -1,0 +1,401 @@
+openapi: 3.1.0
+info:
+  title: nestegg hub API
+  version: 0.1.0
+  summary: API of the nestegg hub (decision 0034, stage 1).
+  description: |
+    Served by `nestegg hub serve` over HTTPS (default port 8443) together
+    with the hub web interface. The certificate is created by
+    `nestegg hub init`; clients that are not browsers pin its public key
+    (`pin`, see below) instead of trusting a certificate authority.
+
+    Conventions
+    - All timestamps are RFC 3339 strings in UTC.
+    - Unknown fields must be ignored by clients (the API may add fields).
+    - Errors use the `Error` schema with a stable machine-readable `code`.
+    - **Pin**: `sha256//` followed by the base64 SHA-256 of the DER
+      SubjectPublicKeyInfo of the hub certificate. This is exactly the format
+      of `curl --pinnedpubkey`.
+
+    Three kinds of callers
+    - **Anonymous**: `/join.sh`, `/pkg/*`, `POST /join` (authorised by the
+      one-time code in the body), `POST /session`.
+    - **Administrator** (browser): session cookie `nestegg_hub_session`
+      (`HttpOnly`, `Secure`, `SameSite=Strict`) from `POST /session`.
+      Every request that is not GET/HEAD must also carry the header
+      `X-Nestegg-Hub: 1` (a custom header cannot be sent cross-site without
+      a CORS preflight, which the hub never answers).
+    - **Computer**: `Authorization: Bearer <machine credential>` from the
+      join response.
+
+    The hub never returns the PBS user's password, a machine credential or a
+    token secret after the single response that creates it, and never logs
+    them. One-time codes and machine credentials are stored only as hashes.
+  license:
+    name: AGPL-3.0-or-later
+    identifier: AGPL-3.0-or-later
+servers:
+  - url: /api/hub/v1
+paths:
+  /session:
+    post:
+      operationId: login
+      summary: Log in as administrator.
+      description: |
+        Wrong passwords are answered with 401 after a delay; repeated
+        failures from one address are slowed down further (429).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        "204": { description: Logged in; the session cookie is set. }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+    get:
+      operationId: getSession
+      summary: Whether the caller is logged in.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [logged_in]
+                properties:
+                  logged_in: { type: boolean }
+    delete:
+      operationId: logout
+      summary: Log out.
+      responses:
+        "204": { description: Logged out. }
+
+  /hub:
+    get:
+      operationId: getHub
+      summary: State of the hub. Administrator only.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Hub" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /machines:
+    get:
+      operationId: listMachines
+      summary: All joined computers with what the PBS knows about their backups. Administrator only.
+      description: |
+        The hub lists the backup groups of the household namespace with the
+        PBS user and merges them with its own list of joined computers.
+        When the PBS cannot be reached (asleep), the hub answers with what it
+        read last and says so (`pbs_read_at`, `pbs_reachable: false`); it does
+        not wake the PBS for a listing.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MachinesResponse" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /machines/{machine_id}:
+    delete:
+      operationId: removeMachine
+      summary: Remove a computer from the hub. Administrator only.
+      description: |
+        Deletes the computer's PBS token and its machine credential. The
+        backups stay on the PBS. The computer itself is not contacted; its
+        next backup fails with a login error until it joins again.
+      parameters:
+        - { name: machine_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Removed. }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+
+  /machines/self/leave:
+    post:
+      operationId: leave
+      summary: The calling computer leaves the hub. Computer only.
+      description: Same effect as `DELETE /machines/{machine_id}` for the caller.
+      responses:
+        "204": { description: Left. }
+        "401": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+
+  /join-codes:
+    get:
+      operationId: listJoinCodes
+      summary: Codes that are still valid (without the code itself). Administrator only.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [codes]
+                properties:
+                  codes:
+                    type: array
+                    items: { $ref: "#/components/schemas/JoinCodeInfo" }
+        "401": { $ref: "#/components/responses/Error" }
+    post:
+      operationId: createJoinCode
+      summary: Create a one-time code for one computer. Administrator only.
+      description: |
+        Refused with `master_key_unproven` until the master key copy has been
+        proven (`nestegg hub init` or `nestegg hub master-key confirm`), and
+        with `no_package` when the hub has no nestegg package to hand out.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note:
+                  type: string
+                  maxLength: 80
+                  description: Free text for the administrator ("laptop in the study").
+      responses:
+        "201":
+          description: Created. The only response that contains the code.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JoinCode" }
+        "401": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /join-codes/{code_id}:
+    delete:
+      operationId: revokeJoinCode
+      summary: Revoke a code that was not used. Administrator only.
+      parameters:
+        - { name: code_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Revoked. }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /join:
+    post:
+      operationId: join
+      summary: A computer joins with a one-time code. Anonymous.
+      description: |
+        The hub wakes the PBS if needed (Wake-on-LAN, bounded wait), creates
+        the token `<pbs user>!<backup_id>` with a new secret and gives it the
+        role `DatastoreBackup` on the household namespace. The code is used
+        up only when all of this worked; a failed join can be repeated with
+        the same code until it expires. A used, expired, revoked or unknown
+        code is answered with the same `invalid_code`, after a delay.
+
+        `backup_id` is the name of the computer on the PBS. If the wanted
+        name belongs to a computer that is joined, the answer is
+        `name_taken`. If a backup group of that name exists on the PBS but
+        no joined computer has it (a computer that left, or was set up
+        without the hub), the join needs `adopt: true`, which the command
+        line asks for explicitly; the new token then becomes owner of that
+        group if the PBS user may change it, otherwise `name_taken`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/JoinRequest" }
+      responses:
+        "200":
+          description: Joined. The only response that contains the secrets.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JoinResponse" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+
+components:
+  responses:
+    Error:
+      description: Error.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            `unauthorized`, `rate_limited`, `invalid_code`, `name_taken`,
+            `name_exists_on_pbs` (join needs `adopt`), `master_key_unproven`,
+            `no_package`, `pbs_unreachable`, `pbs_refused` (the PBS answered
+            with an error; `message` has its text), `not_found`,
+            `bad_request`.
+        message: { type: string }
+
+    Hub:
+      type: object
+      required: [name, version, url, pin, pbs, master_key, package]
+      properties:
+        name: { type: string, description: Name of the household shown in the interface., examples: ["Home"] }
+        version: { type: string, description: Version of the hub program. }
+        url: { type: string, description: Address computers use to reach the hub., examples: ["https://hub.example.com:8443"] }
+        pin: { type: string, examples: ["sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="] }
+        pbs:
+          type: object
+          required: [server, port, datastore, namespace, user, wake_on_lan]
+          properties:
+            server: { type: string, examples: ["pbs.example.com"] }
+            port: { type: integer, examples: [8007] }
+            datastore: { type: string }
+            namespace: { type: [string, "null"] }
+            user: { type: string, examples: ["backup@pbs"] }
+            wake_on_lan: { type: boolean }
+        master_key:
+          type: object
+          required: [present, proven]
+          properties:
+            present: { type: boolean }
+            proven: { type: boolean, description: The copy outside the hub was proven (decision 0018). }
+            proven_at: { type: [string, "null"], format: date-time }
+            fingerprint: { type: [string, "null"], description: SHA-256 of the DER public key, hex with colons. }
+        package:
+          type: object
+          required: [available]
+          properties:
+            available: { type: boolean }
+            version: { type: [string, "null"] }
+            architecture: { type: [string, "null"], examples: ["amd64"] }
+
+    MachinesResponse:
+      type: object
+      required: [pbs_reachable, pbs_read_at, machines, unmanaged]
+      properties:
+        pbs_reachable: { type: boolean }
+        pbs_read_at: { type: [string, "null"], format: date-time, description: When the PBS data below was read; null if never. }
+        machines:
+          type: array
+          items: { $ref: "#/components/schemas/Machine" }
+        unmanaged:
+          type: array
+          description: Backup groups in the namespace that belong to no joined computer.
+          items:
+            type: object
+            required: [backup_id]
+            properties:
+              backup_id: { type: string }
+              last_snapshot: { type: [string, "null"], format: date-time }
+
+    Machine:
+      type: object
+      required: [machine_id, backup_id, hostname, joined_at, snapshot_count]
+      properties:
+        machine_id: { type: string }
+        backup_id: { type: string, examples: ["desktop"] }
+        hostname: { type: string }
+        os: { type: [string, "null"], examples: ["Linux Mint 22.2"] }
+        nestegg_version: { type: [string, "null"] }
+        joined_at: { type: string, format: date-time }
+        snapshot_count: { type: integer }
+        last_snapshot: { type: [string, "null"], format: date-time }
+        last_snapshot_verified:
+          type: [boolean, "null"]
+          description: Result of the server-side verification of the newest snapshot; null if not verified yet.
+        report:
+          description: |
+            The status report the computer stored in the notes of its newest
+            snapshot (schema `StatusReport` of `api/openapi.yaml`), or null
+            when there is none or it cannot be parsed. Display only.
+          type: [object, "null"]
+
+    JoinCodeInfo:
+      type: object
+      required: [code_id, created_at, expires_at]
+      properties:
+        code_id: { type: string }
+        note: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+
+    JoinCode:
+      allOf:
+        - $ref: "#/components/schemas/JoinCodeInfo"
+        - type: object
+          required: [code, command]
+          properties:
+            code:
+              type: string
+              description: Twelve characters in three groups, without letters and digits that are easily confused.
+              examples: ["K7QM-3HXP-9TDW"]
+            command:
+              type: string
+              description: The complete command line for the new computer.
+              examples: ["curl -fsSk --pinnedpubkey 'sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' https://hub.example.com:8443/join.sh | sudo sh -s -- K7QM-3HXP-9TDW"]
+
+    JoinRequest:
+      type: object
+      required: [code, hostname]
+      properties:
+        code: { type: string }
+        hostname: { type: string }
+        backup_id:
+          type: string
+          description: Wanted name on the PBS; default is the host name. Letters, digits, `-`, `_`, `.`; at most 64 characters.
+        adopt: { type: boolean, default: false }
+        os: { type: string }
+        nestegg_version: { type: string }
+
+    JoinResponse:
+      type: object
+      required: [machine_id, backup_id, machine_credential, pbs, master_key, hub]
+      properties:
+        machine_id: { type: string }
+        backup_id: { type: string }
+        machine_credential:
+          type: string
+          description: Secret the computer uses as Bearer token towards the hub.
+        pbs:
+          type: object
+          required: [server, port, datastore, namespace, fingerprint, auth_id, secret]
+          properties:
+            server: { type: string }
+            port: { type: integer }
+            datastore: { type: string }
+            namespace: { type: [string, "null"] }
+            fingerprint:
+              type: [string, "null"]
+              description: SHA-256 fingerprint of the PBS certificate; null if it is trusted through a certificate authority.
+            auth_id: { type: string, examples: ["backup@pbs!desktop"] }
+            secret: { type: string, description: Secret of the new API token. }
+        wake:
+          type: [object, "null"]
+          description: Wake-on-LAN settings for the PBS, or null.
+          required: [mac]
+          properties:
+            mac: { type: string, examples: ["00:00:5e:00:53:01"] }
+            broadcast: { type: [string, "null"] }
+            timeout_seconds: { type: [integer, "null"] }
+        master_key:
+          type: object
+          required: [public_key_pem, fingerprint, proven_at]
+          properties:
+            public_key_pem: { type: string }
+            fingerprint: { type: string }
+            proven_at: { type: string, format: date-time }
+        hub:
+          type: object
+          required: [name, url, pin]
+          properties:
+            name: { type: string }
+            url: { type: string }
+            pin: { type: string }
