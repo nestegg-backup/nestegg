@@ -103,14 +103,28 @@ Windows and macOS are not planned: nestegg is a Linux system service
 built on Linux mechanisms, and it must not reimplement the PBS protocol;
 whether an official client exists for those systems has not been checked.
 
-## v0.5 – Hub (decided, not implemented)
+## v0.5 – Hub (stage 1 implemented)
 
 - One instance in the home network that manages the backups of all
   computers; adding a computer is one command. The hub is never in the data
   path, creates the PBS token of each computer itself and replaces the key
   copy per computer by one household master key.
-- Decision and stages: `docs/decisions/0034-hub.md`. Publication waits for
-  stages 1 and 2.
+- Decision and stages: `docs/decisions/0034-hub.md`; setup in
+  [hub.md](hub.md). Stage 1 (join and overview) is implemented and was tried once
+  with a real PBS and a test computer. Stage 2 (controlling computers from the
+  hub, the rescue stick accepts the master key) is open.
+- Known open points of stage 1, from review:
+  - `join` trusts the hub's statement whether the computer's name already
+    has snapshots.
+  - A crash between removing the master key copies and saving the proof
+    leaves the hub without proof and without the pending private key.
+  - Somebody in the network can slow down joins and logins: wrong join codes
+    hold the provisioning lane, and the login queue can be kept full.
+  - A join that times out can leave an unused PBS token behind, and the
+    timeout is reported as an unreachable PBS.
+  - The package download has no send timeout.
+  - The hub interface has no 14-day history per computer, and the status
+    report of a computer does not mention the master key.
 
 ## Not planned
 

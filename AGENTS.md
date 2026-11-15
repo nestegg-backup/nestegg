@@ -32,11 +32,18 @@ and coding agents alike.
 ## Safety net
 
 - `scripts/privacy-check.sh` runs as `pre-commit` and `commit-msg` hook
-  (`git config core.hooksPath .githooks`). It requires a GitHub noreply commit
-  e-mail, runs gitleaks with `.gitleaks.toml`, and checks a local deny list in
+  (`git config core.hooksPath .githooks`). It requires author and committer
+  e-mails of the form `<id>+<login>@users.noreply.github.com`, runs gitleaks
+  with `.gitleaks.toml`, and checks a local deny list in
   `.git/info/privacy-denylist` (never committed - each maintainer keeps their
   own personal strings there).
-- CI runs gitleaks on every push and pull request.
+- Commit as yourself. Never invent a project identity such as
+  `nestegg@users.noreply.github.com`: a bare `<name>@users.noreply.github.com`
+  can belong to an unrelated GitHub account, which is then shown as the
+  author (decision 0035). Local merges and cherry-picks bypass the hooks, so
+  check the identity before them.
+- CI runs gitleaks on every push and pull request and checks the author and
+  committer e-mail of every commit.
 - Before the repository is made public: run `scripts/privacy-check.sh tree`,
   scan the full history with `gitleaks detect`, and review every commit author
   and message.

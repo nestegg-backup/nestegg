@@ -32,6 +32,9 @@ What it does:
 - a local web UI for status, history, settings and restore, with an
   overview of the other computers of the household that back up to the same
   server
+- an optional hub for a household: one always-on machine lists all
+  computers, and a new computer joins with one command
+  ([docs/hub.md](docs/hub.md); stage 1, no remote control yet)
 - a rescue stick (bootable ISO) that restores the whole computer onto an
   empty disk: partitions, files, boot loader ([docs/rescue.md](docs/rescue.md))
 - a backup stick (USB stick or USB SSD) that works with or without a PBS:

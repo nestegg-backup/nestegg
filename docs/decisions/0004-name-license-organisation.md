@@ -23,4 +23,5 @@ used directly later. The network clause fits a tool with a web interface.
 The public repository will live in a dedicated GitHub organisation rather than
 a personal account. Candidate organisation names that were free on
 2026-11-08: `nestegg-backup`, `nesteggbackup` (`nestegg` itself is taken by a
-user account). The repository is transferred when it goes public.
+user account). The public repository is created fresh in `nestegg-backup`
+instead of transferring this one (decision 0035).

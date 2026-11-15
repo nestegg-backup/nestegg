@@ -17,7 +17,8 @@ the history, or the history would have to be rewritten before release.
    (see `AGENTS.md`).
 2. Commits use the GitHub noreply e-mail address of the author.
 3. A local commit hook (`scripts/privacy-check.sh`) blocks commits with
-   secrets, private network details, non-noreply author e-mails, or strings
+   secrets, private network details, author or committer e-mails that are not
+   `<id>+<login>@users.noreply.github.com` (decision 0035), or strings
    from a per-maintainer deny list kept in `.git/info/` (outside version
    control).
 4. CI runs gitleaks with the project rules in `.gitleaks.toml` on every push
