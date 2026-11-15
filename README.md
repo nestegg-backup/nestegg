@@ -45,6 +45,27 @@ What it does:
 See [docs/roadmap.md](docs/roadmap.md), [docs/architecture.md](docs/architecture.md)
 and the [decision records](docs/decisions/).
 
+## Screenshots
+
+All screenshots show placeholder data from the interface's mock mode.
+
+The local web interface: state of this computer, the last 14 days and the
+other computers of the household.
+
+![Overview of one computer](docs/screenshots/overview.png)
+
+Restoring files: choose a backup, then the files, then the target folder.
+
+![Choosing a backup to restore from](docs/screenshots/restore.png)
+
+The hub: all computers of the household in one place.
+
+![The hub with the list of computers](docs/screenshots/hub.png)
+
+Adding a computer to the hub is one command with a one-time code.
+
+![The command that adds a computer](docs/screenshots/hub-add-computer.png)
+
 ## Development
 
 ```sh
